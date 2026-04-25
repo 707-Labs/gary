@@ -34,6 +34,13 @@ export interface LogEvent {
   raw: Record<string, unknown>;
 }
 
+export interface D1QueryResult {
+  rows: Record<string, unknown>[];
+  rowsRead: number;
+  rowsWritten: number;
+  durationMs: number;
+}
+
 export interface InvocationSummary {
   /** Invocation id (= `$metadata.id` in events). */
   invocationId: string;
@@ -89,6 +96,46 @@ export class CloudflareClient {
     const response = await this.post("/telemetry/query", body);
     const invocations = extractArray(response, "invocations");
     return invocations.map((i) => normalizeInvocation(i));
+  }
+
+  /**
+   * Run a read-only D1 query against one of the configured databases.
+   * Throws if the SQL isn't a SELECT/WITH/EXPLAIN/PRAGMA, or if the database
+   * alias isn't registered in cfg.d1Databases.
+   */
+  async queryD1(args: {
+    database: string;
+    sql: string;
+    params?: readonly (string | number | null)[];
+  }): Promise<D1QueryResult> {
+    const databaseId = this.cfg.d1Databases[args.database];
+    if (!databaseId) {
+      const known = Object.keys(this.cfg.d1Databases).join(", ") || "(none)";
+      throw new Error(
+        `unknown d1 database alias '${args.database}'. Known: ${known}`,
+      );
+    }
+    assertReadOnlySql(args.sql);
+    const url = `${API_BASE}/accounts/${this.cfg.accountId}/d1/database/${databaseId}/query`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.cfg.apiToken}`,
+      },
+      body: JSON.stringify({ sql: args.sql, params: args.params ?? [] }),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      log.error("cloudflare d1 error", {
+        database: args.database,
+        status: res.status,
+        body: text.slice(0, 500),
+      });
+      throw new Error(`cloudflare d1 ${res.status}: ${text.slice(0, 200)}`);
+    }
+    const json = (await res.json()) as unknown;
+    return parseD1Response(json);
   }
 
   /** Diagnostic — list the keys CF currently sees in the telemetry dataset. */
@@ -190,6 +237,50 @@ export class CloudflareClient {
 
 function clamp(n: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, n));
+}
+
+const READ_ONLY_VERB = /^\s*(SELECT|WITH|EXPLAIN|PRAGMA)\b/i;
+
+/**
+ * Reject anything that isn't a single read-only statement. We strip line and
+ * block comments first so a comment can't smuggle "SELECT" in front of a
+ * mutating statement.
+ */
+function assertReadOnlySql(sql: string): void {
+  const stripped = sql
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/--.*$/gm, " ")
+    .trim();
+  if (!READ_ONLY_VERB.test(stripped)) {
+    throw new Error(
+      "d1 query must start with SELECT, WITH, EXPLAIN, or PRAGMA — write operations are not permitted",
+    );
+  }
+  // Forbid multi-statement payloads. A trailing semicolon is fine; a second
+  // statement after it is not.
+  const trimmed = stripped.replace(/;\s*$/, "");
+  if (trimmed.includes(";")) {
+    throw new Error("d1 query must be a single statement");
+  }
+}
+
+function parseD1Response(raw: unknown): D1QueryResult {
+  const empty: D1QueryResult = { rows: [], rowsRead: 0, rowsWritten: 0, durationMs: 0 };
+  if (!isObject(raw)) return empty;
+  const result = raw.result;
+  if (!Array.isArray(result) || result.length === 0) return empty;
+  const first = result[0];
+  if (!isObject(first)) return empty;
+  const rows = Array.isArray(first.results)
+    ? first.results.filter(isObject)
+    : [];
+  const meta = isObject(first.meta) ? first.meta : {};
+  return {
+    rows,
+    rowsRead: typeof meta.rows_read === "number" ? meta.rows_read : 0,
+    rowsWritten: typeof meta.rows_written === "number" ? meta.rows_written : 0,
+    durationMs: typeof meta.duration === "number" ? meta.duration : 0,
+  };
 }
 
 function isObject(v: unknown): v is Record<string, unknown> {

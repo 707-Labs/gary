@@ -30,6 +30,7 @@ bun run scripts/probe-agent-loop.ts      # agent loop in temp workspace
 bun run scripts/probe-loop-tick.ts       # ONE real tick — will post comments / open PRs
 bun run scripts/probe-ticket-details.ts  # print descriptions of Gary's current assignments
 bun run scripts/probe-cloudflare.ts      # verify CF observability auth + recent errors
+bun run scripts/probe-d1.ts              # verify D1 read auth + SELECT-only clamp
 ```
 
 ## Architecture (one-liner)

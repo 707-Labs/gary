@@ -39,6 +39,7 @@ const cfg = {
   apiToken: "test-token-123",
   accountId: "acct-abc",
   observabilityWorkers: ["mulligan-labs", "mulligan-labs-party"],
+  d1Databases: { "mulligan-labs": "db-uuid-1" },
 };
 
 describe("CloudflareClient", () => {
@@ -189,5 +190,89 @@ describe("CloudflareClient", () => {
     installMockFetch(() => new Response("forbidden", { status: 403 }));
     const cf = new CloudflareClient(cfg);
     await expect(cf.queryLogs({})).rejects.toThrow(/403/);
+  });
+
+  describe("queryD1", () => {
+    it("rejects writes before hitting the network", async () => {
+      const { captured } = installMockFetch(() => jsonResponse({}));
+      const cf = new CloudflareClient(cfg);
+      await expect(
+        cf.queryD1({ database: "mulligan-labs", sql: "DELETE FROM users" }),
+      ).rejects.toThrow(/SELECT/);
+      expect(captured).toHaveLength(0);
+    });
+
+    it("rejects multi-statement payloads", async () => {
+      installMockFetch(() => jsonResponse({}));
+      const cf = new CloudflareClient(cfg);
+      await expect(
+        cf.queryD1({
+          database: "mulligan-labs",
+          sql: "SELECT 1; DROP TABLE users",
+        }),
+      ).rejects.toThrow(/single statement/);
+    });
+
+    it("strips comments before checking the verb", async () => {
+      installMockFetch(() => jsonResponse({}));
+      const cf = new CloudflareClient(cfg);
+      await expect(
+        cf.queryD1({
+          database: "mulligan-labs",
+          sql: "/* SELECT */ DELETE FROM users",
+        }),
+      ).rejects.toThrow();
+    });
+
+    it("posts to the right endpoint and parses rows + meta", async () => {
+      const { captured } = installMockFetch(() =>
+        jsonResponse({
+          success: true,
+          result: [
+            {
+              success: true,
+              results: [{ id: 1, name: "alice" }],
+              meta: { duration: 0.42, rows_read: 1, rows_written: 0 },
+            },
+          ],
+        }),
+      );
+      const cf = new CloudflareClient(cfg);
+      const out = await cf.queryD1({
+        database: "mulligan-labs",
+        sql: "SELECT id, name FROM users WHERE id = ?1",
+        params: [1],
+      });
+      expect(out.rows).toHaveLength(1);
+      expect(out.rows[0]).toMatchObject({ id: 1, name: "alice" });
+      expect(out.rowsRead).toBe(1);
+
+      const req = captured[0]!;
+      expect(req.url).toBe(
+        "https://api.cloudflare.com/client/v4/accounts/acct-abc/d1/database/db-uuid-1/query",
+      );
+      expect(req.body).toMatchObject({
+        sql: "SELECT id, name FROM users WHERE id = ?1",
+        params: [1],
+      });
+    });
+
+    it("rejects unknown database aliases", async () => {
+      installMockFetch(() => jsonResponse({}));
+      const cf = new CloudflareClient(cfg);
+      await expect(
+        cf.queryD1({ database: "not-a-real-db", sql: "SELECT 1" }),
+      ).rejects.toThrow(/unknown d1 database/);
+    });
+
+    it("accepts WITH, EXPLAIN, PRAGMA", async () => {
+      installMockFetch(() =>
+        jsonResponse({ success: true, result: [{ results: [] }] }),
+      );
+      const cf = new CloudflareClient(cfg);
+      await cf.queryD1({ database: "mulligan-labs", sql: "WITH x AS (SELECT 1) SELECT * FROM x" });
+      await cf.queryD1({ database: "mulligan-labs", sql: "EXPLAIN SELECT 1" });
+      await cf.queryD1({ database: "mulligan-labs", sql: "PRAGMA table_info(users)" });
+    });
   });
 });

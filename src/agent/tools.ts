@@ -60,6 +60,7 @@ export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): Agen
   if (opts.cloudflare) {
     register(queryCloudflareLogsTool(opts.cloudflare));
     register(listCloudflareInvocationsTool(opts.cloudflare));
+    register(d1QueryTool(opts.cloudflare));
   }
   register(finishTool(out));
 
@@ -636,6 +637,60 @@ function listCloudflareInvocationsTool(cf: CloudflareClient): ToolHandler {
         return invs.map(formatInvocation).join("\n");
       } catch (err) {
         return formatError("list_cloudflare_invocations", err);
+      }
+    },
+  };
+}
+
+const d1QuerySchema = z.object({
+  database: z.string().min(1),
+  sql: z.string().min(1),
+  params: z.array(z.union([z.string(), z.number(), z.null()])).optional(),
+});
+const D1_ROWS_MAX = 200;
+function d1QueryTool(cf: CloudflareClient): ToolHandler {
+  return {
+    definition: {
+      name: "d1_query",
+      description:
+        "Run a read-only SQL query against an Ertai D1 database. Use SELECT, WITH, EXPLAIN, or PRAGMA — write statements are rejected. Useful for inspecting schema (e.g. PRAGMA table_info(users)) and confirming production data shape when debugging a ticket.",
+      input_schema: {
+        type: "object",
+        properties: {
+          database: {
+            type: "string",
+            description: "Database alias (e.g. 'mulligan-labs').",
+          },
+          sql: {
+            type: "string",
+            description:
+              "Single SQL statement. Must start with SELECT, WITH, EXPLAIN, or PRAGMA.",
+          },
+          params: {
+            type: "array",
+            description:
+              "Bound parameters for the query (use ?1, ?2 placeholders in the SQL).",
+            items: {},
+          },
+        },
+        required: ["database", "sql"],
+      },
+    },
+    async run(input) {
+      const args = d1QuerySchema.parse(input);
+      try {
+        const result = await cf.queryD1({
+          database: args.database,
+          sql: args.sql,
+          ...(args.params !== undefined ? { params: args.params } : {}),
+        });
+        const truncated = result.rows.length > D1_ROWS_MAX;
+        const rows = truncated ? result.rows.slice(0, D1_ROWS_MAX) : result.rows;
+        const meta = `rows: ${result.rows.length}${truncated ? ` (showing first ${D1_ROWS_MAX})` : ""} | rows_read: ${result.rowsRead} | duration: ${result.durationMs}ms`;
+        if (rows.length === 0) return `${meta}\n(no rows)`;
+        return `${meta}\n\n${JSON.stringify(rows, null, 2)}`;
+      } catch (err) {
+        return formatError("d1_query", err);
       }
     },
   };

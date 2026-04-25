@@ -75,6 +75,11 @@ export interface CloudflareConfig {
   accountId: string;
   /** Worker names Gary is allowed to query observability for. */
   observabilityWorkers: readonly string[];
+  /**
+   * Alias → D1 database UUID. Aliases keep the agent's tool calls readable
+   * (e.g. d1_query({ database: "mulligan-labs", sql: ... })).
+   */
+  d1Databases: Readonly<Record<string, string>>;
 }
 
 export interface RuntimeConfig {
@@ -172,6 +177,11 @@ const DEFAULT_OBSERVABILITY_WORKERS = [
   "mulligan-labs-discord-bot",
 ];
 
+const DEFAULT_D1_DATABASES: Readonly<Record<string, string>> = {
+  // ID copied from ertai/wrangler.json; same UUID is used by all envs.
+  "mulligan-labs": "d0d963f1-53dd-4f57-b24d-b3fb3da56753",
+};
+
 /**
  * Cloudflare config is optional — Gary runs without it, just without log
  * access. Returns null if the API token isn't set.
@@ -184,7 +194,21 @@ export function loadCloudflareConfig(): CloudflareConfig | null {
   const observabilityWorkers = workersRaw
     ? workersRaw.split(",").map((s) => s.trim()).filter(Boolean)
     : DEFAULT_OBSERVABILITY_WORKERS;
-  return { apiToken, accountId, observabilityWorkers };
+  const d1Raw = optionalString("CLOUDFLARE_D1_DATABASES");
+  const d1Databases = d1Raw ? parseAliasMap(d1Raw) : DEFAULT_D1_DATABASES;
+  return { apiToken, accountId, observabilityWorkers, d1Databases };
+}
+
+function parseAliasMap(raw: string): Readonly<Record<string, string>> {
+  const out: Record<string, string> = {};
+  for (const pair of raw.split(",")) {
+    const [alias, id] = pair.split("=").map((s) => s.trim());
+    if (!alias || !id) {
+      throw new Error(`bad alias=id pair in CLOUDFLARE_D1_DATABASES: ${pair}`);
+    }
+    out[alias] = id;
+  }
+  return out;
 }
 
 export function loadRuntimeConfig(): RuntimeConfig {
