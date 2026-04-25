@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS actions (
   completed_at TEXT,
   success INTEGER,
   error_message TEXT,
+  provider TEXT,
+  model TEXT,
   FOREIGN KEY (ticket_linear_id) REFERENCES tickets(linear_id)
 );
 

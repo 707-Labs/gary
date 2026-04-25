@@ -267,16 +267,20 @@ async function runOne(
   slot: number,
 ): Promise<string | null> {
   const fp = fingerprintDerivedState(action.state);
-  const provider = glm.chain.providers[0]!.name;
+  const primary = glm.chain.providers[0]!;
+  const provider = primary.name;
+  const model = primary.model;
   const actionId = recordActionStart(deps.db, {
     ticketLinearId: action.issue.id,
     stateFingerprint: fp,
     actionType: action.type,
+    provider,
+    model,
   });
   recordEvent(deps.db, {
     eventType: "action_dispatched",
     ticketLinearId: action.issue.id,
-    payload: { type: action.type, fingerprint: fp, slot, provider },
+    payload: { type: action.type, fingerprint: fp, slot, provider, model },
   });
 
   // Each parallel slot needs its own glm so 429-driven primary swaps don't

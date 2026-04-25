@@ -16,6 +16,7 @@ export function openDb(dbPath: string): DB {
   runSql(db, "PRAGMA journal_mode = WAL");
   runSql(db, "PRAGMA foreign_keys = ON");
   applySchema(db);
+  applyMigrations(db);
   return db;
 }
 
@@ -26,6 +27,25 @@ function runSql(db: DB, sql: string): void {
 function applySchema(db: DB): void {
   const sql = readFileSync(SCHEMA_PATH, "utf8");
   db.exec(sql);
+}
+
+/**
+ * Idempotent column adds for tables that pre-date the column's existence in
+ * `schema.sql`. SQLite's `CREATE TABLE IF NOT EXISTS` doesn't reconcile new
+ * columns against the existing definition, so we ALTER explicitly when a
+ * column is missing. Cheap; runs once per open and is a no-op on fresh DBs.
+ */
+function applyMigrations(db: DB): void {
+  const cols = new Set(
+    (db.prepare("PRAGMA table_info(actions)").all() as Array<{ name: string }>)
+      .map((r) => r.name),
+  );
+  if (!cols.has("provider")) {
+    db.exec("ALTER TABLE actions ADD COLUMN provider TEXT");
+  }
+  if (!cols.has("model")) {
+    db.exec("ALTER TABLE actions ADD COLUMN model TEXT");
+  }
 }
 
 export function closeDb(db: DB): void {

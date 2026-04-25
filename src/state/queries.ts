@@ -79,17 +79,25 @@ export function hasActedOn(
 
 export function recordActionStart(
   db: DB,
-  args: { ticketLinearId: string; stateFingerprint: string; actionType: string },
+  args: {
+    ticketLinearId: string;
+    stateFingerprint: string;
+    actionType: string;
+    provider?: string;
+    model?: string;
+  },
 ): number {
   const result = db
     .query(
-      `INSERT INTO actions (ticket_linear_id, state_fingerprint, action_type, started_at)
-       VALUES ($t, $f, $a, datetime('now'))`,
+      `INSERT INTO actions (ticket_linear_id, state_fingerprint, action_type, started_at, provider, model)
+       VALUES ($t, $f, $a, datetime('now'), $provider, $model)`,
     )
     .run({
       t: args.ticketLinearId,
       f: args.stateFingerprint,
       a: args.actionType,
+      provider: args.provider ?? null,
+      model: args.model ?? null,
     });
   return Number(result.lastInsertRowid);
 }
