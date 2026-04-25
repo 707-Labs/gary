@@ -3,7 +3,7 @@ import type { CloudflareClient } from "../adapters/cloudflare.ts";
 import type { GitHubClient } from "../adapters/github.ts";
 import type { GLMClient } from "../adapters/glm.ts";
 import type { AssignedIssue, IssueComment, LinearAdapter } from "../adapters/linear.ts";
-import { runAgentLoop } from "../agent/loop.ts";
+import { type PhaseSpec, runAgentLoop } from "../agent/loop.ts";
 import { composeSystemPrompt } from "../agent/prompts.ts";
 import {
   createWorktree,
@@ -29,6 +29,53 @@ const CHECK_COMMAND = "bun run check";
 const CHECK_TIMEOUT_MS = 10 * 60_000;
 const FIXUP_MAX_ITERATIONS = 15;
 const FIXUP_OUTPUT_BUDGET = 8000;
+
+// Read-only tools advertised in the investigate phase. Anything that
+// mutates the workspace (write_file, edit_file, run_bash, commit) or ends
+// the loop (finish) is hidden until the model transitions to implement.
+const INVESTIGATE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
+  "read_file",
+  "grep",
+  "list_files",
+  "fetch_url",
+  "get_linear_issue",
+  "get_pr",
+  "query_cloudflare_logs",
+  "list_cloudflare_invocations",
+  "d1_query",
+]);
+
+/**
+ * Two-phase loop for the CODE handler. Investigate forces the model to
+ * read the code and form a plan before being able to write; the model
+ * voluntarily ends the phase by producing a turn with no tool calls
+ * (signalling "done exploring") OR is forced over by hitting the
+ * investigate cap. The implement phase opens with a forcing message
+ * directing the model to write a brief plan, implement, and call finish.
+ *
+ * Phase budgets sum to 50, matching the previous flat cap. Splitting the
+ * budget makes the model spend at most 15 iters reading before being
+ * pushed into producing a plan and writing code.
+ */
+function buildCodePhases(): readonly PhaseSpec[] {
+  return [
+    {
+      name: "investigate",
+      maxIter: 15,
+      allowedTools: INVESTIGATE_ALLOWED_TOOLS,
+      nudgeMessage:
+        "you've used most of your investigate budget. wrap up exploration on your next turn — finish reading what's needed and end your turn without tool calls so you can move to the implement phase.",
+    },
+    {
+      name: "implement",
+      maxIter: 35,
+      entryMessage:
+        "good — you've explored. now: (1) write a 3-5 bullet plan of the changes you'll make, (2) implement them with write_file/edit_file/run_bash and commit your work, (3) run `bun run check` and fix anything you broke, (4) call finish() with a 1-2 sentence summary. if at any point you realize the change is bigger than expected or you're stuck, call finish() with a brief partial-progress note and a human will pick it up.",
+      nudgeMessage:
+        "you're approaching the iteration cap. wrap up: commit what you have, then call finish() with a brief summary (or a partial-progress note if you're stuck). a partial-progress finish is much better than running out of iterations mid-stream.",
+    },
+  ];
+}
 
 const CHECK_FIXUP_TASK_INSTRUCTIONS = `Your previous turn ended with finish() but \`${CHECK_COMMAND}\` is failing. Fix the errors caused by your changes, commit, then call finish() again.
 
@@ -166,6 +213,7 @@ export async function runCodeHandler(
     systemPrompt: system,
     task: taskMessage,
     maxIterations: deps.agentLoopMaxIterations,
+    phases: buildCodePhases(),
     timeoutMs: deps.agentLoopTimeoutMs,
     temperature: 0.3,
     linear: deps.linear,
@@ -177,6 +225,7 @@ export async function runCodeHandler(
   log.info("agent loop done", {
     issue: args.issue.identifier,
     status: loopResult.status,
+    phase: loopResult.phase,
     iterations: loopResult.iterations,
     inputTokens: loopResult.inputTokens,
     outputTokens: loopResult.outputTokens,

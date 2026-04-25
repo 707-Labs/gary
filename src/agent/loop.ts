@@ -24,6 +24,44 @@ export interface AgentLoopResult {
   inputTokens: number;
   /** Total output tokens used (sum across turns). */
   outputTokens: number;
+  /** Phase the loop ended in (or "single" when no phases were configured). */
+  phase: string;
+}
+
+/**
+ * One stage of a phased agent loop. Phases let us (a) restrict tools to a
+ * read-only subset early on so the model investigates before writing, and
+ * (b) inject a forcing nudge near the iteration cap so a stuck model
+ * commits partial progress instead of being killed mid-stream.
+ *
+ * Phases run sequentially. A phase ends when the model produces a turn
+ * with `stop_reason !== "tool_use"` (voluntary) or the per-phase iteration
+ * cap is hit (forced). The next phase, if any, opens with `entryMessage`
+ * appended to the conversation. The final phase resolves to `finished` /
+ * `no_finish` / `iteration_cap` as in the legacy loop.
+ */
+export interface PhaseSpec {
+  name: string;
+  maxIter: number;
+  /**
+   * If set, only tool definitions whose `name` appears here are advertised
+   * to the model AND only those names are dispatched on tool_use. A call to
+   * a name not in the set returns a phase-aware error string. Undefined =
+   * no restriction.
+   */
+  allowedTools?: ReadonlySet<string>;
+  /**
+   * User message appended at the start of the phase (skipped on phase 0
+   * since the original task message serves that role). Used to coach the
+   * model through the transition — e.g. "now write your plan and
+   * implement it."
+   */
+  entryMessage?: string;
+  /**
+   * User message appended once at iter `floor(maxIter * 0.8)` to nudge a
+   * stuck model toward wrapping up. Skipped if undefined.
+   */
+  nudgeMessage?: string;
 }
 
 export interface AgentLoopArgs {
@@ -31,8 +69,19 @@ export interface AgentLoopArgs {
   executor: Executor;
   systemPrompt: string;
   task: string;
+  /**
+   * Iteration cap when `phases` is not provided. Ignored when `phases` is
+   * set — each phase has its own `maxIter`. Kept for backwards-compat with
+   * non-code handlers.
+   */
   maxIterations: number;
   timeoutMs: number;
+  /**
+   * Optional sequence of phases. When omitted, the loop runs as a single
+   * phase using `maxIterations` and the default global nudge. Provided by
+   * the code handler to enforce investigate → implement.
+   */
+  phases?: readonly PhaseSpec[];
   signal?: AbortSignal;
   /** Per-turn temperature. Spec defaults to 0.3 for coding. */
   temperature?: number;
@@ -54,12 +103,42 @@ export interface AgentLoopArgs {
 const DEFAULT_TEMPERATURE = 0.3;
 const DEFAULT_MAX_TOKENS = 8192;
 
+const DEFAULT_NUDGE =
+  "you're approaching the iteration cap. wrap up: commit what you have, then call finish() with a brief summary (or a partial-progress note if you're stuck).";
+
+/** Append `text` as a user message, merging into the last user message if
+ * the conversation already ends in one (Anthropic disallows consecutive
+ * same-role turns). */
+function appendUserText(
+  messages: Anthropic.MessageParam[],
+  text: string,
+): void {
+  const last = messages[messages.length - 1];
+  if (last && last.role === "user" && Array.isArray(last.content)) {
+    last.content.push({ type: "text", text });
+    return;
+  }
+  if (last && last.role === "user" && typeof last.content === "string") {
+    messages[messages.length - 1] = {
+      role: "user",
+      content: `${last.content}\n\n${text}`,
+    };
+    return;
+  }
+  messages.push({ role: "user", content: text });
+}
+
 /**
- * Drives a tool-calling conversation with GLM until the model calls finish,
- * we hit the iteration cap, or the wall-clock timeout fires.
+ * Drives a tool-calling conversation with GLM through one or more phases
+ * until the model calls finish, we hit the iteration cap of the final
+ * phase, or the wall-clock timeout fires.
  *
- * The CODE handler constructs an Executor (LocalExecutor for Weekend 1,
- * DockerExecutor later), wires the toolset against it, and calls this.
+ * Phases are optional. Without `phases`, the loop runs as a single phase
+ * using `maxIterations` (legacy behavior) with a default cap nudge fired
+ * at 80%. With `phases`, each phase has its own iteration cap, optional
+ * tool restriction, and optional nudge — and a non-final phase ends by
+ * voluntary stop or cap and rolls forward into the next phase with its
+ * `entryMessage` injected into the conversation.
  */
 export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult> {
   const toolsetOpts: ToolsetOptions = {};
@@ -71,108 +150,251 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
   const start = Date.now();
   const deadline = start + args.timeoutMs;
 
+  const phases: readonly PhaseSpec[] = args.phases ?? [
+    {
+      name: "single",
+      maxIter: args.maxIterations,
+      nudgeMessage: DEFAULT_NUDGE,
+    },
+  ];
+
   const messages: Anthropic.MessageParam[] = [
     { role: "user", content: args.task },
   ];
 
-  let iterations = 0;
+  let totalIterations = 0;
   let inputTokens = 0;
   let outputTokens = 0;
+  let lastPhaseName = phases[0]?.name ?? "single";
 
-  while (iterations < args.maxIterations) {
-    if (args.signal?.aborted) {
-      return done("error", null, iterations, inputTokens, outputTokens, "aborted");
-    }
-    if (Date.now() > deadline) {
-      return done("timeout", null, iterations, inputTokens, outputTokens);
-    }
-    iterations++;
+  for (let phaseIdx = 0; phaseIdx < phases.length; phaseIdx++) {
+    const phase = phases[phaseIdx]!;
+    const isLastPhase = phaseIdx === phases.length - 1;
+    lastPhaseName = phase.name;
 
-    let response: Anthropic.Message;
-    try {
-      response = await args.glm.createMessage({
-        max_tokens: args.maxTokensPerTurn ?? DEFAULT_MAX_TOKENS,
-        temperature: args.temperature ?? DEFAULT_TEMPERATURE,
-        system: args.systemPrompt,
-        tools: tools.definitions,
-        messages,
-      });
-    } catch (err) {
-      // Per-provider 429s are handled inside `glm.createMessage` (it falls
-      // through to the next provider). The only rate-limit case that
-      // reaches here is "every provider is armed" — propagate so the tick
-      // can record the skip without bouncing the ticket.
-      if (err instanceof AllProvidersExhaustedError) {
-        log.warn("agent loop: all providers armed; will back off", {
-          iteration: iterations,
-          earliestReset: err.earliestReset?.toISOString() ?? null,
-        });
-        throw err;
+    if (phase.entryMessage && phaseIdx > 0) {
+      appendUserText(messages, phase.entryMessage);
+    }
+
+    const phaseDefs = phase.allowedTools
+      ? tools.definitions.filter((d) => phase.allowedTools!.has(d.name))
+      : tools.definitions;
+    const nudgeAt = phase.nudgeMessage
+      ? Math.max(1, Math.floor(phase.maxIter * 0.8))
+      : -1;
+
+    let phaseIter = 0;
+    let nudgeFired = false;
+    let phaseEndedVoluntarily = false;
+
+    while (phaseIter < phase.maxIter) {
+      if (args.signal?.aborted) {
+        return done(
+          "error",
+          null,
+          totalIterations,
+          inputTokens,
+          outputTokens,
+          phase.name,
+          "aborted",
+        );
       }
-      const message = err instanceof Error ? err.message : String(err);
-      log.error("agent loop API error", { iteration: iterations, error: message });
-      return done("error", null, iterations, inputTokens, outputTokens, message);
-    }
+      if (Date.now() > deadline) {
+        return done(
+          "timeout",
+          null,
+          totalIterations,
+          inputTokens,
+          outputTokens,
+          phase.name,
+        );
+      }
 
-    inputTokens += response.usage.input_tokens;
-    outputTokens += response.usage.output_tokens;
+      if (!nudgeFired && phaseIter + 1 === nudgeAt && phase.nudgeMessage) {
+        appendUserText(messages, phase.nudgeMessage);
+        nudgeFired = true;
+        log.info("agent loop nudge", {
+          phase: phase.name,
+          iter: phaseIter + 1,
+          maxIter: phase.maxIter,
+        });
+      }
 
-    log.debug("agent turn", {
-      iteration: iterations,
-      stopReason: response.stop_reason,
-      blocks: response.content.length,
-    });
+      phaseIter++;
+      totalIterations++;
 
-    messages.push({ role: "assistant", content: response.content });
+      let response: Anthropic.Message;
+      try {
+        response = await args.glm.createMessage({
+          max_tokens: args.maxTokensPerTurn ?? DEFAULT_MAX_TOKENS,
+          temperature: args.temperature ?? DEFAULT_TEMPERATURE,
+          system: args.systemPrompt,
+          tools: phaseDefs,
+          messages,
+        });
+      } catch (err) {
+        // Per-provider 429s are handled inside `glm.createMessage` (it falls
+        // through to the next provider). The only rate-limit case that
+        // reaches here is "every provider is armed" — propagate so the tick
+        // can record the skip without bouncing the ticket.
+        if (err instanceof AllProvidersExhaustedError) {
+          log.warn("agent loop: all providers armed; will back off", {
+            phase: phase.name,
+            iteration: totalIterations,
+            earliestReset: err.earliestReset?.toISOString() ?? null,
+          });
+          throw err;
+        }
+        const message = err instanceof Error ? err.message : String(err);
+        log.error("agent loop API error", {
+          phase: phase.name,
+          iteration: totalIterations,
+          error: message,
+        });
+        return done(
+          "error",
+          null,
+          totalIterations,
+          inputTokens,
+          outputTokens,
+          phase.name,
+          message,
+        );
+      }
 
-    if (response.stop_reason !== "tool_use") {
-      // Model ended without calling finish. Treat as failure unless finish
-      // was somehow set (won't happen unless the model both finished and
-      // emitted a closing turn, which is fine).
+      inputTokens += response.usage.input_tokens;
+      outputTokens += response.usage.output_tokens;
+
+      log.debug("agent turn", {
+        phase: phase.name,
+        iteration: totalIterations,
+        stopReason: response.stop_reason,
+        blocks: response.content.length,
+      });
+
+      messages.push({ role: "assistant", content: response.content });
+
+      if (response.stop_reason !== "tool_use") {
+        if (tools.finishSummary !== null) {
+          return done(
+            "finished",
+            tools.finishSummary,
+            totalIterations,
+            inputTokens,
+            outputTokens,
+            phase.name,
+          );
+        }
+        // Voluntary phase exit. If there's a next phase, transition; if
+        // this was the last phase, the model wrapped up without calling
+        // finish — that's no_finish (existing behavior).
+        if (isLastPhase) {
+          return done(
+            "no_finish",
+            null,
+            totalIterations,
+            inputTokens,
+            outputTokens,
+            phase.name,
+          );
+        }
+        phaseEndedVoluntarily = true;
+        break;
+      }
+
+      const toolCalls = response.content.filter(
+        (b): b is Anthropic.ToolUseBlock => b.type === "tool_use",
+      );
+      if (toolCalls.length === 0) {
+        // Defensive: shouldn't happen given stop_reason === "tool_use".
+        return done(
+          "no_finish",
+          null,
+          totalIterations,
+          inputTokens,
+          outputTokens,
+          phase.name,
+        );
+      }
+
+      const toolResults: Anthropic.ToolResultBlockParam[] = [];
+      for (const call of toolCalls) {
+        toolResults.push(await executTool(tools, call, phase));
+      }
+      messages.push({ role: "user", content: toolResults });
+
       if (tools.finishSummary !== null) {
         return done(
           "finished",
           tools.finishSummary,
-          iterations,
+          totalIterations,
           inputTokens,
           outputTokens,
+          phase.name,
         );
       }
-      return done("no_finish", null, iterations, inputTokens, outputTokens);
     }
 
-    const toolCalls = response.content.filter(
-      (b): b is Anthropic.ToolUseBlock => b.type === "tool_use",
-    );
-    if (toolCalls.length === 0) {
-      // Defensive: shouldn't happen given stop_reason === "tool_use".
-      return done("no_finish", null, iterations, inputTokens, outputTokens);
+    if (phaseEndedVoluntarily) {
+      log.info("phase complete (voluntary)", {
+        phase: phase.name,
+        iter: phaseIter,
+      });
+      continue;
     }
 
-    const toolResults: Anthropic.ToolResultBlockParam[] = [];
-    for (const call of toolCalls) {
-      toolResults.push(await executTool(tools, call));
-    }
-    messages.push({ role: "user", content: toolResults });
-
-    if (tools.finishSummary !== null) {
+    // Hit phase cap. If this is the last phase, that's iteration_cap.
+    // Otherwise log and roll into the next phase — the entry message is
+    // injected at the top of the next iteration.
+    if (isLastPhase) {
       return done(
-        "finished",
-        tools.finishSummary,
-        iterations,
+        "iteration_cap",
+        null,
+        totalIterations,
         inputTokens,
         outputTokens,
+        phase.name,
       );
     }
+    log.info("phase complete (cap reached)", {
+      phase: phase.name,
+      iter: phaseIter,
+      maxIter: phase.maxIter,
+    });
   }
 
-  return done("iteration_cap", null, iterations, inputTokens, outputTokens);
+  // All phases exhausted without a return path — should be unreachable
+  // since the final phase always returns. Defensive default.
+  return done(
+    "no_finish",
+    null,
+    totalIterations,
+    inputTokens,
+    outputTokens,
+    lastPhaseName,
+  );
 }
 
 async function executTool(
   tools: AgentTools,
   call: Anthropic.ToolUseBlock,
+  phase: PhaseSpec,
 ): Promise<Anthropic.ToolResultBlockParam> {
+  // Phase-aware rejection: even if the model hallucinates a tool not
+  // advertised this phase, refuse it with an instructive error so the
+  // model can adapt instead of getting an opaque "unknown tool".
+  if (phase.allowedTools && !phase.allowedTools.has(call.name)) {
+    return {
+      type: "tool_result",
+      tool_use_id: call.id,
+      content: `error: tool '${call.name}' is not available in the '${phase.name}' phase. ${
+        phase.name === "investigate"
+          ? "use read-only tools (read_file, grep, list_files, fetch_url, get_linear_issue, get_pr) to explore. when you're ready to plan and write code, end your turn without tool calls and you'll move to the implement phase."
+          : "use only the advertised tools."
+      }`,
+      is_error: true,
+    };
+  }
   const handler = tools.handlers[call.name];
   if (!handler) {
     return {
@@ -206,9 +428,10 @@ function done(
   iterations: number,
   inputTokens: number,
   outputTokens: number,
+  phase: string,
   errorMessage?: string,
 ): AgentLoopResult {
   return errorMessage !== undefined
-    ? { status, summary, iterations, inputTokens, outputTokens, errorMessage }
-    : { status, summary, iterations, inputTokens, outputTokens };
+    ? { status, summary, iterations, inputTokens, outputTokens, phase, errorMessage }
+    : { status, summary, iterations, inputTokens, outputTokens, phase };
 }
