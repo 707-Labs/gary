@@ -1,3 +1,4 @@
+import type { CloudflareClient } from "./adapters/cloudflare.ts";
 import type { GitHubClient, PullRequestRef } from "./adapters/github.ts";
 import type { LinearAdapter } from "./adapters/linear.ts";
 import type { GLMClient } from "./adapters/glm.ts";
@@ -39,6 +40,7 @@ export interface LoopDeps {
   linear: LinearAdapter;
   github: GitHubClient;
   glm: GLMClient;
+  cloudflare: CloudflareClient | null;
   allowedRepos: readonly string[];
   reposDir: string;
   workspacesDir: string;
@@ -192,6 +194,7 @@ async function runWriteAnswer(
       linear: deps.linear,
       github: deps.github,
       glm: deps.glm,
+      cloudflare: deps.cloudflare,
       reposDir: deps.reposDir,
       workspacesDir: deps.workspacesDir,
       agentLoopMaxIterations: deps.agentLoopMaxIterations,
@@ -221,6 +224,7 @@ async function runFixCiFailure(
       linear: deps.linear,
       github: deps.github,
       glm: deps.glm,
+      cloudflare: deps.cloudflare,
       reposDir: deps.reposDir,
       workspacesDir: deps.workspacesDir,
       agentLoopMaxIterations: deps.agentLoopMaxIterations,
@@ -264,6 +268,7 @@ async function runStartCoding(
       linear: deps.linear,
       github: deps.github,
       glm: deps.glm,
+      cloudflare: deps.cloudflare,
       reposDir: deps.reposDir,
       workspacesDir: deps.workspacesDir,
       agentLoopMaxIterations: deps.agentLoopMaxIterations,

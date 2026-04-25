@@ -1,5 +1,6 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
+import type { CloudflareClient } from "../adapters/cloudflare.ts";
 import type { Executor } from "../executors/index.ts";
 
 export interface ToolHandler {
@@ -16,8 +17,13 @@ export interface AgentTools {
   finishSummary: string | null;
 }
 
+export interface ToolsetOptions {
+  /** When set, exposes Cloudflare Workers Observability tools. */
+  cloudflare?: CloudflareClient;
+}
+
 /** Builds the toolset bound to an Executor. The agent loop drives this. */
-export function makeToolset(executor: Executor): AgentTools {
+export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): AgentTools {
   const out: AgentTools = {
     definitions: [],
     handlers: {},
@@ -36,6 +42,10 @@ export function makeToolset(executor: Executor): AgentTools {
   register(listFilesTool(executor));
   register(runBashTool(executor));
   register(commitTool(executor));
+  if (opts.cloudflare) {
+    register(queryCloudflareLogsTool(opts.cloudflare));
+    register(listCloudflareInvocationsTool(opts.cloudflare));
+  }
   register(finishTool(out));
 
   return out;
@@ -321,4 +331,141 @@ function formatError(toolName: string, err: unknown): string {
 
 function truncate(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max)}...` : s;
+}
+
+const queryLogsSchema = z.object({
+  service: z.string().optional(),
+  needle: z.string().optional(),
+  errors_only: z.boolean().optional(),
+  since_minutes: z.number().int().positive().optional(),
+  limit: z.number().int().positive().optional(),
+});
+function queryCloudflareLogsTool(cf: CloudflareClient): ToolHandler {
+  return {
+    definition: {
+      name: "query_cloudflare_logs",
+      description:
+        "Search Cloudflare Workers logs for the production app. Use this when a ticket references a runtime error, a specific user-facing failure, or asks to investigate an incident. Stack traces come back de-minified (source maps are uploaded). Returns one line per matching event.",
+      input_schema: {
+        type: "object",
+        properties: {
+          service: {
+            type: "string",
+            description:
+              "Worker name to scope the search to (e.g. 'mulligan-labs', 'mulligan-labs-party'). Omit to search all production workers.",
+          },
+          needle: {
+            type: "string",
+            description:
+              "Free-text substring to search for in event payloads (case-insensitive). Use this to find a specific error message, user id, or request path.",
+          },
+          errors_only: {
+            type: "boolean",
+            description:
+              "Restrict to events with `$metadata.error` set. Default false.",
+          },
+          since_minutes: {
+            type: "number",
+            description:
+              "Time window length ending now, in minutes. Default 60. Max 10080 (7 days).",
+          },
+          limit: {
+            type: "number",
+            description: "Max events to return. Default 50, max 200.",
+          },
+        },
+      },
+    },
+    async run(input) {
+      const parsed = queryLogsSchema.parse(input);
+      try {
+        const args: Parameters<typeof cf.queryLogs>[0] = {};
+        if (parsed.service !== undefined) args.service = parsed.service;
+        if (parsed.needle !== undefined) args.needle = parsed.needle;
+        if (parsed.errors_only !== undefined) args.errorsOnly = parsed.errors_only;
+        if (parsed.since_minutes !== undefined) args.sinceMinutes = parsed.since_minutes;
+        if (parsed.limit !== undefined) args.limit = parsed.limit;
+        const events = await cf.queryLogs(args);
+        if (events.length === 0) return "no events matched";
+        return events.map(formatLogEvent).join("\n\n");
+      } catch (err) {
+        return formatError("query_cloudflare_logs", err);
+      }
+    },
+  };
+}
+
+const listInvocationsSchema = z.object({
+  service: z.string().optional(),
+  errors_only: z.boolean().optional(),
+  since_minutes: z.number().int().positive().optional(),
+  limit: z.number().int().positive().optional(),
+});
+function listCloudflareInvocationsTool(cf: CloudflareClient): ToolHandler {
+  return {
+    definition: {
+      name: "list_cloudflare_invocations",
+      description:
+        "List recent invocations (requests/triggers) of a Cloudflare Worker, grouped by invocation id. Use this to find specific failing requests, then drill in with query_cloudflare_logs.",
+      input_schema: {
+        type: "object",
+        properties: {
+          service: {
+            type: "string",
+            description: "Worker name. Omit to span all production workers.",
+          },
+          errors_only: {
+            type: "boolean",
+            description: "Only invocations whose events include an error. Default false.",
+          },
+          since_minutes: {
+            type: "number",
+            description: "Time window in minutes. Default 60, max 10080.",
+          },
+          limit: {
+            type: "number",
+            description: "Max invocations. Default 50, max 200.",
+          },
+        },
+      },
+    },
+    async run(input) {
+      const parsed = listInvocationsSchema.parse(input);
+      try {
+        const args: Parameters<typeof cf.listInvocations>[0] = {};
+        if (parsed.service !== undefined) args.service = parsed.service;
+        if (parsed.errors_only !== undefined) args.errorsOnly = parsed.errors_only;
+        if (parsed.since_minutes !== undefined) args.sinceMinutes = parsed.since_minutes;
+        if (parsed.limit !== undefined) args.limit = parsed.limit;
+        const invs = await cf.listInvocations(args);
+        if (invs.length === 0) return "no invocations matched";
+        return invs.map(formatInvocation).join("\n");
+      } catch (err) {
+        return formatError("list_cloudflare_invocations", err);
+      }
+    },
+  };
+}
+
+function formatLogEvent(e: import("../adapters/cloudflare.ts").LogEvent): string {
+  const t = new Date(e.timestamp).toISOString();
+  const head = `${t} [${e.service}]${e.level ? ` ${e.level}` : ""}${e.invocationId ? ` inv=${e.invocationId.slice(0, 8)}` : ""}`;
+  const lines = [head];
+  if (e.error) lines.push(`error: ${truncate(e.error, 1500)}`);
+  if (e.message) lines.push(truncate(e.message, 1500));
+  return lines.join("\n");
+}
+
+function formatInvocation(i: import("../adapters/cloudflare.ts").InvocationSummary): string {
+  const t = new Date(i.timestamp).toISOString();
+  const parts = [
+    t,
+    `[${i.service}]`,
+    `inv=${i.invocationId.slice(0, 8)}`,
+    `events=${i.events}`,
+  ];
+  if (i.status !== null) parts.push(`status=${i.status}`);
+  if (i.durationMs !== null) parts.push(`dur=${Math.round(i.durationMs)}ms`);
+  if (i.hasError) parts.push("ERROR");
+  return parts.join(" ");
 }

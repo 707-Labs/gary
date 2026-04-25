@@ -5,6 +5,7 @@
 // Run with: bun run scripts/probe-loop-tick.ts
 
 import { mkdirSync } from "node:fs";
+import { CloudflareClient } from "../src/adapters/cloudflare.ts";
 import { GLMClient } from "../src/adapters/glm.ts";
 import { makeGitHubClient } from "../src/adapters/github.ts";
 import { LinearAdapter } from "../src/adapters/linear.ts";
@@ -19,12 +20,14 @@ const db = openDb(cfg.gary.dbPath);
 const linear = new LinearAdapter({ gary: cfg.gary, linear: cfg.linear });
 const github = makeGitHubClient(cfg.github);
 const glm = new GLMClient(cfg.glm);
+const cloudflare = cfg.cloudflare ? new CloudflareClient(cfg.cloudflare) : null;
 
 const result = await tick({
   db,
   linear,
   github,
   glm,
+  cloudflare,
   allowedRepos: cfg.gary.allowedRepos,
   reposDir: cfg.gary.reposDir,
   workspacesDir: cfg.gary.workspacesDir,

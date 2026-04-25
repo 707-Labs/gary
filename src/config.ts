@@ -70,6 +70,13 @@ export interface GLMConfig {
   model: string;
 }
 
+export interface CloudflareConfig {
+  apiToken: string;
+  accountId: string;
+  /** Worker names Gary is allowed to query observability for. */
+  observabilityWorkers: readonly string[];
+}
+
 export interface RuntimeConfig {
   pollIntervalMs: number;
   maxAttemptsPerTicket: number;
@@ -84,6 +91,7 @@ export interface Config {
   linear: LinearConfig;
   github: GitHubConfig;
   glm: GLMConfig;
+  cloudflare: CloudflareConfig | null;
   runtime: RuntimeConfig;
 }
 
@@ -157,6 +165,28 @@ export function loadGLMConfig(): GLMConfig {
   };
 }
 
+const DEFAULT_OBSERVABILITY_WORKERS = [
+  "mulligan-labs",
+  "mulligan-labs-party",
+  "mulligan-labs-feedback",
+  "mulligan-labs-discord-bot",
+];
+
+/**
+ * Cloudflare config is optional — Gary runs without it, just without log
+ * access. Returns null if the API token isn't set.
+ */
+export function loadCloudflareConfig(): CloudflareConfig | null {
+  const apiToken = optionalString("CLOUDFLARE_API_TOKEN");
+  if (!apiToken) return null;
+  const accountId = stringFromEnv("CLOUDFLARE_ACCOUNT_ID");
+  const workersRaw = optionalString("CLOUDFLARE_OBSERVABILITY_WORKERS");
+  const observabilityWorkers = workersRaw
+    ? workersRaw.split(",").map((s) => s.trim()).filter(Boolean)
+    : DEFAULT_OBSERVABILITY_WORKERS;
+  return { apiToken, accountId, observabilityWorkers };
+}
+
 export function loadRuntimeConfig(): RuntimeConfig {
   return {
     pollIntervalMs: intFromEnv("POLL_INTERVAL_MS", 60_000),
@@ -174,6 +204,7 @@ export function loadConfig(): Config {
     linear: loadLinearConfig(),
     github: loadGitHubConfig(),
     glm: loadGLMConfig(),
+    cloudflare: loadCloudflareConfig(),
     runtime: loadRuntimeConfig(),
   };
 }

@@ -1,4 +1,5 @@
 import type Anthropic from "@anthropic-ai/sdk";
+import type { CloudflareClient } from "../adapters/cloudflare.ts";
 import type { GLMClient } from "../adapters/glm.ts";
 import type { Executor } from "../executors/index.ts";
 import { log } from "../logger.ts";
@@ -34,6 +35,11 @@ export interface AgentLoopArgs {
   temperature?: number;
   /** Per-turn max_tokens. Spec defaults to 8192. */
   maxTokensPerTurn?: number;
+  /**
+   * If provided, the toolset includes Cloudflare Workers Observability tools
+   * (`query_cloudflare_logs`, `list_cloudflare_invocations`).
+   */
+  cloudflare?: CloudflareClient;
 }
 
 const DEFAULT_TEMPERATURE = 0.3;
@@ -47,7 +53,10 @@ const DEFAULT_MAX_TOKENS = 8192;
  * DockerExecutor later), wires the toolset against it, and calls this.
  */
 export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult> {
-  const tools = makeToolset(args.executor);
+  const tools = makeToolset(
+    args.executor,
+    args.cloudflare ? { cloudflare: args.cloudflare } : {},
+  );
   const start = Date.now();
   const deadline = start + args.timeoutMs;
 

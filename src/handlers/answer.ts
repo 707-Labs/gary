@@ -1,3 +1,4 @@
+import type { CloudflareClient } from "../adapters/cloudflare.ts";
 import type { GitHubClient } from "../adapters/github.ts";
 import type { GLMClient } from "../adapters/glm.ts";
 import type { AssignedIssue, IssueComment, LinearAdapter } from "../adapters/linear.ts";
@@ -25,6 +26,7 @@ export interface AnswerHandlerDeps {
   linear: LinearAdapter;
   github: GitHubClient;
   glm: GLMClient;
+  cloudflare: CloudflareClient | null;
   reposDir: string;
   workspacesDir: string;
   agentLoopMaxIterations: number;
@@ -82,6 +84,7 @@ export async function runAnswerHandler(
     maxIterations: Math.min(deps.agentLoopMaxIterations, 20),
     timeoutMs: Math.min(deps.agentLoopTimeoutMs, 5 * 60_000),
     temperature: 0.3,
+    ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
   });
 
   log.info("answer agent loop done", {

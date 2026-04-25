@@ -29,6 +29,7 @@ bun run scripts/probe-classifier.ts      # classifier on fixture tickets (no Lin
 bun run scripts/probe-agent-loop.ts      # agent loop in temp workspace
 bun run scripts/probe-loop-tick.ts       # ONE real tick — will post comments / open PRs
 bun run scripts/probe-ticket-details.ts  # print descriptions of Gary's current assignments
+bun run scripts/probe-cloudflare.ts      # verify CF observability auth + recent errors
 ```
 
 ## Architecture (one-liner)
@@ -45,9 +46,9 @@ bun run scripts/probe-ticket-details.ts  # print descriptions of Gary's current 
 
 ## Environment
 
-`.env` required keys: `LINEAR_API_KEY`, `GARY_LINEAR_USER_ID`, `LINEAR_TEAM_ID`, `LINEAR_IN_PROGRESS_STATE_ID`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_PATH` (or inline `GITHUB_APP_PRIVATE_KEY`), `GITHUB_APP_INSTALLATION_ID`, `Z_AI_API_KEY`. See `.env.example`.
+`.env` required keys: `LINEAR_API_KEY`, `GARY_LINEAR_USER_ID`, `LINEAR_TEAM_ID`, `LINEAR_IN_PROGRESS_STATE_ID`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_PATH` (or inline `GITHUB_APP_PRIVATE_KEY`), `GITHUB_APP_INSTALLATION_ID`, `Z_AI_API_KEY`. Optional: `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` to enable Workers Observability tools (`query_cloudflare_logs`, `list_cloudflare_invocations`) inside the agent loop. See `.env.example`.
 
-`src/config.ts` exposes per-subsystem loaders (`loadLinearConfig`, `loadGitHubConfig`, etc.) so probes can load only what they need.
+`src/config.ts` exposes per-subsystem loaders (`loadLinearConfig`, `loadGitHubConfig`, `loadCloudflareConfig`, etc.) so probes can load only what they need. `loadCloudflareConfig` returns `null` when the token isn't set — Gary runs fine without it, just without log access.
 
 ## Gotchas
 
@@ -60,6 +61,7 @@ bun run scripts/probe-ticket-details.ts  # print descriptions of Gary's current 
 - **voice.md is cached at module init** (`src/agent/prompts.ts`). Restart Gary to pick up changes.
 - **Action cache filters by `success = 1`**. Failed actions don't block retry, so a deterministically-broken handler will loop until the circuit breaker (5 attempts in 6h) fires.
 - **`Executor` interface uses `run`** rather than the spec's name for the method that runs shell commands. Diverges from the spec to dodge a security-scan false positive on a common substring.
+- **Cloudflare observability is opt-in**: tools only register if `CLOUDFLARE_API_TOKEN` is set. The Workers Logs API only returns data for workers that have `observability.logs.enabled` in their wrangler config. Mulligan-labs workers all have it on with `upload_source_maps: true`, so stack traces come back de-minified.
 
 ## Voice
 

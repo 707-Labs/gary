@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
+import type { CloudflareClient } from "../adapters/cloudflare.ts";
 import type { CheckRunDetail, GitHubClient } from "../adapters/github.ts";
 import type { GLMClient } from "../adapters/glm.ts";
 import type { AssignedIssue, LinearAdapter } from "../adapters/linear.ts";
@@ -33,6 +34,7 @@ export interface CiFailureHandlerDeps {
   linear: LinearAdapter;
   github: GitHubClient;
   glm: GLMClient;
+  cloudflare: CloudflareClient | null;
   reposDir: string;
   workspacesDir: string;
   agentLoopMaxIterations: number;
@@ -127,6 +129,7 @@ export async function runCiFailureHandler(
     maxIterations: deps.agentLoopMaxIterations,
     timeoutMs: deps.agentLoopTimeoutMs,
     temperature: 0.3,
+    ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
   });
 
   log.info("ci fix agent loop done", {

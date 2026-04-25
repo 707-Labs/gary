@@ -1,4 +1,5 @@
 import { mkdirSync } from "node:fs";
+import { CloudflareClient } from "./adapters/cloudflare.ts";
 import { GLMClient } from "./adapters/glm.ts";
 import { makeGitHubClient } from "./adapters/github.ts";
 import { LinearAdapter } from "./adapters/linear.ts";
@@ -22,12 +23,14 @@ async function main(): Promise<void> {
   const linear = new LinearAdapter({ gary: cfg.gary, linear: cfg.linear });
   const github = makeGitHubClient(cfg.github);
   const glm = new GLMClient(cfg.glm);
+  const cloudflare = cfg.cloudflare ? new CloudflareClient(cfg.cloudflare) : null;
 
   log.info("gary booted", {
     name: cfg.gary.name,
     dbPath: cfg.gary.dbPath,
     githubAuth: cfg.github.kind,
     glmModel: cfg.glm.model,
+    cloudflare: cloudflare ? cfg.cloudflare?.observabilityWorkers : "disabled",
     pollIntervalMs: cfg.runtime.pollIntervalMs,
     allowedRepos: cfg.gary.allowedRepos,
   });
@@ -45,6 +48,7 @@ async function main(): Promise<void> {
     linear,
     github,
     glm,
+    cloudflare,
     allowedRepos: cfg.gary.allowedRepos,
     reposDir: cfg.gary.reposDir,
     workspacesDir: cfg.gary.workspacesDir,
