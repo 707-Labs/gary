@@ -89,6 +89,39 @@ export class LinearAdapter {
     return out;
   }
 
+  /**
+   * Look up an issue by its identifier (e.g. "ERT-1500"). Returns null if no
+   * issue matches. Same shape as fetchAssignedIssues entries.
+   */
+  async fetchByIdentifier(identifier: string): Promise<AssignedIssue | null> {
+    const result = await this.client.issues({
+      filter: { number: { eq: parseIdentifierNumber(identifier) }, team: { key: { eq: parseIdentifierTeamKey(identifier) } } },
+      first: 1,
+    });
+    const issue = result.nodes[0];
+    if (!issue) return null;
+    const [state, team, creator] = await Promise.all([
+      issue.state,
+      issue.team,
+      issue.creator,
+    ]);
+    return {
+      id: issue.id,
+      identifier: issue.identifier,
+      title: issue.title,
+      description: issue.description ?? null,
+      url: issue.url,
+      stateName: state?.name ?? "",
+      stateType: state?.type ?? "",
+      createdAt: issue.createdAt.toISOString(),
+      updatedAt: issue.updatedAt.toISOString(),
+      creatorId: creator?.id ?? null,
+      creatorName: creator?.name ?? null,
+      teamId: team?.id ?? "",
+      teamKey: team?.key ?? "",
+    };
+  }
+
   async fetchComments(issueId: string, limit = 20): Promise<IssueComment[]> {
     const issue = await this.client.issue(issueId);
     const result = await issue.comments({ first: limit });
@@ -139,4 +172,16 @@ export class LinearAdapter {
     await this.client.attachmentLinkURL(issueId, url, { title });
     log.debug("attachment added", { issueId, url });
   }
+}
+
+function parseIdentifierTeamKey(identifier: string): string {
+  const m = identifier.match(/^([A-Z]+)-\d+$/);
+  if (!m || !m[1]) throw new Error(`bad identifier: ${identifier}`);
+  return m[1];
+}
+
+function parseIdentifierNumber(identifier: string): number {
+  const m = identifier.match(/^[A-Z]+-(\d+)$/);
+  if (!m || !m[1]) throw new Error(`bad identifier: ${identifier}`);
+  return Number(m[1]);
 }

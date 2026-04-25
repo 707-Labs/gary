@@ -1,6 +1,7 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import type { CloudflareClient } from "../adapters/cloudflare.ts";
+import type { LinearAdapter } from "../adapters/linear.ts";
 import type { Executor } from "../executors/index.ts";
 
 export interface ToolHandler {
@@ -20,6 +21,8 @@ export interface AgentTools {
 export interface ToolsetOptions {
   /** When set, exposes Cloudflare Workers Observability tools. */
   cloudflare?: CloudflareClient;
+  /** When set, exposes Linear read tools (e.g. `get_linear_issue`). */
+  linear?: LinearAdapter;
 }
 
 /** Builds the toolset bound to an Executor. The agent loop drives this. */
@@ -43,6 +46,9 @@ export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): Agen
   register(runBashTool(executor));
   register(commitTool(executor));
   register(fetchUrlTool());
+  if (opts.linear) {
+    register(getLinearIssueTool(opts.linear));
+  }
   if (opts.cloudflare) {
     register(queryCloudflareLogsTool(opts.cloudflare));
     register(listCloudflareInvocationsTool(opts.cloudflare));
@@ -387,6 +393,65 @@ function fetchUrlTool(): ToolHandler {
         return formatError("fetch_url", err);
       } finally {
         clearTimeout(timer);
+      }
+    },
+  };
+}
+
+const getLinearIssueSchema = z.object({
+  identifier: z.string().regex(/^[A-Z]+-\d+$/, "must be like ERT-1234"),
+  include_comments: z.boolean().optional(),
+});
+function getLinearIssueTool(linear: LinearAdapter): ToolHandler {
+  return {
+    definition: {
+      name: "get_linear_issue",
+      description:
+        "Fetch another Linear ticket by identifier (e.g. 'ERT-1500'). Returns title, status, description, and recent comments. Use when a ticket references another one ('duplicate of', 'follow-up to', 'see X for context').",
+      input_schema: {
+        type: "object",
+        properties: {
+          identifier: {
+            type: "string",
+            description: "Linear ticket identifier like 'ERT-1500'.",
+          },
+          include_comments: {
+            type: "boolean",
+            description: "Include the most recent comments. Default true.",
+          },
+        },
+        required: ["identifier"],
+      },
+    },
+    async run(input) {
+      const { identifier, include_comments } = getLinearIssueSchema.parse(input);
+      try {
+        const issue = await linear.fetchByIdentifier(identifier);
+        if (!issue) return `no issue found for ${identifier}`;
+        const lines = [
+          `${issue.identifier}: ${issue.title}`,
+          `state: ${issue.stateName} (${issue.stateType})`,
+          `creator: ${issue.creatorName ?? "?"}`,
+          `url: ${issue.url}`,
+          `created: ${issue.createdAt}  updated: ${issue.updatedAt}`,
+          "",
+          "description:",
+          issue.description ?? "(empty)",
+        ];
+        if (include_comments !== false) {
+          const comments = await linear.fetchComments(issue.id, 10);
+          lines.push("");
+          lines.push(`comments (${comments.length}, oldest first):`);
+          const sorted = [...comments].sort((a, b) =>
+            a.createdAt.localeCompare(b.createdAt),
+          );
+          for (const c of sorted) {
+            lines.push(`  ${c.userName ?? "?"} (${c.createdAt}): ${truncate(c.body, 800)}`);
+          }
+        }
+        return lines.join("\n");
+      } catch (err) {
+        return formatError("get_linear_issue", err);
       }
     },
   };

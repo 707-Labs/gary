@@ -143,6 +143,7 @@ export async function runCodeHandler(
     maxIterations: deps.agentLoopMaxIterations,
     timeoutMs: deps.agentLoopTimeoutMs,
     temperature: 0.3,
+    linear: deps.linear,
     ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
   });
 

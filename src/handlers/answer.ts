@@ -84,6 +84,7 @@ export async function runAnswerHandler(
     maxIterations: Math.min(deps.agentLoopMaxIterations, 20),
     timeoutMs: Math.min(deps.agentLoopTimeoutMs, 5 * 60_000),
     temperature: 0.3,
+    linear: deps.linear,
     ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
   });
 

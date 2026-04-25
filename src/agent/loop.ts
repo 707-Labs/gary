@@ -1,9 +1,10 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import type { CloudflareClient } from "../adapters/cloudflare.ts";
 import type { GLMClient } from "../adapters/glm.ts";
+import type { LinearAdapter } from "../adapters/linear.ts";
 import type { Executor } from "../executors/index.ts";
 import { log } from "../logger.ts";
-import { type AgentTools, makeToolset } from "./tools.ts";
+import { type AgentTools, type ToolsetOptions, makeToolset } from "./tools.ts";
 
 export type AgentLoopStatus =
   | "finished"
@@ -40,6 +41,8 @@ export interface AgentLoopArgs {
    * (`query_cloudflare_logs`, `list_cloudflare_invocations`).
    */
   cloudflare?: CloudflareClient;
+  /** If provided, the toolset includes `get_linear_issue`. */
+  linear?: LinearAdapter;
 }
 
 const DEFAULT_TEMPERATURE = 0.3;
@@ -53,10 +56,10 @@ const DEFAULT_MAX_TOKENS = 8192;
  * DockerExecutor later), wires the toolset against it, and calls this.
  */
 export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult> {
-  const tools = makeToolset(
-    args.executor,
-    args.cloudflare ? { cloudflare: args.cloudflare } : {},
-  );
+  const toolsetOpts: ToolsetOptions = {};
+  if (args.cloudflare) toolsetOpts.cloudflare = args.cloudflare;
+  if (args.linear) toolsetOpts.linear = args.linear;
+  const tools = makeToolset(args.executor, toolsetOpts);
   const start = Date.now();
   const deadline = start + args.timeoutMs;
 
