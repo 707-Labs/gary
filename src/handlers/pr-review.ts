@@ -27,6 +27,13 @@ import { markPrCommentsResponded } from "../state/queries.ts";
 
 const PR_REVIEW_TASK_INSTRUCTIONS = `A reviewer has left comments on your open PR. Your job: read the comments, decide whether each is a question/discussion or a concrete change request, then respond.
 
+Cover every item — when a single review body raises multiple distinct asks (numbered list, multiple paragraphs, "and another thing"), treat each as a separate item with its own disposition. Don't silently drop the vague ones.
+
+For each item, the disposition is exactly one of:
+- ADDRESS NOW: concrete enough to implement, you're confident it's right, change is small.
+- DEFER: legitimate but out of scope or larger than this PR. Acknowledge it explicitly and propose filing a follow-up ticket.
+- ASK: too vague to action without guessing. Quote the specific phrase and ask what good looks like (e.g. "you mentioned caching — should that live in the worker, the D1 layer, or the SvelteKit load? what's the staleness budget?"). Don't pick the lowest-hanging interpretation and silently move on.
+
 Default posture is REPLY-ONLY:
 - Read the comment in context (use get_pr to see the PR + diff, read_file to inspect referenced code).
 - If it's a question, a discussion, or an ambiguous suggestion, write a reply explaining your thinking. No code changes.
@@ -45,6 +52,7 @@ If you push:
 
 If you reply without pushing:
 - Your finish() summary IS the reply that gets posted on the PR. Address the reviewer by name. Be specific about what you considered and why.
+- If the reply covers multiple items, structure it so each one is identifiable — the reviewer should be able to scan and confirm nothing was dropped.
 
 If you can't decide, REPLY asking for clarification. Don't push speculative fixes.`;
 
