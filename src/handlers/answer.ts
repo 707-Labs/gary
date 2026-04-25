@@ -12,6 +12,11 @@ import {
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { log } from "../logger.ts";
+import {
+  formatProjectContext,
+  loadProjectContext,
+  loadSkillIndex,
+} from "../skills.ts";
 
 const ANSWER_TASK_INSTRUCTIONS = `Someone asked a question on this Linear ticket. The classifier already posted an initial reply at triage. Your job here is to take a deeper look at the code and either confirm the initial answer or post a clarifying follow-up.
 
@@ -74,7 +79,14 @@ export async function runAnswerHandler(
 
   const executor = new LocalExecutor(worktreePath);
   const system = composeSystemPrompt({ taskInstructions: ANSWER_TASK_INSTRUCTIONS });
-  const task = renderQuestion(args.issue, args.comments);
+  const projectSection = formatProjectContext(
+    loadProjectContext(worktreePath),
+    loadSkillIndex(worktreePath),
+  );
+  const question = renderQuestion(args.issue, args.comments);
+  const task = projectSection
+    ? `${projectSection}\n\n---\n\n${question}`
+    : question;
 
   const loopResult = await runAgentLoop({
     glm: deps.glm,

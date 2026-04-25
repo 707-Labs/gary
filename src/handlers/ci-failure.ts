@@ -14,6 +14,11 @@ import {
   pushBranch,
 } from "../git.ts";
 import { log } from "../logger.ts";
+import {
+  formatProjectContext,
+  loadProjectContext,
+  loadSkillIndex,
+} from "../skills.ts";
 import type { DB } from "../state/db.ts";
 import { countActionsSince, setTerminalState } from "../state/queries.ts";
 
@@ -119,7 +124,14 @@ export async function runCiFailureHandler(
 
   const executor = new LocalExecutor(worktreePath);
   const system = composeSystemPrompt({ taskInstructions: CI_FIX_TASK_INSTRUCTIONS });
-  const taskMessage = renderCiFailureForAgent(args, failingChecks);
+  const projectSection = formatProjectContext(
+    loadProjectContext(worktreePath),
+    loadSkillIndex(worktreePath),
+  );
+  const failureMessage = renderCiFailureForAgent(args, failingChecks);
+  const taskMessage = projectSection
+    ? `${projectSection}\n\n---\n\n${failureMessage}`
+    : failureMessage;
 
   const loopResult = await runAgentLoop({
     glm: deps.glm,

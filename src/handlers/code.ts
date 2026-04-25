@@ -16,6 +16,11 @@ import {
 } from "../git.ts";
 import { LocalExecutor } from "../executors/local.ts";
 import { log } from "../logger.ts";
+import {
+  formatProjectContext,
+  loadProjectContext,
+  loadSkillIndex,
+} from "../skills.ts";
 import type { DB } from "../state/db.ts";
 import { recordPr, setTerminalState } from "../state/queries.ts";
 
@@ -26,7 +31,7 @@ const CODE_TASK_INSTRUCTIONS = `You are working on a Linear ticket for 707 Labs.
 You can use tools to read, edit, run bash commands, and commit. When you're done, call finish() with a one-sentence summary.
 
 Rules:
-- Read before you write. Look at the existing code, the project's conventions, and any related files before changing anything.
+- Read before you write. Look at the existing code, the project's conventions (CLAUDE.md, AGENTS.md, .claude/skills/), and any related files before changing anything.
 - Make the smallest change that solves the ticket. Don't refactor unrelated code.
 - BEFORE calling finish, run \`bun run check\` (the project's typecheck/svelte-check command). If there are errors caused by your changes, fix them and re-run. The repo has a pre-push hook that runs the same command — your push will be rejected if it fails.
 - Run other tests if there's an obvious command for the area you touched (look at package.json scripts and tests in the changed file's directory). If tests fail, try to fix them.
@@ -130,10 +135,17 @@ export async function runCodeHandler(
 
   const executor = new LocalExecutor(worktreePath);
   const system = composeSystemPrompt({ taskInstructions: CODE_TASK_INSTRUCTIONS });
-  const taskMessage = renderTicketForAgent(args.issue, args.comments, {
+  const projectSection = formatProjectContext(
+    loadProjectContext(worktreePath),
+    loadSkillIndex(worktreePath),
+  );
+  const ticketMessage = renderTicketForAgent(args.issue, args.comments, {
     worktreePath,
     branch,
   });
+  const taskMessage = projectSection
+    ? `${projectSection}\n\n---\n\n${ticketMessage}`
+    : ticketMessage;
 
   const loopResult = await runAgentLoop({
     glm: deps.glm,
