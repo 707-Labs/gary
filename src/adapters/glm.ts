@@ -11,6 +11,93 @@ import { UsageLimitError } from "../rate-limit.ts";
 
 const DEFAULT_MAX_TOKENS = 8192;
 
+// SDK 0.32.1 doesn't carry `cache_control` in the GA Messages types — only
+// in the beta namespace. The wire format is identical though, and Z.ai /
+// Kimi / DeepSeek all honor it on their Anthropic-compatible endpoints
+// (verified via scripts/probe-cache.ts). We cast at the boundary instead
+// of pulling in a major SDK upgrade.
+const EPHEMERAL = { type: "ephemeral" } as const;
+
+type WithCacheControl<T> = T & { cache_control?: { type: "ephemeral" } };
+
+/**
+ * Inject cache_control breakpoints so providers cache the static prefix
+ * across iterations. Breakpoints land on:
+ *   1. End of the system prompt (most stable — voice + project preamble)
+ *   2. End of the tool list (stable until phase transitions)
+ *   3. End of the last message's last content block (caches the full
+ *      conversation prefix — saves the most on long runs)
+ *
+ * Providers that ignore cache_control silently pay no penalty — the field
+ * is treated as a no-op.
+ *
+ * Exported for tests; not part of the GLMClient surface.
+ */
+export function withCacheControl(
+  args: Omit<Anthropic.MessageCreateParamsNonStreaming, "model" | "stream">,
+): Omit<Anthropic.MessageCreateParamsNonStreaming, "model" | "stream"> {
+  const out: Omit<Anthropic.MessageCreateParamsNonStreaming, "model" | "stream"> = {
+    ...args,
+    messages:
+      args.messages.length > 0 ? withCacheOnLastMessage(args.messages) : args.messages,
+  };
+
+  if (typeof args.system === "string" && args.system.length > 0) {
+    out.system = [
+      { type: "text", text: args.system, cache_control: EPHEMERAL } as Anthropic.TextBlockParam,
+    ];
+  } else if (Array.isArray(args.system) && args.system.length > 0) {
+    out.system = args.system.map((b, i, arr): Anthropic.TextBlockParam =>
+      i === arr.length - 1
+        ? ({ ...b, cache_control: EPHEMERAL } as Anthropic.TextBlockParam)
+        : b,
+    );
+  }
+  // else: leave args.system as-is (undefined or empty array passes through).
+
+  if (args.tools && args.tools.length > 0) {
+    out.tools = args.tools.map((t, i, arr): Anthropic.Tool =>
+      i === arr.length - 1
+        ? ({ ...t, cache_control: EPHEMERAL } as Anthropic.Tool)
+        : t,
+    );
+  }
+
+  return out;
+}
+
+function withCacheOnLastMessage(
+  messages: readonly Anthropic.MessageParam[],
+): Anthropic.MessageParam[] {
+  const out = messages.slice();
+  const i = out.length - 1;
+  const last = out[i]!;
+  if (typeof last.content === "string") {
+    out[i] = {
+      ...last,
+      content: [
+        {
+          type: "text",
+          text: last.content,
+          cache_control: EPHEMERAL,
+        } as Anthropic.TextBlockParam,
+      ],
+    };
+    return out;
+  }
+  const blocks = [...last.content];
+  const j = blocks.length - 1;
+  if (j < 0) return out;
+  const tail = blocks[j]!;
+  // Cache_control attaches at the block level for any block variant
+  // (TextBlock, ToolResultBlock, etc.). The SDK type for 0.32.1 doesn't
+  // model it, so widen via `WithCacheControl` and cast back.
+  const tagged: WithCacheControl<typeof tail> = { ...tail, cache_control: EPHEMERAL };
+  blocks[j] = tagged as typeof tail;
+  out[i] = { ...last, content: blocks };
+  return out;
+}
+
 export interface CompleteArgs {
   system: string;
   user: string;
@@ -84,9 +171,10 @@ export class GLMClient {
   async createMessage(
     args: Omit<Anthropic.MessageCreateParamsNonStreaming, "model" | "stream">,
   ): Promise<Anthropic.Message> {
+    const cached = withCacheControl(args);
     return await this.runWithFallback((provider) =>
       provider.client.messages.create({
-        ...args,
+        ...cached,
         model: provider.model,
       }),
     );

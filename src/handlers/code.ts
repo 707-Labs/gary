@@ -229,6 +229,8 @@ export async function runCodeHandler(
     iterations: loopResult.iterations,
     inputTokens: loopResult.inputTokens,
     outputTokens: loopResult.outputTokens,
+    cacheCreationTokens: loopResult.cacheCreationTokens,
+    cacheReadTokens: loopResult.cacheReadTokens,
   });
 
   const baseRef = BASE_BRANCH;
@@ -488,6 +490,8 @@ async function ensurePostFinishCheckPasses(
     iterations: fixupResult.iterations,
     inputTokens: fixupResult.inputTokens,
     outputTokens: fixupResult.outputTokens,
+    cacheCreationTokens: fixupResult.cacheCreationTokens,
+    cacheReadTokens: fixupResult.cacheReadTokens,
   });
 
   const second = await ctx.executor.run(CHECK_COMMAND, {

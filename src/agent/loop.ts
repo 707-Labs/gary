@@ -20,10 +20,14 @@ export interface AgentLoopResult {
   summary: string | null;
   iterations: number;
   errorMessage?: string;
-  /** Total input tokens used (sum across turns). */
+  /** Total input tokens used (sum across turns) — excludes cached reads. */
   inputTokens: number;
   /** Total output tokens used (sum across turns). */
   outputTokens: number;
+  /** Tokens written to the prompt cache across turns (~1.25× billable). */
+  cacheCreationTokens: number;
+  /** Tokens read from the prompt cache across turns (~0.10× billable). */
+  cacheReadTokens: number;
   /** Phase the loop ended in (or "single" when no phases were configured). */
   phase: string;
 }
@@ -163,9 +167,32 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
   ];
 
   let totalIterations = 0;
-  let inputTokens = 0;
-  let outputTokens = 0;
+  const usage = {
+    input: 0,
+    output: 0,
+    cacheCreation: 0,
+    cacheRead: 0,
+  };
   let lastPhaseName = phases[0]?.name ?? "single";
+
+  const done = (
+    status: AgentLoopStatus,
+    summary: string | null,
+    phase: string,
+    errorMessage?: string,
+  ): AgentLoopResult => {
+    const base: AgentLoopResult = {
+      status,
+      summary,
+      iterations: totalIterations,
+      inputTokens: usage.input,
+      outputTokens: usage.output,
+      cacheCreationTokens: usage.cacheCreation,
+      cacheReadTokens: usage.cacheRead,
+      phase,
+    };
+    return errorMessage !== undefined ? { ...base, errorMessage } : base;
+  };
 
   for (let phaseIdx = 0; phaseIdx < phases.length; phaseIdx++) {
     const phase = phases[phaseIdx]!;
@@ -189,25 +216,10 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
 
     while (phaseIter < phase.maxIter) {
       if (args.signal?.aborted) {
-        return done(
-          "error",
-          null,
-          totalIterations,
-          inputTokens,
-          outputTokens,
-          phase.name,
-          "aborted",
-        );
+        return done("error", null, phase.name, "aborted");
       }
       if (Date.now() > deadline) {
-        return done(
-          "timeout",
-          null,
-          totalIterations,
-          inputTokens,
-          outputTokens,
-          phase.name,
-        );
+        return done("timeout", null, phase.name);
       }
 
       if (!nudgeFired && phaseIter + 1 === nudgeAt && phase.nudgeMessage) {
@@ -251,19 +263,19 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
           iteration: totalIterations,
           error: message,
         });
-        return done(
-          "error",
-          null,
-          totalIterations,
-          inputTokens,
-          outputTokens,
-          phase.name,
-          message,
-        );
+        return done("error", null, phase.name, message);
       }
 
-      inputTokens += response.usage.input_tokens;
-      outputTokens += response.usage.output_tokens;
+      // SDK 0.32.1 doesn't model the cache fields on Usage; they ship in the
+      // wire format and our providers populate them. Widen via cast.
+      const u = response.usage as Anthropic.Usage & {
+        cache_creation_input_tokens?: number | null;
+        cache_read_input_tokens?: number | null;
+      };
+      usage.input += u.input_tokens;
+      usage.output += u.output_tokens;
+      usage.cacheCreation += u.cache_creation_input_tokens ?? 0;
+      usage.cacheRead += u.cache_read_input_tokens ?? 0;
 
       log.debug("agent turn", {
         phase: phase.name,
@@ -276,27 +288,13 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
 
       if (response.stop_reason !== "tool_use") {
         if (tools.finishSummary !== null) {
-          return done(
-            "finished",
-            tools.finishSummary,
-            totalIterations,
-            inputTokens,
-            outputTokens,
-            phase.name,
-          );
+          return done("finished", tools.finishSummary, phase.name);
         }
         // Voluntary phase exit. If there's a next phase, transition; if
         // this was the last phase, the model wrapped up without calling
         // finish — that's no_finish (existing behavior).
         if (isLastPhase) {
-          return done(
-            "no_finish",
-            null,
-            totalIterations,
-            inputTokens,
-            outputTokens,
-            phase.name,
-          );
+          return done("no_finish", null, phase.name);
         }
         phaseEndedVoluntarily = true;
         break;
@@ -307,14 +305,7 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
       );
       if (toolCalls.length === 0) {
         // Defensive: shouldn't happen given stop_reason === "tool_use".
-        return done(
-          "no_finish",
-          null,
-          totalIterations,
-          inputTokens,
-          outputTokens,
-          phase.name,
-        );
+        return done("no_finish", null, phase.name);
       }
 
       const toolResults: Anthropic.ToolResultBlockParam[] = [];
@@ -324,14 +315,7 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
       messages.push({ role: "user", content: toolResults });
 
       if (tools.finishSummary !== null) {
-        return done(
-          "finished",
-          tools.finishSummary,
-          totalIterations,
-          inputTokens,
-          outputTokens,
-          phase.name,
-        );
+        return done("finished", tools.finishSummary, phase.name);
       }
     }
 
@@ -347,14 +331,7 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
     // Otherwise log and roll into the next phase — the entry message is
     // injected at the top of the next iteration.
     if (isLastPhase) {
-      return done(
-        "iteration_cap",
-        null,
-        totalIterations,
-        inputTokens,
-        outputTokens,
-        phase.name,
-      );
+      return done("iteration_cap", null, phase.name);
     }
     log.info("phase complete (cap reached)", {
       phase: phase.name,
@@ -365,14 +342,7 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
 
   // All phases exhausted without a return path — should be unreachable
   // since the final phase always returns. Defensive default.
-  return done(
-    "no_finish",
-    null,
-    totalIterations,
-    inputTokens,
-    outputTokens,
-    lastPhaseName,
-  );
+  return done("no_finish", null, lastPhaseName);
 }
 
 async function executTool(
@@ -422,16 +392,3 @@ async function executTool(
   }
 }
 
-function done(
-  status: AgentLoopStatus,
-  summary: string | null,
-  iterations: number,
-  inputTokens: number,
-  outputTokens: number,
-  phase: string,
-  errorMessage?: string,
-): AgentLoopResult {
-  return errorMessage !== undefined
-    ? { status, summary, iterations, inputTokens, outputTokens, phase, errorMessage }
-    : { status, summary, iterations, inputTokens, outputTokens, phase };
-}
