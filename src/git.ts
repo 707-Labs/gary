@@ -180,8 +180,25 @@ export async function pushBranch(args: {
   freshTokenUrl: string;
   branch: string;
 }): Promise<void> {
+  // `--force-with-lease` (no value) compares against the local remote-tracking
+  // ref. Bare clones with worktrees never populate `refs/remotes/origin/*`, so
+  // that form refuses every push with "stale info" once the branch exists on
+  // the remote (e.g. on a retry, or when picking a ticket back up). Look up
+  // the current remote SHA and pass it as an explicit expected value so the
+  // lease has accurate input. An empty value tells git to expect the ref to
+  // be absent, which is correct for first-time pushes.
+  const lsr = await gitRun(
+    ["ls-remote", args.freshTokenUrl, `refs/heads/${args.branch}`],
+    { cwd: args.worktreePath },
+  );
+  const expectedSha = lsr.stdout.trim().split(/\s+/)[0] ?? "";
   await gitMust(
-    ["push", args.freshTokenUrl, `${args.branch}:${args.branch}`, "--force-with-lease"],
+    [
+      "push",
+      args.freshTokenUrl,
+      `${args.branch}:${args.branch}`,
+      `--force-with-lease=${args.branch}:${expectedSha}`,
+    ],
     { cwd: args.worktreePath },
   );
 }
