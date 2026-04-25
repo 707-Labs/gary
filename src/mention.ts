@@ -9,17 +9,46 @@
  * false positive that hits `RegExp.exec` (see CLAUDE.md gotchas).
  */
 
-const PICKUP_TRIGGERS: readonly RegExp[] = [
+// Strict patterns: @gary directly precedes the imperative verb. These match
+// without any further check because the @gary adjacency is already encoded.
+const STRICT_PICKUP_TRIGGERS: readonly RegExp[] = [
   /@gary[,]?\s+take\s+(this|it)\b/i,
   /@gary[,]?\s+pick\s+(this|it)\s+up\b/i,
+  /@gary[,]?\s+pick\s+up\s+(this|it)\b/i,
   /@gary[,]?\s+handle\s+(this|it)\b/i,
   /@gary[,]?\s+grab\s+(this|it)\b/i,
+];
+
+// Relaxed patterns: imperative verb appears anywhere with a polite/interrogative
+// prefix. These only fire when @gary is also in the comment (looksLikeMention),
+// otherwise "please take this approach" or "can you handle it" in unrelated
+// discussion would falsely trigger pickup.
+const RELAXED_PICKUP_TRIGGERS: readonly RegExp[] = [
+  // "please <verb>"
+  /\bplease\s+take\s+(this|it)\b/i,
+  /\bplease\s+pick\s+(this|it)\s+up\b/i,
+  /\bplease\s+pick\s+up\s+(this|it)\b/i,
+  /\bplease\s+handle\s+(this|it)\b/i,
+  /\bplease\s+grab\s+(this|it)\b/i,
+  // "can you <verb>" — interrogative imperative
+  /\bcan\s+you\s+take\s+(this|it)\b/i,
+  /\bcan\s+you\s+pick\s+(this|it)\s+up\b/i,
+  /\bcan\s+you\s+pick\s+up\s+(this|it)\b/i,
+  /\bcan\s+you\s+handle\s+(this|it)\b/i,
+  /\bcan\s+you\s+grab\s+(this|it)\b/i,
 ];
 
 const MENTION_PATTERN = /@gary\b/i;
 
 export function looksLikePickup(body: string): boolean {
-  return PICKUP_TRIGGERS.some((re) => body.match(re) !== null);
+  for (const re of STRICT_PICKUP_TRIGGERS) {
+    if (body.match(re) !== null) return true;
+  }
+  if (!looksLikeMention(body)) return false;
+  for (const re of RELAXED_PICKUP_TRIGGERS) {
+    if (body.match(re) !== null) return true;
+  }
+  return false;
 }
 
 export function looksLikeMention(body: string): boolean {

@@ -8,17 +8,29 @@ import {
 
 describe("looksLikePickup", () => {
   it.each([
+    // strict — @gary directly preceding
     "@gary take this",
     "@gary, take this",
     "@gary take it",
     "@gary pick this up",
     "@gary, pick it up",
+    "@gary pick up this",
     "@gary handle this",
     "@gary handle it",
     "@gary grab this",
     "@gary grab it",
     "Hey @gary take this and run with it",
     "@Gary TAKE THIS",
+    // relaxed — @gary somewhere + polite/interrogative imperative
+    "@gary please take this",
+    "@gary can you take this?",
+    "@gary, please pick it up",
+    "@gary please pick this up when you have a sec",
+    "@gary please pick up this",
+    "@gary please handle this",
+    "@gary can you handle it?",
+    "@gary please grab this",
+    "@gary can you check if this was handled in another ticket? if not please pick it up",
   ])("matches %s", (body) => {
     expect(looksLikePickup(body)).toBe(true);
   });
@@ -31,6 +43,10 @@ describe("looksLikePickup", () => {
     "pick this up",
     "@gary's idea was good",
     "@gary",
+    // relaxed patterns must NOT match without @gary
+    "please pick this up",
+    "can you take this?",
+    "please handle this",
   ])("does not match %s", (body) => {
     expect(looksLikePickup(body)).toBe(false);
   });
