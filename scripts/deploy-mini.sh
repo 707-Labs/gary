@@ -60,16 +60,19 @@ fi
 echo "[deploy] bootstrap $target"
 launchctl bootstrap "gui/$uid" "$PLIST_DST"
 
-# Wait briefly for the service to spawn and emit its first log line.
+# Wait for launchd to spawn the process and assign a PID. The "boot
+# complete" condition is a non-zero PID in `launchctl print`.
 echo "[deploy] waiting for boot…"
 for _ in {1..20}; do
-  if grep -q '"msg":"loop starting"' "$LOG_DIR/stdout.log" 2>/dev/null; then
+  pid=$(launchctl print "$target" 2>/dev/null | awk -F' = ' '/^\tpid =/ { print $2; exit }')
+  if [[ -n "${pid:-}" ]]; then
+    echo "[deploy] running, pid=$pid"
     break
   fi
   sleep 0.5
 done
 
-echo "[deploy] head $LOG_DIR/stdout.log:"
+echo "[deploy] tail $LOG_DIR/stdout.log:"
 tail -5 "$LOG_DIR/stdout.log"
 echo
 echo "[deploy] done. before=$before after=$after"
