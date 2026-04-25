@@ -33,6 +33,7 @@ async function main(): Promise<void> {
     cloudflare: cloudflare ? cfg.cloudflare?.observabilityWorkers : "disabled",
     pollIntervalMs: cfg.runtime.pollIntervalMs,
     allowedRepos: cfg.gary.allowedRepos,
+    mentionAllowlistSize: cfg.gary.allowlistedMentionUserIds.length,
   });
 
   const controller = new AbortController();

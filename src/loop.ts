@@ -210,18 +210,34 @@ async function collectMentionCandidates(
   assignedIssues: readonly { id: string }[],
   candidates: CandidateAction[],
 ): Promise<void> {
+  // Telemetry counters for the mention_scan event. Surfaced so a silently-
+  // broken pipeline (e.g. the GraphQL type bug we hit) is visible in the
+  // events table without needing a probe to diagnose.
+  const stats = {
+    scanned: 0,
+    mentionOnly: 0,
+    pickup: 0,
+    mention: 0,
+    fetchCommentsErrors: 0,
+    fetchMentionedError: false as boolean,
+  };
+
   let mentioned: Awaited<ReturnType<LinearAdapter["fetchMentionedIssues"]>>;
   try {
     mentioned = await deps.linear.fetchMentionedIssues();
+    stats.scanned = mentioned.length;
   } catch (err) {
+    stats.fetchMentionedError = true;
     log.warn("could not fetch mentioned issues; skipping mention pipeline", {
       error: err instanceof Error ? err.message : String(err),
     });
+    recordEvent(deps.db, { eventType: "mention_scan", payload: stats });
     return;
   }
 
   const assignedIds = new Set(assignedIssues.map((i) => i.id));
   const mentionOnly = mentioned.filter((i) => !assignedIds.has(i.id));
+  stats.mentionOnly = mentionOnly.length;
 
   for (const issue of mentionOnly) {
     upsertTicket(deps.db, { linearId: issue.id, identifier: issue.identifier });
@@ -232,6 +248,7 @@ async function collectMentionCandidates(
     try {
       comments = await deps.linear.fetchComments(issue.id);
     } catch (err) {
+      stats.fetchCommentsErrors++;
       log.warn("could not fetch comments for mentioned ticket", {
         issue: issue.identifier,
         error: err instanceof Error ? err.message : String(err),
@@ -250,6 +267,8 @@ async function collectMentionCandidates(
       allowlistedUserIds: deps.allowlistedMentionUserIds,
     });
     if (analysis.kind === "none") continue;
+    if (analysis.kind === "pickup") stats.pickup++;
+    else if (analysis.kind === "mention") stats.mention++;
 
     const humanInputSignature = computeHumanInputSignature({
       description: issue.description,
@@ -283,6 +302,8 @@ async function collectMentionCandidates(
     }
     candidates.push(candidate);
   }
+
+  recordEvent(deps.db, { eventType: "mention_scan", payload: stats });
 }
 
 async function dispatch(deps: LoopDeps, action: CandidateAction): Promise<void> {
