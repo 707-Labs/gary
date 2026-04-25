@@ -63,14 +63,18 @@ launchctl bootstrap "gui/$uid" "$PLIST_DST"
 # Wait for launchd to spawn the process and assign a PID. The "boot
 # complete" condition is a non-zero PID in `launchctl print`.
 echo "[deploy] waiting for boot…"
+pid=""
 for _ in {1..20}; do
-  pid=$(launchctl print "$target" 2>/dev/null | awk -F' = ' '/^\tpid =/ { print $2; exit }')
-  if [[ -n "${pid:-}" ]]; then
+  pid=$(launchctl print "$target" 2>/dev/null | grep -E '^[[:space:]]+pid = [0-9]+' | head -1 | awk '{print $3}')
+  if [[ -n "$pid" ]]; then
     echo "[deploy] running, pid=$pid"
     break
   fi
   sleep 0.5
 done
+if [[ -z "$pid" ]]; then
+  echo "[deploy] WARNING: could not confirm pid after 10s — check launchctl print $target manually"
+fi
 
 echo "[deploy] tail $LOG_DIR/stdout.log:"
 tail -5 "$LOG_DIR/stdout.log"
