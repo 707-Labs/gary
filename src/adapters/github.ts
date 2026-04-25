@@ -46,6 +46,15 @@ export interface CheckRunDetail extends CheckRun {
   outputText: string | null;
 }
 
+export interface PullRequestDetail extends PullRequestRef {
+  title: string;
+  body: string;
+  baseRef: string;
+  headRef: string;
+  /** Unified diff — can be large; callers truncate at their boundary. */
+  diff: string;
+}
+
 export type AggregateCi = "green" | "red" | "pending" | "none";
 
 export interface ViewerInfo {
@@ -79,6 +88,16 @@ export interface GitHubClient {
     repo: string,
     number: number,
   ): Promise<PullRequestRef>;
+
+  /**
+   * Like getPullRequest but also returns title, body, base/head refs, and the
+   * full unified diff. Used by the agent's `get_pr` tool.
+   */
+  getPullRequestDetail(
+    owner: string,
+    repo: string,
+    number: number,
+  ): Promise<PullRequestDetail>;
 
   getCheckRuns(owner: string, repo: string, sha: string): Promise<CheckRun[]>;
 
@@ -172,6 +191,14 @@ class AppGitHubClient implements GitHubClient {
   ): Promise<PullRequestRef> {
     const { data } = await this.app.pulls.get({ owner, repo, pull_number: number });
     return prRefFromOctokit(owner, repo, data);
+  }
+
+  async getPullRequestDetail(
+    owner: string,
+    repo: string,
+    number: number,
+  ): Promise<PullRequestDetail> {
+    return getPrDetailVia(this.app, owner, repo, number);
   }
 
   async getCheckRuns(
@@ -314,6 +341,14 @@ class PatGitHubClient implements GitHubClient {
     return prRefFromOctokit(owner, repo, data);
   }
 
+  async getPullRequestDetail(
+    owner: string,
+    repo: string,
+    number: number,
+  ): Promise<PullRequestDetail> {
+    return getPrDetailVia(this.api, owner, repo, number);
+  }
+
   async getCheckRuns(
     owner: string,
     repo: string,
@@ -427,6 +462,32 @@ function prRefFromOctokit(
     state: pr.state === "closed" ? "closed" : "open",
     merged: Boolean(pr.merged),
     isDraft: Boolean(pr.draft),
+  };
+}
+
+async function getPrDetailVia(
+  api: Octokit,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<PullRequestDetail> {
+  const { data } = await api.pulls.get({ owner, repo, pull_number: number });
+  // Octokit decodes the diff response as a string when the diff media type
+  // is requested. The type system doesn't capture that, so we widen.
+  const diffRes = await api.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", {
+    owner,
+    repo,
+    pull_number: number,
+    mediaType: { format: "diff" },
+  });
+  const diff = typeof diffRes.data === "string" ? diffRes.data : "";
+  return {
+    ...prRefFromOctokit(owner, repo, data),
+    title: data.title,
+    body: data.body ?? "",
+    baseRef: data.base.ref,
+    headRef: data.head.ref,
+    diff,
   };
 }
 

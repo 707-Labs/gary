@@ -1,6 +1,7 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import type { CloudflareClient } from "../adapters/cloudflare.ts";
+import type { GitHubClient } from "../adapters/github.ts";
 import type { LinearAdapter } from "../adapters/linear.ts";
 import type { Executor } from "../executors/index.ts";
 
@@ -23,6 +24,10 @@ export interface ToolsetOptions {
   cloudflare?: CloudflareClient;
   /** When set, exposes Linear read tools (e.g. `get_linear_issue`). */
   linear?: LinearAdapter;
+  /** When set, exposes GitHub read tools (e.g. `get_pr`). */
+  github?: GitHubClient;
+  /** "owner/repo" used as the default for github tools when omitted. */
+  defaultRepo?: string;
 }
 
 /** Builds the toolset bound to an Executor. The agent loop drives this. */
@@ -48,6 +53,9 @@ export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): Agen
   register(fetchUrlTool());
   if (opts.linear) {
     register(getLinearIssueTool(opts.linear));
+  }
+  if (opts.github) {
+    register(getPrTool(opts.github, opts.defaultRepo));
   }
   if (opts.cloudflare) {
     register(queryCloudflareLogsTool(opts.cloudflare));
@@ -452,6 +460,68 @@ function getLinearIssueTool(linear: LinearAdapter): ToolHandler {
         return lines.join("\n");
       } catch (err) {
         return formatError("get_linear_issue", err);
+      }
+    },
+  };
+}
+
+const getPrSchema = z.object({
+  number: z.number().int().positive(),
+  repo: z.string().regex(/^[^/]+\/[^/]+$/, "must be owner/repo").optional(),
+  include_diff: z.boolean().optional(),
+});
+const PR_DIFF_MAX_BYTES = 30_000;
+const PR_BODY_MAX_BYTES = 4_000;
+function getPrTool(github: GitHubClient, defaultRepo?: string): ToolHandler {
+  return {
+    definition: {
+      name: "get_pr",
+      description:
+        "Fetch a GitHub pull request by number — title, body, base/head refs, and (optionally) the unified diff. Use when a ticket says 'see PR #260' or you want to align with prior work. Diff is truncated to ~30KB.",
+      input_schema: {
+        type: "object",
+        properties: {
+          number: { type: "number", description: "PR number." },
+          repo: {
+            type: "string",
+            description: `Optional 'owner/repo'. Defaults to ${defaultRepo ?? "the configured repo"}.`,
+          },
+          include_diff: {
+            type: "boolean",
+            description: "Include the unified diff. Default true.",
+          },
+        },
+        required: ["number"],
+      },
+    },
+    async run(input) {
+      const args = getPrSchema.parse(input);
+      const repo = args.repo ?? defaultRepo;
+      if (!repo) {
+        return "error: no repo specified and no default configured";
+      }
+      const [owner, name] = repo.split("/") as [string, string];
+      try {
+        const pr = await github.getPullRequestDetail(owner, name, args.number);
+        const lines = [
+          `${repo}#${pr.number}: ${pr.title}`,
+          `state: ${pr.state}${pr.merged ? " (merged)" : ""}${pr.isDraft ? " (draft)" : ""}`,
+          `base: ${pr.baseRef}  head: ${pr.headRef}  sha: ${pr.headSha}`,
+          `url: ${pr.url}`,
+          "",
+          "body:",
+          truncate(pr.body, PR_BODY_MAX_BYTES) || "(empty)",
+        ];
+        if (args.include_diff !== false) {
+          const truncated = pr.diff.length > PR_DIFF_MAX_BYTES;
+          const diff = truncated ? pr.diff.slice(0, PR_DIFF_MAX_BYTES) : pr.diff;
+          lines.push("");
+          lines.push(`diff (${pr.diff.length} bytes${truncated ? `, truncated to ${PR_DIFF_MAX_BYTES}` : ""}):`);
+          lines.push(diff);
+        }
+        return lines.join("\n");
+      } catch (err) {
+        return formatError("get_pr", err);
       }
     },
   };

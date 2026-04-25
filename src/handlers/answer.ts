@@ -85,6 +85,8 @@ export async function runAnswerHandler(
     timeoutMs: Math.min(deps.agentLoopTimeoutMs, 5 * 60_000),
     temperature: 0.3,
     linear: deps.linear,
+    github: deps.github,
+    defaultRepo: args.repo,
     ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
   });
 

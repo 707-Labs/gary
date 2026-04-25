@@ -1,5 +1,6 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import type { CloudflareClient } from "../adapters/cloudflare.ts";
+import type { GitHubClient } from "../adapters/github.ts";
 import type { GLMClient } from "../adapters/glm.ts";
 import type { LinearAdapter } from "../adapters/linear.ts";
 import type { Executor } from "../executors/index.ts";
@@ -43,6 +44,10 @@ export interface AgentLoopArgs {
   cloudflare?: CloudflareClient;
   /** If provided, the toolset includes `get_linear_issue`. */
   linear?: LinearAdapter;
+  /** If provided (with defaultRepo), the toolset includes `get_pr`. */
+  github?: GitHubClient;
+  /** Default "owner/repo" for `get_pr` when called without a repo arg. */
+  defaultRepo?: string;
 }
 
 const DEFAULT_TEMPERATURE = 0.3;
@@ -59,6 +64,8 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
   const toolsetOpts: ToolsetOptions = {};
   if (args.cloudflare) toolsetOpts.cloudflare = args.cloudflare;
   if (args.linear) toolsetOpts.linear = args.linear;
+  if (args.github) toolsetOpts.github = args.github;
+  if (args.defaultRepo) toolsetOpts.defaultRepo = args.defaultRepo;
   const tools = makeToolset(args.executor, toolsetOpts);
   const start = Date.now();
   const deadline = start + args.timeoutMs;

@@ -130,6 +130,8 @@ export async function runCiFailureHandler(
     timeoutMs: deps.agentLoopTimeoutMs,
     temperature: 0.3,
     linear: deps.linear,
+    github: deps.github,
+    defaultRepo: args.repo,
     ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
   });
 
