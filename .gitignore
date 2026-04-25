@@ -3,6 +3,7 @@ dist/
 .env
 .env.local
 .gary/
+.claude/
 *.log
 *.pem
 *.private-key.pem

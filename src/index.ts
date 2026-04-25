@@ -6,7 +6,7 @@ import { LinearAdapter } from "./adapters/linear.ts";
 import { loadConfig } from "./config.ts";
 import { log } from "./logger.ts";
 import { runLoop } from "./loop.ts";
-import { createRateLimitGate } from "./rate-limit.ts";
+import { createProvider, createProviderChain } from "./providers.ts";
 import { closeDb, openDb } from "./state/db.ts";
 import { recordEvent } from "./state/queries.ts";
 
@@ -23,15 +23,15 @@ async function main(): Promise<void> {
 
   const linear = new LinearAdapter({ gary: cfg.gary, linear: cfg.linear });
   const github = makeGitHubClient(cfg.github);
-  const glm = new GLMClient(cfg.glm);
+  const chain = createProviderChain(cfg.providers.map((p) => createProvider(p)));
+  const glm = new GLMClient(chain);
   const cloudflare = cfg.cloudflare ? new CloudflareClient(cfg.cloudflare) : null;
-  const rateLimitGate = createRateLimitGate();
 
   log.info("gary booted", {
     name: cfg.gary.name,
     dbPath: cfg.gary.dbPath,
     githubAuth: cfg.github.kind,
-    glmModel: cfg.glm.model,
+    providers: chain.providers.map((p) => `${p.name}:${p.model}`),
     cloudflare: cloudflare ? cfg.cloudflare?.observabilityWorkers : "disabled",
     pollIntervalMs: cfg.runtime.pollIntervalMs,
     allowedRepos: cfg.gary.allowedRepos,
@@ -52,7 +52,6 @@ async function main(): Promise<void> {
     github,
     glm,
     cloudflare,
-    rateLimitGate,
     allowedRepos: cfg.gary.allowedRepos,
     allowlistedMentionUserIds: cfg.gary.allowlistedMentionUserIds,
     reposDir: cfg.gary.reposDir,

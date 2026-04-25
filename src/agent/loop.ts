@@ -5,7 +5,7 @@ import type { GLMClient } from "../adapters/glm.ts";
 import type { LinearAdapter } from "../adapters/linear.ts";
 import type { Executor } from "../executors/index.ts";
 import { log } from "../logger.ts";
-import { parseUsageLimitError, UsageLimitError } from "../rate-limit.ts";
+import { AllProvidersExhaustedError } from "../providers.ts";
 import { type AgentTools, type ToolsetOptions, makeToolset } from "./tools.ts";
 
 export type AgentLoopStatus =
@@ -90,8 +90,7 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
 
     let response: Anthropic.Message;
     try {
-      response = await args.glm.client.messages.create({
-        model: args.glm.model,
+      response = await args.glm.createMessage({
         max_tokens: args.maxTokensPerTurn ?? DEFAULT_MAX_TOKENS,
         temperature: args.temperature ?? DEFAULT_TEMPERATURE,
         system: args.systemPrompt,
@@ -99,18 +98,18 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
         messages,
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      const resetAt = parseUsageLimitError(message);
-      if (resetAt) {
-        // Long-window provider cap (e.g. Z.ai 5-hour). Throw so the loop
-        // arms the rate-limit gate and skips dispatch until reset, instead
-        // of letting the handler bounce a perfectly good ticket.
-        log.warn("agent loop hit usage limit; will back off", {
+      // Per-provider 429s are handled inside `glm.createMessage` (it falls
+      // through to the next provider). The only rate-limit case that
+      // reaches here is "every provider is armed" — propagate so the tick
+      // can record the skip without bouncing the ticket.
+      if (err instanceof AllProvidersExhaustedError) {
+        log.warn("agent loop: all providers armed; will back off", {
           iteration: iterations,
-          resetAt: resetAt.toISOString(),
+          earliestReset: err.earliestReset?.toISOString() ?? null,
         });
-        throw new UsageLimitError(resetAt, message);
+        throw err;
       }
+      const message = err instanceof Error ? err.message : String(err);
       log.error("agent loop API error", { iteration: iterations, error: message });
       return done("error", null, iterations, inputTokens, outputTokens, message);
     }

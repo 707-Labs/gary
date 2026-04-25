@@ -1,9 +1,10 @@
 import { log } from "./logger.ts";
 
 /**
- * Thrown when a provider responds with a long-window usage limit (e.g.
- * Z.ai's 5-hour cap). Distinct from generic 429s — this one we wait out
- * by arming the rate-limit gate, not by retrying immediately.
+ * Thrown when a provider's long-window usage limit kicks in (e.g. Z.ai's
+ * 5-hour cap, Kimi Code's 5-hour Moderato window). The provider chain
+ * uses this to decide when to fall through to the next provider — see
+ * `src/providers.ts`.
  */
 export class UsageLimitError extends Error {
   readonly resetAt: Date;
@@ -12,24 +13,6 @@ export class UsageLimitError extends Error {
     this.name = "UsageLimitError";
     this.resetAt = resetAt;
   }
-}
-
-/**
- * Z.ai's 5-hour cap returns:
- *   429 {"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-04-25 15:43:26"},...}
- *
- * The reset timestamp is server time. Z.ai's docs and observed behavior treat
- * it as UTC. If they're ever off by a timezone we wait too long (safe).
- */
-const USAGE_LIMIT_PATTERN =
-  /Usage limit reached[^"]*?reset at\s+(\d{4}-\d{2}-\d{2})[\sT](\d{2}:\d{2}:\d{2})/i;
-
-export function parseUsageLimitError(message: string): Date | null {
-  const m = message.match(USAGE_LIMIT_PATTERN);
-  if (!m || !m[1] || !m[2]) return null;
-  const iso = `${m[1]}T${m[2]}Z`;
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? null : d;
 }
 
 export interface RateLimitGate {

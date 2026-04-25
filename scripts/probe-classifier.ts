@@ -7,7 +7,7 @@ import {
   classifyTicket,
   generateClassificationComment,
 } from "../src/handlers/classifier.ts";
-import { loadGLMConfig } from "../src/config.ts";
+import { loadGLMChain } from "../src/config.ts";
 
 const fixtures: AssignedIssue[] = [
   {
@@ -60,8 +60,7 @@ const fixtures: AssignedIssue[] = [
   },
 ];
 
-const cfg = loadGLMConfig();
-const glm = new GLMClient(cfg);
+const glm = new GLMClient(loadGLMChain());
 
 for (const issue of fixtures) {
   console.log(`\n=== ${issue.identifier}: ${issue.title} ===`);

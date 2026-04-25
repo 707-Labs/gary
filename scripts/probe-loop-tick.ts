@@ -11,7 +11,7 @@ import { makeGitHubClient } from "../src/adapters/github.ts";
 import { LinearAdapter } from "../src/adapters/linear.ts";
 import { loadConfig } from "../src/config.ts";
 import { tick } from "../src/loop.ts";
-import { createRateLimitGate } from "../src/rate-limit.ts";
+import { createProvider, createProviderChain } from "../src/providers.ts";
 import { closeDb, openDb } from "../src/state/db.ts";
 
 const cfg = loadConfig();
@@ -20,7 +20,8 @@ const db = openDb(cfg.gary.dbPath);
 
 const linear = new LinearAdapter({ gary: cfg.gary, linear: cfg.linear });
 const github = makeGitHubClient(cfg.github);
-const glm = new GLMClient(cfg.glm);
+const chain = createProviderChain(cfg.providers.map((p) => createProvider(p)));
+const glm = new GLMClient(chain);
 const cloudflare = cfg.cloudflare ? new CloudflareClient(cfg.cloudflare) : null;
 
 const result = await tick({
@@ -29,7 +30,6 @@ const result = await tick({
   github,
   glm,
   cloudflare,
-  rateLimitGate: createRateLimitGate(),
   allowedRepos: cfg.gary.allowedRepos,
   allowlistedMentionUserIds: cfg.gary.allowlistedMentionUserIds,
   reposDir: cfg.gary.reposDir,

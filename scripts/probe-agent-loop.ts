@@ -8,14 +8,13 @@ import { join } from "node:path";
 import { GLMClient } from "../src/adapters/glm.ts";
 import { runAgentLoop } from "../src/agent/loop.ts";
 import { composeSystemPrompt } from "../src/agent/prompts.ts";
-import { loadGLMConfig } from "../src/config.ts";
+import { loadGLMChain } from "../src/config.ts";
 import { LocalExecutor } from "../src/executors/local.ts";
 
 const workspace = mkdtempSync(join(tmpdir(), "gary-probe-agent-"));
 console.log(`workspace: ${workspace}`);
 
-const cfg = loadGLMConfig();
-const glm = new GLMClient(cfg);
+const glm = new GLMClient(loadGLMChain());
 const executor = new LocalExecutor(workspace);
 
 const system = composeSystemPrompt({

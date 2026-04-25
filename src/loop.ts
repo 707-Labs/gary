@@ -22,7 +22,7 @@ import {
   pickActionForTicket,
   pickHighestPriority,
 } from "./priority.ts";
-import { type RateLimitGate, UsageLimitError } from "./rate-limit.ts";
+import { AllProvidersExhaustedError } from "./providers.ts";
 import {
   computeHumanInputSignature,
   computePrCommentSignature,
@@ -53,7 +53,6 @@ export interface LoopDeps {
   github: GitHubClient;
   glm: GLMClient;
   cloudflare: CloudflareClient | null;
-  rateLimitGate: RateLimitGate;
   allowedRepos: readonly string[];
   /**
    * Linear user ids permitted to summon Gary via @mention. Empty array
@@ -80,12 +79,13 @@ export interface TickResult {
  * info about what happened so callers can decide cadence.
  */
 export async function tick(deps: LoopDeps): Promise<TickResult> {
-  // Provider-level long-window rate limit (e.g. Z.ai's 5-hour cap). When
-  // armed, every GLM call would 429 — skip the tick entirely so we don't
-  // burn handler dispatches that all bounce-on-failure.
-  if (deps.rateLimitGate.isArmed()) {
-    const until = deps.rateLimitGate.armedUntil();
-    log.info("rate-limit gate armed; skipping tick", {
+  // Every configured provider has its long-window cap armed. Skip the
+  // tick entirely so we don't burn fetch + dispatch on calls that will
+  // immediately throw AllProvidersExhausted. Cheap optimization;
+  // correctness is upheld by the dispatch catch below.
+  if (deps.glm.chain.allArmed()) {
+    const until = deps.glm.chain.earliestReset();
+    log.info("all providers armed; skipping tick", {
       until: until?.toISOString(),
     });
     recordEvent(deps.db, {
@@ -209,20 +209,25 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
     return { candidatesConsidered: candidates.length, actionTaken: action.type };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    if (err instanceof UsageLimitError) {
-      // Long-window provider cap — arm the gate so subsequent ticks skip
-      // dispatch until reset. Record the action as a non-bouncing failure
-      // so it retries with the same fingerprint once the gate clears.
-      deps.rateLimitGate.armUntil(err.resetAt);
-      log.warn("action paused on usage limit", {
+    if (err instanceof AllProvidersExhaustedError) {
+      // Every provider rate-limited mid-action. Per-provider gates are
+      // already armed by `GLMClient.runWithFallback`; the next tick's
+      // `chain.allArmed()` check will short-circuit until one clears.
+      // Record the action as a non-bouncing failure so it retries with
+      // the same fingerprint.
+      log.warn("action paused; all providers armed", {
         action: action.type,
         issue: action.issue.identifier,
-        until: err.resetAt.toISOString(),
+        earliestReset: err.earliestReset?.toISOString() ?? null,
+      });
+      recordEvent(deps.db, {
+        eventType: "rate_limit_skip",
+        payload: { until: err.earliestReset?.toISOString() ?? null },
       });
       recordActionEnd(deps.db, {
         id: actionId,
         success: false,
-        errorMessage: `usage limit; resets ${err.resetAt.toISOString()}`,
+        errorMessage: `all providers armed; earliest reset ${err.earliestReset?.toISOString() ?? "unknown"}`,
       });
       return { candidatesConsidered: candidates.length, actionTaken: null };
     }

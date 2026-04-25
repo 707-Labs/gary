@@ -1,38 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import {
-  createRateLimitGate,
-  parseUsageLimitError,
-  UsageLimitError,
-} from "../src/rate-limit.ts";
-
-describe("parseUsageLimitError", () => {
-  it("parses the Z.ai 5-hour cap message", () => {
-    const raw =
-      '429 {"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-04-25 15:43:26"},"request_id":"abc"}';
-    const d = parseUsageLimitError(raw);
-    expect(d).not.toBeNull();
-    expect(d?.toISOString()).toBe("2026-04-25T15:43:26.000Z");
-  });
-
-  it("parses with T separator instead of space", () => {
-    const raw = "Usage limit reached for 5 hour. Your limit will reset at 2026-04-25T15:43:26";
-    expect(parseUsageLimitError(raw)?.toISOString()).toBe(
-      "2026-04-25T15:43:26.000Z",
-    );
-  });
-
-  it("returns null on unrelated messages", () => {
-    expect(parseUsageLimitError("400 bad request")).toBeNull();
-    expect(parseUsageLimitError("429 Too Many Requests")).toBeNull();
-    expect(parseUsageLimitError("")).toBeNull();
-  });
-
-  it("returns null when the timestamp is malformed", () => {
-    expect(
-      parseUsageLimitError("Usage limit reached. reset at NOPE-NOPE-NOPE 99:99:99"),
-    ).toBeNull();
-  });
-});
+import { createRateLimitGate, UsageLimitError } from "../src/rate-limit.ts";
 
 describe("RateLimitGate", () => {
   it("starts disarmed", () => {

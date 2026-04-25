@@ -9,7 +9,7 @@ import { LinearAdapter } from "../src/adapters/linear.ts";
 import { composeSystemPrompt } from "../src/agent/prompts.ts";
 import {
   loadGaryConfig,
-  loadGLMConfig,
+  loadGLMChain,
   loadLinearConfig,
 } from "../src/config.ts";
 import { getCommitLog, getDiff } from "../src/git.ts";
@@ -86,7 +86,7 @@ const commitLog = await getCommitLog(worktreePath, "main");
 console.log(`  diff length: ${diff.length} bytes`);
 console.log(`  commits:\n${commitLog.split("\n").map((l) => "    " + l).join("\n")}`);
 
-const glm = new GLMClient(loadGLMConfig());
+const glm = new GLMClient(loadGLMChain());
 
 const truncatedDiff =
   diff.length > 12_000 ? diff.slice(0, 12_000) + "\n... (diff truncated)" : diff;

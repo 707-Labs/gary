@@ -2,6 +2,13 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { z } from "zod";
+import {
+  createProvider,
+  createProviderChain,
+  type ProviderChain,
+  type ProviderConfig,
+  type ProviderName,
+} from "./providers.ts";
 
 const expandHome = (p: string): string =>
   p.startsWith("~") ? resolve(homedir(), p.slice(2)) : resolve(p);
@@ -69,6 +76,11 @@ export type GitHubConfig =
       username: string;
     };
 
+/**
+ * Single-provider config. The legacy `loadGLMConfig` returns this for
+ * Z.ai compatibility with the older probe scripts; the chain-aware
+ * `loadProviderConfigs` returns an array.
+ */
 export interface GLMConfig {
   apiKey: string;
   baseUrl: string;
@@ -100,7 +112,8 @@ export interface Config {
   gary: GaryConfig;
   linear: LinearConfig;
   github: GitHubConfig;
-  glm: GLMConfig;
+  /** Ordered LLM provider chain — primary first. */
+  providers: readonly ProviderConfig[];
   cloudflare: CloudflareConfig | null;
   runtime: RuntimeConfig;
 }
@@ -181,6 +194,80 @@ export function loadGLMConfig(): GLMConfig {
   };
 }
 
+const DEFAULT_BACKOFF_MS = 60_000;
+
+const PROVIDER_DEFAULTS: Record<
+  ProviderName,
+  { baseUrl: string; model: string; apiKeyEnv: string; defaultBackoffMs: number }
+> = {
+  "z.ai": {
+    apiKeyEnv: "Z_AI_API_KEY",
+    baseUrl: "https://api.z.ai/api/anthropic",
+    model: "glm-4.6",
+    defaultBackoffMs: DEFAULT_BACKOFF_MS,
+  },
+  kimi: {
+    apiKeyEnv: "KIMI_API_KEY",
+    baseUrl: "https://api.kimi.com/coding",
+    model: "kimi-for-coding",
+    defaultBackoffMs: DEFAULT_BACKOFF_MS,
+  },
+  deepseek: {
+    apiKeyEnv: "DEEPSEEK_API_KEY",
+    baseUrl: "https://api.deepseek.com/anthropic",
+    model: "deepseek-v4-pro",
+    defaultBackoffMs: DEFAULT_BACKOFF_MS,
+  },
+};
+
+const PROVIDER_ENV_PREFIX: Record<ProviderName, string> = {
+  "z.ai": "Z_AI",
+  kimi: "KIMI",
+  deepseek: "DEEPSEEK",
+};
+
+function loadProviderConfig(name: ProviderName): ProviderConfig | null {
+  const defaults = PROVIDER_DEFAULTS[name];
+  const apiKey = optionalString(defaults.apiKeyEnv);
+  if (!apiKey) return null;
+  const prefix = PROVIDER_ENV_PREFIX[name];
+  return {
+    name,
+    apiKey,
+    baseUrl: stringFromEnv(`${prefix}_BASE_URL`, defaults.baseUrl),
+    model: stringFromEnv(`${prefix}_MODEL`, defaults.model),
+    defaultBackoffMs: intFromEnv(
+      `${prefix}_DEFAULT_BACKOFF_MS`,
+      defaults.defaultBackoffMs,
+    ),
+  };
+}
+
+/**
+ * Load every configured provider, in priority order (Z.ai → Kimi → DeepSeek).
+ * Z.ai is required; Kimi and DeepSeek are optional (omit their key to
+ * disable). The returned array is non-empty.
+ */
+export function loadProviderConfigs(): readonly ProviderConfig[] {
+  // Z.ai stays required so existing deployments keep working without
+  // env changes. Kimi/DeepSeek are opt-in fallbacks.
+  const zai = loadProviderConfig("z.ai");
+  if (!zai) {
+    throw new Error("Missing required env var: Z_AI_API_KEY");
+  }
+  const out: ProviderConfig[] = [zai];
+  const kimi = loadProviderConfig("kimi");
+  if (kimi) out.push(kimi);
+  const deepseek = loadProviderConfig("deepseek");
+  if (deepseek) out.push(deepseek);
+  return out;
+}
+
+/** Convenience: build the production provider chain in one shot. */
+export function loadGLMChain(): ProviderChain {
+  return createProviderChain(loadProviderConfigs().map((p) => createProvider(p)));
+}
+
 const DEFAULT_OBSERVABILITY_WORKERS = [
   "mulligan-labs",
   "mulligan-labs-party",
@@ -238,7 +325,7 @@ export function loadConfig(): Config {
     gary: loadGaryConfig(),
     linear: loadLinearConfig(),
     github: loadGitHubConfig(),
-    glm: loadGLMConfig(),
+    providers: loadProviderConfigs(),
     cloudflare: loadCloudflareConfig(),
     runtime: loadRuntimeConfig(),
   };
