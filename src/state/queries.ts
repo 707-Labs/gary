@@ -146,6 +146,33 @@ export function setTerminalState(
   });
 }
 
+/**
+ * Clear `terminal_state` so the loop re-engages on the ticket. Called when
+ * Gary previously concluded a ticket (bounce/escalate) but a human has
+ * reassigned it back to him in Linear.
+ */
+export function clearTerminalState(db: DB, linearId: string): void {
+  db.query(`UPDATE tickets SET terminal_state = NULL WHERE linear_id = $id`).run({
+    id: linearId,
+  });
+}
+
+/**
+ * Wipe the classification fields so the classifier runs fresh on the next
+ * tick. Used when reopening a previously bounced ticket — the new context
+ * (comments added since the bounce) may now route to CODE or ANSWER.
+ */
+export function clearClassification(db: DB, linearId: string): void {
+  db.query(
+    `UPDATE tickets SET
+       classification = NULL,
+       classification_confidence = NULL,
+       classification_scope = NULL,
+       classified_at = NULL
+     WHERE linear_id = $id`,
+  ).run({ id: linearId });
+}
+
 export interface CountSinceArgs {
   ticketLinearId: string;
   sinceHoursAgo: number;

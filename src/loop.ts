@@ -33,6 +33,8 @@ import {
 } from "./state-fingerprint.ts";
 import type { DB } from "./state/db.ts";
 import {
+  clearClassification,
+  clearTerminalState,
   countActionsSince,
   getPrForTicket,
   getRespondedPrCommentIds,
@@ -44,6 +46,7 @@ import {
   recordEvent,
   setClassification,
   setRevisitMark,
+  type TicketRow,
   upsertTicket,
 } from "./state/queries.ts";
 
@@ -102,10 +105,15 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
   for (const issue of issues) {
     upsertTicket(deps.db, { linearId: issue.id, identifier: issue.identifier });
 
-    const ticketRow = getTicket(deps.db, issue.id);
+    let ticketRow = getTicket(deps.db, issue.id);
     if (ticketRow?.terminal_state) {
-      // We've already concluded this ticket. Don't act again.
-      continue;
+      // The ticket is back in Gary's queue despite being previously
+      // concluded — a human reassigned it. Reopen and let the action
+      // cache decide whether there's anything new to do (it'll block
+      // identical work via the success=1 fingerprint match, but unblock
+      // anything where the human added context since the bounce).
+      reopenTicket(deps.db, issue, ticketRow);
+      ticketRow = getTicket(deps.db, issue.id);
     }
 
     // Circuit breaker: if Gary has thrashed on this ticket too many times in
@@ -351,6 +359,34 @@ async function collectMentionCandidates(
   }
 
   recordEvent(deps.db, { eventType: "mention_scan", payload: stats });
+}
+
+/**
+ * Wipe terminal_state so the loop re-engages, and (for bounced tickets)
+ * also wipe classification so the classifier re-runs with the new context.
+ * Idempotent — repeated calls do nothing once cleared.
+ */
+function reopenTicket(
+  db: DB,
+  issue: { id: string; identifier: string },
+  row: TicketRow,
+): void {
+  if (!row.terminal_state) return;
+  log.info("ticket reopened", {
+    issue: issue.identifier,
+    previous: row.terminal_state,
+  });
+  recordEvent(db, {
+    eventType: "ticket_reopened",
+    ticketLinearId: issue.id,
+    payload: { previous: row.terminal_state },
+  });
+  if (row.terminal_state === "bounced") {
+    // BOUNCE was a classification call. The user re-engaging usually means
+    // the new context changes the routing — let the classifier rerun.
+    clearClassification(db, issue.id);
+  }
+  clearTerminalState(db, issue.id);
 }
 
 async function dispatch(deps: LoopDeps, action: CandidateAction): Promise<void> {
