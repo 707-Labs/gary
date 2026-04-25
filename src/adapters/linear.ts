@@ -60,38 +60,70 @@ export class LinearAdapter {
   }
 
   async fetchAssignedIssues(): Promise<AssignedIssue[]> {
-    const result = await this.client.issues({
-      filter: {
-        assignee: { id: { eq: this.userId } },
-        state: { type: { nin: ["completed", "canceled"] } },
+    // Single raw GraphQL roundtrip — the SDK's lazy resolvers (`issue.state`,
+    // `issue.team`, `issue.creator`) each cost a network call, which adds up
+    // fast on a per-tick basis. Mirror the fetchMentionedIssues pattern.
+    const query = `
+      query AssignedIssues($userId: ID!, $first: Int!) {
+        issues(
+          filter: { assignee: { id: { eq: $userId } } },
+          first: $first
+        ) {
+          nodes {
+            id
+            identifier
+            title
+            description
+            url
+            createdAt
+            updatedAt
+            state { name type }
+            team { id key }
+            creator { id name }
+          }
+        }
+      }
+    `;
+    const data = await this.client.client.request<
+      {
+        issues: {
+          nodes: {
+            id: string;
+            identifier: string;
+            title: string;
+            description: string | null;
+            url: string;
+            createdAt: string;
+            updatedAt: string;
+            state: { name: string; type: string } | null;
+            team: { id: string; key: string } | null;
+            creator: { id: string; name: string } | null;
+          }[];
+        };
       },
-      first: 50,
-    });
+      { userId: string; first: number }
+    >(query, { userId: this.userId, first: 50 });
 
-    const out: AssignedIssue[] = [];
-    for (const issue of result.nodes) {
-      const [state, team, creator] = await Promise.all([
-        issue.state,
-        issue.team,
-        issue.creator,
-      ]);
-      out.push({
-        id: issue.id,
-        identifier: issue.identifier,
-        title: issue.title,
-        description: issue.description ?? null,
-        url: issue.url,
-        stateName: state?.name ?? "",
-        stateType: state?.type ?? "",
-        createdAt: issue.createdAt.toISOString(),
-        updatedAt: issue.updatedAt.toISOString(),
-        creatorId: creator?.id ?? null,
-        creatorName: creator?.name ?? null,
-        teamId: team?.id ?? "",
-        teamKey: team?.key ?? "",
-      });
-    }
-    return out;
+    return data.issues.nodes
+      .filter(
+        (n) =>
+          n.state?.type !== "completed" && n.state?.type !== "canceled",
+      )
+      .map((n) => ({
+        id: n.id,
+        identifier: n.identifier,
+        title: n.title,
+        description: n.description ?? null,
+        url: n.url,
+        stateName: n.state?.name ?? "",
+        stateType: n.state?.type ?? "",
+        createdAt: n.createdAt,
+        updatedAt: n.updatedAt,
+        creatorId: n.creator?.id ?? null,
+        creatorName: n.creator?.name ?? null,
+        teamId: n.team?.id ?? "",
+        teamKey: n.team?.key ?? "",
+      }));
   }
 
   /**
@@ -248,20 +280,46 @@ export class LinearAdapter {
   }
 
   async fetchComments(issueId: string, limit = 20): Promise<IssueComment[]> {
-    const issue = await this.client.issue(issueId);
-    const result = await issue.comments({ first: limit });
-    const out: IssueComment[] = [];
-    for (const c of result.nodes) {
-      const user = await c.user;
-      out.push({
-        id: c.id,
-        body: c.body,
-        createdAt: c.createdAt.toISOString(),
-        userId: user?.id ?? null,
-        userName: user?.name ?? null,
-      });
-    }
-    return out;
+    // Single roundtrip vs the SDK's N+2 (issue lookup + comments page + per-
+    // comment user resolve). Same shape; trades the SDK's typed wrappers for
+    // a one-shot GraphQL response.
+    const query = `
+      query IssueComments($id: String!, $first: Int!) {
+        issue(id: $id) {
+          comments(first: $first) {
+            nodes {
+              id
+              body
+              createdAt
+              user { id name }
+            }
+          }
+        }
+      }
+    `;
+    const data = await this.client.client.request<
+      {
+        issue: {
+          comments: {
+            nodes: {
+              id: string;
+              body: string;
+              createdAt: string;
+              user: { id: string; name: string } | null;
+            }[];
+          };
+        } | null;
+      },
+      { id: string; first: number }
+    >(query, { id: issueId, first: limit });
+    const nodes = data.issue?.comments?.nodes ?? [];
+    return nodes.map((n) => ({
+      id: n.id,
+      body: n.body,
+      createdAt: n.createdAt,
+      userId: n.user?.id ?? null,
+      userName: n.user?.name ?? null,
+    }));
   }
 
   async postComment(issueId: string, body: string): Promise<string> {
