@@ -42,6 +42,7 @@ export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): Agen
   register(listFilesTool(executor));
   register(runBashTool(executor));
   register(commitTool(executor));
+  register(fetchUrlTool());
   if (opts.cloudflare) {
     register(queryCloudflareLogsTool(opts.cloudflare));
     register(listCloudflareInvocationsTool(opts.cloudflare));
@@ -331,6 +332,64 @@ function formatError(toolName: string, err: unknown): string {
 
 function truncate(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max)}...` : s;
+}
+
+const fetchUrlSchema = z.object({
+  url: z.string().url(),
+});
+const FETCH_URL_TIMEOUT_MS = 30_000;
+const FETCH_URL_MAX_BYTES = 200_000;
+function fetchUrlTool(): ToolHandler {
+  return {
+    definition: {
+      name: "fetch_url",
+      description:
+        "GET an http(s) URL and return the response body as text. Use for reading external docs, API specs, or anything the ticket links to. Truncates large responses.",
+      input_schema: {
+        type: "object",
+        properties: {
+          url: {
+            type: "string",
+            description: "Full http(s) URL to fetch.",
+          },
+        },
+        required: ["url"],
+      },
+    },
+    async run(input) {
+      const { url } = fetchUrlSchema.parse(input);
+      let parsed: URL;
+      try {
+        parsed = new URL(url);
+      } catch {
+        return `error: invalid url`;
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return `error: only http(s) urls are allowed (got ${parsed.protocol})`;
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), FETCH_URL_TIMEOUT_MS);
+      try {
+        const res = await fetch(url, {
+          headers: { "User-Agent": "gary-707-labs (https://github.com/707-Labs/gary)" },
+          redirect: "follow",
+          signal: controller.signal,
+        });
+        const text = await res.text();
+        const truncated = text.length > FETCH_URL_MAX_BYTES;
+        const body = truncated ? text.slice(0, FETCH_URL_MAX_BYTES) : text;
+        const header = `status: ${res.status}\ncontent-type: ${res.headers.get("content-type") ?? ""}\nbytes: ${text.length}${truncated ? ` (truncated to ${FETCH_URL_MAX_BYTES})` : ""}`;
+        return `${header}\n\n${body}`;
+      } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") {
+          return `error: fetch timed out after ${FETCH_URL_TIMEOUT_MS / 1000}s`;
+        }
+        return formatError("fetch_url", err);
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+  };
 }
 
 const queryLogsSchema = z.object({
