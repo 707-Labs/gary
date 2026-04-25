@@ -702,7 +702,7 @@ If all 9 steps happen without manual intervention beyond what's listed, Weekend 
 - User report triage
 - Multi-repo support
 - Webhook receivers for Linear or GitHub (polling is fine)
-- Rebase-on-main automation
+- ~~Rebase-on-main automation~~ — flipped 2026-04-25; Gary now rebases his branch onto fresh `main` between post-finish check and push (`rebaseOntoFreshBase` in `src/git.ts`). Conflict aborts cleanly; broken post-rebase check reverts via `git reset --hard`.
 - Stale PR nudging
 - PR merge automation (Gary never merges his own — architectural, not Weekend-1-deferral)
 - Metrics / observability beyond event log in SQLite

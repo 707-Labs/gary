@@ -10,8 +10,10 @@ import {
   ensureBareClone,
   getCommitLog,
   getDiff,
+  gitMust,
   hasCommitsAhead,
   pushBranch,
+  rebaseOntoFreshBase,
   slugify,
 } from "../git.ts";
 import { LocalExecutor } from "../executors/local.ts";
@@ -288,8 +290,44 @@ export async function runCodeHandler(
     return { status: "agent_failed", branch, summary: loopResult.summary };
   }
 
-  // Open the PR.
+  // Rebase onto fresh main so the PR opens on top of latest. Degrades
+  // gracefully: conflict → push un-rebased; check fails after rebase →
+  // revert and push pre-rebase. Never fails the run.
   const freshUrlForPush = await deps.github.cloneUrl(owner, name);
+  const rebase = await rebaseOntoFreshBase({
+    bareDir,
+    worktreePath,
+    freshTokenUrl: freshUrlForPush,
+    baseBranch: BASE_BRANCH,
+  });
+  if (rebase.kind === "conflict") {
+    log.warn("rebase onto main conflicted; pushing un-rebased branch", {
+      issue: args.issue.identifier,
+      branch,
+    });
+  } else if (rebase.kind === "clean") {
+    const recheck = await executor.run(CHECK_COMMAND, {
+      timeoutMs: CHECK_TIMEOUT_MS,
+    });
+    if (recheck.exitCode !== 0) {
+      log.warn("check failed after rebase; reverting and pushing pre-rebase", {
+        issue: args.issue.identifier,
+        branch,
+        exitCode: recheck.exitCode,
+      });
+      await gitMust(["reset", "--hard", rebase.preRebaseSha], {
+        cwd: worktreePath,
+      });
+    } else {
+      log.info("rebased onto fresh main", {
+        issue: args.issue.identifier,
+        branch,
+        preRebaseSha: rebase.preRebaseSha,
+        postRebaseSha: rebase.postRebaseSha,
+      });
+    }
+  }
+
   await pushBranch({ worktreePath, freshTokenUrl: freshUrlForPush, branch });
 
   const diff = await getDiff(worktreePath, baseRef);

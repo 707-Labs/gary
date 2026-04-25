@@ -175,6 +175,55 @@ export async function createWorktree(args: CreateWorktreeArgs): Promise<void> {
   });
 }
 
+export interface RebaseOntoBaseArgs {
+  bareDir: string;
+  worktreePath: string;
+  freshTokenUrl: string;
+  baseBranch: string;
+}
+
+export type RebaseOutcome =
+  | { kind: "clean"; preRebaseSha: string; postRebaseSha: string }
+  | { kind: "no_op"; sha: string }
+  | { kind: "conflict"; preRebaseSha: string };
+
+/**
+ * Refresh `baseBranch` from origin, then rebase the worktree's current branch
+ * onto it. Aborts cleanly on conflict so callers can fall back to pushing the
+ * un-rebased branch. Caller is responsible for re-running any post-rebase
+ * verification (e.g. `bun run check`) and reverting via `preRebaseSha` if
+ * desired.
+ */
+export async function rebaseOntoFreshBase(
+  args: RebaseOntoBaseArgs,
+): Promise<RebaseOutcome> {
+  await withBareLock(args.bareDir, async () => {
+    await gitMust(
+      [
+        "fetch",
+        args.freshTokenUrl,
+        `+refs/heads/${args.baseBranch}:refs/heads/${args.baseBranch}`,
+      ],
+      { cwd: args.bareDir },
+    );
+  });
+  const pre = (
+    await gitMust(["rev-parse", "HEAD"], { cwd: args.worktreePath })
+  ).stdout.trim();
+  const r = await gitRun(["rebase", args.baseBranch], {
+    cwd: args.worktreePath,
+  });
+  if (r.exitCode !== 0) {
+    await gitRun(["rebase", "--abort"], { cwd: args.worktreePath });
+    return { kind: "conflict", preRebaseSha: pre };
+  }
+  const post = (
+    await gitMust(["rev-parse", "HEAD"], { cwd: args.worktreePath })
+  ).stdout.trim();
+  if (pre === post) return { kind: "no_op", sha: post };
+  return { kind: "clean", preRebaseSha: pre, postRebaseSha: post };
+}
+
 export async function pushBranch(args: {
   worktreePath: string;
   freshTokenUrl: string;
