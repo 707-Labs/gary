@@ -34,12 +34,14 @@ import {
   countActionsSince,
   getPrForTicket,
   getRespondedPrCommentIds,
+  getRevisitMark,
   getTicket,
   hasActedOn,
   recordActionEnd,
   recordActionStart,
   recordEvent,
   setClassification,
+  setRevisitMark,
   upsertTicket,
 } from "./state/queries.ts";
 
@@ -142,7 +144,12 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
       pr,
     };
 
-    const candidate = pickActionForTicket({ issue, state });
+    const lastRespondedHumanSignature = getRevisitMark(deps.db, issue.id);
+    const candidate = pickActionForTicket({
+      issue,
+      state,
+      lastRespondedHumanSignature,
+    });
     if (!candidate) continue;
     const fp = fingerprintDerivedState(state);
     if (hasActedOn(deps.db, {
@@ -320,6 +327,9 @@ async function dispatch(deps: LoopDeps, action: CandidateAction): Promise<void> 
     case "respond_to_pr_review":
       await runRespondToPrReview(deps, action);
       return;
+    case "revisit_code":
+      await runRevisitCode(deps, action);
+      return;
     case "pickup_ticket":
       await runPickupHandler(
         { linear: deps.linear },
@@ -493,6 +503,20 @@ async function runStartCoding(
     },
     { issue, comments, repo },
   );
+  // Mark this signature as the last input Gary acted on. Subsequent comments
+  // bump the signature and revisit_code fires; without comments it stays
+  // stable and revisit_code is dormant.
+  setRevisitMark(deps.db, issue.id, action.state.humanInputSignature);
+}
+
+async function runRevisitCode(
+  deps: LoopDeps,
+  action: CandidateAction,
+): Promise<void> {
+  // Reuses the answer handler — read-only investigation + Linear comment.
+  // Push-on-unambiguous-ask is deferred (mirrors pr-review's reply-default).
+  await runWriteAnswer(deps, action);
+  setRevisitMark(deps.db, action.issue.id, action.state.humanInputSignature);
 }
 
 async function runClassify(

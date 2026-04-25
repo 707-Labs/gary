@@ -65,3 +65,14 @@ CREATE TABLE IF NOT EXISTS pr_comment_responses (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pr_comment_responses_pr ON pr_comment_responses(pr_github_id);
+
+-- Tracks the humanInputSignature Gary acted on for each Linear ticket.
+-- Set by start_coding (after the PR opens) and revisit_code (after Gary
+-- responds to a follow-up comment). The priority logic emits revisit_code
+-- only when the current signature differs from what's recorded here, so
+-- Gary doesn't keep responding to the same description.
+CREATE TABLE IF NOT EXISTS ticket_revisit_marks (
+  ticket_linear_id TEXT PRIMARY KEY,
+  last_human_signature TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

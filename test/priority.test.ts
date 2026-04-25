@@ -143,6 +143,72 @@ describe("pickActionForTicket", () => {
     expect(action).toBeNull();
   });
 
+  describe("revisit_code", () => {
+    const codeWithPr: DerivedState = {
+      ...baseState,
+      humanInputSignature: "sig-current",
+      classification: { classification: "CODE" },
+      pr: {
+        number: 5,
+        state: "open",
+        merged: false,
+        isDraft: false,
+        headSha: "x",
+        ciStatus: "green",
+        prCommentSignature: "empty",
+      },
+    };
+
+    it("picks revisit_code when signature differs from the mark", () => {
+      const action = pickActionForTicket({
+        issue,
+        state: codeWithPr,
+        lastRespondedHumanSignature: "sig-old",
+      });
+      expect(action?.type).toBe("revisit_code");
+      expect(action?.priority).toBe(2.5);
+    });
+
+    it("does NOT pick revisit_code when signature equals the mark", () => {
+      const action = pickActionForTicket({
+        issue,
+        state: codeWithPr,
+        lastRespondedHumanSignature: "sig-current",
+      });
+      expect(action).toBeNull();
+    });
+
+    it("does NOT pick revisit_code when no mark exists yet (dormant for pre-feature tickets)", () => {
+      const action = pickActionForTicket({
+        issue,
+        state: codeWithPr,
+        lastRespondedHumanSignature: null,
+      });
+      expect(action).toBeNull();
+    });
+
+    it("yields to fix_ci_failure when both apply", () => {
+      const action = pickActionForTicket({
+        issue,
+        state: { ...codeWithPr, pr: { ...codeWithPr.pr!, ciStatus: "red" } },
+        lastRespondedHumanSignature: "sig-old",
+      });
+      expect(action?.type).toBe("fix_ci_failure");
+    });
+
+    it("yields to respond_to_pr_review when both apply", () => {
+      const action = pickActionForTicket({
+        issue,
+        state: {
+          ...codeWithPr,
+          pr: { ...codeWithPr.pr!, prCommentSignature: "abc" },
+        },
+        lastRespondedHumanSignature: "sig-old",
+      });
+      expect(action?.type).toBe("respond_to_pr_review");
+    });
+  });
+
   it("returns null for CODE classification once a PR exists and CI is green", () => {
     const action = pickActionForTicket({
       issue,

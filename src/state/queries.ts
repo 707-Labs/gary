@@ -210,6 +210,32 @@ export function getPrForTicket(db: DB, ticketLinearId: string): PrRow | null {
   return row ?? null;
 }
 
+export function getRevisitMark(
+  db: DB,
+  ticketLinearId: string,
+): string | null {
+  const row = db
+    .query<{ last_human_signature: string }, [string]>(
+      `SELECT last_human_signature FROM ticket_revisit_marks WHERE ticket_linear_id = ?`,
+    )
+    .get(ticketLinearId);
+  return row?.last_human_signature ?? null;
+}
+
+export function setRevisitMark(
+  db: DB,
+  ticketLinearId: string,
+  humanSignature: string,
+): void {
+  db.query(
+    `INSERT INTO ticket_revisit_marks (ticket_linear_id, last_human_signature)
+     VALUES ($id, $sig)
+     ON CONFLICT(ticket_linear_id) DO UPDATE SET
+       last_human_signature = excluded.last_human_signature,
+       updated_at = datetime('now')`,
+  ).run({ id: ticketLinearId, sig: humanSignature });
+}
+
 export function getRespondedPrCommentIds(
   db: DB,
   prGithubId: number,

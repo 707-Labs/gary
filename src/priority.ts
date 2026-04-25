@@ -9,6 +9,7 @@ export type ActionType =
   | "fix_ci_failure"
   | "respond_to_pr_review"
   | "pickup_ticket"
+  | "revisit_code"
   | "classify"
   | "start_coding"
   | "answer_mention"
@@ -25,6 +26,16 @@ export interface CandidateAction {
 export interface PriorityInputs {
   issue: AssignedIssue;
   state: DerivedState;
+  /**
+   * The humanInputSignature recorded the last time Gary acted on this
+   * ticket's content (start_coding or revisit_code). Compared against the
+   * current signature to decide whether to emit revisit_code.
+   *
+   * `null` means "no mark exists yet" — revisit_code stays dormant in that
+   * case to avoid re-engaging on stale state for tickets that pre-date
+   * this feature.
+   */
+  lastRespondedHumanSignature?: string | null;
 }
 
 /**
@@ -57,6 +68,22 @@ export function pickActionForTicket(
     state.pr.prCommentSignature !== PR_COMMENT_SIGNATURE_EMPTY
   ) {
     return { type: "respond_to_pr_review", priority: 2, issue, state };
+  }
+
+  // 2.5. revisit_code — CODE ticket has new human input on the Linear side
+  //    since Gary last acted (start_coding or a previous revisit). Re-reads
+  //    the comment thread and posts a follow-up answer. Read-only for now —
+  //    push-on-unambiguous-ask is a v2 like pr-review.
+  if (
+    state.classification?.classification === "CODE" &&
+    state.pr &&
+    state.pr.state === "open" &&
+    !state.pr.merged &&
+    inputs.lastRespondedHumanSignature !== null &&
+    inputs.lastRespondedHumanSignature !== undefined &&
+    inputs.lastRespondedHumanSignature !== state.humanInputSignature
+  ) {
+    return { type: "revisit_code", priority: 2.5, issue, state };
   }
 
   // 3. classify — assigned to Gary, no classification yet
