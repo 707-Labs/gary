@@ -60,8 +60,11 @@ export interface PullRequestComment {
   /**
    * "issue" = a top-level PR comment (general discussion).
    * "review" = a line-level review comment, inline on the diff.
+   * "review_body" = the body of a formal review (the text reviewers write
+   *   alongside an Approve / Request Changes / Comment action). This is
+   *   distinct from inline review comments, which are anchored to lines.
    */
-  kind: "issue" | "review";
+  kind: "issue" | "review" | "review_body";
   authorLogin: string | null;
   /**
    * GitHub user type of the comment author. Used to filter out bot noise
@@ -557,7 +560,7 @@ async function getPrCommentsVia(
   repo: string,
   number: number,
 ): Promise<PullRequestComment[]> {
-  const [issueRes, reviewRes] = await Promise.all([
+  const [issueRes, reviewRes, reviewsRes] = await Promise.all([
     api.issues.listComments({
       owner,
       repo,
@@ -570,9 +573,58 @@ async function getPrCommentsVia(
       pull_number: number,
       per_page: 100,
     }),
+    api.pulls.listReviews({
+      owner,
+      repo,
+      pull_number: number,
+      per_page: 100,
+    }),
   ]);
+  return mergePrComments({
+    issueComments: issueRes.data,
+    reviewComments: reviewRes.data,
+    reviews: reviewsRes.data,
+  });
+}
+
+export interface RawIssueComment {
+  id: number;
+  user: { login: string; type?: string } | null;
+  body?: string | null;
+  created_at: string;
+  html_url: string;
+}
+export interface RawReviewComment extends RawIssueComment {
+  path?: string | null;
+  line?: number | null;
+  original_line?: number | null;
+}
+export interface RawReview {
+  id: number;
+  user: { login: string; type?: string } | null;
+  state: string;
+  body?: string | null;
+  submitted_at?: string;
+  html_url: string;
+}
+
+/**
+ * Merge GitHub's three PR-feedback streams into one ordered list. Pure
+ * function (no I/O) so it can be tested without standing up Octokit.
+ *
+ * Review bodies are included only when they carry actionable content:
+ * APPROVED reviews are terminal and don't require a response; DISMISSED
+ * reviews are no-ops; CHANGES_REQUESTED and COMMENTED bodies become
+ * comments Gary owes a response to. Inline review comments on the same
+ * review are surfaced separately as `kind: "review"`.
+ */
+export function mergePrComments(args: {
+  issueComments: ReadonlyArray<RawIssueComment>;
+  reviewComments: ReadonlyArray<RawReviewComment>;
+  reviews: ReadonlyArray<RawReview>;
+}): PullRequestComment[] {
   const merged: PullRequestComment[] = [
-    ...issueRes.data.map(
+    ...args.issueComments.map(
       (c): PullRequestComment => ({
         id: c.id,
         kind: "issue",
@@ -583,7 +635,7 @@ async function getPrCommentsVia(
         htmlUrl: c.html_url,
       }),
     ),
-    ...reviewRes.data.map(
+    ...args.reviewComments.map(
       (c): PullRequestComment => ({
         id: c.id,
         kind: "review",
@@ -596,6 +648,23 @@ async function getPrCommentsVia(
         line: c.line ?? c.original_line ?? null,
       }),
     ),
+    ...args.reviews
+      .filter(
+        (r) =>
+          (r.state === "CHANGES_REQUESTED" || r.state === "COMMENTED") &&
+          (r.body ?? "").trim().length > 0,
+      )
+      .map(
+        (r): PullRequestComment => ({
+          id: r.id,
+          kind: "review_body",
+          authorLogin: r.user?.login ?? null,
+          authorType: r.user?.type ?? "User",
+          body: r.body ?? "",
+          createdAt: r.submitted_at ?? new Date(0).toISOString(),
+          htmlUrl: r.html_url,
+        }),
+      ),
   ];
   return merged.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
