@@ -6,6 +6,7 @@ import { LinearAdapter } from "./adapters/linear.ts";
 import { loadConfig } from "./config.ts";
 import { log } from "./logger.ts";
 import { runLoop } from "./loop.ts";
+import { createRateLimitGate } from "./rate-limit.ts";
 import { closeDb, openDb } from "./state/db.ts";
 import { recordEvent } from "./state/queries.ts";
 
@@ -24,6 +25,7 @@ async function main(): Promise<void> {
   const github = makeGitHubClient(cfg.github);
   const glm = new GLMClient(cfg.glm);
   const cloudflare = cfg.cloudflare ? new CloudflareClient(cfg.cloudflare) : null;
+  const rateLimitGate = createRateLimitGate();
 
   log.info("gary booted", {
     name: cfg.gary.name,
@@ -50,6 +52,7 @@ async function main(): Promise<void> {
     github,
     glm,
     cloudflare,
+    rateLimitGate,
     allowedRepos: cfg.gary.allowedRepos,
     allowlistedMentionUserIds: cfg.gary.allowlistedMentionUserIds,
     reposDir: cfg.gary.reposDir,

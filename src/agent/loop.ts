@@ -5,6 +5,7 @@ import type { GLMClient } from "../adapters/glm.ts";
 import type { LinearAdapter } from "../adapters/linear.ts";
 import type { Executor } from "../executors/index.ts";
 import { log } from "../logger.ts";
+import { parseUsageLimitError, UsageLimitError } from "../rate-limit.ts";
 import { type AgentTools, type ToolsetOptions, makeToolset } from "./tools.ts";
 
 export type AgentLoopStatus =
@@ -99,6 +100,17 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      const resetAt = parseUsageLimitError(message);
+      if (resetAt) {
+        // Long-window provider cap (e.g. Z.ai 5-hour). Throw so the loop
+        // arms the rate-limit gate and skips dispatch until reset, instead
+        // of letting the handler bounce a perfectly good ticket.
+        log.warn("agent loop hit usage limit; will back off", {
+          iteration: iterations,
+          resetAt: resetAt.toISOString(),
+        });
+        throw new UsageLimitError(resetAt, message);
+      }
       log.error("agent loop API error", { iteration: iterations, error: message });
       return done("error", null, iterations, inputTokens, outputTokens, message);
     }

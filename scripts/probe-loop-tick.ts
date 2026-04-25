@@ -11,6 +11,7 @@ import { makeGitHubClient } from "../src/adapters/github.ts";
 import { LinearAdapter } from "../src/adapters/linear.ts";
 import { loadConfig } from "../src/config.ts";
 import { tick } from "../src/loop.ts";
+import { createRateLimitGate } from "../src/rate-limit.ts";
 import { closeDb, openDb } from "../src/state/db.ts";
 
 const cfg = loadConfig();
@@ -28,6 +29,7 @@ const result = await tick({
   github,
   glm,
   cloudflare,
+  rateLimitGate: createRateLimitGate(),
   allowedRepos: cfg.gary.allowedRepos,
   allowlistedMentionUserIds: cfg.gary.allowlistedMentionUserIds,
   reposDir: cfg.gary.reposDir,

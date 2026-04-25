@@ -5,6 +5,7 @@ import type { GLMClient } from "./adapters/glm.ts";
 import { escalate } from "./escalate.ts";
 import {
   classifyTicket,
+  decideClassifyOutcome,
   generateClassificationComment,
 } from "./handlers/classifier.ts";
 import { runAnswerHandler } from "./handlers/answer.ts";
@@ -21,6 +22,7 @@ import {
   pickActionForTicket,
   pickHighestPriority,
 } from "./priority.ts";
+import { type RateLimitGate, UsageLimitError } from "./rate-limit.ts";
 import {
   computeHumanInputSignature,
   computePrCommentSignature,
@@ -51,6 +53,7 @@ export interface LoopDeps {
   github: GitHubClient;
   glm: GLMClient;
   cloudflare: CloudflareClient | null;
+  rateLimitGate: RateLimitGate;
   allowedRepos: readonly string[];
   /**
    * Linear user ids permitted to summon Gary via @mention. Empty array
@@ -77,6 +80,21 @@ export interface TickResult {
  * info about what happened so callers can decide cadence.
  */
 export async function tick(deps: LoopDeps): Promise<TickResult> {
+  // Provider-level long-window rate limit (e.g. Z.ai's 5-hour cap). When
+  // armed, every GLM call would 429 — skip the tick entirely so we don't
+  // burn handler dispatches that all bounce-on-failure.
+  if (deps.rateLimitGate.isArmed()) {
+    const until = deps.rateLimitGate.armedUntil();
+    log.info("rate-limit gate armed; skipping tick", {
+      until: until?.toISOString(),
+    });
+    recordEvent(deps.db, {
+      eventType: "rate_limit_skip",
+      payload: { until: until?.toISOString() ?? null },
+    });
+    return { candidatesConsidered: 0, actionTaken: null };
+  }
+
   const issues = await deps.linear.fetchAssignedIssues();
   recordEvent(deps.db, { eventType: "poll", payload: { count: issues.length } });
 
@@ -191,6 +209,23 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
     return { candidatesConsidered: candidates.length, actionTaken: action.type };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    if (err instanceof UsageLimitError) {
+      // Long-window provider cap — arm the gate so subsequent ticks skip
+      // dispatch until reset. Record the action as a non-bouncing failure
+      // so it retries with the same fingerprint once the gate clears.
+      deps.rateLimitGate.armUntil(err.resetAt);
+      log.warn("action paused on usage limit", {
+        action: action.type,
+        issue: action.issue.identifier,
+        until: err.resetAt.toISOString(),
+      });
+      recordActionEnd(deps.db, {
+        id: actionId,
+        success: false,
+        errorMessage: `usage limit; resets ${err.resetAt.toISOString()}`,
+      });
+      return { candidatesConsidered: candidates.length, actionTaken: null };
+    }
     log.error("action failed", {
       action: action.type,
       issue: action.issue.identifier,
@@ -533,8 +568,8 @@ async function runClassify(
     scope: classification.scope,
   });
 
-  // Low-confidence escalation: spec §14 says < 0.5 should bounce.
-  if (classification.confidence < 0.5) {
+  const outcome = decideClassifyOutcome(classification);
+  if (outcome.kind === "low_confidence") {
     log.warn("classification confidence too low; escalating", {
       issue: issue.identifier,
       confidence: classification.confidence,
@@ -542,6 +577,21 @@ async function runClassify(
     await escalate(
       { db: deps.db, linear: deps.linear },
       { issue, reason: "low_classifier_confidence" },
+    );
+    return;
+  }
+  if (outcome.kind === "scope_too_big") {
+    log.info("scope=L on CODE; auto-bouncing", {
+      issue: issue.identifier,
+      confidence: classification.confidence,
+    });
+    await escalate(
+      { db: deps.db, linear: deps.linear },
+      {
+        issue,
+        reason: "scope_too_big",
+        customBody: `${classification.reasoning.trim()}\n\nbouncing — this is bigger than i should take on without a clearer scope. happy to pick it up if it gets chunked into smaller pieces.`,
+      },
     );
     return;
   }

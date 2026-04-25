@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { GLMConfig } from "../config.ts";
+import { parseUsageLimitError, UsageLimitError } from "../rate-limit.ts";
 
 export type AnthropicClient = Anthropic;
 
@@ -32,14 +33,22 @@ export class GLMClient {
 
   /** Single-turn text completion. Classifier uses this. */
   async complete(args: CompleteArgs): Promise<string> {
-    const response = await this.client.messages.create({
-      model: this.model,
-      max_tokens: args.maxTokens ?? DEFAULT_MAX_TOKENS,
-      ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
-      system: args.system,
-      messages: [{ role: "user", content: args.user }],
-      ...(args.stopSequences ? { stop_sequences: [...args.stopSequences] } : {}),
-    });
+    let response: Anthropic.Message;
+    try {
+      response = await this.client.messages.create({
+        model: this.model,
+        max_tokens: args.maxTokens ?? DEFAULT_MAX_TOKENS,
+        ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
+        system: args.system,
+        messages: [{ role: "user", content: args.user }],
+        ...(args.stopSequences ? { stop_sequences: [...args.stopSequences] } : {}),
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const resetAt = parseUsageLimitError(message);
+      if (resetAt) throw new UsageLimitError(resetAt, message);
+      throw err;
+    }
 
     return response.content
       .filter((block): block is Anthropic.TextBlock => block.type === "text")

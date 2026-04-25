@@ -100,6 +100,31 @@ function renderTicket(
   return sections.join("\n");
 }
 
+/**
+ * Decide what happens after a classification lands. Returns a
+ * post-classification routing decision the loop can act on without having
+ * to re-derive the conditions.
+ */
+export type ClassifyOutcome =
+  | { kind: "low_confidence" }
+  | { kind: "scope_too_big" }
+  | { kind: "proceed" };
+
+export function decideClassifyOutcome(
+  c: Classification,
+  opts: { confidenceFloor?: number } = {},
+): ClassifyOutcome {
+  const floor = opts.confidenceFloor ?? 0.5;
+  if (c.confidence < floor) return { kind: "low_confidence" };
+  // The classifier prompt asks the model to prefer BOUNCE on L, but it
+  // doesn't always listen — see ERT-1648 (617k input tokens spent before
+  // hitting the iteration cap). Auto-bounce CODE/L tickets here.
+  if (c.classification === "CODE" && c.scope === "L") {
+    return { kind: "scope_too_big" };
+  }
+  return { kind: "proceed" };
+}
+
 export function parseClassification(raw: string): Classification {
   const json = extractJson(raw);
   if (json === null) {
