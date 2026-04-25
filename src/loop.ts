@@ -1,7 +1,7 @@
 import type { CloudflareClient } from "./adapters/cloudflare.ts";
 import type { GitHubClient, PullRequestRef } from "./adapters/github.ts";
 import type { LinearAdapter } from "./adapters/linear.ts";
-import type { GLMClient } from "./adapters/glm.ts";
+import { GLMClient } from "./adapters/glm.ts";
 import { escalate } from "./escalate.ts";
 import {
   classifyTicket,
@@ -20,9 +20,11 @@ import {
   type CandidateAction,
   pickActionForMention,
   pickActionForTicket,
-  pickHighestPriority,
 } from "./priority.ts";
-import { AllProvidersExhaustedError } from "./providers.ts";
+import {
+  AllProvidersExhaustedError,
+  chainStartingWith,
+} from "./providers.ts";
 import {
   computeHumanInputSignature,
   computePrCommentSignature,
@@ -73,13 +75,20 @@ export interface LoopDeps {
 
 export interface TickResult {
   candidatesConsidered: number;
-  actionTaken: string | null;
+  actionsTaken: readonly string[];
 }
 
 /**
  * One iteration of the poll loop. Fetches assigned issues, derives state,
- * picks the highest-priority action, runs it, records to SQLite. Returns
- * info about what happened so callers can decide cadence.
+ * picks the top-N candidates by priority, and runs them concurrently —
+ * each slot pinned to a different unarmed provider so they don't all hammer
+ * the same per-account quota. Returns info about what happened so callers
+ * can decide cadence.
+ *
+ * Concurrency is naturally capped by the number of unarmed providers:
+ * fewer providers → fewer slots, all-armed → 0 slots (skip). Bare-repo git
+ * operations are serialized inside `git.ts` so concurrent worktree setup
+ * doesn't collide on `.git` locks.
  */
 export async function tick(deps: LoopDeps): Promise<TickResult> {
   // Every configured provider has its long-window cap armed. Skip the
@@ -95,7 +104,7 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
       eventType: "rate_limit_skip",
       payload: { until: until?.toISOString() ?? null },
     });
-    return { candidatesConsidered: 0, actionTaken: null };
+    return { candidatesConsidered: 0, actionsTaken: [] };
   }
 
   const issues = await deps.linear.fetchAssignedIssues();
@@ -194,12 +203,71 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
     await collectMentionCandidates(deps, issues, candidates);
   }
 
-  const action = pickHighestPriority(candidates);
-  if (!action) {
-    return { candidatesConsidered: candidates.length, actionTaken: null };
+  if (candidates.length === 0) {
+    return { candidatesConsidered: 0, actionsTaken: [] };
   }
 
+  // Sort by priority and dispatch top-N concurrently. Slot count is bounded
+  // by the number of unarmed providers so each parallel slot starts on a
+  // different primary — three providers + three candidates = three
+  // concurrent handlers, none competing for the same quota.
+  const sorted = [...candidates].sort((a, b) => a.priority - b.priority);
+  const unarmed = deps.glm.chain.providers.filter((p) => !p.gate.isArmed());
+  const slots = Math.min(unarmed.length, sorted.length);
+  if (slots === 0) {
+    return { candidatesConsidered: candidates.length, actionsTaken: [] };
+  }
+
+  const dispatched = sorted.slice(0, slots);
+  log.info("dispatching tick", {
+    candidates: candidates.length,
+    slots,
+    plan: dispatched.map((a, i) => ({
+      issue: a.issue.identifier,
+      action: a.type,
+      provider: unarmed[i]!.name,
+    })),
+  });
+
+  const results = await Promise.allSettled(
+    dispatched.map((action, slotIdx) => {
+      const primary = unarmed[slotIdx]!;
+      const slotChain = chainStartingWith(deps.glm.chain, primary);
+      const slotGlm = new GLMClient(slotChain);
+      return runOne(deps, action, slotGlm, slotIdx);
+    }),
+  );
+
+  const actionsTaken: string[] = [];
+  for (const r of results) {
+    if (r.status === "fulfilled" && r.value !== null) {
+      actionsTaken.push(r.value);
+    } else if (r.status === "rejected") {
+      // runOne is supposed to swallow all errors. If something escapes,
+      // log loudly so we can find it.
+      log.error("runOne escaped its catch", {
+        error: r.reason instanceof Error ? r.reason.message : String(r.reason),
+      });
+    }
+  }
+  return { candidatesConsidered: candidates.length, actionsTaken };
+}
+
+/**
+ * Dispatch a single action with a per-slot, provider-pinned `GLMClient`.
+ * Records start/end action rows and converts AllProvidersExhausted into a
+ * recorded-but-non-fatal failure so the action retries on the same
+ * fingerprint when a provider clears. Never throws — escapes are logged
+ * by the caller's allSettled aggregation.
+ */
+async function runOne(
+  deps: LoopDeps,
+  action: CandidateAction,
+  glm: GLMClient,
+  slot: number,
+): Promise<string | null> {
   const fp = fingerprintDerivedState(action.state);
+  const provider = glm.chain.providers[0]!.name;
   const actionId = recordActionStart(deps.db, {
     ticketLinearId: action.issue.id,
     stateFingerprint: fp,
@@ -208,40 +276,50 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
   recordEvent(deps.db, {
     eventType: "action_dispatched",
     ticketLinearId: action.issue.id,
-    payload: { type: action.type, fingerprint: fp },
+    payload: { type: action.type, fingerprint: fp, slot, provider },
   });
 
+  // Each parallel slot needs its own glm so 429-driven primary swaps don't
+  // bleed across slots. Everything else in deps is shared (DB, adapters).
+  const slotDeps: LoopDeps = { ...deps, glm };
+
   try {
-    await dispatch(deps, action);
+    await dispatch(slotDeps, action);
     recordActionEnd(deps.db, { id: actionId, success: true });
-    return { candidatesConsidered: candidates.length, actionTaken: action.type };
+    log.info("action complete", {
+      action: action.type,
+      issue: action.issue.identifier,
+      slot,
+      provider,
+    });
+    return action.type;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (err instanceof AllProvidersExhaustedError) {
-      // Every provider rate-limited mid-action. Per-provider gates are
-      // already armed by `GLMClient.runWithFallback`; the next tick's
-      // `chain.allArmed()` check will short-circuit until one clears.
-      // Record the action as a non-bouncing failure so it retries with
-      // the same fingerprint.
       log.warn("action paused; all providers armed", {
         action: action.type,
         issue: action.issue.identifier,
+        slot,
+        provider,
         earliestReset: err.earliestReset?.toISOString() ?? null,
       });
       recordEvent(deps.db, {
         eventType: "rate_limit_skip",
-        payload: { until: err.earliestReset?.toISOString() ?? null },
+        ticketLinearId: action.issue.id,
+        payload: { until: err.earliestReset?.toISOString() ?? null, slot },
       });
       recordActionEnd(deps.db, {
         id: actionId,
         success: false,
         errorMessage: `all providers armed; earliest reset ${err.earliestReset?.toISOString() ?? "unknown"}`,
       });
-      return { candidatesConsidered: candidates.length, actionTaken: null };
+      return null;
     }
     log.error("action failed", {
       action: action.type,
       issue: action.issue.identifier,
+      slot,
+      provider,
       error: message,
     });
     recordActionEnd(deps.db, {
@@ -249,7 +327,7 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
       success: false,
       errorMessage: message,
     });
-    return { candidatesConsidered: candidates.length, actionTaken: action.type };
+    return action.type;
   }
 }
 

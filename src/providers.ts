@@ -154,6 +154,28 @@ export function createProviderChain(
   };
 }
 
+/**
+ * Build a chain rooted at `primary`, with the rest of `canonical`'s
+ * providers following in their original order. Used by the loop to dispatch
+ * concurrent slots against different primaries — each slot gets its own
+ * chain so one slot's 429 doesn't cascade into a primary swap that the
+ * other slots are already using. All slots share the same provider objects
+ * (and their gates), so a 429 on Z.ai arms it globally regardless of which
+ * slot saw it.
+ */
+export function chainStartingWith(
+  canonical: ProviderChain,
+  primary: LLMProvider,
+): ProviderChain {
+  if (!canonical.providers.includes(primary)) {
+    throw new Error(
+      `chainStartingWith: provider ${primary.name} not in canonical chain`,
+    );
+  }
+  const others = canonical.providers.filter((p) => p !== primary);
+  return createProviderChain([primary, ...others]);
+}
+
 export class AllProvidersExhaustedError extends Error {
   readonly earliestReset: Date | null;
   constructor(earliestReset: Date | null) {

@@ -10,6 +10,34 @@ export interface GitResult {
 }
 
 /**
+ * Per-bare-repo serializer. Concurrent `git fetch` or `git worktree add`
+ * calls against the same bare repo race on internal locks (refs, HEAD,
+ * worktree metadata) — git emits "another git process is running" or
+ * silently corrupts state. The loop now dispatches multiple handlers
+ * concurrently, each of which prepares a worktree off the same bare clone,
+ * so we serialize bare-repo writes per path.
+ *
+ * Worktree-local operations (commits, push from the worktree) don't touch
+ * the bare repo's lock-protected files and don't go through here.
+ */
+const bareRepoLocks = new Map<string, Promise<unknown>>();
+
+export async function withBareLock<T>(
+  bareDir: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const prev = bareRepoLocks.get(bareDir);
+  // Treat a prior failure as "done" so a single broken handler doesn't wedge
+  // the queue. The new caller still runs.
+  const ready = prev ? prev.catch(() => undefined) : Promise.resolve();
+  const next = ready.then(fn);
+  // Track the tail so the next caller chains after this one. Map entry stays
+  // forever (one entry per bare repo, so unbounded growth is a non-issue).
+  bareRepoLocks.set(bareDir, next);
+  return await next;
+}
+
+/**
  * Run git with explicit argv (no shell). Token URLs may appear in argv but
  * not in shell-interpolated strings, so we don't risk shell injection from
  * voice-generated input.
@@ -74,24 +102,26 @@ export async function ensureBareClone(args: EnsureBareCloneArgs): Promise<string
   const bareDir = `${args.reposDir}/${args.repo}.git`;
   const cleanUrl = `https://github.com/${args.owner}/${args.repo}.git`;
 
-  if (!existsSync(bareDir)) {
-    await gitMust(["clone", "--bare", args.freshTokenUrl, bareDir]);
-    await gitMust(["remote", "set-url", "origin", cleanUrl], { cwd: bareDir });
-  } else {
-    // Fetch latest from origin. We only refresh `main` because Gary's
-    // active worktree branches live in `refs/heads/*` of this same bare
-    // clone — fetching `+refs/heads/*:refs/heads/*` would refuse to update
-    // any branch that's currently checked out in a worktree.
-    await gitMust(
-      [
-        "fetch",
-        args.freshTokenUrl,
-        "+refs/heads/main:refs/heads/main",
-      ],
-      { cwd: bareDir },
-    );
-  }
-  return bareDir;
+  return await withBareLock(bareDir, async () => {
+    if (!existsSync(bareDir)) {
+      await gitMust(["clone", "--bare", args.freshTokenUrl, bareDir]);
+      await gitMust(["remote", "set-url", "origin", cleanUrl], { cwd: bareDir });
+    } else {
+      // Fetch latest from origin. We only refresh `main` because Gary's
+      // active worktree branches live in `refs/heads/*` of this same bare
+      // clone — fetching `+refs/heads/*:refs/heads/*` would refuse to update
+      // any branch that's currently checked out in a worktree.
+      await gitMust(
+        [
+          "fetch",
+          args.freshTokenUrl,
+          "+refs/heads/main:refs/heads/main",
+        ],
+        { cwd: bareDir },
+      );
+    }
+    return bareDir;
+  });
 }
 
 export interface CreateWorktreeArgs {
@@ -109,25 +139,31 @@ export interface CreateWorktreeArgs {
  * worktree so commits are attributed to Gary.
  */
 export async function createWorktree(args: CreateWorktreeArgs): Promise<void> {
-  if (existsSync(args.worktreePath)) {
-    // Best-effort cleanup of any prior worktree state.
-    await gitRun(["worktree", "remove", "--force", args.worktreePath], {
-      cwd: args.bareDir,
-    });
-    await rm(args.worktreePath, { recursive: true, force: true });
-  }
-  await mkdir(dirname(args.worktreePath), { recursive: true });
-  await gitMust(
-    [
-      "worktree",
-      "add",
-      "-B",
-      args.branch,
-      args.worktreePath,
-      args.baseBranch,
-    ],
-    { cwd: args.bareDir },
-  );
+  // Lock the bare repo for the duration: `worktree add` mutates the bare
+  // repo's worktree metadata and refs. `worktree remove` does the same.
+  // Per-worktree config (user.name/user.email) is local to the worktree
+  // path so we leave it outside the lock.
+  await withBareLock(args.bareDir, async () => {
+    if (existsSync(args.worktreePath)) {
+      // Best-effort cleanup of any prior worktree state.
+      await gitRun(["worktree", "remove", "--force", args.worktreePath], {
+        cwd: args.bareDir,
+      });
+      await rm(args.worktreePath, { recursive: true, force: true });
+    }
+    await mkdir(dirname(args.worktreePath), { recursive: true });
+    await gitMust(
+      [
+        "worktree",
+        "add",
+        "-B",
+        args.branch,
+        args.worktreePath,
+        args.baseBranch,
+      ],
+      { cwd: args.bareDir },
+    );
+  });
   await gitMust(["config", "user.name", args.authorName], {
     cwd: args.worktreePath,
   });
