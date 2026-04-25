@@ -59,12 +59,14 @@ function fakeExecutor(): Executor {
   };
 }
 
-const STANDARD_USAGE: Anthropic.Usage = {
+// SDK's Usage type shape varies across minor versions (cache fields come
+// and go); cast around the literal to avoid a brittle compile-time check.
+const STANDARD_USAGE = {
   input_tokens: 10,
   output_tokens: 5,
   cache_creation_input_tokens: null,
   cache_read_input_tokens: null,
-};
+} as unknown as Anthropic.Usage;
 
 function turnWithToolUse(
   toolName: string,
