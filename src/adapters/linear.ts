@@ -95,6 +95,79 @@ export class LinearAdapter {
   }
 
   /**
+   * Issues where Gary is a subscriber but NOT the assignee. In Linear, being
+   * @mentioned auto-subscribes you, so this is a reasonable proxy for "tickets
+   * mentioning Gary". Done via raw GraphQL to inline state/team/creator and
+   * avoid the N+1 the lazy resolvers in `fetchAssignedIssues` cause.
+   */
+  async fetchMentionedIssues(): Promise<AssignedIssue[]> {
+    const query = `
+      query MentionedIssues($userId: String!, $first: Int!) {
+        issues(
+          filter: { subscribers: { id: { eq: $userId } } },
+          first: $first
+        ) {
+          nodes {
+            id
+            identifier
+            title
+            description
+            url
+            createdAt
+            updatedAt
+            state { name type }
+            team { id key }
+            creator { id name }
+            assignee { id }
+          }
+        }
+      }
+    `;
+    const data = await this.client.client.request<
+      {
+        issues: {
+          nodes: {
+            id: string;
+            identifier: string;
+            title: string;
+            description: string | null;
+            url: string;
+            createdAt: string;
+            updatedAt: string;
+            state: { name: string; type: string } | null;
+            team: { id: string; key: string } | null;
+            creator: { id: string; name: string } | null;
+            assignee: { id: string } | null;
+          }[];
+        };
+      },
+      { userId: string; first: number }
+    >(query, { userId: this.userId, first: 50 });
+
+    return data.issues.nodes
+      .filter((n) => n.assignee?.id !== this.userId)
+      .filter(
+        (n) =>
+          n.state?.type !== "completed" && n.state?.type !== "canceled",
+      )
+      .map((n) => ({
+        id: n.id,
+        identifier: n.identifier,
+        title: n.title,
+        description: n.description ?? null,
+        url: n.url,
+        stateName: n.state?.name ?? "",
+        stateType: n.state?.type ?? "",
+        createdAt: n.createdAt,
+        updatedAt: n.updatedAt,
+        creatorId: n.creator?.id ?? null,
+        creatorName: n.creator?.name ?? null,
+        teamId: n.team?.id ?? "",
+        teamKey: n.team?.key ?? "",
+      }));
+  }
+
+  /**
    * Look up an issue by its identifier (e.g. "ERT-1500"). Returns null if no
    * issue matches. Same shape as fetchAssignedIssues entries.
    */

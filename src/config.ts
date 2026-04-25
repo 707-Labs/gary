@@ -42,6 +42,11 @@ export interface GaryConfig {
   workspacesDir: string;
   dbPath: string;
   allowedRepos: readonly string[];
+  /**
+   * Linear user ids permitted to summon Gary via @mention on tickets he's
+   * not assigned to. Empty list disables the @mention pipeline entirely.
+   */
+  allowlistedMentionUserIds: readonly string[];
 }
 
 export interface LinearConfig {
@@ -113,6 +118,11 @@ export function loadGaryConfig(): GaryConfig {
     stringFromEnv("GARY_ALLOWED_REPOS", "707-Labs/ertai"),
   );
 
+  const allowlistRaw = optionalString("GARY_ALLOWLISTED_MENTION_USER_IDS");
+  const allowlistedMentionUserIds = allowlistRaw
+    ? allowlistRaw.split(",").map((s) => s.trim()).filter(Boolean)
+    : [];
+
   return {
     name: stringFromEnv("GARY_NAME", "Gary"),
     linearUserId: stringFromEnv("GARY_LINEAR_USER_ID"),
@@ -122,6 +132,7 @@ export function loadGaryConfig(): GaryConfig {
     workspacesDir,
     dbPath,
     allowedRepos,
+    allowlistedMentionUserIds,
   };
 }
 

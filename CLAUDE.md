@@ -35,7 +35,7 @@ bun run scripts/probe-d1.ts              # verify D1 read auth + SELECT-only cla
 
 ## Architecture (one-liner)
 
-`src/index.ts → src/loop.ts (every 60s) → derive state per ticket → pickActionForTicket → dispatch handler`. Handlers in `src/handlers/{classifier,code,ci-failure,pr-review,answer,bounce}.ts`. Coding handlers run an agent loop (`src/agent/loop.ts`) with tools (`src/agent/tools.ts`) bound to an `Executor` (`src/executors/`).
+`src/index.ts → src/loop.ts (every 60s) → derive state per ticket → pickActionForTicket → dispatch handler`. Handlers in `src/handlers/{classifier,code,ci-failure,pr-review,pickup,answer,bounce}.ts`. Coding handlers run an agent loop (`src/agent/loop.ts`) with tools (`src/agent/tools.ts`) bound to an `Executor` (`src/executors/`). The loop also pulls @mentioned tickets via `linear.fetchMentionedIssues` when an allowlist is configured — see `src/mention.ts` for the pickup/answer trigger detection.
 
 ## Key files
 
@@ -47,7 +47,7 @@ bun run scripts/probe-d1.ts              # verify D1 read auth + SELECT-only cla
 
 ## Environment
 
-`.env` required keys: `LINEAR_API_KEY`, `GARY_LINEAR_USER_ID`, `LINEAR_TEAM_ID`, `LINEAR_IN_PROGRESS_STATE_ID`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_PATH` (or inline `GITHUB_APP_PRIVATE_KEY`), `GITHUB_APP_INSTALLATION_ID`, `Z_AI_API_KEY`. Optional: `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` to enable Workers Observability tools (`query_cloudflare_logs`, `list_cloudflare_invocations`) inside the agent loop. See `.env.example`.
+`.env` required keys: `LINEAR_API_KEY`, `GARY_LINEAR_USER_ID`, `LINEAR_TEAM_ID`, `LINEAR_IN_PROGRESS_STATE_ID`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_PATH` (or inline `GITHUB_APP_PRIVATE_KEY`), `GITHUB_APP_INSTALLATION_ID`, `Z_AI_API_KEY`. Optional: `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` to enable Workers Observability tools (`query_cloudflare_logs`, `list_cloudflare_invocations`) inside the agent loop. `GARY_ALLOWLISTED_MENTION_USER_IDS` (comma-separated Linear user ids) opts into the @mention pipeline — empty (default) disables it. See `.env.example`.
 
 `src/config.ts` exposes per-subsystem loaders (`loadLinearConfig`, `loadGitHubConfig`, `loadCloudflareConfig`, etc.) so probes can load only what they need. `loadCloudflareConfig` returns `null` when the token isn't set — Gary runs fine without it, just without log access.
 

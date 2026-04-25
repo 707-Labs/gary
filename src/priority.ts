@@ -1,4 +1,5 @@
 import type { AssignedIssue } from "./adapters/linear.ts";
+import type { MentionAnalysis } from "./mention.ts";
 import {
   type DerivedState,
   PR_COMMENT_SIGNATURE_EMPTY,
@@ -7,8 +8,10 @@ import {
 export type ActionType =
   | "fix_ci_failure"
   | "respond_to_pr_review"
+  | "pickup_ticket"
   | "classify"
   | "start_coding"
+  | "answer_mention"
   | "write_answer"
   | "bounce";
 
@@ -77,6 +80,31 @@ export function pickActionForTicket(
     return { type: "bounce", priority: 6, issue, state };
   }
 
+  return null;
+}
+
+/**
+ * Variant of pickActionForTicket for tickets where Gary is @mentioned but
+ * NOT yet assigned. The decision space is much narrower:
+ *   - explicit pickup phrase from an allowlisted user → self-assign
+ *   - generic @mention from an allowlisted user → answer in-place
+ *   - anything else → ignore (priority returns null)
+ *
+ * Once Gary self-assigns, the ticket flows through the normal
+ * `pickActionForTicket` path on the next tick.
+ */
+export function pickActionForMention(inputs: {
+  issue: AssignedIssue;
+  state: DerivedState;
+  mention: MentionAnalysis;
+}): CandidateAction | null {
+  const { issue, state, mention } = inputs;
+  if (mention.kind === "pickup") {
+    return { type: "pickup_ticket", priority: 1.5, issue, state };
+  }
+  if (mention.kind === "mention") {
+    return { type: "answer_mention", priority: 2.5, issue, state };
+  }
   return null;
 }
 

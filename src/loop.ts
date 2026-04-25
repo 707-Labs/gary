@@ -11,10 +11,13 @@ import { runAnswerHandler } from "./handlers/answer.ts";
 import { runBounceHandler } from "./handlers/bounce.ts";
 import { runCiFailureHandler } from "./handlers/ci-failure.ts";
 import { runCodeHandler } from "./handlers/code.ts";
+import { runPickupHandler } from "./handlers/pickup.ts";
 import { runPrReviewHandler } from "./handlers/pr-review.ts";
+import { analyzeMentions } from "./mention.ts";
 import { log } from "./logger.ts";
 import {
   type CandidateAction,
+  pickActionForMention,
   pickActionForTicket,
   pickHighestPriority,
 } from "./priority.ts";
@@ -47,6 +50,11 @@ export interface LoopDeps {
   glm: GLMClient;
   cloudflare: CloudflareClient | null;
   allowedRepos: readonly string[];
+  /**
+   * Linear user ids permitted to summon Gary via @mention. Empty array
+   * disables the @mention pipeline.
+   */
+  allowlistedMentionUserIds: readonly string[];
   reposDir: string;
   workspacesDir: string;
   agentLoopMaxIterations: number;
@@ -159,6 +167,12 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
     candidates.push(candidate);
   }
 
+  // @mention pipeline — only when an allowlist is configured, since the
+  // default empty allowlist means no one can summon Gary.
+  if (deps.allowlistedMentionUserIds.length > 0) {
+    await collectMentionCandidates(deps, issues, candidates);
+  }
+
   const action = pickHighestPriority(candidates);
   if (!action) {
     return { candidatesConsidered: candidates.length, actionTaken: null };
@@ -196,6 +210,93 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
   }
 }
 
+/**
+ * Fetch tickets where Gary is @mentioned (subscriber but not assignee), run
+ * the mention analyzer, and add pickup/answer candidates to the shared list.
+ * Idempotence is via the same action-cache fingerprint pattern as assigned
+ * tickets — humanInputSignature already includes non-Gary comments, so a
+ * new mention bumps the fingerprint and a stale one doesn't.
+ */
+async function collectMentionCandidates(
+  deps: LoopDeps,
+  assignedIssues: readonly { id: string }[],
+  candidates: CandidateAction[],
+): Promise<void> {
+  let mentioned: Awaited<ReturnType<LinearAdapter["fetchMentionedIssues"]>>;
+  try {
+    mentioned = await deps.linear.fetchMentionedIssues();
+  } catch (err) {
+    log.warn("could not fetch mentioned issues; skipping mention pipeline", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return;
+  }
+
+  const assignedIds = new Set(assignedIssues.map((i) => i.id));
+  const mentionOnly = mentioned.filter((i) => !assignedIds.has(i.id));
+
+  for (const issue of mentionOnly) {
+    upsertTicket(deps.db, { linearId: issue.id, identifier: issue.identifier });
+    const ticketRow = getTicket(deps.db, issue.id);
+    if (ticketRow?.terminal_state) continue;
+
+    let comments: Awaited<ReturnType<LinearAdapter["fetchComments"]>>;
+    try {
+      comments = await deps.linear.fetchComments(issue.id);
+    } catch (err) {
+      log.warn("could not fetch comments for mentioned ticket", {
+        issue: issue.identifier,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      continue;
+    }
+
+    const analysis = analyzeMentions({
+      comments: comments.map((c) => ({
+        id: c.id,
+        body: c.body,
+        createdAt: c.createdAt,
+        userId: c.userId,
+      })),
+      garyUserId: deps.linear.linearUserId,
+      allowlistedUserIds: deps.allowlistedMentionUserIds,
+    });
+    if (analysis.kind === "none") continue;
+
+    const humanInputSignature = computeHumanInputSignature({
+      description: issue.description,
+      comments: comments.map((c) => ({
+        id: c.id,
+        userId: c.userId,
+        createdAt: c.createdAt,
+      })),
+      garyUserId: deps.linear.linearUserId,
+    });
+    const state: DerivedState = {
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      issueUpdatedAt: issue.updatedAt,
+      humanInputSignature,
+      classification: null,
+      pr: null,
+    };
+
+    const candidate = pickActionForMention({ issue, state, mention: analysis });
+    if (!candidate) continue;
+    const fp = fingerprintDerivedState(state);
+    if (
+      hasActedOn(deps.db, {
+        ticketLinearId: issue.id,
+        stateFingerprint: fp,
+        actionType: candidate.type,
+      })
+    ) {
+      continue;
+    }
+    candidates.push(candidate);
+  }
+}
+
 async function dispatch(deps: LoopDeps, action: CandidateAction): Promise<void> {
   switch (action.type) {
     case "classify":
@@ -209,6 +310,15 @@ async function dispatch(deps: LoopDeps, action: CandidateAction): Promise<void> 
       return;
     case "respond_to_pr_review":
       await runRespondToPrReview(deps, action);
+      return;
+    case "pickup_ticket":
+      await runPickupHandler(
+        { linear: deps.linear },
+        { issue: action.issue },
+      );
+      return;
+    case "answer_mention":
+      await runWriteAnswer(deps, action);
       return;
     case "write_answer":
       await runWriteAnswer(deps, action);

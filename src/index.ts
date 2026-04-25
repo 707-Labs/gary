@@ -50,6 +50,7 @@ async function main(): Promise<void> {
     glm,
     cloudflare,
     allowedRepos: cfg.gary.allowedRepos,
+    allowlistedMentionUserIds: cfg.gary.allowlistedMentionUserIds,
     reposDir: cfg.gary.reposDir,
     workspacesDir: cfg.gary.workspacesDir,
     agentLoopMaxIterations: cfg.runtime.agentLoopMaxIterations,

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { AssignedIssue } from "../src/adapters/linear.ts";
 import {
+  pickActionForMention,
   pickActionForTicket,
   pickHighestPriority,
 } from "../src/priority.ts";
@@ -160,6 +161,45 @@ describe("pickActionForTicket", () => {
       },
     });
     expect(action).toBeNull();
+  });
+});
+
+describe("pickActionForMention", () => {
+  const mentionComment = {
+    id: "c1",
+    body: "@gary thoughts?",
+    createdAt: "2026-04-24T00:00:00Z",
+    userId: "u-tanner",
+  };
+
+  it("returns pickup_ticket for a pickup analysis", () => {
+    const action = pickActionForMention({
+      issue,
+      state: baseState,
+      mention: { kind: "pickup", comment: mentionComment },
+    });
+    expect(action?.type).toBe("pickup_ticket");
+    expect(action?.priority).toBe(1.5);
+  });
+
+  it("returns answer_mention for a generic mention", () => {
+    const action = pickActionForMention({
+      issue,
+      state: baseState,
+      mention: { kind: "mention", comment: mentionComment },
+    });
+    expect(action?.type).toBe("answer_mention");
+    expect(action?.priority).toBe(2.5);
+  });
+
+  it("returns null when no mention applies", () => {
+    expect(
+      pickActionForMention({
+        issue,
+        state: baseState,
+        mention: { kind: "none" },
+      }),
+    ).toBeNull();
   });
 });
 
