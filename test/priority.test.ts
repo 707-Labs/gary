@@ -26,6 +26,7 @@ const baseState: DerivedState = {
   issueId: issue.id,
   issueIdentifier: issue.identifier,
   issueUpdatedAt: issue.updatedAt,
+  humanInputSignature: "sig-0",
   classification: null,
   pr: null,
 };

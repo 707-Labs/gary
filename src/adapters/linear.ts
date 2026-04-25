@@ -44,6 +44,11 @@ export class LinearAdapter {
     this.inProgressStateId = cfg.linear.inProgressStateId;
   }
 
+  /** Gary's Linear user id — exposed so the loop can filter his own comments. */
+  get linearUserId(): string {
+    return this.userId;
+  }
+
   async getViewer(): Promise<ViewerInfo> {
     const v = await this.client.viewer;
     return {
@@ -120,6 +125,51 @@ export class LinearAdapter {
       teamId: team?.id ?? "",
       teamKey: team?.key ?? "",
     };
+  }
+
+  /**
+   * Fetch only id + author + createdAt for an issue's comments. Uses one raw
+   * GraphQL call (vs `fetchComments` which lazily resolves user records and
+   * incurs N+1 round trips). Used in the loop to compute the human-input
+   * signature without blowing the Linear rate limit.
+   */
+  async fetchCommentMeta(
+    issueId: string,
+    limit = 50,
+  ): Promise<{ id: string; userId: string | null; createdAt: string }[]> {
+    const query = `
+      query CommentMeta($id: String!, $first: Int!) {
+        issue(id: $id) {
+          comments(first: $first) {
+            nodes {
+              id
+              createdAt
+              user { id }
+            }
+          }
+        }
+      }
+    `;
+    const data = await this.client.client.request<
+      {
+        issue: {
+          comments: {
+            nodes: {
+              id: string;
+              createdAt: string;
+              user: { id: string } | null;
+            }[];
+          };
+        } | null;
+      },
+      { id: string; first: number }
+    >(query, { id: issueId, first: limit });
+    const nodes = data.issue?.comments?.nodes ?? [];
+    return nodes.map((n) => ({
+      id: n.id,
+      createdAt: n.createdAt,
+      userId: n.user?.id ?? null,
+    }));
   }
 
   async fetchComments(issueId: string, limit = 20): Promise<IssueComment[]> {

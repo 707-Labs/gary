@@ -17,16 +17,27 @@ export interface DerivedClassification {
 export interface DerivedState {
   issueId: string;
   issueIdentifier: string;
+  /**
+   * Linear's `updatedAt` for the issue. Bumped on ANY change including Gary's
+   * own writes — kept here for logging only, NOT included in the fingerprint.
+   * Use `humanInputSignature` for idempotence.
+   */
   issueUpdatedAt: string;
+  /**
+   * Hash of (description + non-Gary comment ids), so Gary's own answers
+   * don't invalidate the action cache. See `computeHumanInputSignature`.
+   */
+  humanInputSignature: string;
   classification: DerivedClassification | null;
   pr: DerivedPrState | null;
 }
 
 /**
  * Stable, deterministic 16-hex-char hash of the inputs that affect any
- * action's decision for a given ticket. If state changes (new commit, new
- * comment surfaced via updatedAt, classification gained, PR status moved),
- * the fingerprint changes and Gary is free to act again on that ticket.
+ * action's decision for a given ticket.
+ *
+ * Replaces the old `issueUpdatedAt`-based hash, which looped on ANSWER
+ * tickets — Gary's own comment bumped updatedAt and the cache missed.
  *
  * Action type is part of the SQLite cache key (see hasActedOn) so the
  * fingerprint itself doesn't need it.
@@ -34,7 +45,7 @@ export interface DerivedState {
 export function fingerprintDerivedState(state: DerivedState): string {
   const canonical = JSON.stringify({
     issueId: state.issueId,
-    issueUpdatedAt: state.issueUpdatedAt,
+    humanInputSignature: state.humanInputSignature,
     classification: state.classification?.classification ?? null,
     pr: state.pr
       ? {
@@ -46,6 +57,40 @@ export function fingerprintDerivedState(state: DerivedState): string {
           ciStatus: state.pr.ciStatus,
         }
       : null,
+  });
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
+}
+
+export interface CommentMeta {
+  id: string;
+  userId: string | null;
+  createdAt: string;
+}
+
+/**
+ * Hash of inputs that come from humans, not Gary. Used to make the action
+ * cache fingerprint stable across Gary's own writes (which would otherwise
+ * loop on ANSWER tickets).
+ *
+ * Inputs:
+ * - description (full text, since edits should re-trigger)
+ * - non-Gary comment ids (sorted, so order-independent)
+ *
+ * Comments authored by Gary (matched on userId) are excluded entirely. Null
+ * userId is preserved as a non-Gary comment — anonymous webhook posts etc.
+ */
+export function computeHumanInputSignature(args: {
+  description: string | null;
+  comments: readonly CommentMeta[];
+  garyUserId: string;
+}): string {
+  const ids = args.comments
+    .filter((c) => c.userId !== args.garyUserId)
+    .map((c) => c.id)
+    .sort();
+  const canonical = JSON.stringify({
+    description: args.description ?? null,
+    commentIds: ids,
   });
   return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
 }

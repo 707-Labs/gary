@@ -83,7 +83,11 @@ export async function runAnswerHandler(
     loadProjectContext(worktreePath),
     loadSkillIndex(worktreePath),
   );
-  const question = renderQuestion(args.issue, args.comments);
+  const question = renderQuestion(
+    args.issue,
+    args.comments,
+    deps.linear.linearUserId,
+  );
   const task = projectSection
     ? `${projectSection}\n\n---\n\n${question}`
     : question;
@@ -115,25 +119,50 @@ export async function runAnswerHandler(
   return { status: "answered", followup: loopResult.summary };
 }
 
-function renderQuestion(
+/**
+ * Build the prompt body for the answer agent. Renders the description and
+ * the chronological comment thread, then surfaces the *latest non-Gary
+ * comment* as an explicit "current question" so the agent focuses on what's
+ * actually being asked rather than re-answering the original.
+ *
+ * Exported so tests can pin the structure directly.
+ */
+export function renderQuestion(
   issue: AssignedIssue,
   comments: readonly IssueComment[],
+  garyUserId: string,
 ): string {
   const sections: string[] = [];
   sections.push(`Ticket: ${issue.identifier} — ${issue.title}`);
   sections.push("");
   sections.push("Description:");
   sections.push(issue.description ?? "(no description)");
-  if (comments.length > 0) {
+
+  const sorted = [...comments].sort((a, b) =>
+    a.createdAt.localeCompare(b.createdAt),
+  );
+  if (sorted.length > 0) {
     sections.push("");
-    sections.push(`Comments (${comments.length}, oldest first):`);
-    const sorted = [...comments].sort((a, b) =>
-      a.createdAt.localeCompare(b.createdAt),
-    );
+    sections.push(`Comments (${sorted.length}, oldest first):`);
     for (const c of sorted) {
       sections.push(`  ${c.userName ?? "?"} (${c.createdAt}): ${c.body}`);
     }
   }
+
+  // Find the latest non-Gary comment — that's the actual question to focus on.
+  // If the most recent input is a follow-up, this prevents the agent from
+  // re-explaining the original answer.
+  const latestHuman = [...sorted]
+    .reverse()
+    .find((c) => c.userId !== garyUserId);
+  if (latestHuman) {
+    sections.push("");
+    sections.push(
+      `Latest from ${latestHuman.userName ?? "?"} (${latestHuman.createdAt}) — focus your reply on this:`,
+    );
+    sections.push(latestHuman.body);
+  }
+
   sections.push("");
   sections.push(
     "Investigate the code as needed (read-only) and call finish() with your follow-up comment as the summary.",

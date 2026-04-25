@@ -18,6 +18,7 @@ import {
   pickHighestPriority,
 } from "./priority.ts";
 import {
+  computeHumanInputSignature,
   type DerivedPrState,
   type DerivedState,
   fingerprintDerivedState,
@@ -100,10 +101,31 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
 
     const pr = await derivePr(deps, issue.id);
 
+    // The fingerprint includes a hash of human-only inputs (description +
+    // non-Gary comment ids) so that Gary's own comments don't invalidate the
+    // action cache. Without this, ANSWER tickets loop until the circuit
+    // breaker fires.
+    let humanInputSignature: string;
+    try {
+      const commentMeta = await deps.linear.fetchCommentMeta(issue.id);
+      humanInputSignature = computeHumanInputSignature({
+        description: issue.description,
+        comments: commentMeta,
+        garyUserId: deps.linear.linearUserId,
+      });
+    } catch (err) {
+      log.warn("could not fetch comment meta; falling back to updatedAt", {
+        issue: issue.identifier,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      humanInputSignature = `fallback:${issue.updatedAt}`;
+    }
+
     const state: DerivedState = {
       issueId: issue.id,
       issueIdentifier: issue.identifier,
       issueUpdatedAt: issue.updatedAt,
+      humanInputSignature,
       classification,
       pr,
     };
