@@ -1,7 +1,8 @@
 import type { AssignedIssue, LinearAdapter } from "../adapters/linear.ts";
 import { log } from "../logger.ts";
 
-const PICKUP_ACK = `picked it up — classifying now and i'll either open a PR or post an answer in a sec`;
+// Source of truth for this string is voice.md example 16. Keep them in sync.
+const PICKUP_ACK = `picked it up — classifying now, i'll either open a PR or post an answer shortly`;
 
 export interface PickupHandlerDeps {
   linear: LinearAdapter;
