@@ -18,6 +18,12 @@ export interface DerivedPrState {
 
 export interface DerivedClassification {
   classification: "CODE" | "ANSWER" | "BOUNCE";
+  /**
+   * Optional so older tests don't have to set it. Live state always
+   * populates this from the classifier; readers without scope info default
+   * to "M" (the historical flat behavior).
+   */
+  scope?: "S" | "M" | "L";
 }
 
 export interface DerivedState {

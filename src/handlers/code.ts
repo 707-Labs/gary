@@ -53,22 +53,29 @@ const INVESTIGATE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
  * investigate cap. The implement phase opens with a forcing message
  * directing the model to write a brief plan, implement, and call finish.
  *
- * Phase budgets sum to 50, matching the previous flat cap. Splitting the
- * budget makes the model spend at most 15 iters reading before being
- * pushed into producing a plan and writing code.
+ * Iteration budgets are scaled by classification scope: small tickets get
+ * a tight cap (rename a button, fix a typo) while medium tickets get the
+ * historical 15/35 budget. L tickets are already auto-bounced upstream.
  */
-function buildCodePhases(): readonly PhaseSpec[] {
+function phaseBudget(scope: "S" | "M" | "L"): { investigate: number; implement: number } {
+  if (scope === "S") return { investigate: 8, implement: 20 };
+  // M is the historical flat cap (50 total). L never reaches here.
+  return { investigate: 15, implement: 35 };
+}
+
+function buildCodePhases(scope: "S" | "M" | "L" = "M"): readonly PhaseSpec[] {
+  const { investigate, implement } = phaseBudget(scope);
   return [
     {
       name: "investigate",
-      maxIter: 15,
+      maxIter: investigate,
       allowedTools: INVESTIGATE_ALLOWED_TOOLS,
       nudgeMessage:
         "you've used most of your investigate budget. wrap up exploration on your next turn — finish reading what's needed and end your turn without tool calls so you can move to the implement phase.",
     },
     {
       name: "implement",
-      maxIter: 35,
+      maxIter: implement,
       entryMessage:
         "good — you've explored. now: (1) write a 3-5 bullet plan of the changes you'll make, (2) implement them with write_file/edit_file/run_bash and commit your work, (3) run `bun run check` and fix anything you broke, (4) call finish() with a 1-2 sentence summary. if at any point you realize the change is bigger than expected or you're stuck, call finish() with a brief partial-progress note and a human will pick it up.",
       nudgeMessage:
@@ -147,6 +154,13 @@ export interface CodeHandlerArgs {
   issue: AssignedIssue;
   comments: readonly IssueComment[];
   repo: string; // "owner/repo"
+  /**
+   * Classifier-assigned scope. Used to scale the agent loop iteration caps:
+   * S tickets get a tighter budget (28 iters total) than M (50). L is
+   * already auto-bounced before reaching here. Optional — old call paths
+   * without scope info default to M.
+   */
+  scope?: "S" | "M" | "L";
 }
 
 export interface CodeHandlerResult {
@@ -213,7 +227,7 @@ export async function runCodeHandler(
     systemPrompt: system,
     task: taskMessage,
     maxIterations: deps.agentLoopMaxIterations,
-    phases: buildCodePhases(),
+    phases: buildCodePhases(args.scope),
     timeoutMs: deps.agentLoopTimeoutMs,
     temperature: 0.3,
     linear: deps.linear,

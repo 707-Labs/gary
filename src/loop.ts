@@ -145,7 +145,13 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
     }
 
     const classification = ticketRow?.classification
-      ? { classification: ticketRow.classification }
+      ? {
+          classification: ticketRow.classification,
+          // Default to M for any pre-scope rows; scope is recorded by
+          // setClassification on every fresh classify, so this only matters
+          // for ancient tickets in the DB.
+          scope: (ticketRow.classification_scope ?? "M") as "S" | "M" | "L",
+        }
       : null;
 
     const pr = await derivePr(deps, issue.id);
@@ -647,6 +653,7 @@ async function runStartCoding(
     throw new Error("no allowed repos configured");
   }
   const comments = await deps.linear.fetchComments(issue.id);
+  const scope = action.state.classification?.scope ?? "M";
   await runCodeHandler(
     {
       db: deps.db,
@@ -659,7 +666,7 @@ async function runStartCoding(
       agentLoopMaxIterations: deps.agentLoopMaxIterations,
       agentLoopTimeoutMs: deps.agentLoopTimeoutMs,
     },
-    { issue, comments, repo },
+    { issue, comments, repo, scope },
   );
   // Mark this signature as the last input Gary acted on. Subsequent comments
   // bump the signature and revisit_code fires; without comments it stays
