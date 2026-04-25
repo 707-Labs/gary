@@ -1,8 +1,12 @@
 import type { AssignedIssue } from "./adapters/linear.ts";
-import type { DerivedState } from "./state-fingerprint.ts";
+import {
+  type DerivedState,
+  PR_COMMENT_SIGNATURE_EMPTY,
+} from "./state-fingerprint.ts";
 
 export type ActionType =
   | "fix_ci_failure"
+  | "respond_to_pr_review"
   | "classify"
   | "start_coding"
   | "write_answer"
@@ -38,6 +42,18 @@ export function pickActionForTicket(
     state.pr.ciStatus === "red"
   ) {
     return { type: "fix_ci_failure", priority: 1, issue, state };
+  }
+
+  // 2. respond_to_pr_review — open PR has reviewer comments Gary hasn't
+  //    addressed yet. Lower priority than CI red so Gary fixes broken builds
+  //    before chasing comment threads.
+  if (
+    state.pr &&
+    state.pr.state === "open" &&
+    !state.pr.merged &&
+    state.pr.prCommentSignature !== PR_COMMENT_SIGNATURE_EMPTY
+  ) {
+    return { type: "respond_to_pr_review", priority: 2, issue, state };
   }
 
   // 3. classify — assigned to Gary, no classification yet

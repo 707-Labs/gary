@@ -52,3 +52,16 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_events_ticket ON events(ticket_linear_id);
+
+-- Tracks which PR review comments Gary has already responded to. The
+-- pr-review handler appends here on success; the loop's prCommentSignature
+-- excludes already-responded ids so the action cache doesn't re-fire when
+-- Gary's own response (or push) shifts other parts of the PR fingerprint.
+CREATE TABLE IF NOT EXISTS pr_comment_responses (
+  pr_github_id INTEGER NOT NULL,
+  comment_id INTEGER NOT NULL,
+  responded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (pr_github_id, comment_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pr_comment_responses_pr ON pr_comment_responses(pr_github_id);

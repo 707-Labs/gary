@@ -1,8 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import {
   computeHumanInputSignature,
+  computePrCommentSignature,
   type DerivedState,
   fingerprintDerivedState,
+  PR_COMMENT_SIGNATURE_EMPTY,
 } from "../src/state-fingerprint.ts";
 
 const baseState: DerivedState = {
@@ -58,6 +60,7 @@ describe("fingerprintDerivedState", () => {
         isDraft: false,
         headSha: "aaa",
         ciStatus: "green",
+        prCommentSignature: "empty",
       },
     };
     const a = fingerprintDerivedState(stateWithPr);
@@ -78,6 +81,7 @@ describe("fingerprintDerivedState", () => {
         isDraft: false,
         headSha: "aaa",
         ciStatus: "green",
+        prCommentSignature: "empty",
       },
     };
     expect(fingerprintDerivedState(open)).not.toBe(
@@ -195,5 +199,87 @@ describe("computeHumanInputSignature", () => {
       garyUserId: garyId,
     });
     expect(a).toBe(b);
+  });
+});
+
+describe("computePrCommentSignature", () => {
+  const garyLogin = "gary-707-labs[bot]";
+
+  it("returns the empty token when no comments", () => {
+    expect(
+      computePrCommentSignature({
+        comments: [],
+        garyLogin,
+        alreadyRespondedIds: [],
+      }),
+    ).toBe(PR_COMMENT_SIGNATURE_EMPTY);
+  });
+
+  it("returns the empty token when only Gary's comments are present", () => {
+    expect(
+      computePrCommentSignature({
+        comments: [
+          { id: 1, authorLogin: garyLogin },
+          { id: 2, authorLogin: garyLogin },
+        ],
+        garyLogin,
+        alreadyRespondedIds: [],
+      }),
+    ).toBe(PR_COMMENT_SIGNATURE_EMPTY);
+  });
+
+  it("returns the empty token when all non-Gary comments are already responded", () => {
+    expect(
+      computePrCommentSignature({
+        comments: [{ id: 10, authorLogin: "tanner" }],
+        garyLogin,
+        alreadyRespondedIds: [10],
+      }),
+    ).toBe(PR_COMMENT_SIGNATURE_EMPTY);
+  });
+
+  it("returns a non-empty hash when there's a pending comment", () => {
+    const sig = computePrCommentSignature({
+      comments: [{ id: 11, authorLogin: "tanner" }],
+      garyLogin,
+      alreadyRespondedIds: [],
+    });
+    expect(sig).not.toBe(PR_COMMENT_SIGNATURE_EMPTY);
+    expect(sig).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it("changes when a new pending comment arrives", () => {
+    const a = computePrCommentSignature({
+      comments: [{ id: 1, authorLogin: "tanner" }],
+      garyLogin,
+      alreadyRespondedIds: [],
+    });
+    const b = computePrCommentSignature({
+      comments: [
+        { id: 1, authorLogin: "tanner" },
+        { id: 2, authorLogin: "tanner" },
+      ],
+      garyLogin,
+      alreadyRespondedIds: [],
+    });
+    expect(a).not.toBe(b);
+  });
+
+  it("is stable across Gary's own comments and pushes", () => {
+    const before = computePrCommentSignature({
+      comments: [{ id: 1, authorLogin: "tanner" }],
+      garyLogin,
+      alreadyRespondedIds: [],
+    });
+    const after = computePrCommentSignature({
+      comments: [
+        { id: 1, authorLogin: "tanner" },
+        { id: 2, authorLogin: garyLogin },
+        { id: 3, authorLogin: garyLogin },
+      ],
+      garyLogin,
+      alreadyRespondedIds: [],
+    });
+    expect(before).toBe(after);
   });
 });

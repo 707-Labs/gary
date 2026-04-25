@@ -8,6 +8,12 @@ export interface DerivedPrState {
   isDraft: boolean;
   headSha: string;
   ciStatus: AggregateCi;
+  /**
+   * Hash of (non-Gary, not-yet-responded) PR comment ids. Empty hash means
+   * there's nothing for Gary to respond to. See `computePrCommentSignature`.
+   * Stable across Gary's own PR comments and pushes.
+   */
+  prCommentSignature: string;
 }
 
 export interface DerivedClassification {
@@ -55,6 +61,7 @@ export function fingerprintDerivedState(state: DerivedState): string {
           isDraft: state.pr.isDraft,
           headSha: state.pr.headSha,
           ciStatus: state.pr.ciStatus,
+          prCommentSignature: state.pr.prCommentSignature,
         }
       : null,
   });
@@ -92,5 +99,33 @@ export function computeHumanInputSignature(args: {
     description: args.description ?? null,
     commentIds: ids,
   });
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
+}
+
+/**
+ * Hash of PR comments that Gary still owes a response to. Filters out
+ * Gary's own comments (matched on author login) AND comments Gary has
+ * already responded to (tracked in `pr_comment_responses`).
+ *
+ * Returns the special token "empty" when there's nothing pending — the
+ * caller checks against this to decide whether to emit a respond_to_pr_review
+ * candidate. Using a fixed token (vs the natural empty-list hash) makes the
+ * "nothing to do" check obvious at call sites and in logs.
+ */
+export const PR_COMMENT_SIGNATURE_EMPTY = "empty";
+
+export function computePrCommentSignature(args: {
+  comments: readonly { id: number; authorLogin: string | null }[];
+  garyLogin: string;
+  alreadyRespondedIds: readonly number[];
+}): string {
+  const responded = new Set(args.alreadyRespondedIds);
+  const pending = args.comments
+    .filter((c) => c.authorLogin !== args.garyLogin)
+    .filter((c) => !responded.has(c.id))
+    .map((c) => c.id)
+    .sort((a, b) => a - b);
+  if (pending.length === 0) return PR_COMMENT_SIGNATURE_EMPTY;
+  const canonical = JSON.stringify({ pending });
   return createHash("sha256").update(canonical).digest("hex").slice(0, 16);
 }

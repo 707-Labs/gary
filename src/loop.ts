@@ -11,6 +11,7 @@ import { runAnswerHandler } from "./handlers/answer.ts";
 import { runBounceHandler } from "./handlers/bounce.ts";
 import { runCiFailureHandler } from "./handlers/ci-failure.ts";
 import { runCodeHandler } from "./handlers/code.ts";
+import { runPrReviewHandler } from "./handlers/pr-review.ts";
 import { log } from "./logger.ts";
 import {
   type CandidateAction,
@@ -19,14 +20,17 @@ import {
 } from "./priority.ts";
 import {
   computeHumanInputSignature,
+  computePrCommentSignature,
   type DerivedPrState,
   type DerivedState,
   fingerprintDerivedState,
+  PR_COMMENT_SIGNATURE_EMPTY,
 } from "./state-fingerprint.ts";
 import type { DB } from "./state/db.ts";
 import {
   countActionsSince,
   getPrForTicket,
+  getRespondedPrCommentIds,
   getTicket,
   hasActedOn,
   recordActionEnd,
@@ -66,6 +70,18 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
   const issues = await deps.linear.fetchAssignedIssues();
   recordEvent(deps.db, { eventType: "poll", payload: { count: issues.length } });
 
+  // Cache Gary's GitHub login once per tick so derivePr can filter his own
+  // PR comments out of the pending-review signature.
+  let garyLogin = "";
+  try {
+    const viewer = await deps.github.getViewer();
+    garyLogin = viewer.login;
+  } catch (err) {
+    log.warn("could not fetch GitHub viewer; PR comment filter falls back to empty login", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
   const candidates: CandidateAction[] = [];
   for (const issue of issues) {
     upsertTicket(deps.db, { linearId: issue.id, identifier: issue.identifier });
@@ -99,7 +115,7 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
       ? { classification: ticketRow.classification }
       : null;
 
-    const pr = await derivePr(deps, issue.id);
+    const pr = await derivePr(deps, issue.id, garyLogin);
 
     // The fingerprint includes a hash of human-only inputs (description +
     // non-Gary comment ids) so that Gary's own comments don't invalidate the
@@ -191,6 +207,9 @@ async function dispatch(deps: LoopDeps, action: CandidateAction): Promise<void> 
     case "fix_ci_failure":
       await runFixCiFailure(deps, action);
       return;
+    case "respond_to_pr_review":
+      await runRespondToPrReview(deps, action);
+      return;
     case "write_answer":
       await runWriteAnswer(deps, action);
       return;
@@ -201,6 +220,42 @@ async function dispatch(deps: LoopDeps, action: CandidateAction): Promise<void> 
       );
       return;
   }
+}
+
+async function runRespondToPrReview(
+  deps: LoopDeps,
+  action: CandidateAction,
+): Promise<void> {
+  const issue = action.issue;
+  if (!action.state.pr) {
+    throw new Error("respond_to_pr_review dispatched without a PR");
+  }
+  const prRow = getPrForTicket(deps.db, issue.id);
+  if (!prRow) {
+    throw new Error(
+      `respond_to_pr_review: no PR row for ticket ${issue.identifier}`,
+    );
+  }
+  await runPrReviewHandler(
+    {
+      db: deps.db,
+      linear: deps.linear,
+      github: deps.github,
+      glm: deps.glm,
+      cloudflare: deps.cloudflare,
+      reposDir: deps.reposDir,
+      workspacesDir: deps.workspacesDir,
+      agentLoopMaxIterations: deps.agentLoopMaxIterations,
+      agentLoopTimeoutMs: deps.agentLoopTimeoutMs,
+    },
+    {
+      issue,
+      repo: prRow.repo,
+      prGithubId: prRow.github_id,
+      prNumber: prRow.pr_number,
+      branch: prRow.branch,
+    },
+  );
 }
 
 async function runWriteAnswer(
@@ -351,6 +406,7 @@ async function runClassify(
 async function derivePr(
   deps: LoopDeps,
   ticketLinearId: string,
+  garyLogin: string,
 ): Promise<DerivedPrState | null> {
   const row = getPrForTicket(deps.db, ticketLinearId);
   if (!row) return null;
@@ -368,6 +424,33 @@ async function derivePr(
     return null;
   }
   const ciStatus = await deps.github.aggregateCiStatus(owner, name, pr.headSha);
+
+  // Compute the pending-comment signature so the priority logic knows whether
+  // there are reviewer comments Gary still owes a response to. Skip this for
+  // closed/merged PRs — no respond_to_pr_review action will fire anyway.
+  let prCommentSignature = PR_COMMENT_SIGNATURE_EMPTY;
+  if (pr.state === "open" && !pr.merged) {
+    try {
+      const comments = await deps.github.getPullRequestComments(
+        owner,
+        name,
+        pr.number,
+      );
+      const respondedIds = getRespondedPrCommentIds(deps.db, row.github_id);
+      prCommentSignature = computePrCommentSignature({
+        comments,
+        garyLogin,
+        alreadyRespondedIds: respondedIds,
+      });
+    } catch (err) {
+      log.warn("could not fetch PR comments; skipping review-response check", {
+        repo: row.repo,
+        number: row.pr_number,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   return {
     number: pr.number,
     state: pr.state,
@@ -375,6 +458,7 @@ async function derivePr(
     isDraft: pr.isDraft,
     headSha: pr.headSha,
     ciStatus,
+    prCommentSignature,
   };
 }
 

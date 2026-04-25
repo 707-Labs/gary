@@ -55,6 +55,23 @@ export interface PullRequestDetail extends PullRequestRef {
   diff: string;
 }
 
+export interface PullRequestComment {
+  id: number;
+  /**
+   * "issue" = a top-level PR comment (general discussion).
+   * "review" = a line-level review comment, inline on the diff.
+   */
+  kind: "issue" | "review";
+  authorLogin: string | null;
+  body: string;
+  createdAt: string;
+  htmlUrl: string;
+  /** Set on review comments — file path the comment is anchored to. */
+  path?: string | null;
+  /** Set on review comments — line in the diff (or null if outdated). */
+  line?: number | null;
+}
+
 export type AggregateCi = "green" | "red" | "pending" | "none";
 
 export interface ViewerInfo {
@@ -129,6 +146,17 @@ export interface GitHubClient {
     repo: string,
     creatorLogin: string,
   ): Promise<PullRequestRef[]>;
+
+  /**
+   * Combined fetch of top-level PR comments and inline review comments.
+   * Sorted oldest-first so callers can identify the latest. Used by the
+   * pr-review handler to find new reviewer feedback Gary needs to address.
+   */
+  getPullRequestComments(
+    owner: string,
+    repo: string,
+    number: number,
+  ): Promise<PullRequestComment[]>;
 }
 
 class AppGitHubClient implements GitHubClient {
@@ -289,6 +317,14 @@ class AppGitHubClient implements GitHubClient {
       .filter((p) => p.user?.login === creatorLogin)
       .map((p) => prRefFromOctokit(owner, repo, p));
   }
+
+  async getPullRequestComments(
+    owner: string,
+    repo: string,
+    number: number,
+  ): Promise<PullRequestComment[]> {
+    return getPrCommentsVia(this.app, owner, repo, number);
+  }
 }
 
 class PatGitHubClient implements GitHubClient {
@@ -437,6 +473,14 @@ class PatGitHubClient implements GitHubClient {
       .filter((p) => p.user?.login === creatorLogin)
       .map((p) => prRefFromOctokit(owner, repo, p));
   }
+
+  async getPullRequestComments(
+    owner: string,
+    repo: string,
+    number: number,
+  ): Promise<PullRequestComment[]> {
+    return getPrCommentsVia(this.api, owner, repo, number);
+  }
 }
 
 interface PrPayload {
@@ -489,6 +533,53 @@ async function getPrDetailVia(
     headRef: data.head.ref,
     diff,
   };
+}
+
+async function getPrCommentsVia(
+  api: Octokit,
+  owner: string,
+  repo: string,
+  number: number,
+): Promise<PullRequestComment[]> {
+  const [issueRes, reviewRes] = await Promise.all([
+    api.issues.listComments({
+      owner,
+      repo,
+      issue_number: number,
+      per_page: 100,
+    }),
+    api.pulls.listReviewComments({
+      owner,
+      repo,
+      pull_number: number,
+      per_page: 100,
+    }),
+  ]);
+  const merged: PullRequestComment[] = [
+    ...issueRes.data.map(
+      (c): PullRequestComment => ({
+        id: c.id,
+        kind: "issue",
+        authorLogin: c.user?.login ?? null,
+        body: c.body ?? "",
+        createdAt: c.created_at,
+        htmlUrl: c.html_url,
+      }),
+    ),
+    ...reviewRes.data.map(
+      (c): PullRequestComment => ({
+        id: c.id,
+        kind: "review",
+        authorLogin: c.user?.login ?? null,
+        body: c.body ?? "",
+        createdAt: c.created_at,
+        htmlUrl: c.html_url,
+        path: c.path ?? null,
+        line: c.line ?? c.original_line ?? null,
+      }),
+    ),
+  ];
+  return merged.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
 function summarizeCi(runs: CheckRun[]): AggregateCi {

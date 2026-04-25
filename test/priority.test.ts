@@ -73,11 +73,73 @@ describe("pickActionForTicket", () => {
           isDraft: false,
           headSha: "x",
           ciStatus: "red",
+          prCommentSignature: "empty",
         },
       },
     });
     expect(action?.type).toBe("fix_ci_failure");
     expect(action?.priority).toBe(1);
+  });
+
+  it("picks respond_to_pr_review when there's a pending PR comment and CI is green", () => {
+    const action = pickActionForTicket({
+      issue,
+      state: {
+        ...baseState,
+        classification: { classification: "CODE" },
+        pr: {
+          number: 5,
+          state: "open",
+          merged: false,
+          isDraft: false,
+          headSha: "x",
+          ciStatus: "green",
+          prCommentSignature: "abc123",
+        },
+      },
+    });
+    expect(action?.type).toBe("respond_to_pr_review");
+    expect(action?.priority).toBe(2);
+  });
+
+  it("prioritizes CI failure above PR review when both are present", () => {
+    const action = pickActionForTicket({
+      issue,
+      state: {
+        ...baseState,
+        classification: { classification: "CODE" },
+        pr: {
+          number: 5,
+          state: "open",
+          merged: false,
+          isDraft: false,
+          headSha: "x",
+          ciStatus: "red",
+          prCommentSignature: "abc123",
+        },
+      },
+    });
+    expect(action?.type).toBe("fix_ci_failure");
+  });
+
+  it("does NOT pick respond_to_pr_review when signature is the empty token", () => {
+    const action = pickActionForTicket({
+      issue,
+      state: {
+        ...baseState,
+        classification: { classification: "CODE" },
+        pr: {
+          number: 5,
+          state: "open",
+          merged: false,
+          isDraft: false,
+          headSha: "x",
+          ciStatus: "green",
+          prCommentSignature: "empty",
+        },
+      },
+    });
+    expect(action).toBeNull();
   });
 
   it("returns null for CODE classification once a PR exists and CI is green", () => {
@@ -93,6 +155,7 @@ describe("pickActionForTicket", () => {
           isDraft: false,
           headSha: "x",
           ciStatus: "green",
+          prCommentSignature: "empty",
         },
       },
     });
@@ -119,6 +182,7 @@ describe("pickHighestPriority", () => {
           isDraft: false,
           headSha: "y",
           ciStatus: "red",
+          prCommentSignature: "empty",
         },
       },
     })!;

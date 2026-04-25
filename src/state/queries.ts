@@ -209,3 +209,30 @@ export function getPrForTicket(db: DB, ticketLinearId: string): PrRow | null {
     .get(ticketLinearId);
   return row ?? null;
 }
+
+export function getRespondedPrCommentIds(
+  db: DB,
+  prGithubId: number,
+): readonly number[] {
+  const rows = db
+    .query<{ comment_id: number }, [number]>(
+      `SELECT comment_id FROM pr_comment_responses WHERE pr_github_id = ?`,
+    )
+    .all(prGithubId);
+  return rows.map((r) => r.comment_id);
+}
+
+export function markPrCommentsResponded(
+  db: DB,
+  prGithubId: number,
+  commentIds: readonly number[],
+): void {
+  if (commentIds.length === 0) return;
+  const stmt = db.query(
+    `INSERT OR IGNORE INTO pr_comment_responses (pr_github_id, comment_id)
+     VALUES ($prId, $commentId)`,
+  );
+  for (const id of commentIds) {
+    stmt.run({ prId: prGithubId, commentId: id });
+  }
+}

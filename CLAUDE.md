@@ -35,7 +35,7 @@ bun run scripts/probe-d1.ts              # verify D1 read auth + SELECT-only cla
 
 ## Architecture (one-liner)
 
-`src/index.ts → src/loop.ts (every 60s) → derive state per ticket → pickActionForTicket → dispatch handler`. Handlers in `src/handlers/{classifier,code,ci-failure,answer,bounce}.ts`. Coding handlers run an agent loop (`src/agent/loop.ts`) with tools (`src/agent/tools.ts`) bound to an `Executor` (`src/executors/`).
+`src/index.ts → src/loop.ts (every 60s) → derive state per ticket → pickActionForTicket → dispatch handler`. Handlers in `src/handlers/{classifier,code,ci-failure,pr-review,answer,bounce}.ts`. Coding handlers run an agent loop (`src/agent/loop.ts`) with tools (`src/agent/tools.ts`) bound to an `Executor` (`src/executors/`).
 
 ## Key files
 
@@ -64,6 +64,7 @@ bun run scripts/probe-d1.ts              # verify D1 read auth + SELECT-only cla
 - **`Executor` interface uses `run`** rather than the spec's name for the method that runs shell commands. Diverges from the spec to dodge a security-scan false positive on a common substring.
 - **Cloudflare observability is opt-in**: tools only register if `CLOUDFLARE_API_TOKEN` is set. The Workers Logs API only returns data for workers that have `observability.logs.enabled` in their wrangler config. Mulligan-labs workers all have it on with `upload_source_maps: true`, so stack traces come back de-minified.
 - **Project context auto-load**: every coding handler prepends CLAUDE.md / AGENTS.md / `.claude/skills/*/SKILL.md` frontmatter from the worktree to the agent's task message. The agent loads skill bodies on demand via `read_file`. Implemented in `src/skills.ts`. Regex parsing uses `String.match` not `RegExp.exec` to dodge the same security-scan false positive as `Executor.run`.
+- **Comment-based fingerprints excise Gary's own writes**: `humanInputSignature` (Linear) and `prCommentSignature` (GitHub) are computed from non-Gary comment ids. Without this, ANSWER tickets and PR-review tickets would loop because Gary's own response bumps `updatedAt` and shifts the cache. PR review responses are also tracked in `pr_comment_responses` so the signature returns "empty" once Gary has answered every pending comment. See `src/state-fingerprint.ts`.
 
 ## Voice
 
