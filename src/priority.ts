@@ -1,0 +1,76 @@
+import type { AssignedIssue } from "./adapters/linear.ts";
+import type { DerivedState } from "./state-fingerprint.ts";
+
+export type ActionType =
+  | "fix_ci_failure"
+  | "classify"
+  | "start_coding"
+  | "write_answer"
+  | "bounce";
+
+export interface CandidateAction {
+  type: ActionType;
+  priority: number; // lower = higher priority
+  issue: AssignedIssue;
+  state: DerivedState;
+}
+
+export interface PriorityInputs {
+  issue: AssignedIssue;
+  state: DerivedState;
+}
+
+/**
+ * Pick the single best candidate for a ticket given its derived state, or
+ * null if no action applies. Mirrors the table in GARY_SPEC.md §6 with the
+ * Weekend 2 rows omitted.
+ */
+export function pickActionForTicket(
+  inputs: PriorityInputs,
+): CandidateAction | null {
+  const { issue, state } = inputs;
+
+  // 1. fix_ci_failure — Gary has an open PR with CI red
+  if (
+    state.pr &&
+    state.pr.state === "open" &&
+    !state.pr.merged &&
+    state.pr.ciStatus === "red"
+  ) {
+    return { type: "fix_ci_failure", priority: 1, issue, state };
+  }
+
+  // 3. classify — assigned to Gary, no classification yet
+  if (state.classification === null) {
+    return { type: "classify", priority: 3, issue, state };
+  }
+
+  // 4. start_coding — CODE classification, no PR yet
+  if (state.classification.classification === "CODE" && state.pr === null) {
+    return { type: "start_coding", priority: 4, issue, state };
+  }
+
+  // 5. write_answer — ANSWER classification, no comment yet (idempotence
+  //    is handled by the action-cache layer; we always emit the candidate)
+  if (state.classification.classification === "ANSWER") {
+    return { type: "write_answer", priority: 5, issue, state };
+  }
+
+  // 6. bounce — BOUNCE classification, hasn't been bounced yet
+  if (state.classification.classification === "BOUNCE") {
+    return { type: "bounce", priority: 6, issue, state };
+  }
+
+  return null;
+}
+
+/**
+ * Across all tickets, pick the single highest-priority action. Returns null
+ * if there's nothing to do this tick.
+ */
+export function pickHighestPriority(
+  candidates: readonly CandidateAction[],
+): CandidateAction | null {
+  if (candidates.length === 0) return null;
+  return [...candidates].sort((a, b) => a.priority - b.priority)[0] ?? null;
+}
