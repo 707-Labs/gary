@@ -101,8 +101,10 @@ export class LinearAdapter {
    * avoid the N+1 the lazy resolvers in `fetchAssignedIssues` cause.
    */
   async fetchMentionedIssues(): Promise<AssignedIssue[]> {
+    // Linear's filter expects ID! (not String!) for user-id equality —
+    // sending String! gets the GraphQL validator to 400.
     const query = `
-      query MentionedIssues($userId: String!, $first: Int!) {
+      query MentionedIssues($userId: ID!, $first: Int!) {
         issues(
           filter: { subscribers: { id: { eq: $userId } } },
           first: $first

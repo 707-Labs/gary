@@ -203,45 +203,48 @@ describe("computeHumanInputSignature", () => {
 });
 
 describe("computePrCommentSignature", () => {
-  const garyLogin = "gary-707-labs[bot]";
+  const human = (id: number, login = "tanner") => ({
+    id,
+    authorLogin: login,
+    authorType: "User",
+  });
+  const bot = (id: number, login: string) => ({
+    id,
+    authorLogin: login,
+    authorType: "Bot",
+  });
 
   it("returns the empty token when no comments", () => {
     expect(
-      computePrCommentSignature({
-        comments: [],
-        garyLogin,
-        alreadyRespondedIds: [],
-      }),
+      computePrCommentSignature({ comments: [], alreadyRespondedIds: [] }),
     ).toBe(PR_COMMENT_SIGNATURE_EMPTY);
   });
 
-  it("returns the empty token when only Gary's comments are present", () => {
+  it("ignores all bot comments (Gary, linear[bot], dependabot, etc.)", () => {
     expect(
       computePrCommentSignature({
         comments: [
-          { id: 1, authorLogin: garyLogin },
-          { id: 2, authorLogin: garyLogin },
+          bot(1, "gary-707-labs[bot]"),
+          bot(2, "linear[bot]"),
+          bot(3, "dependabot[bot]"),
         ],
-        garyLogin,
         alreadyRespondedIds: [],
       }),
     ).toBe(PR_COMMENT_SIGNATURE_EMPTY);
   });
 
-  it("returns the empty token when all non-Gary comments are already responded", () => {
+  it("returns the empty token when all human comments are already responded", () => {
     expect(
       computePrCommentSignature({
-        comments: [{ id: 10, authorLogin: "tanner" }],
-        garyLogin,
+        comments: [human(10)],
         alreadyRespondedIds: [10],
       }),
     ).toBe(PR_COMMENT_SIGNATURE_EMPTY);
   });
 
-  it("returns a non-empty hash when there's a pending comment", () => {
+  it("returns a non-empty hash when there's a pending human comment", () => {
     const sig = computePrCommentSignature({
-      comments: [{ id: 11, authorLogin: "tanner" }],
-      garyLogin,
+      comments: [human(11)],
       alreadyRespondedIds: [],
     });
     expect(sig).not.toBe(PR_COMMENT_SIGNATURE_EMPTY);
@@ -250,34 +253,27 @@ describe("computePrCommentSignature", () => {
 
   it("changes when a new pending comment arrives", () => {
     const a = computePrCommentSignature({
-      comments: [{ id: 1, authorLogin: "tanner" }],
-      garyLogin,
+      comments: [human(1)],
       alreadyRespondedIds: [],
     });
     const b = computePrCommentSignature({
-      comments: [
-        { id: 1, authorLogin: "tanner" },
-        { id: 2, authorLogin: "tanner" },
-      ],
-      garyLogin,
+      comments: [human(1), human(2)],
       alreadyRespondedIds: [],
     });
     expect(a).not.toBe(b);
   });
 
-  it("is stable across Gary's own comments and pushes", () => {
+  it("is stable across new bot comments (Gary's own responses, linkbacks, etc.)", () => {
     const before = computePrCommentSignature({
-      comments: [{ id: 1, authorLogin: "tanner" }],
-      garyLogin,
+      comments: [human(1)],
       alreadyRespondedIds: [],
     });
     const after = computePrCommentSignature({
       comments: [
-        { id: 1, authorLogin: "tanner" },
-        { id: 2, authorLogin: garyLogin },
-        { id: 3, authorLogin: garyLogin },
+        human(1),
+        bot(2, "gary-707-labs[bot]"),
+        bot(3, "linear[bot]"),
       ],
-      garyLogin,
       alreadyRespondedIds: [],
     });
     expect(before).toBe(after);

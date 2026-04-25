@@ -63,6 +63,12 @@ export interface PullRequestComment {
    */
   kind: "issue" | "review";
   authorLogin: string | null;
+  /**
+   * GitHub user type of the comment author. Used to filter out bot noise
+   * (linear[bot] linkbacks, dependabot, Gary himself) from the pending-
+   * review signature.
+   */
+  authorType: "User" | "Bot" | "Mannequin" | "Organization" | string;
   body: string;
   createdAt: string;
   htmlUrl: string;
@@ -179,7 +185,17 @@ class AppGitHubClient implements GitHubClient {
 
   async getViewer(): Promise<ViewerInfo> {
     const { data } = await this.app.apps.getAuthenticated();
-    return { login: data?.slug ?? this.username, type: "Bot" };
+    // The App's slug ("gary-707-labs") is NOT the login that appears on PR
+    // comments authored by the App's installation token — those use the
+    // bot-suffixed login ("gary-707-labs[bot]"). The pr-review handler
+    // filters Gary's own comments by login, so returning the wrong form
+    // here loops the handler. Fall back to the configured username, which
+    // is already in [bot] form per .env.example.
+    const slug = data?.slug;
+    return {
+      login: slug ? `${slug}[bot]` : this.username,
+      type: "Bot",
+    };
   }
 
   async cloneUrl(owner: string, repo: string): Promise<string> {
@@ -561,6 +577,7 @@ async function getPrCommentsVia(
         id: c.id,
         kind: "issue",
         authorLogin: c.user?.login ?? null,
+        authorType: c.user?.type ?? "User",
         body: c.body ?? "",
         createdAt: c.created_at,
         htmlUrl: c.html_url,
@@ -571,6 +588,7 @@ async function getPrCommentsVia(
         id: c.id,
         kind: "review",
         authorLogin: c.user?.login ?? null,
+        authorType: c.user?.type ?? "User",
         body: c.body ?? "",
         createdAt: c.created_at,
         htmlUrl: c.html_url,

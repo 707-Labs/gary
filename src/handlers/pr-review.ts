@@ -84,12 +84,14 @@ export async function runPrReviewHandler(
 
   // Re-fetch comments at handler time. The loop's signature is best-effort —
   // it's possible a new comment landed between candidate selection and now.
+  // Filter to human authors only — Gary, linear[bot] linkbacks, and other
+  // automation aren't review feedback he should respond to.
   const allComments = await deps.github.getPullRequestComments(
     owner,
     name,
     args.prNumber,
   );
-  const pending = allComments.filter((c) => c.authorLogin !== garyLogin);
+  const pending = allComments.filter((c) => c.authorType === "User");
   if (pending.length === 0) {
     log.info("pr-review: nothing pending after handler-time fetch", {
       issue: args.issue.identifier,

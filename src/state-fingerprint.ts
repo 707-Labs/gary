@@ -103,9 +103,11 @@ export function computeHumanInputSignature(args: {
 }
 
 /**
- * Hash of PR comments that Gary still owes a response to. Filters out
- * Gary's own comments (matched on author login) AND comments Gary has
- * already responded to (tracked in `pr_comment_responses`).
+ * Hash of PR comments that Gary still owes a response to. Filters out:
+ *   - bots (Gary, linear[bot] linkbacks, dependabot, etc.) — Gary only
+ *     responds to humans
+ *   - comments Gary has already responded to (tracked in
+ *     `pr_comment_responses`)
  *
  * Returns the special token "empty" when there's nothing pending — the
  * caller checks against this to decide whether to emit a respond_to_pr_review
@@ -115,13 +117,16 @@ export function computeHumanInputSignature(args: {
 export const PR_COMMENT_SIGNATURE_EMPTY = "empty";
 
 export function computePrCommentSignature(args: {
-  comments: readonly { id: number; authorLogin: string | null }[];
-  garyLogin: string;
+  comments: readonly {
+    id: number;
+    authorLogin: string | null;
+    authorType: string;
+  }[];
   alreadyRespondedIds: readonly number[];
 }): string {
   const responded = new Set(args.alreadyRespondedIds);
   const pending = args.comments
-    .filter((c) => c.authorLogin !== args.garyLogin)
+    .filter((c) => c.authorType === "User")
     .filter((c) => !responded.has(c.id))
     .map((c) => c.id)
     .sort((a, b) => a - b);

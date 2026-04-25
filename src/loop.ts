@@ -78,18 +78,6 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
   const issues = await deps.linear.fetchAssignedIssues();
   recordEvent(deps.db, { eventType: "poll", payload: { count: issues.length } });
 
-  // Cache Gary's GitHub login once per tick so derivePr can filter his own
-  // PR comments out of the pending-review signature.
-  let garyLogin = "";
-  try {
-    const viewer = await deps.github.getViewer();
-    garyLogin = viewer.login;
-  } catch (err) {
-    log.warn("could not fetch GitHub viewer; PR comment filter falls back to empty login", {
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
-
   const candidates: CandidateAction[] = [];
   for (const issue of issues) {
     upsertTicket(deps.db, { linearId: issue.id, identifier: issue.identifier });
@@ -123,7 +111,7 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
       ? { classification: ticketRow.classification }
       : null;
 
-    const pr = await derivePr(deps, issue.id, garyLogin);
+    const pr = await derivePr(deps, issue.id);
 
     // The fingerprint includes a hash of human-only inputs (description +
     // non-Gary comment ids) so that Gary's own comments don't invalidate the
@@ -516,7 +504,6 @@ async function runClassify(
 async function derivePr(
   deps: LoopDeps,
   ticketLinearId: string,
-  garyLogin: string,
 ): Promise<DerivedPrState | null> {
   const row = getPrForTicket(deps.db, ticketLinearId);
   if (!row) return null;
@@ -549,7 +536,6 @@ async function derivePr(
       const respondedIds = getRespondedPrCommentIds(deps.db, row.github_id);
       prCommentSignature = computePrCommentSignature({
         comments,
-        garyLogin,
         alreadyRespondedIds: respondedIds,
       });
     } catch (err) {
