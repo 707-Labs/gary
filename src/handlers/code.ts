@@ -25,6 +25,19 @@ import type { DB } from "../state/db.ts";
 import { recordPr, setTerminalState } from "../state/queries.ts";
 
 const BASE_BRANCH = "main";
+const CHECK_COMMAND = "bun run check";
+const CHECK_TIMEOUT_MS = 10 * 60_000;
+const FIXUP_MAX_ITERATIONS = 15;
+const FIXUP_OUTPUT_BUDGET = 8000;
+
+const CHECK_FIXUP_TASK_INSTRUCTIONS = `Your previous turn ended with finish() but \`${CHECK_COMMAND}\` is failing. Fix the errors caused by your changes, commit, then call finish() again.
+
+Rules:
+- Run \`${CHECK_COMMAND}\` and confirm it exits 0 BEFORE calling finish.
+- Only fix what's broken — don't refactor unrelated code.
+- If the failure is in code you didn't touch, investigate before assuming it's pre-existing. The pre-push hook runs the same command, so anything failing here will block your push.
+- Commit your fix-up changes before calling finish.
+- If you can't make the check pass after a few iterations, call finish() with a one-sentence summary of what's still broken so a human can take over.`;
 
 const CODE_TASK_INSTRUCTIONS = `You are working on a Linear ticket for 707 Labs. Make the smallest change that solves the ticket and stop.
 
@@ -196,6 +209,19 @@ export async function runCodeHandler(
     return { status: "no_changes", branch, summary };
   }
 
+  // Trust-but-verify the check gate. The agent task instructions tell it
+  // to run `bun run check` before finish, but it doesn't always honor that
+  // (see ERT-1645). Re-running here lets us catch the failure and feed it
+  // back to the agent for a fix-up cycle, instead of hitting the pre-push
+  // hook with no recourse.
+  const checkPassed = await ensurePostFinishCheckPasses(deps, args, {
+    executor,
+    system,
+  });
+  if (!checkPassed) {
+    return { status: "agent_failed", branch, summary: loopResult.summary };
+  }
+
   // Open the PR.
   const freshUrlForPush = await deps.github.cloneUrl(owner, name);
   await pushBranch({ worktreePath, freshTokenUrl: freshUrlForPush, branch });
@@ -364,6 +390,105 @@ async function composePrTitle(
     maxTokens: 128,
   });
   return raw.trim().split("\n")[0]?.trim() ?? args.issue.title;
+}
+
+interface FixupContext {
+  executor: LocalExecutor;
+  system: string;
+}
+
+/**
+ * Run `bun run check`. If it fails, feed the failure back to the agent for
+ * one fix-up cycle and re-check. Returns true if the check is clean (either
+ * on the first pass or after fix-up); false if we couldn't recover, in
+ * which case the ticket is already escalated.
+ */
+async function ensurePostFinishCheckPasses(
+  deps: CodeHandlerDeps,
+  args: CodeHandlerArgs,
+  ctx: FixupContext,
+): Promise<boolean> {
+  const first = await ctx.executor.run(CHECK_COMMAND, {
+    timeoutMs: CHECK_TIMEOUT_MS,
+  });
+  if (first.exitCode === 0) return true;
+
+  log.warn("post-finish check failed; running fix-up", {
+    issue: args.issue.identifier,
+    exitCode: first.exitCode,
+    timedOut: first.timedOut,
+  });
+
+  const fixupTask = renderCheckFixupTask(first);
+  const fixupResult = await runAgentLoop({
+    glm: deps.glm,
+    executor: ctx.executor,
+    systemPrompt: ctx.system,
+    task: fixupTask,
+    maxIterations: FIXUP_MAX_ITERATIONS,
+    timeoutMs: deps.agentLoopTimeoutMs,
+    temperature: 0.3,
+    linear: deps.linear,
+    github: deps.github,
+    defaultRepo: args.repo,
+    ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
+  });
+  log.info("fixup loop done", {
+    issue: args.issue.identifier,
+    status: fixupResult.status,
+    iterations: fixupResult.iterations,
+    inputTokens: fixupResult.inputTokens,
+    outputTokens: fixupResult.outputTokens,
+  });
+
+  const second = await ctx.executor.run(CHECK_COMMAND, {
+    timeoutMs: CHECK_TIMEOUT_MS,
+  });
+  if (second.exitCode === 0) return true;
+
+  log.warn("check still failing after fix-up; escalating", {
+    issue: args.issue.identifier,
+  });
+  await postCheckFailureEscalation(deps, args, second);
+  return false;
+}
+
+function renderCheckFixupTask(failed: { stdout: string; stderr: string }): string {
+  const combined = `${failed.stdout}\n${failed.stderr}`.trim();
+  const truncated =
+    combined.length > FIXUP_OUTPUT_BUDGET
+      ? `${combined.slice(0, FIXUP_OUTPUT_BUDGET)}\n... (truncated)`
+      : combined;
+  return `${CHECK_FIXUP_TASK_INSTRUCTIONS}\n\nMost recent \`${CHECK_COMMAND}\` output:\n\n\`\`\`\n${truncated}\n\`\`\``;
+}
+
+async function postCheckFailureEscalation(
+  deps: CodeHandlerDeps,
+  args: CodeHandlerArgs,
+  failed: { stdout: string; stderr: string },
+): Promise<void> {
+  const tail = `${failed.stdout}\n${failed.stderr}`
+    .trim()
+    .split("\n")
+    .slice(-25)
+    .join("\n");
+  const body = [
+    `i thought i was done but \`${CHECK_COMMAND}\` is still failing after a fix-up pass. bouncing — i'd want a human to look before i try again.`,
+    "",
+    "tail of the failure output:",
+    "```",
+    tail,
+    "```",
+  ].join("\n");
+  try {
+    await deps.linear.postComment(args.issue.id, body);
+  } catch (err) {
+    log.warn("could not post check-failure escalation comment", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  await reassignToReporter(deps, args);
+  setTerminalState(deps.db, args.issue.id, "escalated");
 }
 
 async function reassignToReporter(

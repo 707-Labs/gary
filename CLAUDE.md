@@ -57,7 +57,7 @@ bun run scripts/probe-d1.ts              # verify D1 read auth + SELECT-only cla
 - **Fetch refspec**: `ensureBareClone` fetches only `+refs/heads/main:refs/heads/main`. A wildcard refspec fails when any branch is checked out in a worktree.
 - **Linear duplicate attachments**: Linear auto-detects `[TICKET]` in PR bodies and creates an attachment. Our manual `addPrAttachment` then 409s. The handler swallows duplicate errors — see `src/handlers/code.ts`.
 - **bun:sqlite strict mode**: parameters are passed without `$` prefix: `query.run({ key: value })`, not `{ $key: value }`. SQL still uses `$key` style.
-- **Pre-push hook runs `bun run check`** in the Ertai repo. The agent loop must typecheck before calling `finish` or push will fail. See `CODE_TASK_INSTRUCTIONS`.
+- **Pre-push hook runs `bun run check`** in the Ertai repo. `code.ts` re-runs the same command after the agent finishes; if it fails, a fix-up agent loop (15 iter cap) gets the failure output as a new task and tries to recover. If it still fails, Gary escalates with a tail of the check output instead of letting the push hook reject the branch with no recourse. See `ensurePostFinishCheckPasses` in `src/handlers/code.ts`.
 - **GitHub App create form drops permissions**: the create wizard often saves an App with no permissions even when you set them. Set them again on the live Permissions page after creation, then accept the new permissions on the installation.
 - **voice.md is cached at module init** (`src/agent/prompts.ts`). Restart Gary to pick up changes.
 - **Action cache filters by `success = 1`**. Failed actions don't block retry, so a deterministically-broken handler will loop until the circuit breaker (5 attempts in 6h) fires.
