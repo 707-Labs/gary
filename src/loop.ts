@@ -327,7 +327,7 @@ async function dispatch(deps: LoopDeps, action: CandidateAction): Promise<void> 
       );
       return;
     case "answer_mention":
-      await runWriteAnswer(deps, action);
+      await runAnswerMention(deps, action);
       return;
     case "write_answer":
       await runWriteAnswer(deps, action);
@@ -375,6 +375,27 @@ async function runRespondToPrReview(
       branch: prRow.branch,
     },
   );
+}
+
+// Source of truth: voice.md example 17. Keep in sync.
+const ANSWER_MENTION_ACK = `on it — taking a look at the code, back in a min`;
+
+async function runAnswerMention(
+  deps: LoopDeps,
+  action: CandidateAction,
+): Promise<void> {
+  // Post a brief ack so the asker knows Gary saw the @mention. The full
+  // answer follows when the agent loop finishes; the ack closes the
+  // perceived-silence gap while the agent investigates.
+  try {
+    await deps.linear.postComment(action.issue.id, ANSWER_MENTION_ACK);
+  } catch (err) {
+    log.warn("could not post answer_mention ack", {
+      issue: action.issue.identifier,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  await runWriteAnswer(deps, action);
 }
 
 async function runWriteAnswer(
