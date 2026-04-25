@@ -102,6 +102,12 @@ export interface AgentLoopArgs {
   github?: GitHubClient;
   /** Default "owner/repo" for `get_pr` when called without a repo arg. */
   defaultRepo?: string;
+  /**
+   * If set, `finish` is rejected until this exact command runs via run_bash
+   * with exit 0 at least once. Used by the code handler to enforce that
+   * the model verifies its work before claiming done.
+   */
+  finishGateCommand?: string;
 }
 
 const DEFAULT_TEMPERATURE = 0.3;
@@ -150,6 +156,7 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
   if (args.linear) toolsetOpts.linear = args.linear;
   if (args.github) toolsetOpts.github = args.github;
   if (args.defaultRepo) toolsetOpts.defaultRepo = args.defaultRepo;
+  if (args.finishGateCommand) toolsetOpts.finishGateCommand = args.finishGateCommand;
   const tools = makeToolset(args.executor, toolsetOpts);
   const start = Date.now();
   const deadline = start + args.timeoutMs;

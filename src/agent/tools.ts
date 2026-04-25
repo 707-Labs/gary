@@ -17,6 +17,11 @@ export interface AgentTools {
   handlers: Record<string, ToolHandler>;
   /** Set when the agent calls finish. */
   finishSummary: string | null;
+  /**
+   * Flipped to true once a run_bash invocation of `finishGateCommand`
+   * exits with code 0. Read by `finish` to gate completion.
+   */
+  finishGateMet: boolean;
 }
 
 export interface ToolsetOptions {
@@ -28,6 +33,12 @@ export interface ToolsetOptions {
   github?: GitHubClient;
   /** "owner/repo" used as the default for github tools when omitted. */
   defaultRepo?: string;
+  /**
+   * If set, `finish` is rejected until `run_bash` executes this exact
+   * command with exit code 0 at least once. Used by the code handler to
+   * stop the model from finishing without verifying its work.
+   */
+  finishGateCommand?: string;
 }
 
 /** Builds the toolset bound to an Executor. The agent loop drives this. */
@@ -36,6 +47,7 @@ export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): Agen
     definitions: [],
     handlers: {},
     finishSummary: null,
+    finishGateMet: false,
   };
 
   const register = (handler: ToolHandler): void => {
@@ -48,7 +60,7 @@ export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): Agen
   register(editFileTool(executor));
   register(grepTool(executor));
   register(listFilesTool(executor));
-  register(runBashTool(executor));
+  register(runBashTool(executor, out, opts.finishGateCommand));
   register(commitTool(executor));
   register(fetchUrlTool());
   if (opts.linear) {
@@ -62,7 +74,7 @@ export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): Agen
     register(listCloudflareInvocationsTool(opts.cloudflare));
     register(d1QueryTool(opts.cloudflare));
   }
-  register(finishTool(out));
+  register(finishTool(out, opts.finishGateCommand));
 
   return out;
 }
@@ -237,7 +249,11 @@ const runBashSchema = z.object({
   command: z.string().min(1),
   timeout_seconds: z.number().int().positive().optional(),
 });
-function runBashTool(executor: Executor): ToolHandler {
+function runBashTool(
+  executor: Executor,
+  tools: AgentTools,
+  finishGateCommand: string | undefined,
+): ToolHandler {
   return {
     definition: {
       name: "run_bash",
@@ -262,6 +278,13 @@ function runBashTool(executor: Executor): ToolHandler {
         : {};
       try {
         const r = await executor.run(args.command, opts);
+        if (
+          finishGateCommand &&
+          args.command.trim() === finishGateCommand &&
+          r.exitCode === 0
+        ) {
+          tools.finishGateMet = true;
+        }
         const parts = [
           `exit_code: ${r.exitCode}${r.timedOut ? " (timed out)" : ""}`,
         ];
@@ -309,12 +332,17 @@ function commitTool(executor: Executor): ToolHandler {
 }
 
 const finishSchema = z.object({ summary: z.string().min(1) });
-function finishTool(out: AgentTools): ToolHandler {
+function finishTool(
+  out: AgentTools,
+  finishGateCommand: string | undefined,
+): ToolHandler {
+  const description = finishGateCommand
+    ? `Signal you're done. Provide a one-sentence summary of what you did. Reject reason if rejected: \`${finishGateCommand}\` must have run with exit 0 in this conversation before finish is accepted. After acceptance, the loop exits.`
+    : "Signal you're done. Provide a one-sentence summary of what you did. After calling this, the loop exits.";
   return {
     definition: {
       name: "finish",
-      description:
-        "Signal you're done. Provide a one-sentence summary of what you did. After calling this, the loop exits.",
+      description,
       input_schema: {
         type: "object",
         properties: { summary: { type: "string" } },
@@ -323,6 +351,9 @@ function finishTool(out: AgentTools): ToolHandler {
     },
     async run(input) {
       const { summary } = finishSchema.parse(input);
+      if (finishGateCommand && !out.finishGateMet) {
+        return `error: cannot finish — \`${finishGateCommand}\` hasn't passed in this conversation. run it first; if it fails, fix the errors and re-run; once it exits 0, call finish() again.`;
+      }
       out.finishSummary = summary;
       return "finished";
     },

@@ -233,6 +233,7 @@ export async function runCodeHandler(
     linear: deps.linear,
     github: deps.github,
     defaultRepo: args.repo,
+    finishGateCommand: CHECK_COMMAND,
     ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
   });
 
@@ -496,6 +497,7 @@ async function ensurePostFinishCheckPasses(
     linear: deps.linear,
     github: deps.github,
     defaultRepo: args.repo,
+    finishGateCommand: CHECK_COMMAND,
     ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
   });
   log.info("fixup loop done", {
