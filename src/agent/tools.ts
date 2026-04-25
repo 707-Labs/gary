@@ -22,6 +22,14 @@ export interface AgentTools {
    * exits with code 0. Read by `finish` to gate completion.
    */
   finishGateMet: boolean;
+  /**
+   * Paths the model has already read in this conversation. `read_file`
+   * short-circuits duplicate reads to a pointer; `write_file` / `edit_file`
+   * remove the path so the next read returns fresh content. `run_bash` is
+   * NOT tracked — the model is responsible for re-reading after running
+   * codegen-style commands.
+   */
+  readCache: Set<string>;
 }
 
 export interface ToolsetOptions {
@@ -48,6 +56,7 @@ export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): Agen
     handlers: {},
     finishSummary: null,
     finishGateMet: false,
+    readCache: new Set<string>(),
   };
 
   const register = (handler: ToolHandler): void => {
@@ -55,9 +64,9 @@ export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): Agen
     out.handlers[handler.definition.name] = handler;
   };
 
-  register(readFileTool(executor));
-  register(writeFileTool(executor));
-  register(editFileTool(executor));
+  register(readFileTool(executor, out));
+  register(writeFileTool(executor, out));
+  register(editFileTool(executor, out));
   register(grepTool(executor));
   register(listFilesTool(executor));
   register(runBashTool(executor, out, opts.finishGateCommand));
@@ -80,11 +89,12 @@ export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): Agen
 }
 
 const readFileSchema = z.object({ path: z.string().min(1) });
-function readFileTool(executor: Executor): ToolHandler {
+function readFileTool(executor: Executor, tools: AgentTools): ToolHandler {
   return {
     definition: {
       name: "read_file",
-      description: "Read the contents of a file in the workspace.",
+      description:
+        "Read the contents of a file in the workspace. Repeat reads of the same path return a short pointer instead of the contents — refer to your earlier tool_result. Modifying the file via write_file/edit_file invalidates this and the next read returns fresh content.",
       input_schema: {
         type: "object",
         properties: { path: { type: "string", description: "Path relative to the workspace root." } },
@@ -93,8 +103,13 @@ function readFileTool(executor: Executor): ToolHandler {
     },
     async run(input) {
       const { path } = readFileSchema.parse(input);
+      if (tools.readCache.has(path)) {
+        return `(already read \`${path}\` earlier in this conversation; refer to your prior tool_result. write_file/edit_file on this path invalidates the cache and a fresh read returns updated content.)`;
+      }
       try {
-        return await executor.readFile(path);
+        const content = await executor.readFile(path);
+        tools.readCache.add(path);
+        return content;
       } catch (err) {
         return formatError("read_file", err);
       }
@@ -106,7 +121,7 @@ const writeFileSchema = z.object({
   path: z.string().min(1),
   content: z.string(),
 });
-function writeFileTool(executor: Executor): ToolHandler {
+function writeFileTool(executor: Executor, tools: AgentTools): ToolHandler {
   return {
     definition: {
       name: "write_file",
@@ -125,6 +140,7 @@ function writeFileTool(executor: Executor): ToolHandler {
       const { path, content } = writeFileSchema.parse(input);
       try {
         await executor.writeFile(path, content);
+        tools.readCache.delete(path);
         return `wrote ${path} (${content.length} bytes)`;
       } catch (err) {
         return formatError("write_file", err);
@@ -138,7 +154,7 @@ const editFileSchema = z.object({
   old_string: z.string().min(1),
   new_string: z.string(),
 });
-function editFileTool(executor: Executor): ToolHandler {
+function editFileTool(executor: Executor, tools: AgentTools): ToolHandler {
   return {
     definition: {
       name: "edit_file",
@@ -167,6 +183,7 @@ function editFileTool(executor: Executor): ToolHandler {
         }
         const updated = content.replace(old_string, new_string);
         await executor.writeFile(path, updated);
+        tools.readCache.delete(path);
         return `edited ${path}`;
       } catch (err) {
         return formatError("edit_file", err);
