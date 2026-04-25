@@ -8,7 +8,9 @@
     "start": "bun run src/index.ts",
     "dev": "bun run --watch src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "deploy": "ssh mini 'bash -lc ~/Developer/gary/scripts/deploy-mini.sh'",
+    "logs": "ssh mini 'tail -f ~/Library/Logs/gary/stdout.log'"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",
