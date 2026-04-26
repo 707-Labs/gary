@@ -12,7 +12,6 @@ export type EscalationReason =
   | "no_finish"
   | "agent_error"
   | "max_ci_attempts"
-  | "scope_too_big"
   | "unknown";
 
 const DEFAULT_MESSAGES: Record<EscalationReason, string> = {
@@ -30,8 +29,6 @@ const DEFAULT_MESSAGES: Record<EscalationReason, string> = {
     "ran into an error i couldn't recover from. bouncing back to you.",
   max_ci_attempts:
     "ci has failed too many times in a row and i'm going in circles. bouncing for now so i don't waste more cycles.",
-  scope_too_big:
-    "this is bigger than i thought when i picked it up. bouncing — i'd want a human to decide on the approach before i keep going.",
   unknown: "something went wrong. bouncing back.",
 };
 

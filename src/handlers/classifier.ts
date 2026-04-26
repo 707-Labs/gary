@@ -31,9 +31,10 @@ Definitions:
 Scope:
 - S: a few lines or one file, ~30 min.
 - M: a few files, < 2 hours, no architectural decisions.
-- L: bigger than M, OR you're not sure how big it is. If it's L, prefer BOUNCE unless the ask is unambiguous.
+- L: bigger than M — multi-file refactors, large surface area, or work that may want a stacked PR series. L is fine if the logic is well-defined; size alone is not a reason to BOUNCE.
 
 Honesty rules:
+- BOUNCE for design ambiguity, missing context, or genuine inability to scope — not for size.
 - If confidence is below 0.5, prefer BOUNCE.
 - If the ticket is too vague to classify, BOUNCE with reasoning explaining what's missing.
 - Don't roleplay being "really good." Be calibrated.
@@ -107,7 +108,6 @@ function renderTicket(
  */
 export type ClassifyOutcome =
   | { kind: "low_confidence" }
-  | { kind: "scope_too_big" }
   | { kind: "proceed" };
 
 export function decideClassifyOutcome(
@@ -116,12 +116,6 @@ export function decideClassifyOutcome(
 ): ClassifyOutcome {
   const floor = opts.confidenceFloor ?? 0.5;
   if (c.confidence < floor) return { kind: "low_confidence" };
-  // The classifier prompt asks the model to prefer BOUNCE on L, but it
-  // doesn't always listen — see ERT-1648 (617k input tokens spent before
-  // hitting the iteration cap). Auto-bounce CODE/L tickets here.
-  if (c.classification === "CODE" && c.scope === "L") {
-    return { kind: "scope_too_big" };
-  }
   return { kind: "proceed" };
 }
 

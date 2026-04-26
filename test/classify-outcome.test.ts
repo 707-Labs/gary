@@ -26,13 +26,11 @@ describe("decideClassifyOutcome", () => {
     ).toBe("low_confidence");
   });
 
-  it("auto-bounces CODE/L even with high confidence", () => {
-    expect(decideClassifyOutcome({ ...base, scope: "L" }).kind).toBe(
-      "scope_too_big",
-    );
+  it("proceeds for high-confidence CODE/L (size alone is no longer auto-bounced)", () => {
+    expect(decideClassifyOutcome({ ...base, scope: "L" }).kind).toBe("proceed");
   });
 
-  it("does NOT auto-bounce ANSWER/L (the L heuristic is for code work)", () => {
+  it("proceeds for high-confidence ANSWER/L", () => {
     expect(
       decideClassifyOutcome({
         ...base,
@@ -42,17 +40,7 @@ describe("decideClassifyOutcome", () => {
     ).toBe("proceed");
   });
 
-  it("does NOT auto-bounce BOUNCE/L (the bounce path runs the bounce handler anyway)", () => {
-    expect(
-      decideClassifyOutcome({
-        ...base,
-        classification: "BOUNCE",
-        scope: "L",
-      }).kind,
-    ).toBe("proceed");
-  });
-
-  it("low_confidence takes precedence over scope_too_big", () => {
+  it("low_confidence still wins regardless of scope", () => {
     expect(
       decideClassifyOutcome({ ...base, confidence: 0.3, scope: "L" }).kind,
     ).toBe("low_confidence");

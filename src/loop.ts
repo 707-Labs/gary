@@ -751,22 +751,6 @@ async function runClassify(
     );
     return;
   }
-  if (outcome.kind === "scope_too_big") {
-    log.info("scope=L on CODE; auto-bouncing", {
-      issue: issue.identifier,
-      confidence: classification.confidence,
-    });
-    await escalate(
-      { db: deps.db, linear: deps.linear },
-      {
-        issue,
-        reason: "scope_too_big",
-        customBody: `${classification.reasoning.trim()}\n\nbouncing — this is bigger than i should take on without a clearer scope. happy to pick it up if it gets chunked into smaller pieces.`,
-      },
-    );
-    return;
-  }
-
   // Pickup acknowledgement: move to In Progress on first classification.
   try {
     await deps.linear.moveToInProgress(issue.id);
