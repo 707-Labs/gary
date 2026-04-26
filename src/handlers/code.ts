@@ -109,9 +109,11 @@ Rules:
 - Don't install new dependencies unless the ticket clearly requires it.
 - Commit your changes before calling finish.`;
 
-export const PR_BODY_TASK_INSTRUCTIONS = `Write a PR title and body for the changes you just made. Use voice.md examples 5 (small, confident) and 6 (medium, with uncertainty) as your structural template — match that exact format. Pick the level of detail based on the size and certainty of this change.
+export const PR_BODY_TASK_INSTRUCTIONS = `Write a PR body for the changes you just made. Use voice.md examples 5 (small, confident) and 6 (medium, with uncertainty) as your structural template — match that exact format. Pick the level of detail based on the size and certainty of this change.
 
 Output ONLY the PR body markdown. Do not output the title — the title is generated separately. Do not output any preamble like "Here is the PR body".
+
+The Summary describes what the diff actually does, not what you originally planned. The diff is the source of truth. If your finish summary, the ticket title, or your initial framing doesn't match what the diff actually changed, trust the diff and describe what landed. Open the file list if you have to — every section in the body should be defensible by pointing at a hunk.
 
 Required sections, in order:
 1. \`## Summary\` — 1-3 short paragraphs and/or bullets explaining what changed and why. Lead with the most important change.
