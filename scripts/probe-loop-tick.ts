@@ -30,7 +30,7 @@ const result = await tick({
   github,
   glm,
   cloudflare,
-  allowedRepos: cfg.gary.allowedRepos,
+  repoMap: cfg.gary.repoMap,
   allowlistedMentionUserIds: cfg.gary.allowlistedMentionUserIds,
   reposDir: cfg.gary.reposDir,
   workspacesDir: cfg.gary.workspacesDir,

@@ -27,7 +27,11 @@ console.log("installation token acquired");
 console.log("permissions:", installation.permissions);
 console.log("repositorySelection:", installation.repositorySelection);
 
-const target = gary.allowedRepos[0]!;
+if (gary.repoMap.size === 0) {
+  console.error("No GARY_REPO_MAP configured");
+  process.exit(1);
+}
+const target = [...gary.repoMap.values()][0]!;
 const headers = {
   Authorization: `Bearer ${installation.token}`,
   Accept: "application/vnd.github+json",

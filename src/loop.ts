@@ -59,7 +59,7 @@ export interface LoopDeps {
   github: GitHubClient;
   glm: GLMClient;
   cloudflare: CloudflareClient | null;
-  allowedRepos: readonly string[];
+  repoMap: ReadonlyMap<string, string>;
   /**
    * Linear user ids permitted to summon Gary via @mention. Empty array
    * disables the @mention pipeline.
@@ -615,8 +615,14 @@ async function runWriteAnswer(
   action: CandidateAction,
 ): Promise<void> {
   const issue = action.issue;
-  const repo = deps.allowedRepos[0];
-  if (!repo) throw new Error("no allowed repos configured");
+  const repo = deps.repoMap.get(issue.teamKey);
+  if (!repo) {
+    log.info("skipping answer: no repo mapping for team", {
+      issue: issue.identifier,
+      teamKey: issue.teamKey,
+    });
+    return;
+  }
   const comments = await deps.linear.fetchComments(issue.id);
   await runAnswerHandler(
     {
@@ -675,20 +681,13 @@ async function runStartCoding(
   action: CandidateAction,
 ): Promise<void> {
   const issue = action.issue;
-  if (!deps.allowedRepos.includes(`${issue.teamKey === "ERT" ? "707-Labs/ertai" : ""}`)) {
-    // Weekend 1 only handles Ertai. Map team → repo. If the team isn't
-    // mapped, escalate.
-    if (deps.allowedRepos.length === 1 && deps.allowedRepos[0]) {
-      // Single allowed repo — assume that's the target.
-    } else {
-      throw new Error(
-        `cannot map team ${issue.teamKey} to a repo; allowed repos: ${deps.allowedRepos.join(", ")}`,
-      );
-    }
-  }
-  const repo = deps.allowedRepos[0];
+  const repo = deps.repoMap.get(issue.teamKey);
   if (!repo) {
-    throw new Error("no allowed repos configured");
+    log.info("skipping ticket: no repo mapping for team", {
+      issue: issue.identifier,
+      teamKey: issue.teamKey,
+    });
+    return;
   }
   const comments = await deps.linear.fetchComments(issue.id);
   const scope = action.state.classification?.scope ?? "M";
@@ -791,7 +790,8 @@ async function derivePr(
 ): Promise<DerivedPrState | null> {
   const row = getPrForTicket(deps.db, ticketLinearId);
   if (!row) return null;
-  if (!deps.allowedRepos.includes(row.repo)) return null;
+  const mappedRepos = new Set(deps.repoMap.values());
+  if (!mappedRepos.has(row.repo)) return null;
   const [owner, name] = row.repo.split("/") as [string, string];
   let pr: PullRequestRef;
   try {

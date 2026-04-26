@@ -34,7 +34,7 @@ async function main(): Promise<void> {
     providers: chain.providers.map((p) => `${p.name}:${p.model}`),
     cloudflare: cloudflare ? cfg.cloudflare?.observabilityWorkers : "disabled",
     pollIntervalMs: cfg.runtime.pollIntervalMs,
-    allowedRepos: cfg.gary.allowedRepos,
+    repoMap: Object.fromEntries(cfg.gary.repoMap),
     mentionAllowlistSize: cfg.gary.allowlistedMentionUserIds.length,
   });
 
@@ -52,7 +52,7 @@ async function main(): Promise<void> {
     github,
     glm,
     cloudflare,
-    allowedRepos: cfg.gary.allowedRepos,
+    repoMap: cfg.gary.repoMap,
     allowlistedMentionUserIds: cfg.gary.allowlistedMentionUserIds,
     reposDir: cfg.gary.reposDir,
     workspacesDir: cfg.gary.workspacesDir,

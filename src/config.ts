@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { z } from "zod";
 import {
   createProvider,
   createProviderChain,
@@ -35,10 +34,41 @@ const intFromEnv = (key: string, fallback: number): number => {
   return n;
 };
 
-const reposSchema = z
-  .string()
-  .transform((s) => s.split(",").map((r) => r.trim()).filter(Boolean))
-  .pipe(z.array(z.string().regex(/^[^/]+\/[^/]+$/, "must be owner/repo")));
+const REPO_SHAPE = /^[^/]+\/[^/]+$/;
+
+export function parseRepoMap(raw: string): ReadonlyMap<string, string> {
+  const map = new Map<string, string>();
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return map;
+  for (const entry of trimmed.split(",")) {
+    const cleaned = entry.trim();
+    if (cleaned.length === 0) continue;
+    const colonAt = cleaned.indexOf(":");
+    if (colonAt < 0) {
+      throw new Error(
+        `GARY_REPO_MAP entry "${cleaned}" expected "<TEAM_KEY>:<owner>/<repo>"`,
+      );
+    }
+    const teamKey = cleaned.slice(0, colonAt).trim();
+    const repo = cleaned.slice(colonAt + 1).trim();
+    if (teamKey.length === 0) {
+      throw new Error(`GARY_REPO_MAP entry "${cleaned}" has empty team key`);
+    }
+    if (repo.length === 0) {
+      throw new Error(`GARY_REPO_MAP entry "${cleaned}" has empty repo`);
+    }
+    if (!REPO_SHAPE.test(repo)) {
+      throw new Error(
+        `GARY_REPO_MAP entry "${cleaned}" repo must be owner/repo, got "${repo}"`,
+      );
+    }
+    if (map.has(teamKey)) {
+      throw new Error(`GARY_REPO_MAP duplicate team key "${teamKey}"`);
+    }
+    map.set(teamKey, repo);
+  }
+  return map;
+}
 
 export interface GaryConfig {
   name: string;
@@ -48,7 +78,8 @@ export interface GaryConfig {
   reposDir: string;
   workspacesDir: string;
   dbPath: string;
-  allowedRepos: readonly string[];
+  /** Linear team key → "owner/repo". Empty map disables the coding pipeline. */
+  repoMap: ReadonlyMap<string, string>;
   /**
    * Linear user ids permitted to summon Gary via @mention on tickets he's
    * not assigned to. Empty list disables the @mention pipeline entirely.
@@ -129,8 +160,8 @@ export function loadGaryConfig(): GaryConfig {
   );
   const dbPath = resolve(stateDir, "gary.db");
 
-  const allowedRepos = reposSchema.parse(
-    stringFromEnv("GARY_ALLOWED_REPOS", "707-Labs/ertai"),
+  const repoMap = parseRepoMap(
+    stringFromEnv("GARY_REPO_MAP", "ERT:707-Labs/ertai"),
   );
 
   const allowlistRaw = optionalString("GARY_ALLOWLISTED_MENTION_USER_IDS");
@@ -146,7 +177,7 @@ export function loadGaryConfig(): GaryConfig {
     reposDir,
     workspacesDir,
     dbPath,
-    allowedRepos,
+    repoMap,
     allowlistedMentionUserIds,
   };
 }

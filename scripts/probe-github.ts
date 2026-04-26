@@ -10,12 +10,12 @@ import { loadGaryConfig, loadGitHubConfig } from "../src/config.ts";
 const gary = loadGaryConfig();
 const github = loadGitHubConfig();
 
-if (gary.allowedRepos.length === 0) {
-  console.error("no allowed repos configured");
+if (gary.repoMap.size === 0) {
+  console.error("No GARY_REPO_MAP configured");
   process.exit(1);
 }
 
-const target = gary.allowedRepos[0]!;
+const target = [...gary.repoMap.values()][0]!;
 const [owner, repo] = target.split("/") as [string, string];
 
 console.log(`auth kind: ${github.kind}`);

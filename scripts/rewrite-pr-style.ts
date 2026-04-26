@@ -25,7 +25,7 @@ if (!prNumber) {
 }
 
 const gary = loadGaryConfig();
-const repo = gary.allowedRepos[0];
+const repo = [...gary.repoMap.values()][0];
 if (!repo) throw new Error("no allowed repos");
 
 // Pull existing PR data to get the head branch.
