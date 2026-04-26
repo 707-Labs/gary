@@ -28,6 +28,18 @@ describe("parseRepoMap", () => {
     expect(parseRepoMap("").size).toBe(0);
   });
 
+  it("returns an empty map for whitespace-only input", () => {
+    expect(parseRepoMap("   ").size).toBe(0);
+    expect(parseRepoMap("\n\t  ").size).toBe(0);
+  });
+
+  it("ignores empty segments from leading/trailing/consecutive commas", () => {
+    const map = parseRepoMap(",ERT:707-Labs/ertai,,GREEN:707-Labs/green-ledger,");
+    expect(map.size).toBe(2);
+    expect(map.get("ERT")).toBe("707-Labs/ertai");
+    expect(map.get("GREEN")).toBe("707-Labs/green-ledger");
+  });
+
   it("rejects duplicate team keys", () => {
     expect(() =>
       parseRepoMap("ERT:707-Labs/ertai,ERT:707-Labs/other"),

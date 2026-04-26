@@ -112,6 +112,10 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
   const issues = await deps.linear.fetchAssignedIssues();
   recordEvent(deps.db, { eventType: "poll", payload: { count: issues.length } });
 
+  // Hoisted once per tick so derivePr can do an O(1) membership check
+  // without rebuilding the set per PR.
+  const mappedRepos = new Set(deps.repoMap.values());
+
   const candidates: CandidateAction[] = [];
   for (const issue of issues) {
     upsertTicket(deps.db, { linearId: issue.id, identifier: issue.identifier });
@@ -156,7 +160,7 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
         }
       : null;
 
-    const pr = await derivePr(deps, issue.id);
+    const pr = await derivePr(deps, issue.id, mappedRepos);
 
     // The fingerprint includes a hash of human-only inputs (description +
     // non-Gary comment ids) so that Gary's own comments don't invalidate the
@@ -787,10 +791,10 @@ async function runClassify(
 async function derivePr(
   deps: LoopDeps,
   ticketLinearId: string,
+  mappedRepos: ReadonlySet<string>,
 ): Promise<DerivedPrState | null> {
   const row = getPrForTicket(deps.db, ticketLinearId);
   if (!row) return null;
-  const mappedRepos = new Set(deps.repoMap.values());
   if (!mappedRepos.has(row.repo)) return null;
   const [owner, name] = row.repo.split("/") as [string, string];
   let pr: PullRequestRef;
