@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import { dirname } from "node:path";
+import { redactGitHubTokens } from "./redact.ts";
 
 export interface GitResult {
   stdout: string;
@@ -74,9 +75,11 @@ export async function gitMust(
 ): Promise<GitResult> {
   const r = await gitRun(args, opts);
   if (r.exitCode !== 0) {
-    throw new Error(
-      `git ${args.join(" ")} failed (exit ${r.exitCode}): ${r.stderr || r.stdout}`,
-    );
+    // Redact token URLs from both argv (we pass them on the command line)
+    // and git's own stderr (it sometimes echoes the URL on push errors).
+    const cmd = redactGitHubTokens(args.join(" "));
+    const out = redactGitHubTokens(r.stderr || r.stdout);
+    throw new Error(`git ${cmd} failed (exit ${r.exitCode}): ${out}`);
   }
   return r;
 }

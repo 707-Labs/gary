@@ -1,3 +1,5 @@
+import { redactValue } from "./redact.ts";
+
 type Level = "debug" | "info" | "warn" | "error";
 
 const LEVELS: Record<Level, number> = {
@@ -12,12 +14,12 @@ const threshold = LEVELS[envLevel] ?? LEVELS.info;
 
 function emit(level: Level, msg: string, fields?: Record<string, unknown>): void {
   if (LEVELS[level] < threshold) return;
-  const record = {
+  const record = redactValue({
     ts: new Date().toISOString(),
     level,
     msg,
     ...fields,
-  };
+  });
   const stream = level === "error" || level === "warn" ? process.stderr : process.stdout;
   stream.write(JSON.stringify(record) + "\n");
 }
