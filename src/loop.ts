@@ -621,10 +621,14 @@ async function runWriteAnswer(
   const issue = action.issue;
   const repo = deps.repoMap.get(issue.teamKey);
   if (!repo) {
-    log.info("skipping answer: no repo mapping for team", {
+    log.warn("no repo mapping for team; bouncing answer", {
       issue: issue.identifier,
       teamKey: issue.teamKey,
     });
+    await escalate(
+      { db: deps.db, linear: deps.linear },
+      { issue, reason: "unmapped_team" },
+    );
     return;
   }
   const comments = await deps.linear.fetchComments(issue.id);
@@ -687,10 +691,14 @@ async function runStartCoding(
   const issue = action.issue;
   const repo = deps.repoMap.get(issue.teamKey);
   if (!repo) {
-    log.info("skipping ticket: no repo mapping for team", {
+    log.warn("no repo mapping for team; bouncing ticket", {
       issue: issue.identifier,
       teamKey: issue.teamKey,
     });
+    await escalate(
+      { db: deps.db, linear: deps.linear },
+      { issue, reason: "unmapped_team" },
+    );
     return;
   }
   const comments = await deps.linear.fetchComments(issue.id);
