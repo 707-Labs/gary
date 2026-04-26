@@ -12,6 +12,7 @@ export type EscalationReason =
   | "no_finish"
   | "agent_error"
   | "max_ci_attempts"
+  | "unmapped_team"
   | "unknown";
 
 const DEFAULT_MESSAGES: Record<EscalationReason, string> = {
@@ -29,6 +30,8 @@ const DEFAULT_MESSAGES: Record<EscalationReason, string> = {
     "ran into an error i couldn't recover from. bouncing back to you.",
   max_ci_attempts:
     "ci has failed too many times in a row and i'm going in circles. bouncing for now so i don't waste more cycles.",
+  unmapped_team:
+    "i'm not wired up for this team's repo yet — bouncing back. ask tanner to add the team to GARY_REPO_MAP if you want me handling these.",
   unknown: "something went wrong. bouncing back.",
 };
 
