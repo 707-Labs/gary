@@ -1,9 +1,10 @@
 # CLAUDE.md
 
 Gary is a single Bun process that polls Linear every 60s, classifies tickets
-assigned to him, opens PRs against `707-Labs/ertai`, and self-fixes CI
-failures. Source of truth is Linear + GitHub; SQLite (`~/.gary/state/gary.db`)
-is operational state and is safe to wipe.
+assigned to him, opens PRs against the matching `707-Labs` repository
+(team key → repo via `GARY_REPO_MAP`), and self-fixes CI failures. Source
+of truth is Linear + GitHub; SQLite (`~/.gary/state/gary.db`) is operational
+state and is safe to wipe.
 
 See `GARY_SPEC.md` for the full architecture and `voice.md` for personality.
 
@@ -47,7 +48,7 @@ bun run scripts/probe-d1.ts              # verify D1 read auth + SELECT-only cla
 
 ## Environment
 
-`.env` required keys: `LINEAR_API_KEY`, `GARY_LINEAR_USER_ID`, `LINEAR_TEAM_ID`, `LINEAR_IN_PROGRESS_STATE_ID`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_PATH` (or inline `GITHUB_APP_PRIVATE_KEY`), `GITHUB_APP_INSTALLATION_ID`, `Z_AI_API_KEY`. Optional fallback providers: `KIMI_API_KEY` (Kimi Code, defaults to `https://api.kimi.com/coding` + `kimi-for-coding`), `DEEPSEEK_API_KEY` (defaults to `https://api.deepseek.com/anthropic` + `deepseek-v4-pro`). Optional: `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` to enable Workers Observability tools (`query_cloudflare_logs`, `list_cloudflare_invocations`) inside the agent loop. `GARY_ALLOWLISTED_MENTION_USER_IDS` (comma-separated Linear user ids) opts into the @mention pipeline — empty (default) disables it. See `.env.example`.
+`.env` required keys: `LINEAR_API_KEY`, `GARY_LINEAR_USER_ID`, `LINEAR_TEAM_ID`, `LINEAR_IN_PROGRESS_STATE_ID`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_PATH` (or inline `GITHUB_APP_PRIVATE_KEY`), `GITHUB_APP_INSTALLATION_ID`, `Z_AI_API_KEY`, `GARY_REPO_MAP`. Optional fallback providers: `KIMI_API_KEY` (Kimi Code, defaults to `https://api.kimi.com/coding` + `kimi-for-coding`), `DEEPSEEK_API_KEY` (defaults to `https://api.deepseek.com/anthropic` + `deepseek-v4-pro`). Optional: `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` to enable Workers Observability tools (`query_cloudflare_logs`, `list_cloudflare_invocations`) inside the agent loop. `GARY_ALLOWLISTED_MENTION_USER_IDS` (comma-separated Linear user ids) opts into the @mention pipeline — empty (default) disables it. See `.env.example`.
 
 `src/config.ts` exposes per-subsystem loaders (`loadLinearConfig`, `loadGitHubConfig`, `loadCloudflareConfig`, etc.) so probes can load only what they need. `loadCloudflareConfig` returns `null` when the token isn't set — Gary runs fine without it, just without log access.
 
@@ -93,7 +94,7 @@ Auth on the mini is a read-only deploy key (`mini-deploy` on `707-Labs/gary`) us
 - No `DockerExecutor` (interface exists, implementation is a stub)
 - No webhook receivers — polling is fine
 - No automatic merging of Gary's own PRs (architectural, not deferred)
-- No multi-repo support
+- ~~No multi-repo support~~ — implemented 2026-04-25 via `GARY_REPO_MAP` (ERT/BIRD/GREEN under the 707-Labs org)
 
 If you're about to build any of these, stop and flag to Tanner.
 

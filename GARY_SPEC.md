@@ -30,7 +30,7 @@ The demo flow in §15 is the contract. If that demo runs cleanly, Weekend 1 is d
 
 - **Docker/VM sandboxing.** The `Executor` interface exists in Weekend 1 (so tools are written against it), but only `LocalExecutor` is implemented. Gary runs in a git worktree on the Mac mini with normal shell access. `DockerExecutor` is Weekend 2.
 - **User report triage.** Gary only handles tickets assigned to him. No inbox scanning, no customer feedback classification.
-- **Multi-repo support.** Weekend 1 is Ertai (the Mulligan Labs deckbuilder repo) only.
+- ~~**Multi-repo support.** Weekend 1 is Ertai (the Mulligan Labs deckbuilder repo) only.~~ Implemented 2026-04-25 via `GARY_REPO_MAP` (Linear team key → owner/repo). Now covers `ERT` (ertai), `BIRD` (birdup), and `GREEN` (green-ledger).
 - **VPS deployment.** Design for portability but ship on the Mac mini.
 - **Review comment response.** Weekend 1 handles CI failures. Responding to human review comments is Weekend 2.
 - **Sophisticated scope estimation.** Gary tries, and bails (escalates) if he fails repeatedly. No upfront "this ticket is too big" detection.
@@ -551,8 +551,8 @@ GARY_STATE_DIR=~/.gary/state
 GARY_REPOS_DIR=~/.gary/repos
 GARY_WORKSPACES_DIR=~/.gary/workspaces
 
-# Repos (Weekend 1: just Ertai)
-GARY_ALLOWED_REPOS=707-labs/ertai
+# Repo map: <TEAM_KEY>:<owner>/<repo>, comma-separated
+GARY_REPO_MAP=ERT:707-Labs/ertai,GREEN:707-Labs/green-ledger,BIRD:707-Labs/birdup
 ```
 
 ### Secrets
@@ -700,7 +700,7 @@ If all 9 steps happen without manual intervention beyond what's listed, Weekend 
 - Review comment response (humans)
 - Review comment response (bots — Gemini reviewer integration)
 - User report triage
-- Multi-repo support
+- ~~Multi-repo support~~ (done 2026-04-25)
 - Webhook receivers for Linear or GitHub (polling is fine)
 - ~~Rebase-on-main automation~~ — flipped 2026-04-25; Gary now rebases his branch onto fresh `main` between post-finish check and push (`rebaseOntoFreshBase` in `src/git.ts`). Conflict aborts cleanly; broken post-rebase check reverts via `git reset --hard`.
 - ~~Stale PR nudging~~ — flipped 2026-04-25; priority-7 `nudge_reviewer` action fires once per stable PR state when CI is green, no review comments are pending, and the PR has been open longer than `STALE_PR_HOURS` (default 72). Comment goes on the Linear ticket addressed to the reporter (voice.md example 14). Action-cache idempotence handles "nudge once".
