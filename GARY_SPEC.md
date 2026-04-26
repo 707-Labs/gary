@@ -703,7 +703,7 @@ If all 9 steps happen without manual intervention beyond what's listed, Weekend 
 - Multi-repo support
 - Webhook receivers for Linear or GitHub (polling is fine)
 - ~~Rebase-on-main automation~~ — flipped 2026-04-25; Gary now rebases his branch onto fresh `main` between post-finish check and push (`rebaseOntoFreshBase` in `src/git.ts`). Conflict aborts cleanly; broken post-rebase check reverts via `git reset --hard`.
-- Stale PR nudging
+- ~~Stale PR nudging~~ — flipped 2026-04-25; priority-7 `nudge_reviewer` action fires once per stable PR state when CI is green, no review comments are pending, and the PR has been open longer than `STALE_PR_HOURS` (default 72). Comment goes on the Linear ticket addressed to the reporter (voice.md example 14). Action-cache idempotence handles "nudge once".
 - PR merge automation (Gary never merges his own — architectural, not Weekend-1-deferral)
 - Metrics / observability beyond event log in SQLite
 - Web dashboard

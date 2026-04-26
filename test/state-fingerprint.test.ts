@@ -61,6 +61,7 @@ describe("fingerprintDerivedState", () => {
         headSha: "aaa",
         ciStatus: "green",
         prCommentSignature: "empty",
+        openedAt: "2099-01-01T00:00:00Z",
       },
     };
     const a = fingerprintDerivedState(stateWithPr);
@@ -82,6 +83,7 @@ describe("fingerprintDerivedState", () => {
         headSha: "aaa",
         ciStatus: "green",
         prCommentSignature: "empty",
+        openedAt: "2099-01-01T00:00:00Z",
       },
     };
     expect(fingerprintDerivedState(open)).not.toBe(

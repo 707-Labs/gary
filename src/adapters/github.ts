@@ -12,6 +12,8 @@ export interface PullRequestRef {
   state: "open" | "closed";
   merged: boolean;
   isDraft: boolean;
+  /** ISO timestamp when the PR was opened. Used to decide staleness. */
+  createdAt: string;
 }
 
 export interface CheckRun {
@@ -509,6 +511,7 @@ interface PrPayload {
   draft?: boolean | undefined;
   merged?: boolean;
   head: { sha: string };
+  created_at: string;
 }
 
 function prRefFromOctokit(
@@ -525,6 +528,7 @@ function prRefFromOctokit(
     state: pr.state === "closed" ? "closed" : "open",
     merged: Boolean(pr.merged),
     isDraft: Boolean(pr.draft),
+    createdAt: pr.created_at,
   };
 }
 

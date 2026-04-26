@@ -39,6 +39,7 @@ const result = await tick({
   maxCiAttempts: cfg.runtime.maxCiAttempts,
   maxAttemptsPerTicket: cfg.runtime.maxAttemptsPerTicket,
   circuitBreakerWindowHours: cfg.runtime.circuitBreakerWindowHours,
+  stalePrAfterMs: cfg.runtime.stalePrAfterMs,
 });
 
 console.log("\nresult:", result);

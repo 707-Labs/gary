@@ -14,6 +14,13 @@ export interface DerivedPrState {
    * Stable across Gary's own PR comments and pushes.
    */
   prCommentSignature: string;
+  /**
+   * ISO timestamp the PR was opened. Carried for staleness checks
+   * (nudge_reviewer). Intentionally NOT included in the fingerprint canonical
+   * — it never changes for a given PR, so adding it would only bloat the hash
+   * without changing cache behavior.
+   */
+  openedAt: string;
 }
 
 export interface DerivedClassification {

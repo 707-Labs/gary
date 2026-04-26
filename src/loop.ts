@@ -12,6 +12,7 @@ import { runAnswerHandler } from "./handlers/answer.ts";
 import { runBounceHandler } from "./handlers/bounce.ts";
 import { runCiFailureHandler } from "./handlers/ci-failure.ts";
 import { runCodeHandler } from "./handlers/code.ts";
+import { runNudgeReviewer } from "./handlers/nudge-reviewer.ts";
 import { runPickupHandler } from "./handlers/pickup.ts";
 import { runPrReviewHandler } from "./handlers/pr-review.ts";
 import { analyzeMentions } from "./mention.ts";
@@ -71,6 +72,7 @@ export interface LoopDeps {
   maxCiAttempts: number;
   maxAttemptsPerTicket: number;
   circuitBreakerWindowHours: number;
+  stalePrAfterMs: number;
 }
 
 export interface TickResult {
@@ -190,6 +192,7 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
       issue,
       state,
       lastRespondedHumanSignature,
+      staleAfterMs: deps.stalePrAfterMs,
     });
     if (!candidate) continue;
     const fp = fingerprintDerivedState(state);
@@ -512,7 +515,42 @@ async function dispatch(deps: LoopDeps, action: CandidateAction): Promise<void> 
         { issue: action.issue },
       );
       return;
+    case "nudge_reviewer":
+      await runNudgeReviewerAction(deps, action);
+      return;
   }
+}
+
+async function runNudgeReviewerAction(
+  deps: LoopDeps,
+  action: CandidateAction,
+): Promise<void> {
+  if (!action.state.pr) {
+    throw new Error("nudge_reviewer dispatched without a PR");
+  }
+  const prRow = getPrForTicket(deps.db, action.issue.id);
+  if (!prRow) {
+    throw new Error(
+      `nudge_reviewer: no PR row for ticket ${action.issue.identifier}`,
+    );
+  }
+  const prUrl = `https://github.com/${prRow.repo}/pull/${prRow.pr_number}`;
+  await runNudgeReviewer(
+    { linear: deps.linear, glm: deps.glm },
+    {
+      issue: action.issue,
+      prUrl,
+      prNumber: prRow.pr_number,
+      prOpenedAt: action.state.pr.openedAt,
+      reviewerName: firstName(action.issue.creatorName),
+    },
+  );
+}
+
+function firstName(full: string | null): string | null {
+  if (!full) return null;
+  const first = full.trim().split(/\s+/)[0];
+  return first ? first.toLowerCase() : null;
 }
 
 async function runRespondToPrReview(
@@ -801,6 +839,7 @@ async function derivePr(
     headSha: pr.headSha,
     ciStatus,
     prCommentSignature,
+    openedAt: pr.createdAt,
   };
 }
 

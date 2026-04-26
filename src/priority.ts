@@ -14,7 +14,8 @@ export type ActionType =
   | "start_coding"
   | "answer_mention"
   | "write_answer"
-  | "bounce";
+  | "bounce"
+  | "nudge_reviewer";
 
 export interface CandidateAction {
   type: ActionType;
@@ -36,7 +37,20 @@ export interface PriorityInputs {
    * this feature.
    */
   lastRespondedHumanSignature?: string | null;
+  /**
+   * Current time in ms since epoch. Defaults to `Date.now()` — the loop
+   * passes a single `now` so all candidates in a tick share a clock.
+   */
+  now?: number;
+  /**
+   * How long an open, idle, CI-green PR can sit before Gary nudges. Defaults
+   * to 72 hours (matching voice.md example 14's "3 days"). Test code passes
+   * tighter values to exercise the boundary without time-warping.
+   */
+  staleAfterMs?: number;
 }
+
+const DEFAULT_STALE_AFTER_MS = 72 * 60 * 60 * 1000;
 
 /**
  * Pick the single best candidate for a ticket given its derived state, or
@@ -105,6 +119,27 @@ export function pickActionForTicket(
   // 6. bounce — BOUNCE classification, hasn't been bounced yet
   if (state.classification.classification === "BOUNCE") {
     return { type: "bounce", priority: 6, issue, state };
+  }
+
+  // 7. nudge_reviewer — open, non-draft PR with green CI, no pending comments,
+  //    idle longer than the staleness threshold. Idempotence is via the action
+  //    cache: once Gary nudges, the fingerprint doesn't change until something
+  //    material does (new commit, CI flip, new comment), so he won't re-nudge.
+  if (
+    state.classification.classification === "CODE" &&
+    state.pr &&
+    state.pr.state === "open" &&
+    !state.pr.merged &&
+    !state.pr.isDraft &&
+    state.pr.ciStatus === "green" &&
+    state.pr.prCommentSignature === PR_COMMENT_SIGNATURE_EMPTY
+  ) {
+    const now = inputs.now ?? Date.now();
+    const staleAfter = inputs.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+    const opened = Date.parse(state.pr.openedAt);
+    if (Number.isFinite(opened) && now - opened > staleAfter) {
+      return { type: "nudge_reviewer", priority: 7, issue, state };
+    }
   }
 
   return null;

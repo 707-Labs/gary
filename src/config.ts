@@ -106,6 +106,8 @@ export interface RuntimeConfig {
   maxCiAttempts: number;
   agentLoopMaxIterations: number;
   agentLoopTimeoutMs: number;
+  /** How long an idle, CI-green PR can sit before nudge_reviewer fires. */
+  stalePrAfterMs: number;
 }
 
 export interface Config {
@@ -317,6 +319,7 @@ export function loadRuntimeConfig(): RuntimeConfig {
     maxCiAttempts: intFromEnv("MAX_CI_ATTEMPTS", 3),
     agentLoopMaxIterations: intFromEnv("AGENT_LOOP_MAX_ITERATIONS", 50),
     agentLoopTimeoutMs: intFromEnv("AGENT_LOOP_TIMEOUT_MS", 900_000),
+    stalePrAfterMs: intFromEnv("STALE_PR_HOURS", 72) * 60 * 60 * 1000,
   };
 }
 

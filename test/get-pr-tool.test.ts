@@ -27,6 +27,7 @@ const samplePr: PullRequestDetail = {
   state: "open",
   merged: false,
   isDraft: false,
+  createdAt: "2026-04-22T00:00:00Z",
   title: "feat(scryfall): split rate limiter",
   body: "## Summary\nsplit interactive and batch queues",
   baseRef: "main",

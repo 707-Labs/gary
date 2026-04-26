@@ -75,6 +75,7 @@ describe("pickActionForTicket", () => {
           headSha: "x",
           ciStatus: "red",
           prCommentSignature: "empty",
+          openedAt: "2099-01-01T00:00:00Z",
         },
       },
     });
@@ -96,6 +97,7 @@ describe("pickActionForTicket", () => {
           headSha: "x",
           ciStatus: "green",
           prCommentSignature: "abc123",
+          openedAt: "2099-01-01T00:00:00Z",
         },
       },
     });
@@ -117,6 +119,7 @@ describe("pickActionForTicket", () => {
           headSha: "x",
           ciStatus: "red",
           prCommentSignature: "abc123",
+          openedAt: "2099-01-01T00:00:00Z",
         },
       },
     });
@@ -137,6 +140,7 @@ describe("pickActionForTicket", () => {
           headSha: "x",
           ciStatus: "green",
           prCommentSignature: "empty",
+          openedAt: "2099-01-01T00:00:00Z",
         },
       },
     });
@@ -156,6 +160,7 @@ describe("pickActionForTicket", () => {
         headSha: "x",
         ciStatus: "green",
         prCommentSignature: "empty",
+        openedAt: "2099-01-01T00:00:00Z",
       },
     };
 
@@ -223,10 +228,115 @@ describe("pickActionForTicket", () => {
           headSha: "x",
           ciStatus: "green",
           prCommentSignature: "empty",
+          openedAt: "2099-01-01T00:00:00Z",
         },
       },
     });
     expect(action).toBeNull();
+  });
+
+  describe("nudge_reviewer", () => {
+    const NOW = Date.parse("2026-04-25T12:00:00Z");
+    const STALE_MS = 72 * 60 * 60 * 1000;
+
+    function stalePr(overrides: Partial<NonNullable<DerivedState["pr"]>> = {}) {
+      return {
+        ...baseState,
+        classification: { classification: "CODE" as const },
+        pr: {
+          number: 5,
+          state: "open" as const,
+          merged: false,
+          isDraft: false,
+          headSha: "x",
+          ciStatus: "green" as const,
+          prCommentSignature: "empty",
+          openedAt: "2026-04-22T00:00:00Z", // 84 hours before NOW
+          ...overrides,
+        },
+      };
+    }
+
+    it("fires when CI green, no pending comments, and idle longer than the threshold", () => {
+      const action = pickActionForTicket({
+        issue,
+        state: stalePr(),
+        now: NOW,
+        staleAfterMs: STALE_MS,
+      });
+      expect(action?.type).toBe("nudge_reviewer");
+      expect(action?.priority).toBe(7);
+    });
+
+    it("does not fire when the PR is fresh", () => {
+      const action = pickActionForTicket({
+        issue,
+        state: stalePr({ openedAt: "2026-04-25T06:00:00Z" }),
+        now: NOW,
+        staleAfterMs: STALE_MS,
+      });
+      expect(action).toBeNull();
+    });
+
+    it("does not fire when the PR is exactly at the threshold (must be strictly greater)", () => {
+      const action = pickActionForTicket({
+        issue,
+        state: stalePr({ openedAt: "2026-04-22T12:00:00Z" }),
+        now: NOW,
+        staleAfterMs: STALE_MS,
+      });
+      expect(action).toBeNull();
+    });
+
+    it("does not fire when the PR is a draft", () => {
+      const action = pickActionForTicket({
+        issue,
+        state: stalePr({ isDraft: true }),
+        now: NOW,
+        staleAfterMs: STALE_MS,
+      });
+      expect(action).toBeNull();
+    });
+
+    it("does not fire when CI is red (yields to fix_ci_failure)", () => {
+      const action = pickActionForTicket({
+        issue,
+        state: stalePr({ ciStatus: "red" }),
+        now: NOW,
+        staleAfterMs: STALE_MS,
+      });
+      expect(action?.type).toBe("fix_ci_failure");
+    });
+
+    it("does not fire when there are pending review comments (yields to respond_to_pr_review)", () => {
+      const action = pickActionForTicket({
+        issue,
+        state: stalePr({ prCommentSignature: "abc123" }),
+        now: NOW,
+        staleAfterMs: STALE_MS,
+      });
+      expect(action?.type).toBe("respond_to_pr_review");
+    });
+
+    it("does not fire when classification is null (yields to classify)", () => {
+      const action = pickActionForTicket({
+        issue,
+        state: { ...stalePr(), classification: null },
+        now: NOW,
+        staleAfterMs: STALE_MS,
+      });
+      expect(action?.type).toBe("classify");
+    });
+
+    it("does not fire for ANSWER classification", () => {
+      const action = pickActionForTicket({
+        issue,
+        state: { ...stalePr(), classification: { classification: "ANSWER" } },
+        now: NOW,
+        staleAfterMs: STALE_MS,
+      });
+      expect(action?.type).toBe("write_answer");
+    });
   });
 });
 
@@ -289,6 +399,7 @@ describe("pickHighestPriority", () => {
           headSha: "y",
           ciStatus: "red",
           prCommentSignature: "empty",
+          openedAt: "2099-01-01T00:00:00Z",
         },
       },
     })!;
