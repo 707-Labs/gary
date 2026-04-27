@@ -176,6 +176,38 @@ export function chainStartingWith(
   return createProviderChain([primary, ...others]);
 }
 
+/**
+ * Build a chain in `requested` order, with any canonical providers not
+ * mentioned in `requested` appended at the end in their canonical order.
+ * Names in `requested` that aren't in the canonical chain are silently
+ * dropped — keeps reviewer config robust to typos in env vars (you'll
+ * still get a working chain, just not the one you typed).
+ *
+ * Use this for the reviewer's chain so it prefers a different provider
+ * than primary, giving uncorrelated blind spots.
+ */
+export function chainWithOrder(
+  canonical: ProviderChain,
+  requested: readonly ProviderName[],
+): ProviderChain {
+  const byName = new Map(canonical.providers.map((p) => [p.name, p]));
+  const ordered: LLMProvider[] = [];
+  const used = new Set<ProviderName>();
+  for (const name of requested) {
+    const p = byName.get(name);
+    if (p && !used.has(name)) {
+      ordered.push(p);
+      used.add(name);
+    }
+  }
+  for (const p of canonical.providers) {
+    if (!used.has(p.name)) {
+      ordered.push(p);
+    }
+  }
+  return createProviderChain(ordered);
+}
+
 export class AllProvidersExhaustedError extends Error {
   readonly earliestReset: Date | null;
   constructor(earliestReset: Date | null) {
