@@ -78,3 +78,28 @@ CREATE TABLE IF NOT EXISTS ticket_revisit_marks (
   last_human_signature TEXT NOT NULL,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- One row per reviewer agent invocation. The reviewer (added in a
+-- later task) runs after the primary's post-finish check and before
+-- push; this table is the calibration surface for tuning reviewer
+-- aggressiveness ("rejection rate by round", "verdict by provider").
+-- issue_id is the Linear linear_id, matching the FK shape used elsewhere.
+CREATE TABLE IF NOT EXISTS review_passes (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  issue_id        TEXT NOT NULL,
+  fingerprint     TEXT NOT NULL,
+  round           INTEGER NOT NULL,
+  verdict         TEXT NOT NULL,
+  finding_count   INTEGER NOT NULL,
+  advisory_count  INTEGER NOT NULL,
+  provider_used   TEXT,
+  input_tokens    INTEGER,
+  output_tokens   INTEGER,
+  duration_ms     INTEGER NOT NULL,
+  escalated       INTEGER NOT NULL DEFAULT 0,
+  created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (issue_id) REFERENCES tickets(linear_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_passes_issue ON review_passes(issue_id);
+CREATE INDEX IF NOT EXISTS idx_review_passes_verdict ON review_passes(verdict, created_at);
