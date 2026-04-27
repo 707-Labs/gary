@@ -2,6 +2,7 @@ import type { CloudflareClient } from "./adapters/cloudflare.ts";
 import type { GitHubClient, PullRequestRef } from "./adapters/github.ts";
 import type { LinearAdapter } from "./adapters/linear.ts";
 import { GLMClient } from "./adapters/glm.ts";
+import type { ReviewConfig } from "./config.ts";
 import { escalate } from "./escalate.ts";
 import {
   classifyTicket,
@@ -73,6 +74,8 @@ export interface LoopDeps {
   maxAttemptsPerTicket: number;
   circuitBreakerWindowHours: number;
   stalePrAfterMs: number;
+  /** Reviewer pass config — threaded into runCodeHandler. */
+  review: ReviewConfig;
 }
 
 export interface TickResult {
@@ -714,6 +717,7 @@ async function runStartCoding(
       workspacesDir: deps.workspacesDir,
       agentLoopMaxIterations: deps.agentLoopMaxIterations,
       agentLoopTimeoutMs: deps.agentLoopTimeoutMs,
+      review: deps.review,
     },
     { issue, comments, repo, scope },
   );
