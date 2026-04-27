@@ -41,3 +41,23 @@ export function recordReviewPass(db: DB, input: ReviewPassInput): void {
     esc: input.escalated ? 1 : 0,
   });
 }
+
+/**
+ * Mark the most recent review_passes row for `(issueLinearId, fingerprint,
+ * round)` as escalated. The row is written by `recordReviewPass` before the
+ * orchestrator decides whether to escalate; this update flips the bit after
+ * the decision so calibration queries can find escalating rounds.
+ */
+export function markReviewPassEscalated(
+  db: DB,
+  args: { issueLinearId: string; fingerprint: string; round: number },
+): void {
+  db.query(
+    `UPDATE review_passes SET escalated = 1
+     WHERE issue_id = $issue AND fingerprint = $fp AND round = $round`,
+  ).run({
+    issue: args.issueLinearId,
+    fp: args.fingerprint,
+    round: args.round,
+  });
+}

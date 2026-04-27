@@ -32,7 +32,7 @@ const DEFAULT_MESSAGES: Record<EscalationReason, string> = {
   max_ci_attempts:
     "ci has failed too many times in a row and i'm going in circles. bouncing for now so i don't waste more cycles.",
   review_rejected:
-    "took 3 swings at this and the reviewer kept finding issues. bouncing so a human can decide whether to retry, split, or fix directly.",
+    "the reviewer kept finding issues across multiple rounds. bouncing so a human can decide whether to retry, split, or fix directly.",
   unmapped_team:
     "i'm not wired up for this team's repo yet — bouncing back. ask tanner to add the team to GARY_REPO_MAP if you want me handling these.",
   unknown: "something went wrong. bouncing back.",
@@ -94,6 +94,7 @@ export async function escalate(
 
 export interface SynthesizeReviewRejectedArgs {
   finalFindings: readonly { title: string; bugClass: string }[];
+  rounds: number;
 }
 
 /**
@@ -105,7 +106,7 @@ export function synthesizeReviewRejectedBody(
   args: SynthesizeReviewRejectedArgs,
 ): string {
   const lines = [
-    "took 3 swings at this and the reviewer kept finding issues. bouncing so a human can decide whether to retry, split, or fix directly.",
+    `took ${args.rounds} swings at this and the reviewer kept finding issues. bouncing so a human can decide whether to retry, split, or fix directly.`,
     "",
     "last round's blockers:",
   ];

@@ -73,9 +73,15 @@ export interface FindUnwiredIdentifiersArgs {
 
 interface AddedIdentifier { name: string; file: string }
 
+// Identifier shapes we care about: query params and dotted event/topic names.
+// Deliberately narrow — a quoted lowercase string isn't enough on its own
+// because the codebase is full of error codes, CSS classes, and one-off
+// labels. Requiring `=` (query param) or `.` (dotted name) gives much higher
+// signal at the cost of missing flat snake_case event names. False negatives
+// here are tolerable; false positives flood the reviewer's context.
 const IDENTIFIER_PATTERNS: readonly RegExp[] = [
   /[?&]([a-z][a-z0-9_-]{2,}=[a-z0-9_-]{2,})/gi,
-  /["']([a-z][a-z0-9_.-]{3,})["']/gi,
+  /["']([a-z][a-z0-9_-]{2,}(?:\.[a-z][a-z0-9_-]{2,})+)["']/gi,
 ];
 
 const STOPWORDS = new Set(["true", "false", "null", "undefined", "none", "default"]);

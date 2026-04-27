@@ -25,6 +25,7 @@ import {
 } from "../skills.ts";
 import type { DB } from "../state/db.ts";
 import { recordEvent, recordPr, setTerminalState } from "../state/queries.ts";
+import { markReviewPassEscalated } from "../state/review-queries.ts";
 import type { ReviewConfig } from "../config.ts";
 import { chainWithOrder } from "../providers.ts";
 import { runReviewer, type ReviewerResult } from "../review/runner.ts";
@@ -802,6 +803,7 @@ async function runReviewLoop(
           title: f.title,
           bugClass: f.bugClass,
         })),
+        rounds: deps.review.maxRounds,
       });
       try {
         await deps.linear.postComment(args.issue.id, body);
@@ -812,6 +814,11 @@ async function runReviewLoop(
       }
       await reassignToReporter(deps, args);
       setTerminalState(deps.db, args.issue.id, "escalated");
+      markReviewPassEscalated(deps.db, {
+        issueLinearId: args.issue.id,
+        fingerprint: ctx.fingerprint,
+        round,
+      });
       return { kind: "escalated" };
     }
 
