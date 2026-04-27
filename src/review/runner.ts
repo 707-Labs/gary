@@ -66,11 +66,30 @@ export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult
   let outputTokens = 0;
   let failureReason: string | null = null;
 
+  // Inject a forcing nudge near the iteration cap so a wandering reviewer
+  // commits a verdict instead of running out of turns. Mirrors the primary
+  // agent loop's nudge mechanic (DEFAULT_NUDGE in src/agent/loop.ts).
+  const nudgeAt = Math.max(1, Math.floor(args.iterationCap * 0.8));
+  let nudgeFired = false;
+
   let iteration = 0;
   while (iteration < args.iterationCap) {
     if (Date.now() > deadline) {
       failureReason = "timeout";
       break;
+    }
+    if (!nudgeFired && iteration + 1 === nudgeAt) {
+      messages.push({
+        role: "user",
+        content: `you have ${args.iterationCap - iteration} turns left. call submit_review on your next turn. if you don't have a specific, defensible blocking bug, approve — false positives waste cycles. don't start new investigation lines.`,
+      });
+      nudgeFired = true;
+      log.info("reviewer nudge", {
+        ticket: args.ticket.identifier,
+        round: args.round,
+        iter: iteration + 1,
+        cap: args.iterationCap,
+      });
     }
     iteration++;
     let response: Anthropic.Message;
