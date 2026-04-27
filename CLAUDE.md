@@ -38,6 +38,31 @@ bun run scripts/probe-d1.ts              # verify D1 read auth + SELECT-only cla
 
 `src/index.ts → src/loop.ts (every 60s) → derive state per ticket → pickActionForTicket → dispatch handler`. Handlers in `src/handlers/{classifier,code,ci-failure,pr-review,pickup,answer,bounce}.ts`. Coding handlers run an agent loop (`src/agent/loop.ts`) with tools (`src/agent/tools.ts`) bound to an `Executor` (`src/executors/`). The loop also pulls @mentioned tickets via `linear.fetchMentionedIssues` when an allowlist is configured — see `src/mention.ts` for the pickup/answer trigger detection.
 
+## Reviewer pass
+
+After the primary agent finishes and `bun run check` passes, a fresh
+reviewer agent (different provider preference: DeepSeek first by
+default, configurable via `GARY_REVIEWER_PROVIDER_ORDER`) reviews the
+diff before push. It has read+run+submit_review tools — it can verify
+claims by running tests/queries/fetches but cannot edit code.
+
+The reviewer's mandate is narrow: it can only block on bug-class
+findings (wrong code path, unverified claim, half-wired feature,
+untested changed logic). Style and refactor opinions go in
+advisory_notes, never findings.
+
+On changes_needed, the primary re-enters its loop with the findings
+as the new task. After `GARY_REVIEW_MAX_ROUNDS` (default 3) rejected
+rounds, the ticket is escalated via review_rejected.
+
+On reviewer crash/timeout, retry once. On second failure, default-
+approve with a placeholder verification report. Calibration is via
+the `review_passes` table.
+
+Files: `src/review/{precheck.ts, tools.ts, prompts.ts, runner.ts}`,
+`src/state/review-queries.ts`. Wired in `src/handlers/code.ts` between
+`ensurePostFinishCheckPasses` and the rebase block.
+
 ## Key files
 
 - `voice.md` — Gary's personality. Loaded verbatim into every system prompt. Update this, not individual prompts.
@@ -48,7 +73,7 @@ bun run scripts/probe-d1.ts              # verify D1 read auth + SELECT-only cla
 
 ## Environment
 
-`.env` required keys: `LINEAR_API_KEY`, `GARY_LINEAR_USER_ID`, `LINEAR_TEAM_ID`, `LINEAR_IN_PROGRESS_STATE_ID`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_PATH` (or inline `GITHUB_APP_PRIVATE_KEY`), `GITHUB_APP_INSTALLATION_ID`, `Z_AI_API_KEY`, `GARY_REPO_MAP`. Optional fallback providers: `KIMI_API_KEY` (Kimi Code, defaults to `https://api.kimi.com/coding` + `kimi-for-coding`), `DEEPSEEK_API_KEY` (defaults to `https://api.deepseek.com/anthropic` + `deepseek-v4-pro`). Optional: `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` to enable Workers Observability tools (`query_cloudflare_logs`, `list_cloudflare_invocations`) inside the agent loop. `GARY_ALLOWLISTED_MENTION_USER_IDS` (comma-separated Linear user ids) opts into the @mention pipeline — empty (default) disables it. See `.env.example`.
+`.env` required keys: `LINEAR_API_KEY`, `GARY_LINEAR_USER_ID`, `LINEAR_TEAM_ID`, `LINEAR_IN_PROGRESS_STATE_ID`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_PATH` (or inline `GITHUB_APP_PRIVATE_KEY`), `GITHUB_APP_INSTALLATION_ID`, `Z_AI_API_KEY`, `GARY_REPO_MAP`. Optional fallback providers: `KIMI_API_KEY` (Kimi Code, defaults to `https://api.kimi.com/coding` + `kimi-for-coding`), `DEEPSEEK_API_KEY` (defaults to `https://api.deepseek.com/anthropic` + `deepseek-v4-pro`). Optional: `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` to enable Workers Observability tools (`query_cloudflare_logs`, `list_cloudflare_invocations`) inside the agent loop. `GARY_ALLOWLISTED_MENTION_USER_IDS` (comma-separated Linear user ids) opts into the @mention pipeline — empty (default) disables it. Reviewer pass env vars (all optional): `GARY_REVIEWER_PROVIDER_ORDER`, `GARY_REVIEW_MAX_ROUNDS`, `GARY_REVIEW_ITERATION_CAP`, `GARY_REVIEW_TIMEOUT_MS`. See `.env.example`.
 
 `src/config.ts` exposes per-subsystem loaders (`loadLinearConfig`, `loadGitHubConfig`, `loadCloudflareConfig`, etc.) so probes can load only what they need. `loadCloudflareConfig` returns `null` when the token isn't set — Gary runs fine without it, just without log access.
 
@@ -73,6 +98,8 @@ bun run scripts/probe-d1.ts              # verify D1 read auth + SELECT-only cla
 - **LLM provider chain (Z.ai → Kimi Code → DeepSeek)**: `GLMClient` owns a `ProviderChain` (`src/providers.ts`). `complete()` and `createMessage()` route through the highest-priority unarmed provider; on a 429 they arm that provider's gate and fall through to the next. Per-provider `parse429` extracts a reset timestamp when possible (Z.ai's `code=1308` shape; Kimi a permissive ISO matcher; DeepSeek always null since it has no documented cap). Falls back to `defaultBackoffMs` (60s default) when no parse. `AllProvidersExhaustedError` only fires when every provider is armed; the tick catches it, emits `rate_limit_skip`, records the action as a non-bouncing failure so it retries with the same fingerprint when a provider clears. Tests live in `test/glm-fallback.test.ts` + `test/providers.test.ts`. **Note Kimi Code ≠ Moonshot Open Platform** — different billing surface, different endpoint (`api.kimi.com/coding` vs `api.moonshot.ai/anthropic`).
 - **Scope=L on a CODE classification auto-bounces** at classification time. The classifier prompt asks the model to prefer BOUNCE on L, but it doesn't always listen (ERT-1648 burned 617k input tokens before iteration_cap fired). `decideClassifyOutcome` in `src/handlers/classifier.ts` enforces the rule, and the bounce comment splices in the model's own reasoning so the message is specific.
 - **Reassigning a concluded ticket to Gary reopens it**: `terminal_state` (bounced/escalated) blocks dispatch, but the tick's per-issue loop calls `reopenTicket` if it sees a terminal-state ticket back in `fetchAssignedIssues` — that means a human reassigned it. `terminal_state` is cleared; for `bounced` tickets the classification is also cleared so the classifier re-runs with the new context. The action cache (`success=1` fingerprint match) blocks identical retries, so a no-context-change reassign is a no-op.
+- **Reviewer agent's task arg is large**: includes diff (up to 30KB), run-log of every primary command, pre-check findings, and previous-round findings. Cache breakpoints land on the system prompt, tool list, and last user message — re-runs are cheap.
+- **Run-log is captured but stdout is not**: `RunLogEntry` records command + exit + ts. The reviewer reasons about *whether* the primary ran a thing, not what it returned. Empty run-log on a non-trivial diff is a strong unverified-claim signal — reflected in the reviewer task render.
 
 ## Voice
 
