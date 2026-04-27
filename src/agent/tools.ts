@@ -4,6 +4,8 @@ import type { CloudflareClient } from "../adapters/cloudflare.ts";
 import type { GitHubClient } from "../adapters/github.ts";
 import type { LinearAdapter } from "../adapters/linear.ts";
 import type { Executor } from "../executors/index.ts";
+import { redactGitHubTokens } from "../redact.ts";
+import type { RunLogEntry } from "./loop.ts";
 
 export interface ToolHandler {
   definition: Anthropic.Tool;
@@ -47,6 +49,12 @@ export interface ToolsetOptions {
    * stop the model from finishing without verifying its work.
    */
   finishGateCommand?: string;
+  /**
+   * If provided, each run_bash invocation appends an entry here. Used
+   * by the agent loop to expose what shell commands ran for downstream
+   * consumers (e.g. the reviewer pass).
+   */
+  runLog?: RunLogEntry[];
 }
 
 /** Builds the toolset bound to an Executor. The agent loop drives this. */
@@ -69,7 +77,7 @@ export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): Agen
   register(editFileTool(executor, out));
   register(grepTool(executor));
   register(listFilesTool(executor));
-  register(runBashTool(executor, out, opts.finishGateCommand));
+  register(runBashTool(executor, out, opts.finishGateCommand, opts.runLog));
   register(commitTool(executor));
   register(fetchUrlTool());
   if (opts.linear) {
@@ -270,6 +278,7 @@ function runBashTool(
   executor: Executor,
   tools: AgentTools,
   finishGateCommand: string | undefined,
+  runLog: RunLogEntry[] | undefined,
 ): ToolHandler {
   return {
     definition: {
@@ -301,6 +310,13 @@ function runBashTool(
           r.exitCode === 0
         ) {
           tools.finishGateMet = true;
+        }
+        if (runLog) {
+          runLog.push({
+            cmd: redactGitHubTokens(args.command),
+            exit: r.exitCode,
+            ts: Date.now(),
+          });
         }
         const parts = [
           `exit_code: ${r.exitCode}${r.timedOut ? " (timed out)" : ""}`,

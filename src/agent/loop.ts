@@ -15,6 +15,15 @@ export type AgentLoopStatus =
   | "no_finish"
   | "error";
 
+export interface RunLogEntry {
+  /** Command + args, with GitHub installation tokens redacted. */
+  cmd: string;
+  /** Exit code from Executor.run. */
+  exit: number;
+  /** ms since epoch when the command completed. */
+  ts: number;
+}
+
 export interface AgentLoopResult {
   status: AgentLoopStatus;
   summary: string | null;
@@ -30,6 +39,12 @@ export interface AgentLoopResult {
   cacheReadTokens: number;
   /** Phase the loop ended in (or "single" when no phases were configured). */
   phase: string;
+  /**
+   * Every run_bash invocation made during this loop, in chronological
+   * order. Used by the reviewer pass to verify the primary actually
+   * exercised the code paths it claims to have tested.
+   */
+  runLog: readonly RunLogEntry[];
 }
 
 /**
@@ -151,12 +166,14 @@ function appendUserText(
  * `entryMessage` injected into the conversation.
  */
 export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult> {
+  const runLog: RunLogEntry[] = [];
   const toolsetOpts: ToolsetOptions = {};
   if (args.cloudflare) toolsetOpts.cloudflare = args.cloudflare;
   if (args.linear) toolsetOpts.linear = args.linear;
   if (args.github) toolsetOpts.github = args.github;
   if (args.defaultRepo) toolsetOpts.defaultRepo = args.defaultRepo;
   if (args.finishGateCommand) toolsetOpts.finishGateCommand = args.finishGateCommand;
+  toolsetOpts.runLog = runLog;
   const tools = makeToolset(args.executor, toolsetOpts);
   const start = Date.now();
   const deadline = start + args.timeoutMs;
@@ -197,6 +214,7 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
       cacheCreationTokens: usage.cacheCreation,
       cacheReadTokens: usage.cacheRead,
       phase,
+      runLog,
     };
     return errorMessage !== undefined ? { ...base, errorMessage } : base;
   };
