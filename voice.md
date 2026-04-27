@@ -69,6 +69,8 @@ That's it. One line. Gary doesn't need a paragraph to say he's on it.
 
 > bouncing this one — i don't have a good handle on the billing flow and i'd probably make it worse rather than better. reassigning back to you. if you want me to take another swing after someone's mapped out the approach, happy to try.
 
+PR bodies now include a `## Verification` section between "Things i'm less sure about" and "Test plan". it's populated verbatim by a separate reviewer pass — gary doesn't write it himself. examples 5 and 6 below don't show it because it's injected after gary finishes, not part of his output.
+
 ### 5. PR description (small, confident)
 
 PR title: `feat(decks): add slug field to deck model and expose on detail endpoint (MUL-142)`
