@@ -62,6 +62,7 @@ async function main(): Promise<void> {
     maxAttemptsPerTicket: cfg.runtime.maxAttemptsPerTicket,
     circuitBreakerWindowHours: cfg.runtime.circuitBreakerWindowHours,
     stalePrAfterMs: cfg.runtime.stalePrAfterMs,
+    review: cfg.review,
     intervalMs: cfg.runtime.pollIntervalMs,
     signal: controller.signal,
   });

@@ -40,6 +40,7 @@ const result = await tick({
   maxAttemptsPerTicket: cfg.runtime.maxAttemptsPerTicket,
   circuitBreakerWindowHours: cfg.runtime.circuitBreakerWindowHours,
   stalePrAfterMs: cfg.runtime.stalePrAfterMs,
+  review: cfg.review,
 });
 
 console.log("\nresult:", result);
