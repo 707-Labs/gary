@@ -320,3 +320,60 @@ describe("runAgentLoop — legacy single-phase mode", () => {
     expect(result.phase).toBe("single");
   });
 });
+
+describe("run-log capture", () => {
+  it("records run_bash invocations with command and exit code", async () => {
+    const glm = fakeGlm([
+      (_msgs) => turnWithToolUse("run_bash", { command: "echo hi" }),
+      (_msgs) => turnWithToolUse("run_bash", { command: "false" }),
+      (_msgs) => turnWithToolUse("finish", { summary: "done" }),
+    ]);
+    const exec: Executor = {
+      ...fakeExecutor(),
+      async run(cmd: string): Promise<ExecResult> {
+        return {
+          stdout: "",
+          stderr: "",
+          exitCode: cmd === "false" ? 1 : 0,
+          timedOut: false,
+        };
+      },
+    };
+    const result = await runAgentLoop({
+      glm,
+      executor: exec,
+      systemPrompt: "you are a test agent",
+      task: "run two commands then finish",
+      maxIterations: 10,
+      timeoutMs: 60_000,
+    });
+    expect(result.status).toBe("finished");
+    expect(result.runLog.length).toBe(2);
+    expect(result.runLog[0]!.cmd).toBe("echo hi");
+    expect(result.runLog[0]!.exit).toBe(0);
+    expect(result.runLog[1]!.cmd).toBe("false");
+    expect(result.runLog[1]!.exit).toBe(1);
+  });
+
+  it("redacts github tokens in captured commands", async () => {
+    const glm = fakeGlm([
+      (_msgs) =>
+        turnWithToolUse("run_bash", {
+          command:
+            "git fetch https://x-access-token:ghs_secret@github.com/owner/repo.git",
+        }),
+      (_msgs) => turnWithToolUse("finish", { summary: "done" }),
+    ]);
+    const result = await runAgentLoop({
+      glm,
+      executor: fakeExecutor(),
+      systemPrompt: "test",
+      task: "fetch then finish",
+      maxIterations: 5,
+      timeoutMs: 60_000,
+    });
+    expect(result.runLog.length).toBe(1);
+    expect(result.runLog[0]!.cmd).toContain("[REDACTED]");
+    expect(result.runLog[0]!.cmd).not.toContain("ghs_secret");
+  });
+});
