@@ -141,6 +141,29 @@ export interface RuntimeConfig {
   stalePrAfterMs: number;
 }
 
+export interface ReviewConfig {
+  providerOrder: readonly ProviderName[];
+  maxRounds: number;
+  iterationCap: number;
+  timeoutMs: number;
+}
+
+const KNOWN_PROVIDERS: ReadonlySet<string> = new Set(["z.ai", "kimi", "deepseek"]);
+
+export function loadReviewConfig(): ReviewConfig {
+  const orderRaw = optionalString("GARY_REVIEWER_PROVIDER_ORDER");
+  const providerOrder = (orderRaw ?? "deepseek,z.ai,kimi")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s): s is ProviderName => KNOWN_PROVIDERS.has(s));
+  return {
+    providerOrder,
+    maxRounds: intFromEnv("GARY_REVIEW_MAX_ROUNDS", 3),
+    iterationCap: intFromEnv("GARY_REVIEW_ITERATION_CAP", 15),
+    timeoutMs: intFromEnv("GARY_REVIEW_TIMEOUT_MS", 300_000),
+  };
+}
+
 export interface Config {
   gary: GaryConfig;
   linear: LinearConfig;
@@ -149,6 +172,7 @@ export interface Config {
   providers: readonly ProviderConfig[];
   cloudflare: CloudflareConfig | null;
   runtime: RuntimeConfig;
+  review: ReviewConfig;
 }
 
 export function loadGaryConfig(): GaryConfig {
@@ -362,5 +386,6 @@ export function loadConfig(): Config {
     providers: loadProviderConfigs(),
     cloudflare: loadCloudflareConfig(),
     runtime: loadRuntimeConfig(),
+    review: loadReviewConfig(),
   };
 }
