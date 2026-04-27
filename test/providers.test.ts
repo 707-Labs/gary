@@ -3,14 +3,18 @@ import {
   AllProvidersExhaustedError,
   armOnRateLimit,
   chainStartingWith,
+  chainWithOrder,
   createProvider,
   createProviderChain,
   isRateLimitError,
+  type AnthropicClient,
   type LLMProvider,
+  type ProviderName,
   parseDeepSeek429,
   parseKimi429,
   parseZAi429,
 } from "../src/providers.ts";
+import { createRateLimitGate } from "../src/rate-limit.ts";
 
 describe("parseZAi429", () => {
   it("parses the Z.ai 5-hour cap message", () => {
@@ -249,5 +253,44 @@ describe("AllProvidersExhaustedError", () => {
     const err = new AllProvidersExhaustedError(null);
     expect(err.earliestReset).toBeNull();
     expect(err.message).toContain("rate-limited");
+  });
+});
+
+describe("chainWithOrder", () => {
+  function fakeProvider(name: ProviderName): LLMProvider {
+    return {
+      name,
+      model: name,
+      client: {} as AnthropicClient,
+      gate: createRateLimitGate(),
+      defaultBackoffMs: 60_000,
+      parse429: () => null,
+    };
+  }
+
+  it("reorders providers to match the requested preference", () => {
+    const zai = fakeProvider("z.ai");
+    const kimi = fakeProvider("kimi");
+    const deepseek = fakeProvider("deepseek");
+    const canonical = createProviderChain([zai, kimi, deepseek]);
+    const reordered = chainWithOrder(canonical, ["deepseek", "z.ai", "kimi"]);
+    expect(reordered.providers.map((p) => p.name)).toEqual(["deepseek", "z.ai", "kimi"]);
+  });
+
+  it("ignores names not present in the canonical chain", () => {
+    const zai = fakeProvider("z.ai");
+    const deepseek = fakeProvider("deepseek");
+    const canonical = createProviderChain([zai, deepseek]);
+    const reordered = chainWithOrder(canonical, ["deepseek", "kimi", "z.ai"]);
+    expect(reordered.providers.map((p) => p.name)).toEqual(["deepseek", "z.ai"]);
+  });
+
+  it("appends unrequested providers at the end in canonical order", () => {
+    const zai = fakeProvider("z.ai");
+    const kimi = fakeProvider("kimi");
+    const deepseek = fakeProvider("deepseek");
+    const canonical = createProviderChain([zai, kimi, deepseek]);
+    const reordered = chainWithOrder(canonical, ["deepseek"]);
+    expect(reordered.providers.map((p) => p.name)).toEqual(["deepseek", "z.ai", "kimi"]);
   });
 });
