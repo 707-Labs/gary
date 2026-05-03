@@ -33,10 +33,29 @@ export interface ViewerInfo {
   email: string;
 }
 
+export type WorkflowStateType =
+  | "triage"
+  | "backlog"
+  | "unstarted"
+  | "started"
+  | "completed"
+  | "canceled";
+
+/** Workflow states change rarely (team workflow restructuring). 30 min
+ * keeps load light while bounding staleness for `setStateByType`. */
+const TEAM_STATES_TTL_MS = 30 * 60_000;
+
 export class LinearAdapter {
   private readonly client: LinearClient;
   private readonly userId: string;
   private readonly inProgressStateId: string;
+  private readonly teamStatesCache = new Map<
+    string,
+    {
+      states: readonly { id: string; name: string; type: string }[];
+      fetchedAt: number;
+    }
+  >();
 
   constructor(cfg: Pick<Config, "linear" | "gary">) {
     this.client = new LinearClient({ apiKey: cfg.linear.apiKey });
@@ -345,6 +364,61 @@ export class LinearAdapter {
   async moveToInProgress(issueId: string): Promise<void> {
     await this.client.updateIssue(issueId, { stateId: this.inProgressStateId });
     log.debug("moved to in progress", { issueId });
+  }
+
+  async updateDescription(issueId: string, description: string): Promise<void> {
+    await this.client.updateIssue(issueId, { description });
+    log.debug("description updated", { issueId, length: description.length });
+  }
+
+  /**
+   * Move an issue to the team's first workflow state matching `type`.
+   * States are scoped to a team; many teams have a single state per type
+   * (one Backlog, one Todo) but the SDK doesn't enforce that. We pick
+   * the first match and cache the lookup per team. Throws if the team
+   * has no state of that type.
+   */
+  async setStateByType(
+    issueId: string,
+    teamId: string,
+    type: WorkflowStateType,
+  ): Promise<{ stateName: string }> {
+    const states = await this.fetchTeamStates(teamId);
+    const match = states.find((s) => s.type === type);
+    if (!match) {
+      const known = states.map((s) => `${s.name} (${s.type})`).join(", ");
+      throw new Error(
+        `team ${teamId} has no workflow state of type "${type}"; known states: ${known || "(none)"}`,
+      );
+    }
+    await this.client.updateIssue(issueId, { stateId: match.id });
+    log.debug("state set", { issueId, type, stateName: match.name });
+    return { stateName: match.name };
+  }
+
+  private async fetchTeamStates(
+    teamId: string,
+  ): Promise<readonly { id: string; name: string; type: string }[]> {
+    const cached = this.teamStatesCache.get(teamId);
+    if (cached && Date.now() - cached.fetchedAt < TEAM_STATES_TTL_MS) {
+      return cached.states;
+    }
+    const data = await this.client.client.request<
+      { team: { states: { nodes: { id: string; name: string; type: string }[] } } | null },
+      { teamId: string }
+    >(
+      `query TeamStates($teamId: String!) {
+        team(id: $teamId) {
+          states {
+            nodes { id name type }
+          }
+        }
+      }`,
+      { teamId },
+    );
+    const nodes = data.team?.states?.nodes ?? [];
+    this.teamStatesCache.set(teamId, { states: nodes, fetchedAt: Date.now() });
+    return nodes;
   }
 
   async addPrAttachment(

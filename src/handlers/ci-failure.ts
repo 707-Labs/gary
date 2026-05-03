@@ -142,6 +142,11 @@ export async function runCiFailureHandler(
     timeoutMs: deps.agentLoopTimeoutMs,
     temperature: 0.3,
     linear: deps.linear,
+    currentIssue: {
+      id: args.issue.id,
+      identifier: args.issue.identifier,
+      teamId: args.issue.teamId,
+    },
     github: deps.github,
     defaultRepo: args.repo,
     ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
