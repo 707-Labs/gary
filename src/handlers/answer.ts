@@ -21,11 +21,15 @@ import {
 const ANSWER_TASK_INSTRUCTIONS = `Someone asked a question on this Linear ticket. The classifier already posted an initial reply at triage. Your job here is to take a deeper look at the code and either confirm the initial answer or post a clarifying follow-up.
 
 Rules:
-- READ ONLY. Do not write, edit, or commit. Do not run commands that modify state. You may run grep, find, ls, cat, git log, etc.
+- READ ONLY on the codebase. Do not write, edit, or commit. Do not run commands that modify state. You may run grep, find, ls, cat, git log, etc.
 - Use list_files, grep, and read_file to investigate. run_bash is fine for read-only commands like \`git log\` or \`cat\`.
 - Output your follow-up via finish() — pass the comment body as the summary. Voice example 3 from voice.md is the model.
 - If the initial classifier reply was complete and accurate, finish() with a brief "still stands, looked at <file>:<line>" rather than re-explaining everything.
-- If the classifier got it wrong, say so plainly and explain what you actually found.`;
+- If the classifier got it wrong, say so plainly and explain what you actually found.
+
+Linear admin actions:
+- If the human asks you to unassign yourself, change ticket status, or update the description, you have tools for those: \`unassign_self\`, \`set_ticket_state\` (e.g. type "backlog"), \`update_ticket_description\` (full replace — read current via \`get_linear_issue\` first if you need to preserve content). Call them, then mention what you did in your finish() comment.
+- NEVER claim you performed an admin action without actually calling the tool. If a request is outside your tool capabilities, say so plainly in your finish() comment instead of fabricating compliance.`;
 
 export interface AnswerHandlerDeps {
   linear: LinearAdapter;
@@ -101,6 +105,11 @@ export async function runAnswerHandler(
     timeoutMs: Math.min(deps.agentLoopTimeoutMs, 5 * 60_000),
     temperature: 0.3,
     linear: deps.linear,
+    currentIssue: {
+      id: args.issue.id,
+      identifier: args.issue.identifier,
+      teamId: args.issue.teamId,
+    },
     github: deps.github,
     defaultRepo: args.repo,
     ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),

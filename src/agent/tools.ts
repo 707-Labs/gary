@@ -2,7 +2,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import type { CloudflareClient } from "../adapters/cloudflare.ts";
 import type { GitHubClient } from "../adapters/github.ts";
-import type { LinearAdapter } from "../adapters/linear.ts";
+import type { LinearAdapter, WorkflowStateType } from "../adapters/linear.ts";
 import type { Executor } from "../executors/index.ts";
 import { redactGitHubTokens } from "../redact.ts";
 import type { RunLogEntry } from "./loop.ts";
@@ -10,6 +10,13 @@ import type { RunLogEntry } from "./loop.ts";
 export interface ToolHandler {
   definition: Anthropic.Tool;
   run(input: unknown): Promise<string>;
+}
+
+export type TodoStatus = "pending" | "in_progress" | "completed";
+
+export interface TodoItem {
+  content: string;
+  status: TodoStatus;
 }
 
 export interface AgentTools {
@@ -32,6 +39,12 @@ export interface AgentTools {
    * codegen-style commands.
    */
   readCache: Set<string>;
+  /**
+   * Agent's current self-organized todo list. Mutated by `todo_write`. The
+   * loop has no opinion on its contents — it's a scratch pad to keep the
+   * model on track across long iterations. Empty list = no todos.
+   */
+  todos: TodoItem[];
 }
 
 export interface ToolsetOptions {
@@ -39,6 +52,13 @@ export interface ToolsetOptions {
   cloudflare?: CloudflareClient;
   /** When set, exposes Linear read tools (e.g. `get_linear_issue`). */
   linear?: LinearAdapter;
+  /**
+   * The ticket this agent run is acting on. When provided alongside `linear`,
+   * exposes mutation tools scoped to that ticket: `unassign_self`,
+   * `set_ticket_state`, `update_ticket_description`. Without this the agent
+   * can read Linear but cannot mutate, even if `linear` is set.
+   */
+  currentIssue?: { id: string; identifier: string; teamId: string };
   /** When set, exposes GitHub read tools (e.g. `get_pr`). */
   github?: GitHubClient;
   /** "owner/repo" used as the default for github tools when omitted. */
@@ -55,6 +75,23 @@ export interface ToolsetOptions {
    * consumers (e.g. the reviewer pass).
    */
   runLog?: RunLogEntry[];
+  /**
+   * When true, omits write_file / edit_file / commit. Used to build a
+   * read-only toolset for sub-agents that should only investigate.
+   */
+  readOnly?: boolean;
+  /**
+   * When provided, registers `dispatch_subagent`, which spawns a fresh
+   * read-only agent loop with the given runner and returns its summary.
+   * The runner is responsible for read-only constraint and recursion guard.
+   */
+  subagentRunner?: (task: string) => Promise<SubagentRunnerResult>;
+}
+
+export interface SubagentRunnerResult {
+  status: string;
+  summary: string | null;
+  iterations: number;
 }
 
 /** Builds the toolset bound to an Executor. The agent loop drives this. */
@@ -65,6 +102,7 @@ export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): Agen
     finishSummary: null,
     finishGateMet: false,
     readCache: new Set<string>(),
+    todos: [],
   };
 
   const register = (handler: ToolHandler): void => {
@@ -73,15 +111,25 @@ export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): Agen
   };
 
   register(readFileTool(executor, out));
-  register(writeFileTool(executor, out));
-  register(editFileTool(executor, out));
+  if (!opts.readOnly) {
+    register(writeFileTool(executor, out));
+    register(editFileTool(executor, out));
+  }
   register(grepTool(executor));
   register(listFilesTool(executor));
   register(runBashTool(executor, out, opts.finishGateCommand, opts.runLog));
-  register(commitTool(executor));
+  if (!opts.readOnly) {
+    register(commitTool(executor));
+  }
+  register(todoWriteTool(out));
   register(fetchUrlTool());
   if (opts.linear) {
     register(getLinearIssueTool(opts.linear));
+    if (opts.currentIssue && !opts.readOnly) {
+      register(unassignSelfTool(opts.linear, opts.currentIssue));
+      register(setTicketStateTool(opts.linear, opts.currentIssue));
+      register(updateTicketDescriptionTool(opts.linear, opts.currentIssue));
+    }
   }
   if (opts.github) {
     register(getPrTool(opts.github, opts.defaultRepo));
@@ -90,6 +138,9 @@ export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): Agen
     register(queryCloudflareLogsTool(opts.cloudflare));
     register(listCloudflareInvocationsTool(opts.cloudflare));
     register(d1QueryTool(opts.cloudflare));
+  }
+  if (opts.subagentRunner) {
+    register(dispatchSubagentTool(opts.subagentRunner));
   }
   register(finishTool(out, opts.finishGateCommand));
 
@@ -413,6 +464,66 @@ function truncate(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max)}...` : s;
 }
 
+const todoWriteSchema = z.object({
+  todos: z
+    .array(
+      z.object({
+        content: z.string().min(1),
+        status: z.enum(["pending", "in_progress", "completed"]),
+      }),
+    )
+    .max(50),
+});
+function todoWriteTool(tools: AgentTools): ToolHandler {
+  return {
+    definition: {
+      name: "todo_write",
+      description:
+        "Maintain your own task list for the current ticket. Replaces the entire list each call. Use when a ticket has 3+ distinct steps so you stay focused; mark exactly one item `in_progress` at a time, flip to `completed` immediately when done. Skip for trivial single-step work. The list returns to you on every subsequent tool result, so it doubles as a working-memory anchor.",
+      input_schema: {
+        type: "object",
+        properties: {
+          todos: {
+            type: "array",
+            description: "The full todo list. Replaces the prior list.",
+            items: {
+              type: "object",
+              properties: {
+                content: { type: "string", description: "Short imperative sentence." },
+                status: {
+                  type: "string",
+                  enum: ["pending", "in_progress", "completed"],
+                },
+              },
+              required: ["content", "status"],
+            },
+          },
+        },
+        required: ["todos"],
+      },
+    },
+    async run(input) {
+      try {
+        const parsed = todoWriteSchema.parse(input);
+        tools.todos = parsed.todos.map((t) => ({ ...t }));
+        return renderTodos(tools.todos);
+      } catch (err) {
+        return formatError("todo_write", err);
+      }
+    },
+  };
+}
+
+export function renderTodos(todos: readonly TodoItem[]): string {
+  if (todos.length === 0) return "(no todos)";
+  const symbol = (s: TodoStatus): string => {
+    if (s === "completed") return "[x]";
+    if (s === "in_progress") return "[>]";
+    return "[ ]";
+  };
+  return todos.map((t) => `${symbol(t.status)} ${t.content}`).join("\n");
+}
+
 const fetchUrlSchema = z.object({
   url: z.string().url(),
 });
@@ -466,6 +577,44 @@ function fetchUrlTool(): ToolHandler {
         return formatError("fetch_url", err);
       } finally {
         clearTimeout(timer);
+      }
+    },
+  };
+}
+
+const dispatchSubagentSchema = z.object({
+  task: z.string().min(1),
+});
+function dispatchSubagentTool(
+  runner: (task: string) => Promise<SubagentRunnerResult>,
+): ToolHandler {
+  return {
+    definition: {
+      name: "dispatch_subagent",
+      description:
+        "Spawn a read-only investigation sub-agent. Give it a focused question (\"find every caller of `parseConfig`\", \"summarize how the rate-limit gate clears\", \"check if test X has been flaky in CI\"). The sub-agent has read_file/grep/list_files/run_bash/fetch_url/get_linear_issue/get_pr but cannot write, edit, or commit. Returns a summary string. Prefer this over running 10+ greps yourself when the answer is best stated as a synthesis. Don't dispatch for one-off lookups.",
+      input_schema: {
+        type: "object",
+        properties: {
+          task: {
+            type: "string",
+            description:
+              "Self-contained question or instruction for the sub-agent. Include any file paths, ticket ids, or context it needs — it doesn't see your conversation.",
+          },
+        },
+        required: ["task"],
+      },
+    },
+    async run(input) {
+      try {
+        const { task } = dispatchSubagentSchema.parse(input);
+        const result = await runner(task);
+        if (result.status === "finished" && result.summary) {
+          return `subagent finished in ${result.iterations} iter:\n${result.summary}`;
+        }
+        return `subagent did not finish (status=${result.status}, iter=${result.iterations}). ${result.summary ?? "no summary"}`;
+      } catch (err) {
+        return formatError("dispatch_subagent", err);
       }
     },
   };
@@ -525,6 +674,118 @@ function getLinearIssueTool(linear: LinearAdapter): ToolHandler {
         return lines.join("\n");
       } catch (err) {
         return formatError("get_linear_issue", err);
+      }
+    },
+  };
+}
+
+const setTicketStateSchema = z.object({
+  type: z.enum([
+    "triage",
+    "backlog",
+    "unstarted",
+    "started",
+    "completed",
+    "canceled",
+  ]),
+});
+const updateTicketDescriptionSchema = z.object({
+  description: z.string(),
+});
+
+function unassignSelfTool(
+  linear: LinearAdapter,
+  current: { id: string; identifier: string },
+): ToolHandler {
+  return {
+    definition: {
+      name: "unassign_self",
+      description:
+        "Remove yourself as the assignee on the current Linear ticket. Use when a human asks you to unassign, or when the ticket needs a product/owner decision before you can proceed. Pair with set_ticket_state to also move it out of \"In Progress\".",
+      input_schema: { type: "object", properties: {}, required: [] },
+    },
+    async run() {
+      try {
+        await linear.unassign(current.id);
+        return `unassigned self from ${current.identifier}`;
+      } catch (err) {
+        return formatError("unassign_self", err);
+      }
+    },
+  };
+}
+
+function setTicketStateTool(
+  linear: LinearAdapter,
+  current: { id: string; identifier: string; teamId: string },
+): ToolHandler {
+  return {
+    definition: {
+      name: "set_ticket_state",
+      description:
+        "Move the current Linear ticket to a workflow state by type. Picks the team's first state matching `type`. Types: triage, backlog, unstarted (e.g. \"Todo\"), started (e.g. \"In Progress\"), completed (e.g. \"Done\"), canceled.",
+      input_schema: {
+        type: "object",
+        properties: {
+          type: {
+            type: "string",
+            enum: [
+              "triage",
+              "backlog",
+              "unstarted",
+              "started",
+              "completed",
+              "canceled",
+            ],
+            description: "Workflow state type to move the ticket into.",
+          },
+        },
+        required: ["type"],
+      },
+    },
+    async run(input) {
+      try {
+        const { type } = setTicketStateSchema.parse(input);
+        const result = await linear.setStateByType(
+          current.id,
+          current.teamId,
+          type as WorkflowStateType,
+        );
+        return `moved ${current.identifier} to "${result.stateName}" (${type})`;
+      } catch (err) {
+        return formatError("set_ticket_state", err);
+      }
+    },
+  };
+}
+
+function updateTicketDescriptionTool(
+  linear: LinearAdapter,
+  current: { id: string; identifier: string },
+): ToolHandler {
+  return {
+    definition: {
+      name: "update_ticket_description",
+      description:
+        "Replace the current Linear ticket's description with `description`. This is a full replace — read the existing description first via get_linear_issue if you want to preserve content. Use to capture findings or requirements so the next person doesn't redo discovery.",
+      input_schema: {
+        type: "object",
+        properties: {
+          description: {
+            type: "string",
+            description: "New description (Linear markdown). Replaces existing.",
+          },
+        },
+        required: ["description"],
+      },
+    },
+    async run(input) {
+      try {
+        const { description } = updateTicketDescriptionSchema.parse(input);
+        await linear.updateDescription(current.id, description);
+        return `updated description on ${current.identifier} (${description.length} chars)`;
+      } catch (err) {
+        return formatError("update_ticket_description", err);
       }
     },
   };

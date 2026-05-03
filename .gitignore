@@ -8,3 +8,4 @@ dist/
 *.pem
 *.private-key.pem
 .DS_Store
+reference/

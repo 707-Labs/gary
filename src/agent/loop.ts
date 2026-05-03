@@ -6,7 +6,17 @@ import type { LinearAdapter } from "../adapters/linear.ts";
 import type { Executor } from "../executors/index.ts";
 import { log } from "../logger.ts";
 import { AllProvidersExhaustedError } from "../providers.ts";
-import { type AgentTools, type ToolsetOptions, makeToolset } from "./tools.ts";
+import {
+  DEFAULT_KEEP_RECENT,
+  microcompactMessages,
+} from "./microcompact.ts";
+import { composeSystemPrompt } from "./prompts.ts";
+import {
+  type AgentTools,
+  type ToolsetOptions,
+  makeToolset,
+  renderTodos,
+} from "./tools.ts";
 
 export type AgentLoopStatus =
   | "finished"
@@ -113,6 +123,12 @@ export interface AgentLoopArgs {
   cloudflare?: CloudflareClient;
   /** If provided, the toolset includes `get_linear_issue`. */
   linear?: LinearAdapter;
+  /**
+   * The ticket this run is operating on. When provided alongside `linear`,
+   * exposes Linear mutation tools (`unassign_self`, `set_ticket_state`,
+   * `update_ticket_description`) scoped to this ticket.
+   */
+  currentIssue?: { id: string; identifier: string; teamId: string };
   /** If provided (with defaultRepo), the toolset includes `get_pr`. */
   github?: GitHubClient;
   /** Default "owner/repo" for `get_pr` when called without a repo arg. */
@@ -123,17 +139,37 @@ export interface AgentLoopArgs {
    * the model verifies its work before claiming done.
    */
   finishGateCommand?: string;
+  /**
+   * Internal: when true, suppresses the `dispatch_subagent` tool. Set by
+   * runAgentLoop on the recursive call so sub-agents can't spawn their own
+   * sub-agents (1-deep recursion guard).
+   */
+  disableSubagent?: boolean;
+  /**
+   * Internal: when true, the toolset is built read-only (no write_file,
+   * edit_file, commit). Used for sub-agent dispatches.
+   */
+  readOnly?: boolean;
 }
 
 const DEFAULT_TEMPERATURE = 0.3;
 const DEFAULT_MAX_TOKENS = 8192;
+
+/** First iteration that may trigger microcompaction. */
+const MICROCOMPACT_AFTER = 12;
+/** Cadence of microcompaction once eligible (every Nth iteration). */
+const MICROCOMPACT_EVERY = 6;
 
 const DEFAULT_NUDGE =
   "you're approaching the iteration cap. wrap up: commit what you have, then call finish() with a brief summary (or a partial-progress note if you're stuck).";
 
 /** Append `text` as a user message, merging into the last user message if
  * the conversation already ends in one (Anthropic disallows consecutive
- * same-role turns). */
+ * same-role turns). The merge path covers tool_results turns too: those
+ * always land as `user` with array content (now possibly mixing
+ * tool_result + text blocks for the trailing todo list), so a phase
+ * entry / nudge appended after one merges into the same message rather
+ * than producing an illegal user→user pair. */
 function appendUserText(
   messages: Anthropic.MessageParam[],
   text: string,
@@ -167,16 +203,24 @@ function appendUserText(
  */
 export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult> {
   const runLog: RunLogEntry[] = [];
+  const start = Date.now();
+  const deadline = start + args.timeoutMs;
   const toolsetOpts: ToolsetOptions = {};
   if (args.cloudflare) toolsetOpts.cloudflare = args.cloudflare;
   if (args.linear) toolsetOpts.linear = args.linear;
+  if (args.currentIssue) toolsetOpts.currentIssue = args.currentIssue;
   if (args.github) toolsetOpts.github = args.github;
   if (args.defaultRepo) toolsetOpts.defaultRepo = args.defaultRepo;
   if (args.finishGateCommand) toolsetOpts.finishGateCommand = args.finishGateCommand;
+  if (args.readOnly) toolsetOpts.readOnly = true;
   toolsetOpts.runLog = runLog;
+  if (!args.disableSubagent) {
+    // Sub-agent gets the parent's *remaining* budget (capped at 5 min) so it
+    // can't run past the parent's deadline while the parent is await-blocked.
+    toolsetOpts.subagentRunner = (task) =>
+      runSubagent(args, task, Math.max(0, deadline - Date.now()));
+  }
   const tools = makeToolset(args.executor, toolsetOpts);
-  const start = Date.now();
-  const deadline = start + args.timeoutMs;
 
   const phases: readonly PhaseSpec[] = args.phases ?? [
     {
@@ -337,10 +381,42 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
       for (const call of toolCalls) {
         toolResults.push(await executTool(tools, call, phase));
       }
-      messages.push({ role: "user", content: toolResults });
+      const userBlocks: (Anthropic.ToolResultBlockParam | Anthropic.TextBlockParam)[] =
+        [...toolResults];
+      // Surface current todo list at the tail of every tool_results turn so
+      // the model can't drift past it, even if older tool_results get
+      // microcompacted later. Skip when no todos to avoid noise.
+      if (tools.todos.length > 0) {
+        userBlocks.push({
+          type: "text",
+          text: `[current todos]\n${renderTodos(tools.todos)}`,
+        });
+      }
+      messages.push({ role: "user", content: userBlocks });
 
       if (tools.finishSummary !== null) {
         return done("finished", tools.finishSummary, phase.name);
+      }
+
+      // Periodically clear stale tool_results from noisy tools so long loops
+      // don't blow up input tokens. Each compaction event invalidates the
+      // prompt cache once, so trigger sparingly. Defaults: first compaction
+      // at iter 12, then every 6 iters thereafter.
+      if (
+        totalIterations >= MICROCOMPACT_AFTER &&
+        (totalIterations - MICROCOMPACT_AFTER) % MICROCOMPACT_EVERY === 0
+      ) {
+        const result = microcompactMessages(messages, {
+          keepRecent: DEFAULT_KEEP_RECENT,
+        });
+        if (result.cleared > 0) {
+          log.info("microcompact", {
+            iter: totalIterations,
+            cleared: result.cleared,
+          });
+          messages.length = 0;
+          messages.push(...result.messages);
+        }
       }
     }
 
@@ -415,5 +491,58 @@ async function executTool(
       is_error: true,
     };
   }
+}
+
+const SUBAGENT_TASK_INSTRUCTIONS = `You're an investigation sub-agent dispatched by a parent agent. Answer ONE focused question, then call finish() with a tight summary the parent can act on.
+
+Rules:
+- Read-only. Your toolset doesn't include write_file / edit_file / commit — don't try to call them. run_bash is available but for read-only commands only (grep, find, ls, cat, git log, etc.).
+- Stay scoped to the question. Don't expand the investigation.
+- finish() with concrete findings: cite file paths and line numbers. No headers, no preamble, no restating the question.`;
+
+/**
+ * Spawn a fresh agent loop scoped to a single investigation. Inherits the
+ * parent's GLM client, executor, and read-only contextual deps. Sub-agents
+ * can't spawn their own sub-agents (1-deep guard via `disableSubagent`).
+ *
+ * `remainingMs` is the parent's remaining wall-clock budget; the sub-agent's
+ * timeout is the lesser of that and 5 min so the parent can't blow past its
+ * own deadline while await-blocked here.
+ *
+ * The sub-agent gets a dedicated system prompt (voice + sub-agent task
+ * instructions), NOT the parent's prompt — the parent's instructions tell
+ * Gary to write code, commit, open PRs, which is misleading and wasteful in
+ * a read-only loop.
+ */
+async function runSubagent(
+  parent: AgentLoopArgs,
+  task: string,
+  remainingMs: number,
+): Promise<{ status: AgentLoopStatus; summary: string | null; iterations: number }> {
+  const subArgs: AgentLoopArgs = {
+    glm: parent.glm,
+    executor: parent.executor,
+    systemPrompt: composeSystemPrompt({
+      taskInstructions: SUBAGENT_TASK_INSTRUCTIONS,
+    }),
+    task,
+    maxIterations: 15,
+    timeoutMs: Math.min(remainingMs, 5 * 60_000),
+    temperature: parent.temperature ?? DEFAULT_TEMPERATURE,
+    disableSubagent: true,
+    readOnly: true,
+  };
+  if (parent.cloudflare) subArgs.cloudflare = parent.cloudflare;
+  if (parent.linear) subArgs.linear = parent.linear;
+  if (parent.currentIssue) subArgs.currentIssue = parent.currentIssue;
+  if (parent.github) subArgs.github = parent.github;
+  if (parent.defaultRepo) subArgs.defaultRepo = parent.defaultRepo;
+
+  const result = await runAgentLoop(subArgs);
+  return {
+    status: result.status,
+    summary: result.summary,
+    iterations: result.iterations,
+  };
 }
 

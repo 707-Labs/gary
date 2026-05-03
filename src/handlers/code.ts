@@ -41,6 +41,9 @@ const FIXUP_OUTPUT_BUDGET = 8000;
 // Read-only tools advertised in the investigate phase. Anything that
 // mutates the workspace (write_file, edit_file, run_bash, commit) or ends
 // the loop (finish) is hidden until the model transitions to implement.
+// `todo_write` and `dispatch_subagent` are both safe and useful here:
+// laying out a plan as todos and offloading wide investigations to a
+// sub-agent are exactly what this phase is for.
 const INVESTIGATE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
   "read_file",
   "grep",
@@ -51,6 +54,8 @@ const INVESTIGATE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
   "query_cloudflare_logs",
   "list_cloudflare_invocations",
   "d1_query",
+  "todo_write",
+  "dispatch_subagent",
 ]);
 
 /**
@@ -244,6 +249,11 @@ export async function runCodeHandler(
     timeoutMs: deps.agentLoopTimeoutMs,
     temperature: 0.3,
     linear: deps.linear,
+    currentIssue: {
+      id: args.issue.id,
+      identifier: args.issue.identifier,
+      teamId: args.issue.teamId,
+    },
     github: deps.github,
     defaultRepo: args.repo,
     finishGateCommand: CHECK_COMMAND,
@@ -566,6 +576,11 @@ async function ensurePostFinishCheckPasses(
     timeoutMs: deps.agentLoopTimeoutMs,
     temperature: 0.3,
     linear: deps.linear,
+    currentIssue: {
+      id: args.issue.id,
+      identifier: args.issue.identifier,
+      teamId: args.issue.teamId,
+    },
     github: deps.github,
     defaultRepo: args.repo,
     finishGateCommand: CHECK_COMMAND,
@@ -836,6 +851,11 @@ async function runReviewLoop(
       timeoutMs: deps.agentLoopTimeoutMs,
       temperature: 0.3,
       linear: deps.linear,
+      currentIssue: {
+        id: args.issue.id,
+        identifier: args.issue.identifier,
+        teamId: args.issue.teamId,
+      },
       github: deps.github,
       defaultRepo: args.repo,
       finishGateCommand: CHECK_COMMAND,
