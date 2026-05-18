@@ -44,7 +44,7 @@ export interface RunReviewerArgs {
 }
 
 const DEFAULT_TEMPERATURE = 0.2;
-const DEFAULT_MAX_TOKENS = 4096;
+const DEFAULT_MAX_TOKENS = 8192;
 
 export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult> {
   const start = Date.now();
@@ -65,6 +65,11 @@ export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult
   let inputTokens = 0;
   let outputTokens = 0;
   let failureReason: string | null = null;
+  // One-shot recovery: if the reviewer ends a turn without calling
+  // submit_review (e.g. wrote a verdict in prose), nudge once and continue
+  // before declaring no_submit_review. Avoids silently default-approving on
+  // a recoverable miss.
+  let promptedToSubmit = false;
 
   // Inject a forcing nudge near the iteration cap so a wandering reviewer
   // commits a verdict instead of running out of turns. Mirrors the primary
@@ -143,7 +148,25 @@ export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult
     messages.push({ role: "assistant", content: response.content });
 
     if (response.stop_reason !== "tool_use") {
-      failureReason = "no_submit_review";
+      if (response.stop_reason === "max_tokens") {
+        failureReason = "max_tokens";
+        break;
+      }
+      if (response.stop_reason === "end_turn" && !promptedToSubmit) {
+        promptedToSubmit = true;
+        log.warn("reviewer ended turn without submit_review; nudging", {
+          ticket: args.ticket.identifier,
+          round: args.round,
+          iteration,
+        });
+        messages.push({
+          role: "user",
+          content:
+            "you didn't call submit_review. you must call the submit_review tool with your verdict — do not respond in prose. if you don't have a specific, defensible blocking bug, approve.",
+        });
+        continue;
+      }
+      failureReason = `no_submit_review:${response.stop_reason ?? "null"}`;
       break;
     }
 

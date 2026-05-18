@@ -45,6 +45,46 @@ export type WorkflowStateType =
  * keeps load light while bounding staleness for `setStateByType`. */
 const TEAM_STATES_TTL_MS = 30 * 60_000;
 
+const RETRY_BACKOFFS_MS = [500, 1500, 4000] as const;
+
+function isTransientLinearError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  // Linear edge throws 5xx as message text; SDK + graphql-request preserve it.
+  // Network/DNS failures surface as ENOTFOUND/EAI_AGAIN/ECONNRESET/ETIMEDOUT/fetch failed.
+  if (/\b50[0-9]\b/.test(msg)) return true;
+  if (msg.includes("bad gateway") || msg.includes("gateway timeout")) return true;
+  if (msg.includes("service unavailable")) return true;
+  if (msg.includes("enotfound") || msg.includes("eai_again")) return true;
+  if (msg.includes("econnreset") || msg.includes("etimedout")) return true;
+  if (msg.includes("fetch failed") || msg.includes("socket hang up")) return true;
+  return false;
+}
+
+/** Retry idempotent Linear reads on 5xx / network errors. Mutations must not
+ * use this — a 502 after the server committed would double-write. */
+async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= RETRY_BACKOFFS_MS.length; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt === RETRY_BACKOFFS_MS.length || !isTransientLinearError(err)) {
+        throw err;
+      }
+      const wait = RETRY_BACKOFFS_MS[attempt]!;
+      log.warn("linear transient error; retrying", {
+        label,
+        attempt: attempt + 1,
+        waitMs: wait,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+  throw lastErr;
+}
+
 export class LinearAdapter {
   private readonly client: LinearClient;
   private readonly userId: string;
@@ -69,7 +109,7 @@ export class LinearAdapter {
   }
 
   async getViewer(): Promise<ViewerInfo> {
-    const v = await this.client.viewer;
+    const v = await withRetry("getViewer", () => this.client.viewer);
     return {
       id: v.id,
       name: v.name,
@@ -103,25 +143,27 @@ export class LinearAdapter {
         }
       }
     `;
-    const data = await this.client.client.request<
-      {
-        issues: {
-          nodes: {
-            id: string;
-            identifier: string;
-            title: string;
-            description: string | null;
-            url: string;
-            createdAt: string;
-            updatedAt: string;
-            state: { name: string; type: string } | null;
-            team: { id: string; key: string } | null;
-            creator: { id: string; name: string } | null;
-          }[];
-        };
-      },
-      { userId: string; first: number }
-    >(query, { userId: this.userId, first: 50 });
+    const data = await withRetry("fetchAssignedIssues", () =>
+      this.client.client.request<
+        {
+          issues: {
+            nodes: {
+              id: string;
+              identifier: string;
+              title: string;
+              description: string | null;
+              url: string;
+              createdAt: string;
+              updatedAt: string;
+              state: { name: string; type: string } | null;
+              team: { id: string; key: string } | null;
+              creator: { id: string; name: string } | null;
+            }[];
+          };
+        },
+        { userId: string; first: number }
+      >(query, { userId: this.userId, first: 50 }),
+    );
 
     return data.issues.nodes
       .filter(
@@ -176,26 +218,28 @@ export class LinearAdapter {
         }
       }
     `;
-    const data = await this.client.client.request<
-      {
-        issues: {
-          nodes: {
-            id: string;
-            identifier: string;
-            title: string;
-            description: string | null;
-            url: string;
-            createdAt: string;
-            updatedAt: string;
-            state: { name: string; type: string } | null;
-            team: { id: string; key: string } | null;
-            creator: { id: string; name: string } | null;
-            assignee: { id: string } | null;
-          }[];
-        };
-      },
-      { userId: string; first: number }
-    >(query, { userId: this.userId, first: 50 });
+    const data = await withRetry("fetchMentionedIssues", () =>
+      this.client.client.request<
+        {
+          issues: {
+            nodes: {
+              id: string;
+              identifier: string;
+              title: string;
+              description: string | null;
+              url: string;
+              createdAt: string;
+              updatedAt: string;
+              state: { name: string; type: string } | null;
+              team: { id: string; key: string } | null;
+              creator: { id: string; name: string } | null;
+              assignee: { id: string } | null;
+            }[];
+          };
+        },
+        { userId: string; first: number }
+      >(query, { userId: this.userId, first: 50 }),
+    );
 
     return data.issues.nodes
       .filter((n) => n.assignee?.id !== this.userId)
@@ -225,17 +269,18 @@ export class LinearAdapter {
    * issue matches. Same shape as fetchAssignedIssues entries.
    */
   async fetchByIdentifier(identifier: string): Promise<AssignedIssue | null> {
-    const result = await this.client.issues({
-      filter: { number: { eq: parseIdentifierNumber(identifier) }, team: { key: { eq: parseIdentifierTeamKey(identifier) } } },
-      first: 1,
-    });
+    const result = await withRetry(`fetchByIdentifier(${identifier})`, () =>
+      this.client.issues({
+        filter: { number: { eq: parseIdentifierNumber(identifier) }, team: { key: { eq: parseIdentifierTeamKey(identifier) } } },
+        first: 1,
+      }),
+    );
     const issue = result.nodes[0];
     if (!issue) return null;
-    const [state, team, creator] = await Promise.all([
-      issue.state,
-      issue.team,
-      issue.creator,
-    ]);
+    const [state, team, creator] = await withRetry(
+      `fetchByIdentifier(${identifier}).resolvers`,
+      () => Promise.all([issue.state, issue.team, issue.creator]),
+    );
     return {
       id: issue.id,
       identifier: issue.identifier,
@@ -276,20 +321,22 @@ export class LinearAdapter {
         }
       }
     `;
-    const data = await this.client.client.request<
-      {
-        issue: {
-          comments: {
-            nodes: {
-              id: string;
-              createdAt: string;
-              user: { id: string } | null;
-            }[];
-          };
-        } | null;
-      },
-      { id: string; first: number }
-    >(query, { id: issueId, first: limit });
+    const data = await withRetry(`fetchCommentMeta(${issueId})`, () =>
+      this.client.client.request<
+        {
+          issue: {
+            comments: {
+              nodes: {
+                id: string;
+                createdAt: string;
+                user: { id: string } | null;
+              }[];
+            };
+          } | null;
+        },
+        { id: string; first: number }
+      >(query, { id: issueId, first: limit }),
+    );
     const nodes = data.issue?.comments?.nodes ?? [];
     return nodes.map((n) => ({
       id: n.id,
@@ -316,21 +363,23 @@ export class LinearAdapter {
         }
       }
     `;
-    const data = await this.client.client.request<
-      {
-        issue: {
-          comments: {
-            nodes: {
-              id: string;
-              body: string;
-              createdAt: string;
-              user: { id: string; name: string } | null;
-            }[];
-          };
-        } | null;
-      },
-      { id: string; first: number }
-    >(query, { id: issueId, first: limit });
+    const data = await withRetry(`fetchComments(${issueId})`, () =>
+      this.client.client.request<
+        {
+          issue: {
+            comments: {
+              nodes: {
+                id: string;
+                body: string;
+                createdAt: string;
+                user: { id: string; name: string } | null;
+              }[];
+            };
+          } | null;
+        },
+        { id: string; first: number }
+      >(query, { id: issueId, first: limit }),
+    );
     const nodes = data.issue?.comments?.nodes ?? [];
     return nodes.map((n) => ({
       id: n.id,
@@ -403,18 +452,20 @@ export class LinearAdapter {
     if (cached && Date.now() - cached.fetchedAt < TEAM_STATES_TTL_MS) {
       return cached.states;
     }
-    const data = await this.client.client.request<
-      { team: { states: { nodes: { id: string; name: string; type: string }[] } } | null },
-      { teamId: string }
-    >(
-      `query TeamStates($teamId: String!) {
-        team(id: $teamId) {
-          states {
-            nodes { id name type }
+    const data = await withRetry(`fetchTeamStates(${teamId})`, () =>
+      this.client.client.request<
+        { team: { states: { nodes: { id: string; name: string; type: string }[] } } | null },
+        { teamId: string }
+      >(
+        `query TeamStates($teamId: String!) {
+          team(id: $teamId) {
+            states {
+              nodes { id name type }
+            }
           }
-        }
-      }`,
-      { teamId },
+        }`,
+        { teamId },
+      ),
     );
     const nodes = data.team?.states?.nodes ?? [];
     this.teamStatesCache.set(teamId, { states: nodes, fetchedAt: Date.now() });
