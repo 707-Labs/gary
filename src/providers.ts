@@ -234,6 +234,44 @@ export function isRateLimitError(err: unknown): boolean {
 }
 
 /**
+ * Detect an authentication/authorization failure (expired or revoked key).
+ * Unlike a 429 this won't clear on its own, but the chain should still
+ * fall through — a dead fallback key must never kill a run when a healthy
+ * provider sits behind it in the chain.
+ */
+export function isAuthError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const status = (err as { status?: unknown }).status;
+  return status === 401 || status === 403;
+}
+
+/**
+ * How long an auth-dead provider stays parked. Long enough that we don't
+ * hammer a dead key every tick, short enough that a rotated key gets
+ * picked up without a restart.
+ */
+export const AUTH_FAILURE_BACKOFF_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Arm the provider's gate following a 401/403. Logs at error level — a
+ * dead key needs human attention (rotate or remove from the chain), the
+ * chain just keeps the lights on in the meantime.
+ */
+export function armOnAuthFailure(
+  provider: LLMProvider,
+  message: string,
+): Date {
+  const resetAt = new Date(Date.now() + AUTH_FAILURE_BACKOFF_MS);
+  provider.gate.armUntil(resetAt);
+  log.error("provider auth failed; parking provider — rotate or remove this key", {
+    provider: provider.name,
+    resetAt: resetAt.toISOString(),
+    error: message,
+  });
+  return resetAt;
+}
+
+/**
  * Arm the provider's gate following a 429. Uses the provider's parser if it
  * extracts a timestamp; otherwise uses defaultBackoffMs from now. Logs at
  * warn level so a sudden burst of cap activity is visible in stdout.

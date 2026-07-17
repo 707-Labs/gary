@@ -371,6 +371,7 @@ async function collectMentionCandidates(
     mentionOnly: 0,
     pickup: 0,
     mention: 0,
+    reopened: 0,
     fetchCommentsErrors: 0,
     fetchMentionedError: false as boolean,
   };
@@ -395,7 +396,10 @@ async function collectMentionCandidates(
   for (const issue of mentionOnly) {
     upsertTicket(deps.db, { linearId: issue.id, identifier: issue.identifier });
     const ticketRow = getTicket(deps.db, issue.id);
-    if (ticketRow?.terminal_state) continue;
+    // Terminal tickets are NOT skipped here. A fresh allowlisted @mention
+    // re-engages a concluded ticket the same way reassignment does — the
+    // reopen happens below, gated on the action cache, so a mention Gary
+    // already handled keeps its fingerprint and stays suppressed.
 
     let comments: Awaited<ReturnType<LinearAdapter["fetchComments"]>>;
     try {
@@ -452,6 +456,12 @@ async function collectMentionCandidates(
       })
     ) {
       continue;
+    }
+    if (ticketRow?.terminal_state) {
+      // Unacted mention on a concluded ticket → the human re-engaged after
+      // the bounce/escalation. Mirror the reassignment reopen path.
+      reopenTicket(deps.db, issue, ticketRow);
+      stats.reopened++;
     }
     candidates.push(candidate);
   }

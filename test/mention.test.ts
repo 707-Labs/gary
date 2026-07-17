@@ -31,6 +31,22 @@ describe("looksLikePickup", () => {
     "@gary can you handle it?",
     "@gary please grab this",
     "@gary can you check if this was handled in another ticket? if not please pick it up",
+    // strict retry phrasings — asking Gary to re-attempt a concluded ticket
+    "@gary try this one again",
+    "@gary try this again",
+    "@gary try it again",
+    "@gary, try again",
+    "@gary retry this",
+    "@gary retry it",
+    "@gary take another crack at this",
+    "@gary have another go at it",
+    "@gary give this another shot",
+    // relaxed retry phrasings — @gary somewhere + polite/interrogative
+    "@gary please try this again",
+    "@gary can you try it again?",
+    "hey @gary — please retry",
+    "@gary can you retry this one?",
+    "@gary when you get a chance, give it another go",
   ])("matches %s", (body) => {
     expect(looksLikePickup(body)).toBe(true);
   });
@@ -47,6 +63,12 @@ describe("looksLikePickup", () => {
     "please pick this up",
     "can you take this?",
     "please handle this",
+    "please try this again",
+    "can you retry this?",
+    "give it another shot",
+    // "try/retry" in unrelated discussion must not trigger even with @gary
+    "@gary suggested we try a different approach",
+    "@gary I'll retry the deploy myself",
   ])("does not match %s", (body) => {
     expect(looksLikePickup(body)).toBe(false);
   });

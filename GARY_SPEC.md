@@ -341,7 +341,7 @@ If time permits: a minimal webhook receiver for GitHub `check_run` and `pull_req
 ### Model config
 
 - Endpoint: `https://api.z.ai/api/anthropic`
-- Model: `glm-4.6` (or whatever the current GLM coding model is — read from env)
+- Model: `glm-5.2` (or whatever the current GLM coding model is — read from env)
 - Auth: `Z_AI_API_KEY` passed as `ANTHROPIC_API_KEY` header
 - Use the Anthropic SDK (`@anthropic-ai/sdk`) pointed at Z.ai's base URL
 - `max_tokens`: 8192 per turn
@@ -535,7 +535,7 @@ GITHUB_APP_USERNAME=gary[bot]
 # GLM via Z.ai
 Z_AI_API_KEY=<key>
 Z_AI_BASE_URL=https://api.z.ai/api/anthropic
-Z_AI_MODEL=glm-4.6
+Z_AI_MODEL=glm-5.2
 
 # Runtime
 POLL_INTERVAL_MS=60000

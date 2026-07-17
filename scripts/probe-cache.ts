@@ -19,7 +19,7 @@ const targets: ProbeTarget[] = [
   {
     name: "z.ai",
     baseURL: "https://api.z.ai/api/anthropic",
-    model: "glm-4.6",
+    model: "glm-5.2",
     apiKeyEnv: "Z_AI_API_KEY",
   },
   {

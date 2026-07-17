@@ -2,7 +2,9 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { log } from "../logger.ts";
 import {
   AllProvidersExhaustedError,
+  armOnAuthFailure,
   armOnRateLimit,
+  isAuthError,
   isRateLimitError,
   type LLMProvider,
   type ProviderChain,
@@ -11,14 +13,9 @@ import { UsageLimitError } from "../rate-limit.ts";
 
 const DEFAULT_MAX_TOKENS = 8192;
 
-// SDK 0.32.1 doesn't carry `cache_control` in the GA Messages types — only
-// in the beta namespace. The wire format is identical though, and Z.ai /
-// Kimi / DeepSeek all honor it on their Anthropic-compatible endpoints
-// (verified via scripts/probe-cache.ts). We cast at the boundary instead
-// of pulling in a major SDK upgrade.
+// Z.ai / Kimi / DeepSeek all honor `cache_control` on their
+// Anthropic-compatible endpoints (verified via scripts/probe-cache.ts).
 const EPHEMERAL = { type: "ephemeral" } as const;
-
-type WithCacheControl<T> = T & { cache_control?: { type: "ephemeral" } };
 
 /**
  * Inject cache_control breakpoints so providers cache the static prefix
@@ -44,22 +41,18 @@ export function withCacheControl(
 
   if (typeof args.system === "string" && args.system.length > 0) {
     out.system = [
-      { type: "text", text: args.system, cache_control: EPHEMERAL } as Anthropic.TextBlockParam,
+      { type: "text", text: args.system, cache_control: EPHEMERAL },
     ];
   } else if (Array.isArray(args.system) && args.system.length > 0) {
     out.system = args.system.map((b, i, arr): Anthropic.TextBlockParam =>
-      i === arr.length - 1
-        ? ({ ...b, cache_control: EPHEMERAL } as Anthropic.TextBlockParam)
-        : b,
+      i === arr.length - 1 ? { ...b, cache_control: EPHEMERAL } : b,
     );
   }
   // else: leave args.system as-is (undefined or empty array passes through).
 
   if (args.tools && args.tools.length > 0) {
-    out.tools = args.tools.map((t, i, arr): Anthropic.Tool =>
-      i === arr.length - 1
-        ? ({ ...t, cache_control: EPHEMERAL } as Anthropic.Tool)
-        : t,
+    out.tools = args.tools.map((t, i, arr): Anthropic.ToolUnion =>
+      i === arr.length - 1 ? { ...t, cache_control: EPHEMERAL } : t,
     );
   }
 
@@ -89,11 +82,10 @@ function withCacheOnLastMessage(
   const j = blocks.length - 1;
   if (j < 0) return out;
   const tail = blocks[j]!;
-  // Cache_control attaches at the block level for any block variant
-  // (TextBlock, ToolResultBlock, etc.). The SDK type for 0.32.1 doesn't
-  // model it, so widen via `WithCacheControl` and cast back.
-  const tagged: WithCacheControl<typeof tail> = { ...tail, cache_control: EPHEMERAL };
-  blocks[j] = tagged as typeof tail;
+  // cache_control attaches at the block level for any block variant except
+  // thinking blocks, which can't carry a breakpoint.
+  if (tail.type === "thinking" || tail.type === "redacted_thinking") return out;
+  blocks[j] = { ...tail, cache_control: EPHEMERAL };
   out[i] = { ...last, content: blocks };
   return out;
 }
@@ -181,11 +173,12 @@ export class GLMClient {
   }
 
   /**
-   * Try the call against successive providers, arming each gate on 429.
-   * Throws `AllProvidersExhaustedError` if every provider is armed before
-   * we can find one that succeeds.
+   * Try the call against successive providers, arming each gate on 429
+   * (short backoff) or 401/403 (long park — dead key). Throws
+   * `AllProvidersExhaustedError` if every provider is armed before we can
+   * find one that succeeds.
    *
-   * Non-429 errors propagate unchanged; we don't want to mask 5xx or
+   * Other errors propagate unchanged; we don't want to mask 5xx or
    * malformed-request errors as if they were caps.
    */
   private async runWithFallback<T>(
@@ -210,9 +203,14 @@ export class GLMClient {
         }
         return out;
       } catch (err) {
-        if (!isRateLimitError(err)) throw err;
         const message = err instanceof Error ? err.message : String(err);
-        armOnRateLimit(provider, message);
+        if (isRateLimitError(err)) {
+          armOnRateLimit(provider, message);
+        } else if (isAuthError(err)) {
+          armOnAuthFailure(provider, message);
+        } else {
+          throw err;
+        }
         // Loop continues — next iteration picks the next-priority provider.
       }
     }

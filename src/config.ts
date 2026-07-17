@@ -247,7 +247,7 @@ export function loadGLMConfig(): GLMConfig {
   return {
     apiKey: stringFromEnv("Z_AI_API_KEY"),
     baseUrl: stringFromEnv("Z_AI_BASE_URL", "https://api.z.ai/api/anthropic"),
-    model: stringFromEnv("Z_AI_MODEL", "glm-4.6"),
+    model: stringFromEnv("Z_AI_MODEL", "glm-5.2"),
   };
 }
 
@@ -260,7 +260,7 @@ const PROVIDER_DEFAULTS: Record<
   "z.ai": {
     apiKeyEnv: "Z_AI_API_KEY",
     baseUrl: "https://api.z.ai/api/anthropic",
-    model: "glm-4.6",
+    model: "glm-5.2",
     defaultBackoffMs: DEFAULT_BACKOFF_MS,
   },
   kimi: {

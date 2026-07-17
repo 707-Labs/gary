@@ -18,7 +18,7 @@ if (!apiKey) {
 }
 
 const baseURL = process.env.Z_AI_BASE_URL ?? "https://api.z.ai/api/anthropic";
-const model = process.env.Z_AI_MODEL ?? "glm-4.6";
+const model = process.env.Z_AI_MODEL ?? "glm-5.2";
 
 // Z.ai accepts both x-api-key and Authorization: Bearer; using authToken so
 // the probe matches the production GLMClient header shape.

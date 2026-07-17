@@ -3,6 +3,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { GLMClient } from "../src/adapters/glm.ts";
 import {
   AllProvidersExhaustedError,
+  AUTH_FAILURE_BACKOFF_MS,
   createProviderChain,
   type LLMProvider,
 } from "../src/providers.ts";
@@ -13,6 +14,7 @@ interface FakeOpts {
   responses: Array<
     | { kind: "ok"; text: string }
     | { kind: "rate_limit"; resetAt?: Date; message?: string }
+    | { kind: "auth_error"; status?: number }
     | { kind: "error"; message: string }
   >;
 }
@@ -63,6 +65,13 @@ function fakeProvider(
               (r.resetAt ? ` resetAt=${r.resetAt.toISOString()}` : "");
             const err = new Error(tagged) as Error & { status?: number };
             err.status = 429;
+            throw err;
+          }
+          if (r.kind === "auth_error") {
+            const err = new Error(
+              "invalid_authentication_error",
+            ) as Error & { status?: number };
+            err.status = r.status ?? 401;
             throw err;
           }
           throw new Error(r.message);
@@ -128,6 +137,47 @@ describe("GLMClient.complete — provider fallback", () => {
     const b = fakeProvider("kimi", {
       responses: [{ kind: "rate_limit", resetAt: reset }],
     });
+    const glm = new GLMClient(createProviderChain([a, b]));
+    await expect(glm.complete({ system: "", user: "" })).rejects.toBeInstanceOf(
+      AllProvidersExhaustedError,
+    );
+    expect(a.gate.isArmed()).toBe(true);
+    expect(b.gate.isArmed()).toBe(true);
+  });
+
+  it("falls through to the next provider on 401 and arms the dead provider", async () => {
+    const a = fakeProvider("kimi", {
+      responses: [{ kind: "auth_error" }],
+    });
+    const b = fakeProvider("deepseek", {
+      responses: [{ kind: "ok", text: "from-deepseek" }],
+    });
+    const glm = new GLMClient(createProviderChain([a, b]));
+    const before = Date.now();
+    const out = await glm.complete({ system: "", user: "" });
+    expect(out).toBe("from-deepseek");
+    // Dead-auth provider is parked for a long time, not the short 429 backoff.
+    const armed = a.gate.armedUntil()!.getTime();
+    expect(armed).toBeGreaterThanOrEqual(before + AUTH_FAILURE_BACKOFF_MS);
+    expect(b.gate.isArmed()).toBe(false);
+  });
+
+  it("falls through on 403 the same as 401", async () => {
+    const a = fakeProvider("kimi", {
+      responses: [{ kind: "auth_error", status: 403 }],
+    });
+    const b = fakeProvider("deepseek", {
+      responses: [{ kind: "ok", text: "from-deepseek" }],
+    });
+    const glm = new GLMClient(createProviderChain([a, b]));
+    const out = await glm.complete({ system: "", user: "" });
+    expect(out).toBe("from-deepseek");
+    expect(a.gate.isArmed()).toBe(true);
+  });
+
+  it("throws AllProvidersExhaustedError when every provider is auth-dead", async () => {
+    const a = fakeProvider("z.ai", { responses: [{ kind: "auth_error" }] });
+    const b = fakeProvider("kimi", { responses: [{ kind: "auth_error" }] });
     const glm = new GLMClient(createProviderChain([a, b]));
     await expect(glm.complete({ system: "", user: "" })).rejects.toBeInstanceOf(
       AllProvidersExhaustedError,

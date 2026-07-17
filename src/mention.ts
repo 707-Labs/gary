@@ -17,6 +17,12 @@ const STRICT_PICKUP_TRIGGERS: readonly RegExp[] = [
   /@gary[,]?\s+pick\s+up\s+(this|it)\b/i,
   /@gary[,]?\s+handle\s+(this|it)\b/i,
   /@gary[,]?\s+grab\s+(this|it)\b/i,
+  // Retry phrasings — re-attempt a ticket Gary previously bounced/escalated.
+  /@gary[,]?\s+try\s+(this|it|that)(\s+one)?\s+again\b/i,
+  /@gary[,]?\s+try\s+again\b/i,
+  /@gary[,]?\s+retry\s+(this|it|that)(\s+one)?\b/i,
+  /@gary[,]?\s+(take|have)\s+another\s+(look|pass|crack|shot|go)\b/i,
+  /@gary[,]?\s+give\s+(this|it|that)(\s+one)?\s+another\s+(go|shot|try|pass)\b/i,
 ];
 
 // Relaxed patterns: imperative verb appears anywhere with a polite/interrogative
@@ -36,6 +42,12 @@ const RELAXED_PICKUP_TRIGGERS: readonly RegExp[] = [
   /\bcan\s+you\s+pick\s+up\s+(this|it)\b/i,
   /\bcan\s+you\s+handle\s+(this|it)\b/i,
   /\bcan\s+you\s+grab\s+(this|it)\b/i,
+  // Retry phrasings
+  /\bplease\s+try\s+(this|it|that)(\s+one)?\s+again\b/i,
+  /\bcan\s+you\s+try\s+(this|it|that)(\s+one)?\s+again\b/i,
+  /\bplease\s+retry\b/i,
+  /\bcan\s+you\s+retry\b/i,
+  /\bgive\s+(this|it|that)(\s+one)?\s+another\s+(go|shot|try|pass)\b/i,
 ];
 
 const MENTION_PATTERN = /@gary\b/i;

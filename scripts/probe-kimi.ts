@@ -1,7 +1,11 @@
-// Smoke test for Moonshot/Kimi. Verifies that the Anthropic SDK pointed at
+// Smoke test for Kimi Code. Verifies that the Anthropic SDK pointed at
 // Kimi's Anthropic-compatible endpoint can:
 //   1. Complete a basic chat (text in / text out)
 //   2. Use tools (the agent loop relies on this)
+//
+// Defaults mirror PROVIDER_DEFAULTS in src/config.ts — the Kimi Code
+// surface (api.kimi.com/coding), NOT the Moonshot Open Platform
+// (api.moonshot.ai). A Kimi Code subscription key 401s on Moonshot.
 //
 // Run with: bun run scripts/probe-kimi.ts
 
@@ -13,10 +17,10 @@ if (!apiKey) {
   process.exit(1);
 }
 
-const baseURL = process.env.KIMI_BASE_URL ?? "https://api.moonshot.ai/anthropic";
-const model = process.env.KIMI_MODEL ?? "kimi-k2.5";
+const baseURL = process.env.KIMI_BASE_URL ?? "https://api.kimi.com/coding";
+const model = process.env.KIMI_MODEL ?? "kimi-for-coding";
 
-// Moonshot expects Authorization: Bearer <key>, not x-api-key. The Anthropic
+// Kimi expects Authorization: Bearer <key>, not x-api-key. The Anthropic
 // SDK sends x-api-key when given `apiKey`; using `authToken` flips it to a
 // Bearer header.
 const client = new Anthropic({ authToken: apiKey, baseURL });
