@@ -6,9 +6,12 @@ import { closeDb, type DB, openDb } from "../src/state/db.ts";
 import {
   clearClassification,
   clearTerminalState,
+  getLastActionStartedAt,
   getTicket,
+  recordActionStart,
   setClassification,
   setTerminalState,
+  sqliteTimestampToDate,
   upsertTicket,
 } from "../src/state/queries.ts";
 
@@ -93,6 +96,48 @@ describe("clearClassification", () => {
     const row = getTicket(db, "ticket-1");
     expect(row?.classification).toBeNull();
     expect(row?.terminal_state).toBe("bounced");
+  });
+});
+
+describe("getLastActionStartedAt", () => {
+  it("returns null for a ticket with no actions", () => {
+    expect(getLastActionStartedAt(db, "ticket-1")).toBeNull();
+  });
+
+  it("returns the newest started_at across all actions", () => {
+    recordActionStart(db, {
+      ticketLinearId: "ticket-1",
+      stateFingerprint: "fp-1",
+      actionType: "classify",
+    });
+    const ts = getLastActionStartedAt(db, "ticket-1");
+    expect(ts).not.toBeNull();
+    // datetime('now') is UTC; the round-trip should land within the last minute.
+    const age = Date.now() - sqliteTimestampToDate(ts!).getTime();
+    expect(age).toBeGreaterThanOrEqual(0);
+    expect(age).toBeLessThan(60_000);
+  });
+});
+
+describe("sqliteTimestampToDate", () => {
+  it("interprets a SQLite UTC timestamp as UTC, not local time", () => {
+    expect(sqliteTimestampToDate("2026-07-17 02:48:35").toISOString()).toBe(
+      "2026-07-17T02:48:35.000Z",
+    );
+  });
+
+  it("passes ISO strings through", () => {
+    expect(
+      sqliteTimestampToDate("2026-04-25T17:36:22.038Z").toISOString(),
+    ).toBe("2026-04-25T17:36:22.038Z");
+  });
+
+  it("orders correctly against ISO comment timestamps", () => {
+    const action = sqliteTimestampToDate("2026-07-17 02:48:35").getTime();
+    const staleComment = new Date("2026-04-25T17:36:22.038Z").getTime();
+    const freshComment = new Date("2026-07-17T09:00:00.000Z").getTime();
+    expect(staleComment).toBeLessThan(action);
+    expect(freshComment).toBeGreaterThan(action);
   });
 });
 

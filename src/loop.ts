@@ -40,6 +40,7 @@ import {
   clearClassification,
   clearTerminalState,
   countActionsSince,
+  getLastActionStartedAt,
   getPrForTicket,
   getRespondedPrCommentIds,
   getRevisitMark,
@@ -50,6 +51,7 @@ import {
   recordEvent,
   setClassification,
   setRevisitMark,
+  sqliteTimestampToDate,
   type TicketRow,
   upsertTicket,
 } from "./state/queries.ts";
@@ -459,7 +461,17 @@ async function collectMentionCandidates(
     }
     if (ticketRow?.terminal_state) {
       // Unacted mention on a concluded ticket → the human re-engaged after
-      // the bounce/escalation. Mirror the reassignment reopen path.
+      // the bounce/escalation. Mirror the reassignment reopen path — but
+      // only for triggers NEWER than Gary's last engagement. Old "@gary
+      // take this" comments stay in the thread forever, and any later
+      // human comment bumps the fingerprint; without this check a stale
+      // trigger would re-summon him every time someone adds context.
+      const lastEngagedAt = getLastActionStartedAt(deps.db, issue.id);
+      if (lastEngagedAt) {
+        const commentAt = new Date(analysis.comment.createdAt).getTime();
+        const engagedAt = sqliteTimestampToDate(lastEngagedAt).getTime();
+        if (!(commentAt > engagedAt)) continue;
+      }
       reopenTicket(deps.db, issue, ticketRow);
       stats.reopened++;
     }

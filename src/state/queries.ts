@@ -77,6 +77,33 @@ export function hasActedOn(
   return (row?.n ?? 0) > 0;
 }
 
+/**
+ * When Gary last engaged this ticket (any dispatched action, successful or
+ * not), as a SQLite UTC timestamp string. Null if he never has. Used to
+ * judge whether an @mention is newer than his last engagement — a stale
+ * trigger sitting in an old comment must not re-summon him.
+ */
+export function getLastActionStartedAt(
+  db: DB,
+  ticketLinearId: string,
+): string | null {
+  const row = db
+    .query<{ ts: string | null }, { t: string }>(
+      `SELECT MAX(started_at) AS ts FROM actions WHERE ticket_linear_id = $t`,
+    )
+    .get({ t: ticketLinearId });
+  return row?.ts ?? null;
+}
+
+/**
+ * SQLite's datetime('now') produces "YYYY-MM-DD HH:MM:SS" in UTC with no
+ * timezone marker — parsed as-is, JS would treat it as local time. Force
+ * the UTC interpretation. ISO strings pass through untouched.
+ */
+export function sqliteTimestampToDate(ts: string): Date {
+  return new Date(ts.includes("T") ? ts : `${ts.replace(" ", "T")}Z`);
+}
+
 export function recordActionStart(
   db: DB,
   args: {
