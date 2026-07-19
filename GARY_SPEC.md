@@ -698,7 +698,7 @@ If all 9 steps happen without manual intervention beyond what's listed, Weekend 
 - Docker sandboxing / VM isolation (interface yes, `DockerExecutor` no)
 - VPS deployment
 - Review comment response (humans)
-- Review comment response (bots — Gemini reviewer integration)
+- ~~Review comment response (bots — Gemini reviewer integration)~~ — flipped 2026-07-19; `gemini-code-assist[bot]` is allowlisted into the pr-review pipeline (`RESPONDABLE_BOT_LOGINS` in `src/state-fingerprint.ts`, applied in both the pending-comment signature and the handler filter). All other bots stay filtered.
 - User report triage
 - ~~Multi-repo support~~ (done 2026-04-25)
 - Webhook receivers for Linear or GitHub (polling is fine)

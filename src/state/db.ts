@@ -46,6 +46,13 @@ function applyMigrations(db: DB): void {
   if (!cols.has("model")) {
     db.exec("ALTER TABLE actions ADD COLUMN model TEXT");
   }
+  const ticketCols = new Set(
+    (db.prepare("PRAGMA table_info(tickets)").all() as Array<{ name: string }>)
+      .map((r) => r.name),
+  );
+  if (!ticketCols.has("classification_type")) {
+    db.exec("ALTER TABLE tickets ADD COLUMN classification_type TEXT");
+  }
 }
 
 export function closeDb(db: DB): void {

@@ -186,6 +186,9 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
           // setClassification on every fresh classify, so this only matters
           // for ancient tickets in the DB.
           scope: (ticketRow.classification_scope ?? "M") as "S" | "M" | "L",
+          ...(ticketRow.classification_type
+            ? { changeType: ticketRow.classification_type }
+            : {}),
         }
       : null;
 
@@ -758,6 +761,7 @@ async function runStartCoding(
   }
   const comments = await deps.linear.fetchComments(issue.id);
   const scope = action.state.classification?.scope ?? "M";
+  const changeType = action.state.classification?.changeType;
   await runCodeHandler(
     {
       db: deps.db,
@@ -771,7 +775,7 @@ async function runStartCoding(
       agentLoopTimeoutMs: deps.agentLoopTimeoutMs,
       review: deps.review,
     },
-    { issue, comments, repo, scope },
+    { issue, comments, repo, scope, ...(changeType ? { changeType } : {}) },
   );
   // Mark this signature as the last input Gary acted on. Subsequent comments
   // bump the signature and revisit_code fires; without comments it stays
@@ -801,6 +805,7 @@ async function runClassify(
     classification: classification.classification,
     confidence: classification.confidence,
     scope: classification.scope,
+    changeType: classification.type ?? null,
   });
 
   const outcome = decideClassifyOutcome(classification);

@@ -85,6 +85,20 @@ export interface PullRequestComment {
 
 export type AggregateCi = "green" | "red" | "pending" | "none";
 
+/**
+ * Slim view of an open PR, regardless of author. Used by the pre-open
+ * duplicate guard in the code handler — it must see PRs opened by ANY
+ * identity (the ERT-1891 double-run came from a second Gary instance
+ * running under a different GitHub login).
+ */
+export interface OpenPullRequestSummary {
+  number: number;
+  url: string;
+  title: string;
+  headRef: string;
+  authorLogin: string | null;
+}
+
 export interface ViewerInfo {
   login: string;
   type: "Bot" | "User";
@@ -168,6 +182,15 @@ export interface GitHubClient {
     repo: string,
     number: number,
   ): Promise<PullRequestComment[]>;
+
+  /**
+   * All open PRs in the repo (any author). Used by the pre-open duplicate
+   * guard — see OpenPullRequestSummary.
+   */
+  listOpenPullRequests(
+    owner: string,
+    repo: string,
+  ): Promise<OpenPullRequestSummary[]>;
 }
 
 class AppGitHubClient implements GitHubClient {
@@ -346,6 +369,13 @@ class AppGitHubClient implements GitHubClient {
   ): Promise<PullRequestComment[]> {
     return getPrCommentsVia(this.app, owner, repo, number);
   }
+
+  async listOpenPullRequests(
+    owner: string,
+    repo: string,
+  ): Promise<OpenPullRequestSummary[]> {
+    return listOpenPrsVia(this.app, owner, repo);
+  }
 }
 
 class PatGitHubClient implements GitHubClient {
@@ -502,6 +532,33 @@ class PatGitHubClient implements GitHubClient {
   ): Promise<PullRequestComment[]> {
     return getPrCommentsVia(this.api, owner, repo, number);
   }
+
+  async listOpenPullRequests(
+    owner: string,
+    repo: string,
+  ): Promise<OpenPullRequestSummary[]> {
+    return listOpenPrsVia(this.api, owner, repo);
+  }
+}
+
+async function listOpenPrsVia(
+  api: Octokit,
+  owner: string,
+  repo: string,
+): Promise<OpenPullRequestSummary[]> {
+  const { data } = await api.pulls.list({
+    owner,
+    repo,
+    state: "open",
+    per_page: 100,
+  });
+  return data.map((p) => ({
+    number: p.number,
+    url: p.html_url,
+    title: p.title,
+    headRef: p.head.ref,
+    authorLogin: p.user?.login ?? null,
+  }));
 }
 
 interface PrPayload {

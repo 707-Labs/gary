@@ -4,10 +4,23 @@ import type { AssignedIssue, IssueComment } from "../adapters/linear.ts";
 import { composeSystemPrompt } from "../agent/prompts.ts";
 import { log } from "../logger.ts";
 
+export const CHANGE_TYPES = [
+  "feat",
+  "fix",
+  "refactor",
+  "chore",
+  "docs",
+  "test",
+  "perf",
+] as const;
+
 export const ClassificationSchema = z.object({
   classification: z.enum(["CODE", "ANSWER", "BOUNCE"]),
   confidence: z.number().min(0).max(1),
   scope: z.enum(["S", "M", "L"]),
+  // Tolerant on purpose: a missing or out-of-vocabulary type degrades to
+  // an unprefixed branch name, never to a failed classification.
+  type: z.enum(CHANGE_TYPES).optional().catch(undefined),
   reasoning: z.string().min(1),
 });
 
@@ -20,8 +33,11 @@ Output ONLY a single JSON object — no prose, no code fences, no preamble. The 
   "classification": "CODE" | "ANSWER" | "BOUNCE",
   "confidence": <number from 0 to 1>,
   "scope": "S" | "M" | "L",
+  "type": "feat" | "fix" | "refactor" | "chore" | "docs" | "test" | "perf",
   "reasoning": "<one or two sentences explaining your call, written in your voice>"
 }
+
+The "type" is the conventional-commit type of the change — it becomes the branch name prefix (e.g. fix/ert-1891-...). Bug reports are "fix", new behavior is "feat", and so on. For ANSWER or BOUNCE it's unused; pick your best guess anyway.
 
 Definitions:
 - CODE: writing code and opening a PR is the right response. Bug fixes, features, refactors, tests. Default here whenever a credible implementation path exists. A ticket that leaves design decisions to the implementer is CODE, not BOUNCE — making those calls is part of the job; pick the strongest approach and run with it.

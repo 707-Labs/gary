@@ -31,6 +31,13 @@ export interface DerivedClassification {
    * to "M" (the historical flat behavior).
    */
   scope?: "S" | "M" | "L";
+  /**
+   * Conventional-commit type from the classifier (feat/fix/refactor/...).
+   * Used to prefix the branch name. Optional — pre-feature rows and
+   * classifier outputs that omit it fall back to the unprefixed branch.
+   * Not part of the fingerprint canonical.
+   */
+  changeType?: string;
 }
 
 export interface DerivedState {
@@ -116,9 +123,34 @@ export function computeHumanInputSignature(args: {
 }
 
 /**
+ * Bot logins whose PR comments Gary treats as review feedback. Everything
+ * else with authorType !== "User" stays filtered (Gary himself, linear[bot]
+ * linkbacks, dependabot, etc.). Gemini's review comments were previously
+ * invisible to the pr-review pipeline — a human had to relay them.
+ */
+export const RESPONDABLE_BOT_LOGINS: ReadonlySet<string> = new Set([
+  "gemini-code-assist[bot]",
+]);
+
+/**
+ * Shared filter for "is this a PR comment Gary owes a response to, by
+ * author?". Used by BOTH the pr-review handler and
+ * `computePrCommentSignature` — if the two ever disagree, the handler
+ * either loops (responds to comments the signature can't see clearing)
+ * or goes dead (signature flags comments the handler filters out).
+ */
+export function isRespondablePrCommentAuthor(c: {
+  authorLogin: string | null;
+  authorType: string;
+}): boolean {
+  if (c.authorType === "User") return true;
+  return c.authorLogin !== null && RESPONDABLE_BOT_LOGINS.has(c.authorLogin);
+}
+
+/**
  * Hash of PR comments that Gary still owes a response to. Filters out:
- *   - bots (Gary, linear[bot] linkbacks, dependabot, etc.) — Gary only
- *     responds to humans
+ *   - bots (Gary, linear[bot] linkbacks, dependabot, etc.) — Gary responds
+ *     to humans plus the review bots in `RESPONDABLE_BOT_LOGINS`
  *   - comments Gary has already responded to (tracked in
  *     `pr_comment_responses`)
  *
@@ -139,7 +171,7 @@ export function computePrCommentSignature(args: {
 }): string {
   const responded = new Set(args.alreadyRespondedIds);
   const pending = args.comments
-    .filter((c) => c.authorType === "User")
+    .filter((c) => isRespondablePrCommentAuthor(c))
     .filter((c) => !responded.has(c.id))
     .map((c) => c.id)
     .sort((a, b) => a - b);

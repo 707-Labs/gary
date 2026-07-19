@@ -12,6 +12,7 @@ export interface TicketRow {
   classification: "CODE" | "ANSWER" | "BOUNCE" | null;
   classification_confidence: number | null;
   classification_scope: "S" | "M" | "L" | null;
+  classification_type: string | null;
   classified_at: string | null;
   last_polled_at: string | null;
   terminal_state: "merged" | "bounced" | "escalated" | null;
@@ -20,7 +21,7 @@ export interface TicketRow {
 export function getTicket(db: DB, linearId: string): TicketRow | null {
   const row = db
     .query<TicketRow, [string]>(
-      "SELECT linear_id, identifier, classification, classification_confidence, classification_scope, classified_at, last_polled_at, terminal_state FROM tickets WHERE linear_id = ?",
+      "SELECT linear_id, identifier, classification, classification_confidence, classification_scope, classification_type, classified_at, last_polled_at, terminal_state FROM tickets WHERE linear_id = ?",
     )
     .get(linearId);
   return row ?? null;
@@ -153,6 +154,8 @@ export function setClassification(
     classification: "CODE" | "ANSWER" | "BOUNCE";
     confidence: number;
     scope: "S" | "M" | "L";
+    /** Conventional-commit type (feat/fix/...). Null when the classifier omitted it. */
+    changeType?: string | null;
   },
 ): void {
   db.query(
@@ -160,6 +163,7 @@ export function setClassification(
        classification = $cls,
        classification_confidence = $conf,
        classification_scope = $scope,
+       classification_type = $ctype,
        classified_at = datetime('now')
      WHERE linear_id = $id`,
   ).run({
@@ -167,6 +171,7 @@ export function setClassification(
     cls: args.classification,
     conf: args.confidence,
     scope: args.scope,
+    ctype: args.changeType ?? null,
   });
 }
 
@@ -203,6 +208,7 @@ export function clearClassification(db: DB, linearId: string): void {
        classification = NULL,
        classification_confidence = NULL,
        classification_scope = NULL,
+       classification_type = NULL,
        classified_at = NULL
      WHERE linear_id = $id`,
   ).run({ id: linearId });

@@ -299,6 +299,45 @@ export class LinearAdapter {
   }
 
   /**
+   * Point-in-time state + assignee of an issue, one raw GraphQL call.
+   * Used by the code handler's pre-open guard to abort a PR when the
+   * ticket concluded (or was pulled from Gary) while the agent was
+   * working. Returns null when the issue can't be found.
+   */
+  async fetchIssueStatus(issueId: string): Promise<{
+    stateName: string;
+    stateType: string;
+    assigneeId: string | null;
+  } | null> {
+    const query = `
+      query IssueStatus($id: String!) {
+        issue(id: $id) {
+          state { name type }
+          assignee { id }
+        }
+      }
+    `;
+    const data = await withRetry(`fetchIssueStatus(${issueId})`, () =>
+      this.client.client.request<
+        {
+          issue: {
+            state: { name: string; type: string } | null;
+            assignee: { id: string } | null;
+          } | null;
+        },
+        { id: string }
+      >(query, { id: issueId }),
+    );
+    const issue = data.issue;
+    if (!issue) return null;
+    return {
+      stateName: issue.state?.name ?? "",
+      stateType: issue.state?.type ?? "",
+      assigneeId: issue.assignee?.id ?? null,
+    };
+  }
+
+  /**
    * Fetch only id + author + createdAt for an issue's comments. Uses one raw
    * GraphQL call (vs `fetchComments` which lazily resolves user records and
    * incurs N+1 round trips). Used in the loop to compute the human-input

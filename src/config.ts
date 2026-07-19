@@ -221,8 +221,13 @@ export function loadGaryConfig(): GaryConfig {
   );
   const dbPath = resolve(stateDir, "gary.db");
 
+  // Default matches the repo's CURRENT GitHub name (ertai was renamed to
+  // mulligan-labs; the old name still resolves via GitHub's redirect).
+  // NOTE: live deployments should keep whatever name their existing `prs`
+  // rows were recorded under — derivePr matches stored row.repo strings
+  // against this map, so renaming the env value strands open-PR tracking.
   const repoMap = parseRepoMap(
-    stringFromEnv("GARY_REPO_MAP", "ERT:707-Labs/ertai"),
+    stringFromEnv("GARY_REPO_MAP", "ERT:707-Labs/mulligan-labs"),
   );
 
   const allowlistRaw = optionalString("GARY_ALLOWLISTED_MENTION_USER_IDS");

@@ -1,6 +1,10 @@
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { CloudflareClient } from "../adapters/cloudflare.ts";
-import type { GitHubClient } from "../adapters/github.ts";
+import type {
+  GitHubClient,
+  OpenPullRequestSummary,
+} from "../adapters/github.ts";
 import { GLMClient } from "../adapters/glm.ts";
 import type { AssignedIssue, IssueComment, LinearAdapter } from "../adapters/linear.ts";
 import { type PhaseSpec, runAgentLoop, type RunLogEntry } from "../agent/loop.ts";
@@ -38,6 +42,39 @@ const CHECK_TIMEOUT_MS = 10 * 60_000;
 const FIXUP_MAX_ITERATIONS = 15;
 const FIXUP_OUTPUT_BUDGET = 8000;
 
+/**
+ * Test command for the post-finish gate. A typecheck-only gate can't see
+ * behavioral breakage, so the gate also runs the target repo's unit tests
+ * when it can find a safe (non-watch) invocation:
+ *
+ *   - GARY_TEST_COMMAND=off      → no test gate
+ *   - GARY_TEST_COMMAND=<cmd>    → run <cmd> verbatim (all repos)
+ *   - unset                     → autodetect from the worktree's
+ *     package.json: `test:run` first, then `test` only when its body
+ *     mentions "run" (ertai's bare `test: vitest` is watch mode and would
+ *     hang the gate until the timeout).
+ *
+ * Returns null when there's nothing safe to run. Exported for tests.
+ */
+export function resolveTestGateCommand(worktreePath: string): string | null {
+  const env = process.env.GARY_TEST_COMMAND?.trim();
+  if (env === "off") return null;
+  if (env) return env;
+  let scripts: Record<string, unknown>;
+  try {
+    const pkg = JSON.parse(
+      readFileSync(resolve(worktreePath, "package.json"), "utf8"),
+    ) as { scripts?: Record<string, unknown> };
+    scripts = pkg.scripts ?? {};
+  } catch {
+    return null;
+  }
+  if (typeof scripts["test:run"] === "string") return "bun run test:run";
+  const test = scripts["test"];
+  if (typeof test === "string" && /\brun\b/.test(test)) return "bun run test";
+  return null;
+}
+
 // Read-only tools advertised in the investigate phase. Anything that
 // mutates the workspace (write_file, edit_file, run_bash, commit) or ends
 // the loop (finish) is hidden until the model transitions to implement.
@@ -66,19 +103,39 @@ const INVESTIGATE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
  * investigate cap. The implement phase opens with a forcing message
  * directing the model to write a brief plan, implement, and call finish.
  *
- * Iteration budgets are scaled by classification scope: small tickets get
- * a tight cap (rename a button, fix a typo), medium keeps the historical
- * 15/35 budget, and L gets real room — ambition without budget just
- * converts big tickets into iteration_cap escalations.
+ * Iteration budgets are scaled by classification scope. Defaults were
+ * raised from 8/20 (S) and 15/35 (M) after ERT-1574-style bounces: a
+ * "small" ticket touching five call sites burns the whole investigate
+ * budget on discovery and never gets to write. Tunable per scope via
+ * GARY_PHASE_BUDGET_{S,M,L}="<investigate>/<implement>" without a deploy;
+ * malformed values fall back to the defaults.
  *
  * Exported for tests.
  */
+const PHASE_BUDGET_DEFAULTS: Record<
+  "S" | "M" | "L",
+  { investigate: number; implement: number }
+> = {
+  S: { investigate: 12, implement: 25 },
+  M: { investigate: 20, implement: 45 },
+  L: { investigate: 20, implement: 50 },
+};
+
 export function phaseBudget(
   scope: "S" | "M" | "L",
 ): { investigate: number; implement: number } {
-  if (scope === "S") return { investigate: 8, implement: 20 };
-  if (scope === "L") return { investigate: 20, implement: 50 };
-  return { investigate: 15, implement: 35 };
+  const fallback = PHASE_BUDGET_DEFAULTS[scope];
+  const raw = process.env[`GARY_PHASE_BUDGET_${scope}`]?.trim();
+  if (!raw) return fallback;
+  const m = raw.match(/^(\d{1,3})\/(\d{1,3})$/);
+  if (!m) {
+    log.warn("malformed phase budget env; using default", { scope, raw });
+    return fallback;
+  }
+  const investigate = Number(m[1]);
+  const implement = Number(m[2]);
+  if (investigate < 1 || implement < 1) return fallback;
+  return { investigate, implement };
 }
 
 /**
@@ -108,14 +165,16 @@ function buildCodePhases(scope: "S" | "M" | "L" = "M"): readonly PhaseSpec[] {
   ];
 }
 
-const CHECK_FIXUP_TASK_INSTRUCTIONS = `Your previous turn ended with finish() but \`${CHECK_COMMAND}\` is failing. Fix the errors caused by your changes, commit, then call finish() again.
+function checkFixupInstructions(command: string): string {
+  return `Your previous turn ended with finish() but \`${command}\` is failing. Fix the errors caused by your changes, commit, then call finish() again.
 
 Rules:
-- Run \`${CHECK_COMMAND}\` and confirm it exits 0 BEFORE calling finish.
+- Run \`${command}\` and confirm it exits 0 BEFORE calling finish.
 - Only fix what's broken — don't refactor unrelated code.
-- If the failure is in code you didn't touch, investigate before assuming it's pre-existing. The pre-push hook runs the same command, so anything failing here will block your push.
+- If the failure is in code you didn't touch, investigate before assuming it's pre-existing. This command gates your push, so anything failing here will block it.
 - Commit your fix-up changes before calling finish.
-- If you can't make the check pass after a few iterations, call finish() with a one-sentence summary of what's still broken so a human can take over.`;
+- If you can't make it pass after a few iterations, call finish() with a one-sentence summary of what's still broken so a human can take over.`;
+}
 
 const CODE_TASK_INSTRUCTIONS = `You are working on a Linear ticket for 707 Labs. Own it end-to-end: solve the real problem behind the ticket, not just the literal sentence in the title, and take a design swing when the ticket leaves room for one.
 
@@ -199,18 +258,54 @@ export interface CodeHandlerArgs {
   repo: string; // "owner/repo"
   /**
    * Classifier-assigned scope. Used to scale the agent loop iteration caps
-   * (S: 28 total, M: 50, L: 70) and the loop timeout (L gets 2x wall
-   * clock). Optional — old call paths without scope info default to M.
+   * (defaults: S: 37 total, M: 65, L: 70 — see phaseBudget) and the loop
+   * timeout (L gets 2x wall clock). Optional — old call paths without
+   * scope info default to M.
    */
   scope?: "S" | "M" | "L";
+  /**
+   * Classifier-assigned conventional-commit type (feat/fix/...). Prefixes
+   * the branch name (fix/ert-1891-...). Optional — absent means the legacy
+   * unprefixed branch format.
+   */
+  changeType?: string;
 }
 
 export interface CodeHandlerResult {
-  status: "pr_opened" | "no_changes" | "agent_failed";
+  status: "pr_opened" | "no_changes" | "agent_failed" | "pr_skipped";
   prUrl?: string;
   prNumber?: number;
   branch: string;
   summary: string | null;
+}
+
+const KNOWN_CHANGE_TYPES = new Set([
+  "feat",
+  "fix",
+  "refactor",
+  "chore",
+  "docs",
+  "test",
+  "perf",
+]);
+
+/**
+ * Branch name for a ticket: `fix/ert-1891-<slug>` when the classifier
+ * supplied a change type, `ERT-1891-<slug>` (legacy) when it didn't.
+ * Lowercased identifier in the prefixed form matches Linear's own
+ * copy-git-branch-name convention; Linear's PR auto-linking matches the
+ * identifier case-insensitively either way. Exported for tests.
+ */
+export function buildBranchName(
+  identifier: string,
+  title: string,
+  changeType?: string,
+): string {
+  const slug = slugify(title);
+  if (changeType && KNOWN_CHANGE_TYPES.has(changeType)) {
+    return `${changeType}/${identifier.toLowerCase()}-${slug}`;
+  }
+  return `${identifier}-${slug}`;
 }
 
 export async function runCodeHandler(
@@ -219,7 +314,11 @@ export async function runCodeHandler(
 ): Promise<CodeHandlerResult> {
   const [owner, name] = args.repo.split("/") as [string, string];
 
-  const branch = `${args.issue.identifier}-${slugify(args.issue.title)}`;
+  const branch = buildBranchName(
+    args.issue.identifier,
+    args.issue.title,
+    args.changeType,
+  );
   const worktreePath = resolve(deps.workspacesDir, args.issue.identifier);
 
   log.info("code handler starting", {
@@ -250,6 +349,7 @@ export async function runCodeHandler(
   });
 
   const executor = new LocalExecutor(worktreePath);
+  const testCommand = resolveTestGateCommand(worktreePath);
   const system = composeSystemPrompt({ taskInstructions: CODE_TASK_INSTRUCTIONS });
   const projectSection = formatProjectContext(
     loadProjectContext(worktreePath),
@@ -331,6 +431,7 @@ export async function runCodeHandler(
   const checkPassed = await ensurePostFinishCheckPasses(deps, args, {
     executor,
     system,
+    testCommand,
   });
   if (!checkPassed) {
     return { status: "agent_failed", branch, summary: loopResult.summary };
@@ -347,6 +448,7 @@ export async function runCodeHandler(
     reviewerGlm,
     fingerprint: reviewFingerprint,
     worktreePath,
+    testCommand,
   });
   if (reviewOutcome.kind === "escalated") {
     return { status: "agent_failed", branch, summary: loopResult.summary };
@@ -410,6 +512,38 @@ export async function runCodeHandler(
     diff,
   });
 
+  // Belt-and-suspenders idempotence: re-check the world right before the
+  // PR call. The agent loop can run for a long time; the ticket may have
+  // been completed or reassigned meanwhile, or another Gary instance may
+  // have already opened an equivalent PR (ERT-1891 got two byte-identical
+  // PRs from two daemons two minutes after the ticket went Done).
+  const skip = await preflightPrOpen(deps, args, { owner, name });
+  if (skip) {
+    log.warn("pr-open preflight tripped; not opening PR", {
+      issue: args.issue.identifier,
+      reason: skip.reason,
+      detail: skip.detail,
+    });
+    recordEvent(deps.db, {
+      eventType: "pr_open_skipped",
+      ticketLinearId: args.issue.id,
+      payload: { reason: skip.reason, detail: skip.detail, branch },
+    });
+    if (skip.reason === "duplicate_pr" && skip.existingPrUrl) {
+      try {
+        await deps.linear.postComment(
+          args.issue.id,
+          `heads up — there's already an open pr covering this: ${skip.existingPrUrl}. i finished my own pass but i'm not opening a duplicate. branch \`${branch}\` is pushed if you want to compare.`,
+        );
+      } catch (err) {
+        log.warn("could not post duplicate-pr comment", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    return { status: "pr_skipped", branch, summary: loopResult.summary };
+  }
+
   const pr = await deps.github.openPullRequest({
     owner,
     repo: name,
@@ -456,6 +590,80 @@ export async function runCodeHandler(
   };
 }
 
+interface PreflightSkip {
+  reason: "ticket_concluded" | "ticket_reassigned" | "duplicate_pr";
+  detail: string;
+  existingPrUrl?: string;
+}
+
+/**
+ * Match an open PR that already covers the ticket, by identifier in the
+ * head ref or title. Word-bounded with a trailing digit guard so ERT-1
+ * doesn't match ERT-1891. Exported for tests.
+ */
+export function findExistingPrForTicket(
+  prs: readonly OpenPullRequestSummary[],
+  identifier: string,
+): OpenPullRequestSummary | null {
+  const escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`\\b${escaped}(?![0-9])`, "i");
+  return (
+    prs.find((p) => pattern.test(p.headRef) || pattern.test(p.title)) ?? null
+  );
+}
+
+/**
+ * Pre-open guard. Returns a skip descriptor when the PR should NOT be
+ * opened, null when it's safe. Each check fails open — a Linear or GitHub
+ * blip must not spike an otherwise-good run; the guard exists to stop the
+ * clearly-wrong cases, not to be a hard dependency.
+ */
+async function preflightPrOpen(
+  deps: CodeHandlerDeps,
+  args: CodeHandlerArgs,
+  repo: { owner: string; name: string },
+): Promise<PreflightSkip | null> {
+  try {
+    const status = await deps.linear.fetchIssueStatus(args.issue.id);
+    if (status) {
+      if (status.stateType === "completed" || status.stateType === "canceled") {
+        return {
+          reason: "ticket_concluded",
+          detail: `${status.stateType} (${status.stateName})`,
+        };
+      }
+      if (status.assigneeId !== deps.linear.linearUserId) {
+        return {
+          reason: "ticket_reassigned",
+          detail: status.assigneeId ?? "unassigned",
+        };
+      }
+    }
+  } catch (err) {
+    log.warn("pr-open preflight: linear check failed; proceeding", {
+      issue: args.issue.identifier,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  try {
+    const open = await deps.github.listOpenPullRequests(repo.owner, repo.name);
+    const existing = findExistingPrForTicket(open, args.issue.identifier);
+    if (existing) {
+      return {
+        reason: "duplicate_pr",
+        detail: `#${existing.number} by ${existing.authorLogin ?? "?"} (${existing.headRef})`,
+        existingPrUrl: existing.url,
+      };
+    }
+  } catch (err) {
+    log.warn("pr-open preflight: github check failed; proceeding", {
+      issue: args.issue.identifier,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  return null;
+}
+
 interface RenderTicketOpts {
   worktreePath: string;
   branch: string;
@@ -487,6 +695,26 @@ function renderTicketForAgent(
   sections.push("");
   sections.push("Make the change, commit, and call finish() when done.");
   return sections.join("\n");
+}
+
+const PR_SIGNATURE_PREFIX = "🤖 Generated by";
+
+/**
+ * Post-process the model's PR body. The prompt says the signature line is
+ * last, but models occasionally trail garbage after it (#512 ended with a
+ * stray "EOF\n)") or wrap the whole body in a markdown fence. The signature
+ * line is the contract: everything after it is dropped. Exported for tests.
+ */
+export function sanitizePrBody(raw: string): string {
+  let body = raw.trim();
+  const fenced = body.match(/^```(?:markdown|md)?\n([\s\S]*?)\n```$/);
+  if (fenced?.[1]) body = fenced[1].trim();
+  const sigAt = body.indexOf(PR_SIGNATURE_PREFIX);
+  if (sigAt >= 0) {
+    const lineEnd = body.indexOf("\n", sigAt);
+    if (lineEnd !== -1) body = body.slice(0, lineEnd);
+  }
+  return body.trim();
 }
 
 interface ComposePrBodyArgs {
@@ -524,12 +752,13 @@ async function composePrBody(
     args.verificationReport,
   ].join("\n");
   // 2048 leaves room for K3's thinking block ahead of the body text.
-  return await deps.glm.complete({
+  const raw = await deps.glm.complete({
     system,
     user,
     temperature: 0.4,
     maxTokens: 2048,
   });
+  return sanitizePrBody(raw);
 }
 
 interface ComposePrTitleArgs {
@@ -572,26 +801,59 @@ async function composePrTitle(
 interface FixupContext {
   executor: LocalExecutor;
   system: string;
+  /** Test command for the gate, or null when the repo has none. */
+  testCommand: string | null;
+}
+
+interface GateFailure {
+  command: string;
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  timedOut: boolean;
+}
+
+/** Run gate commands in order; return the first failure, or null if all pass. */
+async function firstFailingGate(
+  executor: LocalExecutor,
+  commands: readonly string[],
+): Promise<GateFailure | null> {
+  for (const command of commands) {
+    const r = await executor.run(command, { timeoutMs: CHECK_TIMEOUT_MS });
+    if (r.exitCode !== 0) {
+      return {
+        command,
+        stdout: r.stdout,
+        stderr: r.stderr,
+        exitCode: r.exitCode,
+        timedOut: r.timedOut,
+      };
+    }
+  }
+  return null;
 }
 
 /**
- * Run `bun run check`. If it fails, feed the failure back to the agent for
- * one fix-up cycle and re-check. Returns true if the check is clean (either
- * on the first pass or after fix-up); false if we couldn't recover, in
- * which case the ticket is already escalated.
+ * Run the post-finish gate: `bun run check`, then the repo's test command
+ * (see resolveTestGateCommand). If a gate fails, feed the failure back to
+ * the agent for one fix-up cycle and re-run every gate. Returns true if
+ * the gates are clean (either on the first pass or after fix-up); false
+ * if we couldn't recover, in which case the ticket is already escalated.
  */
 async function ensurePostFinishCheckPasses(
   deps: CodeHandlerDeps,
   args: CodeHandlerArgs,
   ctx: FixupContext,
 ): Promise<boolean> {
-  const first = await ctx.executor.run(CHECK_COMMAND, {
-    timeoutMs: CHECK_TIMEOUT_MS,
-  });
-  if (first.exitCode === 0) return true;
+  const gates = ctx.testCommand
+    ? [CHECK_COMMAND, ctx.testCommand]
+    : [CHECK_COMMAND];
+  const first = await firstFailingGate(ctx.executor, gates);
+  if (!first) return true;
 
-  log.warn("post-finish check failed; running fix-up", {
+  log.warn("post-finish gate failed; running fix-up", {
     issue: args.issue.identifier,
+    command: first.command,
     exitCode: first.exitCode,
     timedOut: first.timedOut,
   });
@@ -626,31 +888,30 @@ async function ensurePostFinishCheckPasses(
     cacheReadTokens: fixupResult.cacheReadTokens,
   });
 
-  const second = await ctx.executor.run(CHECK_COMMAND, {
-    timeoutMs: CHECK_TIMEOUT_MS,
-  });
-  if (second.exitCode === 0) return true;
+  const second = await firstFailingGate(ctx.executor, gates);
+  if (!second) return true;
 
-  log.warn("check still failing after fix-up; escalating", {
+  log.warn("gate still failing after fix-up; escalating", {
     issue: args.issue.identifier,
+    command: second.command,
   });
   await postCheckFailureEscalation(deps, args, second);
   return false;
 }
 
-function renderCheckFixupTask(failed: { stdout: string; stderr: string }): string {
+function renderCheckFixupTask(failed: GateFailure): string {
   const combined = `${failed.stdout}\n${failed.stderr}`.trim();
   const truncated =
     combined.length > FIXUP_OUTPUT_BUDGET
       ? `${combined.slice(0, FIXUP_OUTPUT_BUDGET)}\n... (truncated)`
       : combined;
-  return `${CHECK_FIXUP_TASK_INSTRUCTIONS}\n\nMost recent \`${CHECK_COMMAND}\` output:\n\n\`\`\`\n${truncated}\n\`\`\``;
+  return `${checkFixupInstructions(failed.command)}\n\nMost recent \`${failed.command}\` output:\n\n\`\`\`\n${truncated}\n\`\`\``;
 }
 
 async function postCheckFailureEscalation(
   deps: CodeHandlerDeps,
   args: CodeHandlerArgs,
-  failed: { stdout: string; stderr: string },
+  failed: GateFailure,
 ): Promise<void> {
   const tail = `${failed.stdout}\n${failed.stderr}`
     .trim()
@@ -658,7 +919,7 @@ async function postCheckFailureEscalation(
     .slice(-25)
     .join("\n");
   const body = [
-    `i thought i was done but \`${CHECK_COMMAND}\` is still failing after a fix-up pass. bouncing — i'd want a human to look before i try again.`,
+    `i thought i was done but \`${failed.command}\` is still failing after a fix-up pass. bouncing — i'd want a human to look before i try again.`,
     "",
     "tail of the failure output:",
     "```",
@@ -744,6 +1005,8 @@ interface ReviewLoopCtx {
   reviewerGlm: GLMClient;
   fingerprint: string;
   worktreePath: string;
+  /** Test command for the post-fixup gate, or null when the repo has none. */
+  testCommand: string | null;
 }
 
 type ReviewLoopOutcome =
@@ -915,6 +1178,7 @@ async function runReviewLoop(
     const checkOk = await ensurePostFinishCheckPasses(deps, args, {
       executor: ctx.executor,
       system: primarySystem,
+      testCommand: ctx.testCommand,
     });
     if (!checkOk) return { kind: "escalated" };
   }

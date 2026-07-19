@@ -45,4 +45,37 @@ describe("phaseBudget", () => {
     expect(s.investigate + s.implement).toBeLessThan(m.investigate + m.implement);
     expect(m.investigate + m.implement).toBeLessThan(l.investigate + l.implement);
   });
+
+  it("gives S enough investigate room for multi-file discovery", () => {
+    expect(phaseBudget("S").investigate).toBeGreaterThanOrEqual(12);
+  });
+
+  it("honors a GARY_PHASE_BUDGET_<scope> env override", () => {
+    process.env.GARY_PHASE_BUDGET_S = "3/7";
+    try {
+      expect(phaseBudget("S")).toEqual({ investigate: 3, implement: 7 });
+    } finally {
+      delete process.env.GARY_PHASE_BUDGET_S;
+    }
+  });
+
+  it("falls back to defaults on a malformed override", () => {
+    const fallback = phaseBudget("M");
+    process.env.GARY_PHASE_BUDGET_M = "banana";
+    try {
+      expect(phaseBudget("M")).toEqual(fallback);
+    } finally {
+      delete process.env.GARY_PHASE_BUDGET_M;
+    }
+  });
+
+  it("falls back to defaults on a zero budget", () => {
+    const fallback = phaseBudget("L");
+    process.env.GARY_PHASE_BUDGET_L = "0/50";
+    try {
+      expect(phaseBudget("L")).toEqual(fallback);
+    } finally {
+      delete process.env.GARY_PHASE_BUDGET_L;
+    }
+  });
 });

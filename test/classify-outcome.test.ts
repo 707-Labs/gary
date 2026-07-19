@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
   type Classification,
   decideClassifyOutcome,
+  parseClassification,
 } from "../src/handlers/classifier.ts";
 
 const base: Classification = {
@@ -53,5 +54,22 @@ describe("decideClassifyOutcome", () => {
         { confidenceFloor: 0.7 },
       ).kind,
     ).toBe("low_confidence");
+  });
+});
+
+describe("parseClassification type field", () => {
+  const raw = (extra: string) =>
+    `{"classification":"CODE","confidence":0.9,"scope":"S",${extra}"reasoning":"small fix"}`;
+
+  it("parses a valid conventional-commit type", () => {
+    expect(parseClassification(raw('"type":"fix",')).type).toBe("fix");
+  });
+
+  it("tolerates a missing type", () => {
+    expect(parseClassification(raw("")).type).toBeUndefined();
+  });
+
+  it("degrades an out-of-vocabulary type to undefined instead of failing", () => {
+    expect(parseClassification(raw('"type":"bugfix",')).type).toBeUndefined();
   });
 });

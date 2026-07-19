@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS tickets (
   classification TEXT,
   classification_confidence REAL,
   classification_scope TEXT,
+  classification_type TEXT,
   classified_at TEXT,
   last_polled_at TEXT,
   terminal_state TEXT

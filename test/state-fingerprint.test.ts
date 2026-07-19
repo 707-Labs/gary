@@ -235,6 +235,36 @@ describe("computePrCommentSignature", () => {
     ).toBe(PR_COMMENT_SIGNATURE_EMPTY);
   });
 
+  it("treats gemini-code-assist[bot] as pending review feedback", () => {
+    expect(
+      computePrCommentSignature({
+        comments: [bot(1, "gemini-code-assist[bot]")],
+        alreadyRespondedIds: [],
+      }),
+    ).not.toBe(PR_COMMENT_SIGNATURE_EMPTY);
+  });
+
+  it("returns the empty token once gemini comments are responded", () => {
+    expect(
+      computePrCommentSignature({
+        comments: [bot(1, "gemini-code-assist[bot]")],
+        alreadyRespondedIds: [1],
+      }),
+    ).toBe(PR_COMMENT_SIGNATURE_EMPTY);
+  });
+
+  it("still filters Gary himself even alongside allowlisted bots", () => {
+    const withGary = computePrCommentSignature({
+      comments: [bot(1, "gemini-code-assist[bot]"), bot(2, "gary-707-labs[bot]")],
+      alreadyRespondedIds: [],
+    });
+    const withoutGary = computePrCommentSignature({
+      comments: [bot(1, "gemini-code-assist[bot]")],
+      alreadyRespondedIds: [],
+    });
+    expect(withGary).toBe(withoutGary);
+  });
+
   it("returns the empty token when all human comments are already responded", () => {
     expect(
       computePrCommentSignature({
