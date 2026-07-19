@@ -32,6 +32,7 @@ async function main(): Promise<void> {
     dbPath: cfg.gary.dbPath,
     githubAuth: cfg.github.kind,
     providers: chain.providers.map((p) => `${p.name}:${p.model}`),
+    routing: { main: cfg.routing.main, prFollowup: cfg.routing.prFollowup },
     cloudflare: cloudflare ? cfg.cloudflare?.observabilityWorkers : "disabled",
     pollIntervalMs: cfg.runtime.pollIntervalMs,
     repoMap: Object.fromEntries(cfg.gary.repoMap),
@@ -63,6 +64,7 @@ async function main(): Promise<void> {
     circuitBreakerWindowHours: cfg.runtime.circuitBreakerWindowHours,
     stalePrAfterMs: cfg.runtime.stalePrAfterMs,
     review: cfg.review,
+    routing: cfg.routing,
     intervalMs: cfg.runtime.pollIntervalMs,
     signal: controller.signal,
   });

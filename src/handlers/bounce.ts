@@ -15,14 +15,24 @@ export interface BounceHandlerArgs {
 
 /**
  * The classifier-time comment already explained the bounce (per voice.md
- * example 4). This handler just performs the side-effects: reassign the
- * ticket back to the reporter and remove Gary as assignee. We mark the
- * ticket terminal_state='bounced' so we never act on it again.
+ * example 4). This handler just performs the side-effects: move the ticket
+ * back to Todo (classification moved it to In Progress — leaving it there
+ * makes the board lie), reassign it to the reporter, and remove Gary as
+ * assignee. We mark the ticket terminal_state='bounced' so we never act on
+ * it again.
  */
 export async function runBounceHandler(
   deps: BounceHandlerDeps,
   args: BounceHandlerArgs,
 ): Promise<{ status: "bounced" }> {
+  try {
+    await deps.linear.setStateByType(args.issue.id, args.issue.teamId, "unstarted");
+  } catch (err) {
+    log.warn("could not move bounced ticket back to todo", {
+      issue: args.issue.identifier,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
   if (args.issue.creatorId) {
     try {
       await deps.linear.reassign(args.issue.id, args.issue.creatorId);

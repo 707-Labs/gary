@@ -41,6 +41,7 @@ const result = await tick({
   circuitBreakerWindowHours: cfg.runtime.circuitBreakerWindowHours,
   stalePrAfterMs: cfg.runtime.stalePrAfterMs,
   review: cfg.review,
+  routing: cfg.routing,
 });
 
 console.log("\nresult:", result);

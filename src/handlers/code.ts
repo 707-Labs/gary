@@ -67,14 +67,25 @@ const INVESTIGATE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
  * directing the model to write a brief plan, implement, and call finish.
  *
  * Iteration budgets are scaled by classification scope: small tickets get
- * a tight cap (rename a button, fix a typo) while medium tickets get the
- * historical 15/35 budget. L tickets are already auto-bounced upstream.
+ * a tight cap (rename a button, fix a typo), medium keeps the historical
+ * 15/35 budget, and L gets real room — ambition without budget just
+ * converts big tickets into iteration_cap escalations.
+ *
+ * Exported for tests.
  */
-function phaseBudget(scope: "S" | "M" | "L"): { investigate: number; implement: number } {
+export function phaseBudget(
+  scope: "S" | "M" | "L",
+): { investigate: number; implement: number } {
   if (scope === "S") return { investigate: 8, implement: 20 };
-  // M is the historical flat cap (50 total). L never reaches here.
+  if (scope === "L") return { investigate: 20, implement: 50 };
   return { investigate: 15, implement: 35 };
 }
+
+/**
+ * Wall-clock multiplier for L tickets — the iteration budget above is
+ * useless if the 15-minute default timeout fires first.
+ */
+const L_TIMEOUT_MULTIPLIER = 2;
 
 function buildCodePhases(scope: "S" | "M" | "L" = "M"): readonly PhaseSpec[] {
   const { investigate, implement } = phaseBudget(scope);
@@ -106,19 +117,33 @@ Rules:
 - Commit your fix-up changes before calling finish.
 - If you can't make the check pass after a few iterations, call finish() with a one-sentence summary of what's still broken so a human can take over.`;
 
-const CODE_TASK_INSTRUCTIONS = `You are working on a Linear ticket for 707 Labs. Make the smallest change that solves the ticket and stop.
+const CODE_TASK_INSTRUCTIONS = `You are working on a Linear ticket for 707 Labs. Own it end-to-end: solve the real problem behind the ticket, not just the literal sentence in the title, and take a design swing when the ticket leaves room for one.
 
-You can use tools to read, edit, run bash commands, and commit. When you're done, call finish() with a one-sentence summary.
+You can use tools to read, edit, run bash commands, and commit. When you're done, call finish() with a short summary.
 
-Rules:
+Ambition:
+- Fix causes, not symptoms. If the clean solution means restructuring the code you're touching, do it — don't leave a patch on top of a structure that fights the change. Note refactors that are genuinely out of reach as follow-ups in your finish summary.
+- When the ticket leaves design decisions to the implementer, make them. Pick the strongest approach and record the decision — and the alternatives you rejected — in your finish summary; it feeds the PR body.
+- Don't gold-plate. Ambition is depth on the problem the ticket names, not speculative abstractions or drive-by rewrites of unrelated files.
+- Ambition never means forcing a PR. A precise stop that enumerates the open decisions beats a plausible-looking PR you can't back with evidence.
+
+Evidence:
+- For a bug ticket, reproduce the bug first. Write a test that fails before your change and passes after, and name that test in your finish summary. If you can't reproduce it, don't guess at a fix — finish() with what you learned and what you'd need.
+- If the fix turns out to already exist, ship the regression test alone and say so.
+- A green full suite is not evidence that your specific fix works. Name the specific test or command that demonstrates the behavior change.
+
+Process:
+- Read the whole ticket thread before touching code — comments often redefine the ask. If a previous attempt at this ticket failed (bounced, escalated, or review-rejected in the thread), open your plan by stating what that attempt got wrong and how yours differs.
 - Read before you write. Look at the existing code, the project's conventions (CLAUDE.md, AGENTS.md, .claude/skills/), and any related files before changing anything.
-- Make the smallest change that solves the ticket. Don't refactor unrelated code.
 - BEFORE calling finish, run \`bun run check\` (the project's typecheck/svelte-check command). If there are errors caused by your changes, fix them and re-run. The repo has a pre-push hook that runs the same command — your push will be rejected if it fails.
-- Run other tests if there's an obvious command for the area you touched (look at package.json scripts and tests in the changed file's directory). If tests fail, try to fix them.
-- If the ticket is ambiguous, make a reasonable choice and note it in finish()'s summary.
-- If you realize the ticket is bigger than you can handle, call finish() with a summary explaining what you got done and what's left. Escalation will happen automatically.
+- If package.json has a \`ci\` script, run \`bun run ci\` and get it as green as you can before finishing. If part of it can't run in this environment (e.g. missing playwright browsers), say exactly which part in your finish summary instead of claiming green.
+- Run other tests for the area you touched. If tests fail because of your change, fix them.
+- Commit your changes before calling finish.
+
+Hard limits:
+- A change that requires a D1 database migration is an automatic stop. Do not write the migration — finish() explaining what migration would be needed and why you stopped. Migrations don't run through the normal deploy path and this class of change has broken prod before.
 - Don't install new dependencies unless the ticket clearly requires it.
-- Commit your changes before calling finish.`;
+- If you stop early — stuck, missing context, scope blowout — your finish summary must enumerate every open decision as a numbered list of concrete options with your recommended default for each. You're closest to the code; the enumeration is the valuable part of the hand-off.`;
 
 export const PR_BODY_TASK_INSTRUCTIONS = `Write a PR body for the changes you just made. Use voice.md examples 5 (small, confident) and 6 (medium, with uncertainty) as your structural template — match that exact format. Pick the level of detail based on the size and certainty of this change.
 
@@ -173,10 +198,9 @@ export interface CodeHandlerArgs {
   comments: readonly IssueComment[];
   repo: string; // "owner/repo"
   /**
-   * Classifier-assigned scope. Used to scale the agent loop iteration caps:
-   * S tickets get a tighter budget (28 iters total) than M (50). L is
-   * already auto-bounced before reaching here. Optional — old call paths
-   * without scope info default to M.
+   * Classifier-assigned scope. Used to scale the agent loop iteration caps
+   * (S: 28 total, M: 50, L: 70) and the loop timeout (L gets 2x wall
+   * clock). Optional — old call paths without scope info default to M.
    */
   scope?: "S" | "M" | "L";
 }
@@ -246,7 +270,8 @@ export async function runCodeHandler(
     task: taskMessage,
     maxIterations: deps.agentLoopMaxIterations,
     phases: buildCodePhases(args.scope),
-    timeoutMs: deps.agentLoopTimeoutMs,
+    timeoutMs:
+      deps.agentLoopTimeoutMs * (args.scope === "L" ? L_TIMEOUT_MULTIPLIER : 1),
     temperature: 0.3,
     linear: deps.linear,
     currentIssue: {
@@ -498,11 +523,12 @@ async function composePrBody(
     "Verification (from reviewer pass — append this verbatim as the ## Verification section):",
     args.verificationReport,
   ].join("\n");
+  // 2048 leaves room for K3's thinking block ahead of the body text.
   return await deps.glm.complete({
     system,
     user,
     temperature: 0.4,
-    maxTokens: 1024,
+    maxTokens: 2048,
   });
 }
 
@@ -530,11 +556,14 @@ async function composePrTitle(
     "Diff (truncated):",
     truncatedDiff,
   ].join("\n");
+  // 1024 max_tokens for a one-line title because K3 (the main-work
+  // primary) emits a thinking block first; a tight budget can get fully
+  // consumed by reasoning, returning zero text blocks.
   const raw = await deps.glm.complete({
     system,
     user,
     temperature: 0.2,
-    maxTokens: 128,
+    maxTokens: 1024,
   });
   const firstLine = raw.trim().split("\n")[0]?.trim() ?? "";
   return firstLine.length > 0 ? firstLine : args.issue.title;
@@ -651,6 +680,15 @@ async function reassignToReporter(
   deps: CodeHandlerDeps,
   args: CodeHandlerArgs,
 ): Promise<void> {
+  // Hand-off hygiene: an In Progress ticket nobody's working on is a lie.
+  try {
+    await deps.linear.setStateByType(args.issue.id, args.issue.teamId, "unstarted");
+  } catch (err) {
+    log.warn("could not move ticket back to todo on hand-off", {
+      issue: args.issue.identifier,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
   if (args.issue.creatorId) {
     try {
       await deps.linear.reassign(args.issue.id, args.issue.creatorId);

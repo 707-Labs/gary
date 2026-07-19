@@ -2,7 +2,7 @@ import type { CloudflareClient } from "./adapters/cloudflare.ts";
 import type { GitHubClient, PullRequestRef } from "./adapters/github.ts";
 import type { LinearAdapter } from "./adapters/linear.ts";
 import { GLMClient } from "./adapters/glm.ts";
-import type { ReviewConfig } from "./config.ts";
+import type { ProviderRoutingConfig, ReviewConfig } from "./config.ts";
 import { escalate } from "./escalate.ts";
 import {
   classifyTicket,
@@ -19,13 +19,15 @@ import { runPrReviewHandler } from "./handlers/pr-review.ts";
 import { analyzeMentions } from "./mention.ts";
 import { log } from "./logger.ts";
 import {
+  type ActionType,
   type CandidateAction,
   pickActionForMention,
   pickActionForTicket,
 } from "./priority.ts";
 import {
   AllProvidersExhaustedError,
-  chainStartingWith,
+  chainWithOrder,
+  type ProviderName,
 } from "./providers.ts";
 import {
   computeHumanInputSignature,
@@ -78,6 +80,28 @@ export interface LoopDeps {
   stalePrAfterMs: number;
   /** Reviewer pass config — threaded into runCodeHandler. */
   review: ReviewConfig;
+  /** Per-action-type provider preference (main work vs PR follow-ups). */
+  routing: ProviderRoutingConfig;
+}
+
+/**
+ * Actions that follow up on an already-open PR. These prefer the
+ * PR-follow-up provider order (GLM first by default); everything else —
+ * classification, fresh coding runs, answers — prefers the main order
+ * (Kimi K3 first by default).
+ */
+const PR_FOLLOWUP_ACTIONS: ReadonlySet<ActionType> = new Set([
+  "fix_ci_failure",
+  "respond_to_pr_review",
+  "nudge_reviewer",
+]);
+
+/** Exported for tests. */
+export function providerOrderForAction(
+  type: ActionType,
+  routing: ProviderRoutingConfig,
+): readonly ProviderName[] {
+  return PR_FOLLOWUP_ACTIONS.has(type) ? routing.prFollowup : routing.main;
 }
 
 export interface TickResult {
@@ -88,8 +112,8 @@ export interface TickResult {
 /**
  * One iteration of the poll loop. Fetches assigned issues, derives state,
  * picks the top-N candidates by priority, and runs them concurrently —
- * each slot pinned to a different unarmed provider so they don't all hammer
- * the same per-account quota. Returns info about what happened so callers
+ * each action's provider chain ordered by action type (see
+ * `providerOrderForAction`). Returns info about what happened so callers
  * can decide cadence.
  *
  * Concurrency is naturally capped by the number of unarmed providers:
@@ -225,10 +249,12 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
     return { candidatesConsidered: 0, actionsTaken: [] };
   }
 
-  // Sort by priority and dispatch top-N concurrently. Slot count is bounded
-  // by the number of unarmed providers so each parallel slot starts on a
-  // different primary — three providers + three candidates = three
-  // concurrent handlers, none competing for the same quota.
+  // Sort by priority and dispatch top-N concurrently. Each action's chain
+  // is ordered by action type (main work → Kimi K3 first, PR follow-ups →
+  // GLM first) rather than pinned per-slot; concurrent same-type actions
+  // share a primary and the 429 gates handle any resulting cap pressure.
+  // Slot count stays bounded by the number of unarmed providers — a cheap
+  // throttle that scales concurrency down as quotas burn out.
   const sorted = [...candidates].sort((a, b) => a.priority - b.priority);
   const unarmed = deps.glm.chain.providers.filter((p) => !p.gate.isArmed());
   const slots = Math.min(unarmed.length, sorted.length);
@@ -236,24 +262,26 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
     return { candidatesConsidered: candidates.length, actionsTaken: [] };
   }
 
-  const dispatched = sorted.slice(0, slots);
+  const dispatched = sorted.slice(0, slots).map((action) => ({
+    action,
+    glm: new GLMClient(
+      chainWithOrder(deps.glm.chain, providerOrderForAction(action.type, deps.routing)),
+    ),
+  }));
   log.info("dispatching tick", {
     candidates: candidates.length,
     slots,
-    plan: dispatched.map((a, i) => ({
-      issue: a.issue.identifier,
-      action: a.type,
-      provider: unarmed[i]!.name,
+    plan: dispatched.map(({ action, glm }) => ({
+      issue: action.issue.identifier,
+      action: action.type,
+      provider: (glm.chain.active() ?? glm.chain.providers[0]!).name,
     })),
   });
 
   const results = await Promise.allSettled(
-    dispatched.map((action, slotIdx) => {
-      const primary = unarmed[slotIdx]!;
-      const slotChain = chainStartingWith(deps.glm.chain, primary);
-      const slotGlm = new GLMClient(slotChain);
-      return runOne(deps, action, slotGlm, slotIdx);
-    }),
+    dispatched.map(({ action, glm }, slotIdx) =>
+      runOne(deps, action, glm, slotIdx),
+    ),
   );
 
   const actionsTaken: string[] = [];
@@ -285,7 +313,9 @@ async function runOne(
   slot: number,
 ): Promise<string | null> {
   const fp = fingerprintDerivedState(action.state);
-  const primary = glm.chain.providers[0]!;
+  // Record the provider that will actually serve the first call — the
+  // routed primary may be armed, in which case the chain starts further in.
+  const primary = glm.chain.active() ?? glm.chain.providers[0]!;
   const provider = primary.name;
   const model = primary.model;
   const actionId = recordActionStart(deps.db, {

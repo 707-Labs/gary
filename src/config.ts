@@ -150,12 +150,48 @@ export interface ReviewConfig {
 
 const KNOWN_PROVIDERS: ReadonlySet<string> = new Set(["z.ai", "kimi", "deepseek"]);
 
-export function loadReviewConfig(): ReviewConfig {
-  const orderRaw = optionalString("GARY_REVIEWER_PROVIDER_ORDER");
-  const providerOrder = (orderRaw ?? "deepseek,z.ai,kimi")
+/**
+ * Parse a comma-separated provider order from an env var, silently dropping
+ * unknown names (a typo degrades to a shorter-but-working order rather than
+ * a crash). Falls back to `fallback` when the var is unset.
+ */
+function providerOrderFromEnv(
+  key: string,
+  fallback: string,
+): readonly ProviderName[] {
+  return (optionalString(key) ?? fallback)
     .split(",")
     .map((s) => s.trim())
     .filter((s): s is ProviderName => KNOWN_PROVIDERS.has(s));
+}
+
+/**
+ * Per-action-type provider preference. Main work (coding, classification,
+ * answers) prefers Kimi K3; PR follow-ups (CI fixes, review responses,
+ * stale-PR nudges) prefer Z.ai GLM. Providers missing from an order — or
+ * not configured at all — fall back to the canonical chain order, so a
+ * missing KIMI_API_KEY quietly demotes main work to GLM.
+ */
+export interface ProviderRoutingConfig {
+  main: readonly ProviderName[];
+  prFollowup: readonly ProviderName[];
+}
+
+export function loadProviderRoutingConfig(): ProviderRoutingConfig {
+  return {
+    main: providerOrderFromEnv("GARY_MAIN_PROVIDER_ORDER", "kimi,z.ai,deepseek"),
+    prFollowup: providerOrderFromEnv(
+      "GARY_PR_FOLLOWUP_PROVIDER_ORDER",
+      "z.ai,kimi,deepseek",
+    ),
+  };
+}
+
+export function loadReviewConfig(): ReviewConfig {
+  const providerOrder = providerOrderFromEnv(
+    "GARY_REVIEWER_PROVIDER_ORDER",
+    "deepseek,z.ai,kimi",
+  );
   return {
     providerOrder,
     maxRounds: intFromEnv("GARY_REVIEW_MAX_ROUNDS", 3),
@@ -173,6 +209,7 @@ export interface Config {
   cloudflare: CloudflareConfig | null;
   runtime: RuntimeConfig;
   review: ReviewConfig;
+  routing: ProviderRoutingConfig;
 }
 
 export function loadGaryConfig(): GaryConfig {
@@ -266,7 +303,9 @@ const PROVIDER_DEFAULTS: Record<
   kimi: {
     apiKeyEnv: "KIMI_API_KEY",
     baseUrl: "https://api.kimi.com/coding",
-    model: "kimi-for-coding",
+    // K3 is a reasoning model: it emits a thinking block before text, so
+    // single-turn complete() calls need max_tokens headroom (~1024 minimum).
+    model: "k3",
     defaultBackoffMs: DEFAULT_BACKOFF_MS,
   },
   deepseek: {
@@ -387,5 +426,6 @@ export function loadConfig(): Config {
     cloudflare: loadCloudflareConfig(),
     runtime: loadRuntimeConfig(),
     review: loadReviewConfig(),
+    routing: loadProviderRoutingConfig(),
   };
 }

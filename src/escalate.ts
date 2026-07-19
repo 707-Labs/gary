@@ -64,6 +64,16 @@ export async function escalate(
       error: err instanceof Error ? err.message : String(err),
     });
   }
+  // Move the board back to Todo — Gary is handing the ticket off, and an
+  // In Progress ticket with no one working on it is a lie.
+  try {
+    await deps.linear.setStateByType(args.issue.id, args.issue.teamId, "unstarted");
+  } catch (err) {
+    log.warn("could not move escalated ticket back to todo", {
+      issue: args.issue.identifier,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
   if (args.issue.creatorId) {
     try {
       await deps.linear.reassign(args.issue.id, args.issue.creatorId);

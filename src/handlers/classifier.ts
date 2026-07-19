@@ -24,19 +24,19 @@ Output ONLY a single JSON object — no prose, no code fences, no preamble. The 
 }
 
 Definitions:
-- CODE: writing code and opening a PR is the right response. Bug fixes, features, refactors, tests.
+- CODE: writing code and opening a PR is the right response. Bug fixes, features, refactors, tests. Default here whenever a credible implementation path exists. A ticket that leaves design decisions to the implementer is CODE, not BOUNCE — making those calls is part of the job; pick the strongest approach and run with it.
 - ANSWER: a question or clarification request you can answer without touching code.
-- BOUNCE: you can't or shouldn't handle this. Design decisions, ambiguous tickets, work needing context you don't have, anything touching production data, multi-week scope.
+- BOUNCE: you can't or shouldn't handle this. Context that's genuinely missing and not recoverable from the repo or thread; product calls that need human authority (pricing, deleting user data, cross-team commitments); anything requiring a D1 database migration (migrations don't run through the normal deploy and have broken prod before); a bug you have no path to reproducing.
 
 Scope:
 - S: a few lines or one file, ~30 min.
 - M: a few files, < 2 hours, no architectural decisions.
-- L: bigger than M — multi-file refactors, large surface area, or work that may want a stacked PR series. L is fine if the logic is well-defined; size alone is not a reason to BOUNCE.
+- L: bigger than M — multi-file refactors, features with real design surface, work that may want a stacked PR series. L is the interesting work, not a warning label: if the logic is well-defined, take the swing. Size alone is never a reason to BOUNCE.
 
 Honesty rules:
-- BOUNCE for design ambiguity, missing context, or genuine inability to scope — not for size.
+- BOUNCE for missing context or decisions above your pay grade — never for size, and never for design latitude you could exercise yourself.
 - If confidence is below 0.5, prefer BOUNCE.
-- If the ticket is too vague to classify, BOUNCE with reasoning explaining what's missing.
+- If you BOUNCE, your reasoning must enumerate the open decisions as concrete options with a recommended default for each — "here are the decisions, pick one," not "sketch the behavior for me."
 - Don't roleplay being "really good." Be calibrated.
 
 Your reasoning will be used as part of a comment posted on the ticket, so write it in your own voice.`;
@@ -59,11 +59,13 @@ export async function classifyTicket(
   });
   const user = renderTicket(args.issue, args.comments);
 
+  // K3 (main-work primary) spends output tokens on a thinking block before
+  // the JSON lands — 2048 keeps the budget from being eaten by reasoning.
   const raw = await deps.glm.complete({
     system,
     user,
     temperature: 0.1,
-    maxTokens: 1024,
+    maxTokens: 2048,
   });
 
   const parsed = parseClassification(raw);
@@ -184,11 +186,11 @@ const COMMENT_TASK_INSTRUCTIONS = `Write a short Linear comment announcing how y
 Output the comment body as plain markdown text. No JSON, no preamble like "Here is the comment", no code fences. Just the comment.
 
 Rules:
-- One short paragraph, lowercase-friendly.
+- One short paragraph, lowercase-friendly. (BOUNCE may add a numbered list below the paragraph — see below.)
 - Don't repeat your reasoning verbatim — paraphrase if you need it at all.
 - For CODE: say you're picking it up and you'll comment back when the PR is up.
 - For ANSWER: give the actual answer using the reasoning.
-- For BOUNCE: explain what's making you bounce, who you're bouncing it back to, and offer to take another swing if there's more direction.`;
+- For BOUNCE: one short paragraph on what's blocking you and who you're bouncing to, then a numbered list of every open decision — each with 2-3 concrete options and your recommended default. The reader should be able to unblock you by replying "yes to all" or "2b, rest as recommended." Close by offering to take the swing once someone picks.`;
 
 export interface ClassificationCommentArgs {
   issue: AssignedIssue;
@@ -213,11 +215,12 @@ export async function generateClassificationComment(
     `Your reasoning (do not paste verbatim): ${args.classification.reasoning}`,
   ].join("\n");
 
+  // 1024: room for K3's thinking block plus a BOUNCE decision list.
   const body = await deps.glm.complete({
     system,
     user,
     temperature: 0.4,
-    maxTokens: 512,
+    maxTokens: 1024,
   });
   return body.trim();
 }

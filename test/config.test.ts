@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { loadReviewConfig, parseRepoMap } from "../src/config.ts";
+import {
+  loadProviderRoutingConfig,
+  loadReviewConfig,
+  parseRepoMap,
+} from "../src/config.ts";
 
 describe("parseRepoMap", () => {
   it("parses a single entry", () => {
@@ -115,5 +119,43 @@ describe("loadReviewConfig", () => {
   it("throws on non-integer values", () => {
     setEnv("GARY_REVIEW_MAX_ROUNDS", "two");
     expect(() => loadReviewConfig()).toThrow(/integer/);
+  });
+});
+
+describe("loadProviderRoutingConfig", () => {
+  const originals: Record<string, string | undefined> = {};
+  function setEnv(k: string, v: string | undefined): void {
+    if (!(k in originals)) originals[k] = process.env[k];
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  afterEach(() => {
+    for (const [k, v] of Object.entries(originals)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    Object.keys(originals).forEach((k) => delete originals[k]);
+  });
+
+  it("defaults main work to kimi-first and PR follow-ups to z.ai-first", () => {
+    setEnv("GARY_MAIN_PROVIDER_ORDER", undefined);
+    setEnv("GARY_PR_FOLLOWUP_PROVIDER_ORDER", undefined);
+    const cfg = loadProviderRoutingConfig();
+    expect(cfg.main).toEqual(["kimi", "z.ai", "deepseek"]);
+    expect(cfg.prFollowup).toEqual(["z.ai", "kimi", "deepseek"]);
+  });
+
+  it("respects env overrides", () => {
+    setEnv("GARY_MAIN_PROVIDER_ORDER", "deepseek,kimi");
+    setEnv("GARY_PR_FOLLOWUP_PROVIDER_ORDER", "kimi");
+    const cfg = loadProviderRoutingConfig();
+    expect(cfg.main).toEqual(["deepseek", "kimi"]);
+    expect(cfg.prFollowup).toEqual(["kimi"]);
+  });
+
+  it("drops unknown provider names instead of throwing", () => {
+    setEnv("GARY_MAIN_PROVIDER_ORDER", "kimi,gpt5,z.ai");
+    const cfg = loadProviderRoutingConfig();
+    expect(cfg.main).toEqual(["kimi", "z.ai"]);
   });
 });

@@ -155,36 +155,18 @@ export function createProviderChain(
 }
 
 /**
- * Build a chain rooted at `primary`, with the rest of `canonical`'s
- * providers following in their original order. Used by the loop to dispatch
- * concurrent slots against different primaries — each slot gets its own
- * chain so one slot's 429 doesn't cascade into a primary swap that the
- * other slots are already using. All slots share the same provider objects
- * (and their gates), so a 429 on Z.ai arms it globally regardless of which
- * slot saw it.
- */
-export function chainStartingWith(
-  canonical: ProviderChain,
-  primary: LLMProvider,
-): ProviderChain {
-  if (!canonical.providers.includes(primary)) {
-    throw new Error(
-      `chainStartingWith: provider ${primary.name} not in canonical chain`,
-    );
-  }
-  const others = canonical.providers.filter((p) => p !== primary);
-  return createProviderChain([primary, ...others]);
-}
-
-/**
  * Build a chain in `requested` order, with any canonical providers not
  * mentioned in `requested` appended at the end in their canonical order.
  * Names in `requested` that aren't in the canonical chain are silently
- * dropped — keeps reviewer config robust to typos in env vars (you'll
- * still get a working chain, just not the one you typed).
+ * dropped — keeps env-var config robust to typos (you'll still get a
+ * working chain, just not the one you typed).
  *
- * Use this for the reviewer's chain so it prefers a different provider
- * than primary, giving uncorrelated blind spots.
+ * Used by the loop to give each action type its preferred primary (main
+ * work → Kimi, PR follow-ups → GLM) and by the code handler so the
+ * reviewer prefers a different provider than the primary, giving
+ * uncorrelated blind spots. All chains share the same provider objects
+ * (and their gates), so a 429 on one arms it globally regardless of which
+ * chain saw it.
  */
 export function chainWithOrder(
   canonical: ProviderChain,

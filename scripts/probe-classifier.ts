@@ -7,7 +7,8 @@ import {
   classifyTicket,
   generateClassificationComment,
 } from "../src/handlers/classifier.ts";
-import { loadGLMChain } from "../src/config.ts";
+import { loadGLMChain, loadProviderRoutingConfig } from "../src/config.ts";
+import { chainWithOrder } from "../src/providers.ts";
 
 const fixtures: AssignedIssue[] = [
   {
@@ -60,7 +61,14 @@ const fixtures: AssignedIssue[] = [
   },
 ];
 
-const glm = new GLMClient(loadGLMChain());
+// Classification is main work — use the main-work provider order (Kimi K3
+// first by default) so the probe exercises what production will run.
+const glm = new GLMClient(
+  chainWithOrder(loadGLMChain(), loadProviderRoutingConfig().main),
+);
+console.log(
+  `provider order: ${glm.chain.providers.map((p) => `${p.name}:${p.model}`).join(" → ")}`,
+);
 
 for (const issue of fixtures) {
   console.log(`\n=== ${issue.identifier}: ${issue.title} ===`);

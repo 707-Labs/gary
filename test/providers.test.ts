@@ -2,7 +2,6 @@ import { describe, expect, it } from "bun:test";
 import {
   AllProvidersExhaustedError,
   armOnRateLimit,
-  chainStartingWith,
   chainWithOrder,
   createProvider,
   createProviderChain,
@@ -133,7 +132,7 @@ describe("ProviderChain", () => {
   });
 });
 
-describe("chainStartingWith", () => {
+describe("chainWithOrder gate sharing", () => {
   function fakeProvider(name: "z.ai" | "kimi" | "deepseek"): LLMProvider {
     return createProvider({
       name,
@@ -144,49 +143,16 @@ describe("chainStartingWith", () => {
     });
   }
 
-  it("rotates the canonical chain so primary leads", () => {
-    const a = fakeProvider("z.ai");
-    const b = fakeProvider("kimi");
-    const c = fakeProvider("deepseek");
-    const canonical = createProviderChain([a, b, c]);
-    const rotated = chainStartingWith(canonical, b);
-    expect(rotated.providers.map((p) => p.name)).toEqual([
-      "kimi",
-      "z.ai",
-      "deepseek",
-    ]);
-  });
-
-  it("preserves canonical order for non-primary providers", () => {
-    const a = fakeProvider("z.ai");
-    const b = fakeProvider("kimi");
-    const c = fakeProvider("deepseek");
-    const canonical = createProviderChain([a, b, c]);
-    const rotated = chainStartingWith(canonical, c);
-    expect(rotated.providers.map((p) => p.name)).toEqual([
-      "deepseek",
-      "z.ai",
-      "kimi",
-    ]);
-  });
-
   it("shares gates with the canonical chain", () => {
     // Critical: arming a provider via one chain must reflect in another. All
-    // slots see the same gates, so a 429 anywhere arms it everywhere.
+    // routed chains see the same gates, so a 429 anywhere arms it everywhere.
     const a = fakeProvider("z.ai");
     const b = fakeProvider("kimi");
     const canonical = createProviderChain([a, b]);
-    const rotated = chainStartingWith(canonical, b);
+    const reordered = chainWithOrder(canonical, ["kimi", "z.ai"]);
     a.gate.armUntil(new Date(Date.now() + 60_000));
     expect(canonical.active()?.name).toBe("kimi");
-    expect(rotated.active()?.name).toBe("kimi");
-  });
-
-  it("throws when the requested primary isn't in the canonical chain", () => {
-    const a = fakeProvider("z.ai");
-    const b = fakeProvider("kimi");
-    const canonical = createProviderChain([a]);
-    expect(() => chainStartingWith(canonical, b)).toThrow();
+    expect(reordered.active()?.name).toBe("kimi");
   });
 });
 

@@ -5,7 +5,11 @@ import { join } from "node:path";
 import { gitMust, gitRun, rebaseOntoFreshBase } from "../src/git.ts";
 
 async function init(dir: string, bare = false) {
-  await gitMust(bare ? ["init", "--bare", dir] : ["init", dir]);
+  // -b main: the tests assume a `main` default branch; machines without
+  // init.defaultBranch configured would otherwise create `master`.
+  await gitMust(
+    bare ? ["init", "-b", "main", "--bare", dir] : ["init", "-b", "main", dir],
+  );
   if (!bare) {
     await gitMust(["config", "user.email", "t@t"], { cwd: dir });
     await gitMust(["config", "user.name", "t"], { cwd: dir });
