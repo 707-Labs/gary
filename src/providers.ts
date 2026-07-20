@@ -266,6 +266,15 @@ export function looksLikeUsageLimit(message: string): boolean {
 }
 
 /**
+ * Backoff for a usage/quota limit whose body carries no parseable reset
+ * timestamp (e.g. Kimi's "refreshed in the next cycle"). Long enough not to
+ * hammer an over-quota provider every default-backoff tick, short enough to
+ * rejoin within the hour once the window resets. Used only when parse429
+ * can't extract an exact reset.
+ */
+export const QUOTA_BACKOFF_MS = 30 * 60 * 1000;
+
+/**
  * How long an auth-dead provider stays parked. Long enough that we don't
  * hammer a dead key every tick, short enough that a rotated key gets
  * picked up without a restart.
@@ -299,10 +308,11 @@ export function armOnAuthFailure(
 export function armOnRateLimit(
   provider: LLMProvider,
   message: string,
+  fallbackBackoffMs: number = provider.defaultBackoffMs,
 ): Date {
   const parsed = provider.parse429(message);
   const resetAt =
-    parsed ?? new Date(Date.now() + provider.defaultBackoffMs);
+    parsed ?? new Date(Date.now() + fallbackBackoffMs);
   provider.gate.armUntil(resetAt);
   log.warn("provider rate-limited; gate armed", {
     provider: provider.name,

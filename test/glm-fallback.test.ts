@@ -6,6 +6,7 @@ import {
   AUTH_FAILURE_BACKOFF_MS,
   createProviderChain,
   type LLMProvider,
+  QUOTA_BACKOFF_MS,
 } from "../src/providers.ts";
 import { createRateLimitGate } from "../src/rate-limit.ts";
 
@@ -197,6 +198,30 @@ describe("GLMClient.complete — provider fallback", () => {
     const armed = a.gate.armedUntil()!.getTime();
     expect(armed).toBe(reset.getTime());
     expect(armed).toBeLessThan(Date.now() + AUTH_FAILURE_BACKOFF_MS);
+  });
+
+  it("gives a real Kimi quota 403 (no reset timestamp) the moderate quota backoff", async () => {
+    const before = Date.now();
+    const a = fakeProvider("kimi", {
+      responses: [
+        {
+          kind: "auth_error",
+          status: 403,
+          message:
+            "You've reached your usage limit for this billing cycle. Your quota will be refreshed in the next cycle.",
+        },
+      ],
+    });
+    const b = fakeProvider("deepseek", {
+      responses: [{ kind: "ok", text: "from-deepseek" }],
+    });
+    const glm = new GLMClient(createProviderChain([a, b]));
+    const out = await glm.complete({ system: "", user: "" });
+    expect(out).toBe("from-deepseek");
+    const armed = a.gate.armedUntil()!.getTime();
+    // Moderate quota backoff: well past the 60s default, well short of the 6h park.
+    expect(armed).toBeGreaterThanOrEqual(before + QUOTA_BACKOFF_MS);
+    expect(armed).toBeLessThan(before + AUTH_FAILURE_BACKOFF_MS);
   });
 
   it("still parks a genuine 403 auth failure (no usage-limit signal) for the long backoff", async () => {

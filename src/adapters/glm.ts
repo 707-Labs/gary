@@ -7,6 +7,7 @@ import {
   isAuthError,
   isRateLimitError,
   looksLikeUsageLimit,
+  QUOTA_BACKOFF_MS,
   type LLMProvider,
   type ProviderChain,
   type ProviderName,
@@ -235,7 +236,7 @@ export class GLMClient {
           // back off short so the provider rejoins at its real reset instead
           // of a 6h dead-key park (which would drop a concurrency slot).
           if (looksLikeUsageLimit(message)) {
-            armOnRateLimit(provider, message);
+            armOnRateLimit(provider, message, QUOTA_BACKOFF_MS);
           } else {
             armOnAuthFailure(provider, message);
           }
