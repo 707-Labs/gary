@@ -31,6 +31,13 @@ export interface ProjectContext {
   agentsMd: string | null;
 }
 
+export interface RuleDoc {
+  /** Path relative to the workspace root. */
+  path: string;
+  /** First markdown heading, or null when the doc has none. */
+  title: string | null;
+}
+
 const PROJECT_FILE_MAX_BYTES = 12_000;
 const FRONTMATTER_RE = /^---\s*\n([\s\S]+?)\n---/;
 const NAME_RE = /^name:\s*(.+)$/m;
@@ -80,6 +87,52 @@ export function loadProjectContext(workspaceRoot: string): ProjectContext {
 }
 
 /**
+ * Root-level convention docs surfaced by path (bodies loaded on demand via
+ * `read_file`, same as skills). ERT-1924 shipped a hardcoded z-index and a
+ * sanitization bug that DESIGN.md / .claude/rules/security.md explicitly
+ * warn about — the docs existed but nothing pointed the agent at them.
+ */
+const ROOT_RULE_DOCS = ["DESIGN.md", "SECURITY.md", "CONTRIBUTING.md"] as const;
+const RULES_DIR = ".claude/rules";
+const RULE_TITLE_RE = /^#\s+(.+)$/m;
+
+export function loadRuleDocs(workspaceRoot: string): RuleDoc[] {
+  const docs: RuleDoc[] = [];
+  for (const name of ROOT_RULE_DOCS) {
+    const doc = ruleDocIfExists(workspaceRoot, name);
+    if (doc) docs.push(doc);
+  }
+  const rulesRoot = resolve(workspaceRoot, RULES_DIR);
+  if (existsSync(rulesRoot)) {
+    let entries: string[];
+    try {
+      entries = readdirSync(rulesRoot);
+    } catch {
+      entries = [];
+    }
+    for (const entry of entries.sort()) {
+      if (!entry.endsWith(".md")) continue;
+      const doc = ruleDocIfExists(workspaceRoot, `${RULES_DIR}/${entry}`);
+      if (doc) docs.push(doc);
+    }
+  }
+  return docs;
+}
+
+function ruleDocIfExists(workspaceRoot: string, relPath: string): RuleDoc | null {
+  const p = resolve(workspaceRoot, relPath);
+  if (!existsSync(p)) return null;
+  let content: string;
+  try {
+    content = readFileSync(p, "utf8");
+  } catch {
+    return null;
+  }
+  const heading = content.match(RULE_TITLE_RE);
+  return { path: relPath, title: heading?.[1]?.trim() ?? null };
+}
+
+/**
  * Compose CLAUDE.md / AGENTS.md / skill index into a single text block to
  * prepend to the agent's task message. Returns "" when nothing applies, so
  * callers can drop a guard.
@@ -87,6 +140,7 @@ export function loadProjectContext(workspaceRoot: string): ProjectContext {
 export function formatProjectContext(
   context: ProjectContext,
   skills: ProjectSkill[],
+  ruleDocs: RuleDoc[] = [],
 ): string {
   const sections: string[] = [];
   if (context.claudeMd) {
@@ -96,6 +150,17 @@ export function formatProjectContext(
   if (context.agentsMd) {
     sections.push("# AGENTS.md (agent guidance)");
     sections.push(context.agentsMd);
+  }
+  if (ruleDocs.length > 0) {
+    sections.push("# Project rule docs");
+    sections.push(
+      "Conventions and hard rules for this codebase. Read the relevant ones via `read_file` BEFORE writing code — UI/styling changes against the design doc (use its tokens, don't hardcode values), anything touching auth, HTML rendering, sanitization, or SQL against the security rules.",
+    );
+    sections.push(
+      ruleDocs
+        .map((d) => (d.title ? `- \`${d.path}\` — ${d.title}` : `- \`${d.path}\``))
+        .join("\n"),
+    );
   }
   if (skills.length > 0) {
     sections.push("# Project skills");

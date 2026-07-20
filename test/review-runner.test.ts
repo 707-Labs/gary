@@ -66,12 +66,16 @@ function changesNeededTurn(): Anthropic.Message {
 
 function fakeGlm(turns: Array<() => Anthropic.Message>): GLMClient {
   let i = 0;
+  let served = false;
   return {
     async createMessage(): Promise<Anthropic.Message> {
       const make = turns[i++];
       if (!make) throw new Error("no scripted turn");
-      return make();
+      const out = make();
+      served = true;
+      return out;
     },
+    lastProviderUsed: () => (served ? "deepseek" : null),
     chain: {
       providers: [{ name: "deepseek", model: "deepseek-v4-pro" } as never],
       active: () => ({ name: "deepseek", model: "deepseek-v4-pro" }) as never,
@@ -128,6 +132,7 @@ describe("runReviewer", () => {
         await new Promise((r) => setTimeout(r, 200));
         return approveTurn();
       },
+      lastProviderUsed: () => null,
       chain: {
         providers: [{ name: "deepseek", model: "deepseek-v4-pro" } as never],
         active: () => ({ name: "deepseek", model: "deepseek-v4-pro" }) as never,
@@ -146,6 +151,20 @@ describe("runReviewer", () => {
       "SELECT verdict FROM review_passes ORDER BY id DESC LIMIT 1"
     ).get();
     expect(row!.verdict).toBe("failed");
+  });
+
+  it("records the provider that actually served, not the chain head", async () => {
+    await runReviewer({
+      db, glm: fakeGlm([approveTurn]), executor: fakeExecutor(),
+      ticket: { identifier: "ERT-1", title: "t", description: null },
+      issueLinearId: "issue-1", fingerprint: "fp-1", round: 1,
+      diff: "diff", runLog: [], precheckFindings: [], previousFindings: [],
+      worktreePath: "/tmp/wt", iterationCap: 5, timeoutMs: 60_000,
+    });
+    const row = db.query<{ provider_used: string | null }, []>(
+      "SELECT provider_used FROM review_passes ORDER BY id DESC LIMIT 1"
+    ).get();
+    expect(row!.provider_used).toBe("deepseek");
   });
 
   it("returns kind=failed when the agent doesn't call submit_review", async () => {

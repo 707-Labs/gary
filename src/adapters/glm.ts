@@ -8,6 +8,7 @@ import {
   isRateLimitError,
   type LLMProvider,
   type ProviderChain,
+  type ProviderName,
 } from "../providers.ts";
 import { UsageLimitError } from "../rate-limit.ts";
 
@@ -116,9 +117,28 @@ export interface CompleteArgs {
  */
 export class GLMClient {
   readonly chain: ProviderChain;
+  /** Providers that served at least one successful call on this client. */
+  private readonly used = new Set<ProviderName>();
+  /** Provider that served the most recent successful call, or null. */
+  private last: ProviderName | null = null;
 
   constructor(chain: ProviderChain) {
     this.chain = chain;
+  }
+
+  /**
+   * Which providers actually authored responses through this client, in
+   * first-use order. The reviewer chain is decorrelated against this set
+   * so review doesn't share the author's blind spots (see
+   * `decorrelatedOrder` in providers.ts). Per-action instances (one
+   * GLMClient per dispatched action) keep this scoped to a single run.
+   */
+  providersUsed(): readonly ProviderName[] {
+    return [...this.used];
+  }
+
+  lastProviderUsed(): ProviderName | null {
+    return this.last;
   }
 
   /**
@@ -195,6 +215,8 @@ export class GLMClient {
       }
       try {
         const out = await call(provider);
+        this.used.add(provider.name);
+        this.last = provider.name;
         if (attempt > 1) {
           log.info("provider fallback succeeded", {
             provider: provider.name,

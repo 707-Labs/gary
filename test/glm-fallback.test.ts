@@ -220,3 +220,40 @@ describe("GLMClient.createMessage — provider fallback", () => {
     expect(glm.active().name).toBe("kimi");
   });
 });
+
+describe("GLMClient — provider usage tracking", () => {
+  it("starts empty before any call", () => {
+    const a = fakeProvider("z.ai", { responses: [] });
+    const glm = new GLMClient(createProviderChain([a]));
+    expect(glm.providersUsed()).toEqual([]);
+    expect(glm.lastProviderUsed()).toBeNull();
+  });
+
+  it("records the provider that served, not the chain head", async () => {
+    const a = fakeProvider("z.ai", { responses: [{ kind: "rate_limit" }] });
+    const b = fakeProvider("kimi", { responses: [{ kind: "ok", text: "hi" }] });
+    const glm = new GLMClient(createProviderChain([a, b]));
+    await glm.complete({ system: "s", user: "u" });
+    expect(glm.providersUsed()).toEqual(["kimi"]);
+    expect(glm.lastProviderUsed()).toBe("kimi");
+  });
+
+  it("accumulates distinct providers across calls in first-use order", async () => {
+    const a = fakeProvider("z.ai", { responses: [{ kind: "ok", text: "one" }] });
+    const b = fakeProvider("kimi", { responses: [{ kind: "ok", text: "two" }] });
+    const glm = new GLMClient(createProviderChain([a, b]));
+    await glm.complete({ system: "s", user: "u" });
+    a.gate.armUntil(new Date(Date.now() + 60_000));
+    await glm.complete({ system: "s", user: "u" });
+    expect(glm.providersUsed()).toEqual(["z.ai", "kimi"]);
+    expect(glm.lastProviderUsed()).toBe("kimi");
+  });
+
+  it("does not record a provider whose call failed", async () => {
+    const a = fakeProvider("z.ai", { responses: [{ kind: "rate_limit" }] });
+    const b = fakeProvider("kimi", { responses: [{ kind: "ok", text: "hi" }] });
+    const glm = new GLMClient(createProviderChain([a, b]));
+    await glm.complete({ system: "s", user: "u" });
+    expect(glm.providersUsed()).not.toContain("z.ai");
+  });
+});

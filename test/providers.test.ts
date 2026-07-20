@@ -5,6 +5,7 @@ import {
   chainWithOrder,
   createProvider,
   createProviderChain,
+  decorrelatedOrder,
   isRateLimitError,
   type AnthropicClient,
   type LLMProvider,
@@ -258,5 +259,35 @@ describe("chainWithOrder", () => {
     const canonical = createProviderChain([zai, kimi, deepseek]);
     const reordered = chainWithOrder(canonical, ["deepseek"]);
     expect(reordered.providers.map((p) => p.name)).toEqual(["deepseek", "z.ai", "kimi"]);
+  });
+});
+
+describe("decorrelatedOrder", () => {
+  it("sinks the author's provider to the back", () => {
+    expect(decorrelatedOrder(["deepseek", "z.ai", "kimi"], ["deepseek"])).toEqual([
+      "z.ai",
+      "kimi",
+      "deepseek",
+    ]);
+  });
+
+  it("keeps the preferred order when the author used nothing", () => {
+    expect(decorrelatedOrder(["deepseek", "z.ai", "kimi"], [])).toEqual([
+      "deepseek",
+      "z.ai",
+      "kimi",
+    ]);
+  });
+
+  it("degrades to the preferred order when the author used every provider", () => {
+    expect(
+      decorrelatedOrder(["deepseek", "z.ai", "kimi"], ["kimi", "z.ai", "deepseek"]),
+    ).toEqual(["deepseek", "z.ai", "kimi"]);
+  });
+
+  it("preserves relative order within both groups", () => {
+    expect(
+      decorrelatedOrder(["deepseek", "z.ai", "kimi"], ["z.ai", "deepseek"]),
+    ).toEqual(["kimi", "deepseek", "z.ai"]);
   });
 });

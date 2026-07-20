@@ -20,6 +20,7 @@ import { log } from "../logger.ts";
 import {
   formatProjectContext,
   loadProjectContext,
+  loadRuleDocs,
   loadSkillIndex,
 } from "../skills.ts";
 import { isRespondablePrCommentAuthor } from "../state-fingerprint.ts";
@@ -144,6 +145,7 @@ export async function runPrReviewHandler(
   const projectSection = formatProjectContext(
     loadProjectContext(worktreePath),
     loadSkillIndex(worktreePath),
+    loadRuleDocs(worktreePath),
   );
 
   let prDetail: PullRequestDetail | null = null;

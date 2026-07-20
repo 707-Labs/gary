@@ -8,7 +8,8 @@ export type BugClass =
   | "wrong_code_path"
   | "unverified_claim"
   | "half_wired"
-  | "untested_logic";
+  | "untested_logic"
+  | "security";
 
 export interface ReviewFinding {
   title: string;
@@ -274,6 +275,7 @@ const submitReviewSchema = z.object({
         "unverified_claim",
         "half_wired",
         "untested_logic",
+        "security",
       ]),
     }),
   ),
@@ -286,7 +288,7 @@ function submitReviewTool(tools: ReviewerTools): ReviewerToolHandler {
     definition: {
       name: "submit_review",
       description:
-        "Submit your review verdict. Pass `approve` if you can't find a real bug. Pass `changes_needed` ONLY for blocking bugs (wrong code path, unverified claim, half-wired feature, untested changed logic). Style and refactor opinions go in advisory_notes, never in findings. After calling this, the loop exits.",
+        "Submit your review verdict. Pass `approve` if you can't find a real bug. Pass `changes_needed` ONLY for blocking bugs (wrong code path, unverified claim, half-wired feature, untested changed logic, security defect). Style and refactor opinions go in advisory_notes, never in findings. After calling this, the loop exits.",
       input_schema: {
         type: "object",
         properties: {
@@ -313,6 +315,7 @@ function submitReviewTool(tools: ReviewerTools): ReviewerToolHandler {
                     "unverified_claim",
                     "half_wired",
                     "untested_logic",
+                    "security",
                   ],
                 },
               },

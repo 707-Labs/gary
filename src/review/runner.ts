@@ -9,6 +9,7 @@ import {
 } from "../state/review-queries.ts";
 import type { DB } from "../state/db.ts";
 import type { RunLogEntry } from "../agent/loop.ts";
+import type { RuleDoc } from "../skills.ts";
 import type { PrecheckFinding } from "./precheck.ts";
 import {
   composeReviewerSystemPrompt,
@@ -39,6 +40,7 @@ export interface RunReviewerArgs {
   precheckFindings: readonly PrecheckFinding[];
   previousFindings: readonly PreviousFinding[];
   worktreePath: string;
+  ruleDocs?: readonly RuleDoc[];
   iterationCap: number;
   timeoutMs: number;
 }
@@ -57,6 +59,7 @@ export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult
     precheckFindings: args.precheckFindings,
     previousFindings: args.previousFindings,
     worktreePath: args.worktreePath,
+    ...(args.ruleDocs ? { ruleDocs: args.ruleDocs } : {}),
   });
 
   const messages: Anthropic.MessageParam[] = [{ role: "user", content: task }];
@@ -135,13 +138,10 @@ export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult
       break;
     }
 
-    if (providerName === null) {
-      try {
-        providerName = args.glm.chain.providers[0]?.name ?? null;
-      } catch {
-        providerName = null;
-      }
-    }
+    // Record the provider that actually served, not the chain's first
+    // entry — fallback mid-review means those can differ. Last writer
+    // wins; a mid-round fallback records the provider that finished.
+    providerName = args.glm.lastProviderUsed() ?? providerName;
     inputTokens += response.usage.input_tokens;
     outputTokens += response.usage.output_tokens;
 

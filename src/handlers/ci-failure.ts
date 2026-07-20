@@ -17,6 +17,7 @@ import { log } from "../logger.ts";
 import {
   formatProjectContext,
   loadProjectContext,
+  loadRuleDocs,
   loadSkillIndex,
 } from "../skills.ts";
 import type { DB } from "../state/db.ts";
@@ -127,6 +128,7 @@ export async function runCiFailureHandler(
   const projectSection = formatProjectContext(
     loadProjectContext(worktreePath),
     loadSkillIndex(worktreePath),
+    loadRuleDocs(worktreePath),
   );
   const failureMessage = renderCiFailureForAgent(args, failingChecks);
   const taskMessage = projectSection

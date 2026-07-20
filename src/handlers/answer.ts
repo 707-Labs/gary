@@ -15,6 +15,7 @@ import { log } from "../logger.ts";
 import {
   formatProjectContext,
   loadProjectContext,
+  loadRuleDocs,
   loadSkillIndex,
 } from "../skills.ts";
 
@@ -86,6 +87,7 @@ export async function runAnswerHandler(
   const projectSection = formatProjectContext(
     loadProjectContext(worktreePath),
     loadSkillIndex(worktreePath),
+    loadRuleDocs(worktreePath),
   );
   const question = renderQuestion(
     args.issue,

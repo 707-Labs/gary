@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import {
   formatProjectContext,
   loadProjectContext,
+  loadRuleDocs,
   loadSkillIndex,
 } from "../src/skills.ts";
 
@@ -114,5 +115,50 @@ describe("formatProjectContext", () => {
     expect(out).toContain("CLAUDE.md");
     expect(out).not.toContain("AGENTS.md");
     expect(out).not.toContain("Project skills");
+  });
+});
+
+describe("loadRuleDocs", () => {
+  it("returns [] when no rule docs exist", () => {
+    expect(loadRuleDocs(workspace)).toEqual([]);
+  });
+
+  it("finds root docs and .claude/rules/*.md with first headings", () => {
+    writeFileSync(resolve(workspace, "DESIGN.md"), "# Design system\n\nuse tokens");
+    mkdirSync(resolve(workspace, ".claude/rules"), { recursive: true });
+    writeFileSync(
+      resolve(workspace, ".claude/rules/security.md"),
+      "# Security rules\n\nsanitize last",
+    );
+    writeFileSync(resolve(workspace, ".claude/rules/notes.txt"), "not markdown");
+    expect(loadRuleDocs(workspace)).toEqual([
+      { path: "DESIGN.md", title: "Design system" },
+      { path: ".claude/rules/security.md", title: "Security rules" },
+    ]);
+  });
+
+  it("returns null title when the doc has no heading", () => {
+    writeFileSync(resolve(workspace, "CONTRIBUTING.md"), "just prose, no heading");
+    expect(loadRuleDocs(workspace)).toEqual([
+      { path: "CONTRIBUTING.md", title: null },
+    ]);
+  });
+});
+
+describe("formatProjectContext — rule docs", () => {
+  it("lists rule docs with a read-before-writing instruction", () => {
+    const out = formatProjectContext({ claudeMd: null, agentsMd: null }, [], [
+      { path: "DESIGN.md", title: "Design system" },
+      { path: ".claude/rules/security.md", title: null },
+    ]);
+    expect(out).toContain("# Project rule docs");
+    expect(out).toContain("`DESIGN.md` — Design system");
+    expect(out).toContain("`.claude/rules/security.md`");
+    expect(out).toMatch(/read_file/);
+  });
+
+  it("omits the section when there are no rule docs", () => {
+    const out = formatProjectContext({ claudeMd: "x", agentsMd: null }, []);
+    expect(out).not.toContain("# Project rule docs");
   });
 });

@@ -12,11 +12,19 @@ describe("REVIEW_TASK_INSTRUCTIONS", () => {
     expect(REVIEW_TASK_INSTRUCTIONS).toMatch(/bug/i);
     expect(REVIEW_TASK_INSTRUCTIONS).toMatch(/style|refactor|advisory/i);
   });
-  it("lists the four bug classes", () => {
+  it("lists the five bug classes", () => {
     expect(REVIEW_TASK_INSTRUCTIONS).toMatch(/wrong[_\s]code[_\s]path/i);
     expect(REVIEW_TASK_INSTRUCTIONS).toMatch(/unverified[_\s]claim/i);
     expect(REVIEW_TASK_INSTRUCTIONS).toMatch(/half[_\s-]wired/i);
     expect(REVIEW_TASK_INSTRUCTIONS).toMatch(/untested[_\s]logic/i);
+    expect(REVIEW_TASK_INSTRUCTIONS).toMatch(/\*\*security\*\*/);
+  });
+  it("walks a security checklist covering sanitization order, raw HTML sinks, SQL, and auth", () => {
+    expect(REVIEW_TASK_INSTRUCTIONS).toMatch(/sanitiz/i);
+    expect(REVIEW_TASK_INSTRUCTIONS).toMatch(/\{@html\}/);
+    expect(REVIEW_TASK_INSTRUCTIONS).toMatch(/parameterized/i);
+    expect(REVIEW_TASK_INSTRUCTIONS).toMatch(/auth/i);
+    expect(REVIEW_TASK_INSTRUCTIONS).toMatch(/HttpError/);
   });
   it("instructs to call submit_review", () => {
     expect(REVIEW_TASK_INSTRUCTIONS).toMatch(/submit_review/);
@@ -78,5 +86,34 @@ describe("renderReviewTask", () => {
 describe("composeReviewerSystemPrompt", () => {
   it("includes the review task instructions", () => {
     expect(composeReviewerSystemPrompt()).toContain(REVIEW_TASK_INSTRUCTIONS);
+  });
+});
+
+describe("renderReviewTask — rule docs", () => {
+  const base = {
+    ticket: { identifier: "ERT-1", title: "t", description: null },
+    diff: "diff --git a/a b/a",
+    runLog: [] as RunLogEntry[],
+    precheckFindings: [] as PrecheckFinding[],
+    previousFindings: [],
+    worktreePath: "/tmp/wt",
+  };
+
+  it("lists project rule docs when provided", () => {
+    const out = renderReviewTask({
+      ...base,
+      ruleDocs: [
+        { path: "DESIGN.md", title: "Design system" },
+        { path: ".claude/rules/security.md", title: null },
+      ],
+    });
+    expect(out).toContain("project rule docs");
+    expect(out).toContain("DESIGN.md — Design system");
+    expect(out).toContain(".claude/rules/security.md");
+  });
+
+  it("omits the section when no rule docs are passed", () => {
+    const out = renderReviewTask(base);
+    expect(out).not.toContain("project rule docs");
   });
 });

@@ -25,13 +25,14 @@ import { log } from "../logger.ts";
 import {
   formatProjectContext,
   loadProjectContext,
+  loadRuleDocs,
   loadSkillIndex,
 } from "../skills.ts";
 import type { DB } from "../state/db.ts";
 import { recordEvent, recordPr, setTerminalState } from "../state/queries.ts";
 import { markReviewPassEscalated } from "../state/review-queries.ts";
 import type { ReviewConfig } from "../config.ts";
-import { chainWithOrder } from "../providers.ts";
+import { chainWithOrder, decorrelatedOrder } from "../providers.ts";
 import { runReviewer, type ReviewerResult } from "../review/runner.ts";
 import { findUntestedExports, findUnwiredIdentifiers } from "../review/precheck.ts";
 import { synthesizeReviewRejectedBody } from "../escalate.ts";
@@ -189,6 +190,7 @@ Ambition:
 Evidence:
 - For a bug ticket, reproduce the bug first. Write a test that fails before your change and passes after, and name that test in your finish summary. If you can't reproduce it, don't guess at a fix — finish() with what you learned and what you'd need.
 - If the fix turns out to already exist, ship the regression test alone and say so.
+- Feature work is not exempt: a new server route, endpoint, or non-trivial function ships WITH a test that exercises its behavior — including the failure paths (not-found, invalid input, unauthorized). Typecheck passes on plenty of wrong code: a 404 handler that throws 500, HTML sanitized in the wrong order, an error class that doesn't extend Error. Only a test that runs the path catches these.
 - A green full suite is not evidence that your specific fix works. Name the specific test or command that demonstrates the behavior change.
 
 Process:
@@ -354,6 +356,7 @@ export async function runCodeHandler(
   const projectSection = formatProjectContext(
     loadProjectContext(worktreePath),
     loadSkillIndex(worktreePath),
+    loadRuleDocs(worktreePath),
   );
   const ticketMessage = renderTicketForAgent(args.issue, args.comments, {
     worktreePath,
@@ -438,14 +441,10 @@ export async function runCodeHandler(
   }
 
   // ===== reviewer pass =====
-  const reviewerGlm = new GLMClient(
-    chainWithOrder(deps.glm.chain, deps.review.providerOrder),
-  );
   const reviewFingerprint = `${args.issue.id}:${Date.now()}`;
   const reviewOutcome = await runReviewLoop(deps, args, {
     executor,
     primaryRunLog: loopResult.runLog,
-    reviewerGlm,
     fingerprint: reviewFingerprint,
     worktreePath,
     testCommand,
@@ -1002,7 +1001,6 @@ async function escalateToReporter(
 interface ReviewLoopCtx {
   executor: LocalExecutor;
   primaryRunLog: readonly RunLogEntry[];
-  reviewerGlm: GLMClient;
   fingerprint: string;
   worktreePath: string;
   /** Test command for the post-fixup gate, or null when the repo has none. */
@@ -1021,6 +1019,7 @@ async function runReviewLoop(
   let round = 0;
   let previousFindings: readonly { title: string; detail: string; bugClass: string }[] = [];
   let lastRunLog = ctx.primaryRunLog;
+  const ruleDocs = loadRuleDocs(ctx.worktreePath);
 
   while (round < deps.review.maxRounds) {
     round++;
@@ -1036,9 +1035,35 @@ async function runReviewLoop(
       description: args.issue.description ?? null,
     };
 
+    // Rebuild the reviewer chain each round with the author's providers
+    // sunk to the back — fixup rounds can pull in additional providers, so
+    // the decorrelation set grows as the loop iterates. Soft preference:
+    // if rate-limit arming leaves only an author provider available, the
+    // review still runs on it (logged for calibration).
+    const authorProviders = deps.glm.providersUsed();
+    const reviewerGlm = new GLMClient(
+      chainWithOrder(
+        deps.glm.chain,
+        decorrelatedOrder(deps.review.providerOrder, authorProviders),
+      ),
+    );
+    const reviewerProvider = reviewerGlm.chain.active()?.name ?? null;
+    if (reviewerProvider !== null && authorProviders.includes(reviewerProvider)) {
+      log.warn("reviewer decorrelation unavailable; reviewing with author's provider", {
+        issue: args.issue.identifier,
+        round,
+        provider: reviewerProvider,
+      });
+      recordEvent(deps.db, {
+        eventType: "review_correlated_provider",
+        ticketLinearId: args.issue.id,
+        payload: { round, provider: reviewerProvider },
+      });
+    }
+
     let outcome: ReviewerResult = await runReviewer({
       db: deps.db,
-      glm: ctx.reviewerGlm,
+      glm: reviewerGlm,
       executor: ctx.executor,
       ticket,
       issueLinearId: args.issue.id,
@@ -1049,6 +1074,7 @@ async function runReviewLoop(
       precheckFindings: precheck,
       previousFindings,
       worktreePath: ctx.worktreePath,
+      ruleDocs,
       iterationCap: deps.review.iterationCap,
       timeoutMs: deps.review.timeoutMs,
     });
@@ -1061,7 +1087,7 @@ async function runReviewLoop(
       });
       outcome = await runReviewer({
         db: deps.db,
-        glm: ctx.reviewerGlm,
+        glm: reviewerGlm,
         executor: ctx.executor,
         ticket,
         issueLinearId: args.issue.id,
@@ -1072,6 +1098,7 @@ async function runReviewLoop(
         precheckFindings: precheck,
         previousFindings,
         worktreePath: ctx.worktreePath,
+        ruleDocs,
         iterationCap: deps.review.iterationCap,
         timeoutMs: deps.review.timeoutMs,
       });
@@ -1099,6 +1126,8 @@ async function runReviewLoop(
         round,
         verdict: outcome.review.verdict,
         finding_count: outcome.review.findings.length,
+        author_providers: authorProviders.join(","),
+        reviewer_provider: reviewerGlm.lastProviderUsed(),
       },
     });
 

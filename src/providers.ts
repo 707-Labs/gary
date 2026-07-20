@@ -190,6 +190,27 @@ export function chainWithOrder(
   return createProviderChain(ordered);
 }
 
+/**
+ * Reorder a preferred provider order so that providers the author actually
+ * used sink to the back, preserving relative order within both groups.
+ * Static config can't guarantee author/reviewer decorrelation — fallback
+ * can land the primary on the reviewer's preferred provider (ERT-1924:
+ * deepseek authored AND reviewed, and two review rounds rationalized the
+ * same blind spots the author had). This is a soft preference, not a hard
+ * exclusion: if every provider authored (or the others are rate-limited),
+ * the chain still works — same-provider review beats no review.
+ */
+export function decorrelatedOrder(
+  preferred: readonly ProviderName[],
+  authorProviders: readonly ProviderName[],
+): readonly ProviderName[] {
+  const authored = new Set(authorProviders);
+  return [
+    ...preferred.filter((p) => !authored.has(p)),
+    ...preferred.filter((p) => authored.has(p)),
+  ];
+}
+
 export class AllProvidersExhaustedError extends Error {
   readonly earliestReset: Date | null;
   constructor(earliestReset: Date | null) {

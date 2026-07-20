@@ -1,16 +1,25 @@
 import { composeSystemPrompt } from "../agent/prompts.ts";
 import type { RunLogEntry } from "../agent/loop.ts";
+import type { RuleDoc } from "../skills.ts";
 import type { PrecheckFinding } from "./precheck.ts";
 
 export const REVIEW_TASK_INSTRUCTIONS = `You are reviewing another agent's diff. Your ONLY job is to find one concrete, blocking bug. If you can't find a real bug, approve. Default to approving — bias toward shipping when uncertain.
 
 You have a tight iteration budget. Aim to call \`submit_review\` within 4-5 turns. If you haven't found a specific blocking bug after reading the diff and skimming the affected files, just approve.
 
-A blocking finding MUST fall into one of these four classes:
+A blocking finding MUST fall into one of these five classes:
 - **wrong_code_path** — the code won't run, will throw, returns wrong values, has an off-by-one, or has a type mismatch the typechecker missed
 - **unverified_claim** — the diff or commit message claims to have tested or verified something that the run-log shows was never executed
 - **half_wired** — a new producer (query param, event, identifier) has no consumer somewhere in the codebase, or vice versa
 - **untested_logic** — a changed exported function, SQL query, or component has no test that exercises the new behavior
+- **security** — the diff introduces an injection path, breaks a sanitization invariant, or skips an auth check
+
+Security checklist — walk it whenever the diff touches HTML rendering, user input, SQL, or auth (skip it for diffs that touch none of these):
+- Sanitization order: is anything appended, interpolated, or string-mutated AFTER sanitization? Sanitize-then-modify is a bug even when the author's comment calls it "belt and suspenders" — the modification happens outside the sanitizer's guarantees. The fix is to sanitize last.
+- Raw HTML sinks (\`{@html}\`, innerHTML, and similar): is every input either sanitized immediately before the sink, or provably static?
+- SQL: are all values parameterized? Any string-built query with a variable in it is a finding.
+- Auth: does a new route or endpoint check authorization the way sibling routes do?
+- Error typing: framework error values are often NOT \`Error\` subclasses (e.g. SvelteKit's \`HttpError\`) — an \`instanceof Error\` or bare \`catch\` that re-throws as 500 can swallow intentional 4xx responses. If the diff handles thrown framework errors, verify the not-found/redirect path actually produces its intended status.
 
 DO NOT block on:
 - style, formatting, or refactor opinions
@@ -52,6 +61,7 @@ export interface RenderReviewTaskArgs {
   precheckFindings: readonly PrecheckFinding[];
   previousFindings: readonly PreviousFinding[];
   worktreePath: string;
+  ruleDocs?: readonly RuleDoc[];
 }
 
 const DIFF_MAX_BYTES = 30_000;
@@ -89,6 +99,15 @@ export function renderReviewTask(args: RenderReviewTaskArgs): string {
   } else {
     for (const f of args.precheckFindings) {
       sections.push(`- ${f.kind}: ${f.name} (in ${f.file})`);
+    }
+  }
+  if (args.ruleDocs && args.ruleDocs.length > 0) {
+    sections.push("");
+    sections.push(
+      "--- project rule docs (conventions the diff must honor; read via read_file if the diff touches their domain) ---",
+    );
+    for (const d of args.ruleDocs) {
+      sections.push(d.title ? `- ${d.path} — ${d.title}` : `- ${d.path}`);
     }
   }
   if (args.previousFindings.length > 0) {
