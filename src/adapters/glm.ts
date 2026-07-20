@@ -6,6 +6,7 @@ import {
   armOnRateLimit,
   isAuthError,
   isRateLimitError,
+  looksLikeUsageLimit,
   type LLMProvider,
   type ProviderChain,
   type ProviderName,
@@ -229,7 +230,15 @@ export class GLMClient {
         if (isRateLimitError(err)) {
           armOnRateLimit(provider, message);
         } else if (isAuthError(err)) {
-          armOnAuthFailure(provider, message);
+          // A 403 can signal quota/usage exhaustion (e.g. Kimi Code) rather
+          // than a dead key. If the body carries a usage/rate-limit signal,
+          // back off short so the provider rejoins at its real reset instead
+          // of a 6h dead-key park (which would drop a concurrency slot).
+          if (looksLikeUsageLimit(message)) {
+            armOnRateLimit(provider, message);
+          } else {
+            armOnAuthFailure(provider, message);
+          }
         } else {
           throw err;
         }

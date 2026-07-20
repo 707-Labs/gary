@@ -249,6 +249,23 @@ export function isAuthError(err: unknown): boolean {
 }
 
 /**
+ * Some providers (observed: Kimi Code) return 403 — not 429 — when a usage /
+ * quota window is exhausted, rather than only when the key is dead. Treating
+ * that as an auth failure parks the provider for AUTH_FAILURE_BACKOFF_MS (6h)
+ * when it would actually recover at the window reset (often <1h), needlessly
+ * dropping a concurrency slot for the rest of the day. This detects a usage /
+ * rate / quota signal in the error body so such a 403 can be handled as a rate
+ * limit (short/parsed backoff) instead of a dead key. A genuine auth failure
+ * (invalid/expired key, no quota language) won't match and still gets parked.
+ */
+const USAGE_LIMIT_SIGNAL =
+  /usage limit|rate.?limit|quota|too many requests|limit reached|resets? (?:at|in)|reset at/i;
+
+export function looksLikeUsageLimit(message: string): boolean {
+  return USAGE_LIMIT_SIGNAL.test(message);
+}
+
+/**
  * How long an auth-dead provider stays parked. Long enough that we don't
  * hammer a dead key every tick, short enough that a rotated key gets
  * picked up without a restart.

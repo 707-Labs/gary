@@ -14,7 +14,7 @@ interface FakeOpts {
   responses: Array<
     | { kind: "ok"; text: string }
     | { kind: "rate_limit"; resetAt?: Date; message?: string }
-    | { kind: "auth_error"; status?: number }
+    | { kind: "auth_error"; status?: number; message?: string }
     | { kind: "error"; message: string }
   >;
 }
@@ -69,7 +69,7 @@ function fakeProvider(
           }
           if (r.kind === "auth_error") {
             const err = new Error(
-              "invalid_authentication_error",
+              r.message ?? "invalid_authentication_error",
             ) as Error & { status?: number };
             err.status = r.status ?? 401;
             throw err;
@@ -173,6 +173,46 @@ describe("GLMClient.complete — provider fallback", () => {
     const out = await glm.complete({ system: "", user: "" });
     expect(out).toBe("from-deepseek");
     expect(a.gate.isArmed()).toBe(true);
+  });
+
+  it("treats a 403 that signals a usage/quota limit as a rate limit, not a dead key", async () => {
+    const reset = new Date(Date.now() + 60_000);
+    const a = fakeProvider("kimi", {
+      responses: [
+        {
+          kind: "auth_error",
+          status: 403,
+          message: `Usage limit reached resetAt=${reset.toISOString()}`,
+        },
+      ],
+    });
+    const b = fakeProvider("deepseek", {
+      responses: [{ kind: "ok", text: "from-deepseek" }],
+    });
+    const glm = new GLMClient(createProviderChain([a, b]));
+    const out = await glm.complete({ system: "", user: "" });
+    expect(out).toBe("from-deepseek");
+    // Armed to the parsed reset (short), NOT the 6h dead-key park — so the
+    // provider rejoins the chain at its real reset instead of losing a slot.
+    const armed = a.gate.armedUntil()!.getTime();
+    expect(armed).toBe(reset.getTime());
+    expect(armed).toBeLessThan(Date.now() + AUTH_FAILURE_BACKOFF_MS);
+  });
+
+  it("still parks a genuine 403 auth failure (no usage-limit signal) for the long backoff", async () => {
+    const before = Date.now();
+    const a = fakeProvider("kimi", {
+      responses: [{ kind: "auth_error", status: 403, message: "invalid api key" }],
+    });
+    const b = fakeProvider("deepseek", {
+      responses: [{ kind: "ok", text: "from-deepseek" }],
+    });
+    const glm = new GLMClient(createProviderChain([a, b]));
+    const out = await glm.complete({ system: "", user: "" });
+    expect(out).toBe("from-deepseek");
+    expect(a.gate.armedUntil()!.getTime()).toBeGreaterThanOrEqual(
+      before + AUTH_FAILURE_BACKOFF_MS,
+    );
   });
 
   it("throws AllProvidersExhaustedError when every provider is auth-dead", async () => {
