@@ -17,6 +17,7 @@ import {
   type ReviewTaskTicket,
   type PreviousFinding,
 } from "./prompts.ts";
+import type { ReviewRole } from "./roles.ts";
 import {
   makeReviewerToolset,
   type ReviewerTools,
@@ -35,6 +36,8 @@ export interface RunReviewerArgs {
   issueLinearId: string;
   fingerprint: string;
   round: number;
+  /** Which reviewer mandate this pass runs under. Defaults to correctness. */
+  role?: ReviewRole;
   diff: string;
   runLog: readonly RunLogEntry[];
   precheckFindings: readonly PrecheckFinding[];
@@ -50,8 +53,9 @@ const DEFAULT_MAX_TOKENS = 8192;
 
 export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult> {
   const start = Date.now();
+  const role: ReviewRole = args.role ?? "correctness";
   const tools = makeReviewerToolset(args.executor);
-  const system = composeReviewerSystemPrompt();
+  const system = composeReviewerSystemPrompt(role);
   const task = renderReviewTask({
     ticket: args.ticket,
     diff: args.diff,
@@ -218,6 +222,7 @@ export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult
       outputTokens,
       durationMs,
       verdict: tools.review.verdict,
+      role,
       escalated: false,
     });
     return { kind: "verdict", review: tools.review };
@@ -226,6 +231,7 @@ export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult
   const reason = failureReason ?? "iteration_cap";
   log.warn("reviewer pass did not complete", {
     ticket: args.ticket.identifier,
+    role,
     round: args.round,
     reason,
   });
@@ -238,6 +244,7 @@ export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult
     outputTokens,
     durationMs,
     verdict: "failed",
+    role,
     escalated: false,
   });
   return { kind: "failed", reason };
@@ -252,6 +259,7 @@ function persist(p: {
   outputTokens: number;
   durationMs: number;
   verdict: PersistedVerdict;
+  role: ReviewRole;
   escalated: boolean;
 }): void {
   recordReviewPass(p.db, {
@@ -259,6 +267,7 @@ function persist(p: {
     fingerprint: p.args.fingerprint,
     round: p.args.round,
     verdict: p.verdict,
+    role: p.role,
     findingCount: p.tools.review?.findings.length ?? 0,
     advisoryCount: p.tools.review?.advisoryNotes.length ?? 0,
     providerUsed: p.providerName,

@@ -7,6 +7,12 @@ export interface ReviewPassInput {
   fingerprint: string;
   round: number;
   verdict: ReviewVerdict;
+  /**
+   * Reviewer mandate this row came from. Optional so pre-split callers (and
+   * tests) keep compiling; rows written without it record "correctness",
+   * which is what the single-role era actually ran.
+   */
+  role?: string;
   findingCount: number;
   advisoryCount: number;
   providerUsed: string | null;
@@ -19,11 +25,11 @@ export interface ReviewPassInput {
 export function recordReviewPass(db: DB, input: ReviewPassInput): void {
   db.query(
     `INSERT INTO review_passes (
-       issue_id, fingerprint, round, verdict,
+       issue_id, fingerprint, round, verdict, role,
        finding_count, advisory_count, provider_used,
        input_tokens, output_tokens, duration_ms, escalated
      ) VALUES (
-       $issue, $fp, $round, $verdict,
+       $issue, $fp, $round, $verdict, $role,
        $findings, $advisories, $provider,
        $inTok, $outTok, $dur, $esc
      )`,
@@ -32,6 +38,7 @@ export function recordReviewPass(db: DB, input: ReviewPassInput): void {
     fp: input.fingerprint,
     round: input.round,
     verdict: input.verdict,
+    role: input.role ?? "correctness",
     findings: input.findingCount,
     advisories: input.advisoryCount,
     provider: input.providerUsed,

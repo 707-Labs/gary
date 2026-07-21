@@ -53,6 +53,18 @@ function applyMigrations(db: DB): void {
   if (!ticketCols.has("classification_type")) {
     db.exec("ALTER TABLE tickets ADD COLUMN classification_type TEXT");
   }
+  const reviewCols = new Set(
+    (db.prepare("PRAGMA table_info(review_passes)").all() as Array<{ name: string }>)
+      .map((r) => r.name),
+  );
+  // Pre-split rows all came from the single reviewer, whose mandate is what
+  // the correctness role now carries — so backfilling them to 'correctness'
+  // keeps historical calibration queries comparable to new ones.
+  if (!reviewCols.has("role")) {
+    db.exec(
+      "ALTER TABLE review_passes ADD COLUMN role TEXT NOT NULL DEFAULT 'correctness'",
+    );
+  }
 }
 
 export function closeDb(db: DB): void {

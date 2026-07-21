@@ -40,11 +40,40 @@ bun run scripts/probe-d1.ts              # verify D1 read auth + SELECT-only cla
 
 ## Reviewer pass
 
-After the primary agent finishes and `bun run check` passes, a fresh
-reviewer agent (different provider preference: DeepSeek first by
-default, configurable via `GARY_REVIEWER_PROVIDER_ORDER`) reviews the
-diff before push. It has read+run+submit_review tools — it can verify
-claims by running tests/queries/fetches but cannot edit code.
+After the primary agent finishes and `bun run check` passes, fresh
+reviewer agents (different provider preference: DeepSeek first by
+default, configurable via `GARY_REVIEWER_PROVIDER_ORDER`) review the
+diff before push. They have read+run+submit_review tools — they can
+verify claims by running tests/queries/fetches but cannot edit code.
+
+**Two roles run in parallel each round** (`GARY_REVIEW_ROLES`, default
+`correctness,adversarial`; set to `correctness` to fall back to the
+pre-split single reviewer without a code change):
+
+- `correctness` — ordinary bugs: wrong code path, unverified claims,
+  half-wired features, untested logic. Carries the original reviewer
+  prompt verbatim.
+- `adversarial` — blast radius: auth, money, data integrity, security,
+  privacy, and anything hard to undo. Ported from the `adversarial-reviewer`
+  agent in `~/.pi/agent/agents/`.
+
+Both roles keep the full security checklist. The split is about
+independence and emphasis, not about carving the security domain out of
+one reviewer — a single pass decorrelates on model weights but still
+shares one prompt scaffold and one context-assembly blind spot.
+
+Merge semantics (`src/review/merge.ts`): the verdict is **pessimistic**
+(any role's `changes_needed` blocks), findings dedupe by normalized
+title (both roles can flag the same security bug), and verification
+reports concatenate under `**<role> reviewer**` headers so the PR body
+stays attributable. Roles are kept off each other's primary provider by
+rotating the decorrelated order per role index (`orderForRole` in
+`src/review/roles.ts`) — rotation rather than sinking the sibling's pick,
+because parallel roles can't observe each other's choice.
+
+Each role retries once on failure. Default-approve only fires when
+**every** role fails; a single surviving role is a real review. Per-role
+outcomes land in `review_passes.role` for calibration.
 
 The reviewer chain is additionally decorrelated at runtime: providers
 that actually authored the diff (tracked per-run via
@@ -72,9 +101,9 @@ On reviewer crash/timeout, retry once. On second failure, default-
 approve with a placeholder verification report. Calibration is via
 the `review_passes` table.
 
-Files: `src/review/{precheck.ts, tools.ts, prompts.ts, runner.ts}`,
-`src/state/review-queries.ts`. Wired in `src/handlers/code.ts` between
-`ensurePostFinishCheckPasses` and the rebase block.
+Files: `src/review/{precheck.ts, tools.ts, prompts.ts, runner.ts, roles.ts,
+merge.ts}`, `src/state/review-queries.ts`. Wired in `src/handlers/code.ts`
+between `ensurePostFinishCheckPasses` and the rebase block.
 
 ## Key files
 

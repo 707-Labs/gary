@@ -34,6 +34,8 @@ import { markReviewPassEscalated } from "../state/review-queries.ts";
 import type { ReviewConfig } from "../config.ts";
 import { chainWithOrder, decorrelatedOrder } from "../providers.ts";
 import { runReviewer, type ReviewerResult } from "../review/runner.ts";
+import { mergeReviews, type RoleFailure, type RoleReview } from "../review/merge.ts";
+import { orderForRole } from "../review/roles.ts";
 import { findUntestedExports, findUnwiredIdentifiers } from "../review/precheck.ts";
 import { synthesizeReviewRejectedBody } from "../escalate.ts";
 
@@ -1041,103 +1043,132 @@ async function runReviewLoop(
     // if rate-limit arming leaves only an author provider available, the
     // review still runs on it (logged for calibration).
     const authorProviders = deps.glm.providersUsed();
-    const reviewerGlm = new GLMClient(
-      chainWithOrder(
-        deps.glm.chain,
-        decorrelatedOrder(deps.review.providerOrder, authorProviders),
+    const baseOrder = decorrelatedOrder(deps.review.providerOrder, authorProviders);
+    const roles = deps.review.roles;
+
+    // One client per role, each on a rotation of the decorrelated order so
+    // the roles prefer different providers from each other as well as from
+    // the author. Rotation (rather than sinking the sibling's pick) is what
+    // lets the roles run in parallel — neither can observe the other's
+    // choice before starting.
+    const roleRuns = roles.map((role) => ({
+      role,
+      glm: new GLMClient(
+        chainWithOrder(deps.glm.chain, orderForRole(baseOrder, role, roles)),
       ),
-    );
-    const reviewerProvider = reviewerGlm.chain.active()?.name ?? null;
-    if (reviewerProvider !== null && authorProviders.includes(reviewerProvider)) {
-      log.warn("reviewer decorrelation unavailable; reviewing with author's provider", {
-        issue: args.issue.identifier,
-        round,
-        provider: reviewerProvider,
-      });
-      recordEvent(deps.db, {
-        eventType: "review_correlated_provider",
-        ticketLinearId: args.issue.id,
-        payload: { round, provider: reviewerProvider },
-      });
-    }
+    }));
 
-    let outcome: ReviewerResult = await runReviewer({
-      db: deps.db,
-      glm: reviewerGlm,
-      executor: ctx.executor,
-      ticket,
-      issueLinearId: args.issue.id,
-      fingerprint: ctx.fingerprint,
-      round,
-      diff,
-      runLog: lastRunLog,
-      precheckFindings: precheck,
-      previousFindings,
-      worktreePath: ctx.worktreePath,
-      ruleDocs,
-      iterationCap: deps.review.iterationCap,
-      timeoutMs: deps.review.timeoutMs,
-    });
-
-    if (outcome.kind === "failed") {
-      log.warn("reviewer pass failed; retrying once", {
-        issue: args.issue.identifier,
-        round,
-        reason: outcome.reason,
-      });
-      outcome = await runReviewer({
-        db: deps.db,
-        glm: reviewerGlm,
-        executor: ctx.executor,
-        ticket,
-        issueLinearId: args.issue.id,
-        fingerprint: ctx.fingerprint,
-        round,
-        diff,
-        runLog: lastRunLog,
-        precheckFindings: precheck,
-        previousFindings,
-        worktreePath: ctx.worktreePath,
-        ruleDocs,
-        iterationCap: deps.review.iterationCap,
-        timeoutMs: deps.review.timeoutMs,
-      });
-      if (outcome.kind === "failed") {
-        recordEvent(deps.db, {
-          eventType: "review_failed",
-          ticketLinearId: args.issue.id,
-          payload: { round, reason: outcome.reason },
-        });
-        log.warn("reviewer failed twice; default-approving", {
+    for (const { role, glm } of roleRuns) {
+      const active = glm.chain.active()?.name ?? null;
+      if (active !== null && authorProviders.includes(active)) {
+        log.warn("reviewer decorrelation unavailable; reviewing with author's provider", {
           issue: args.issue.identifier,
           round,
+          role,
+          provider: active,
         });
-        return {
-          kind: "approved",
-          verificationReport: "_reviewer pass unavailable for this PR_",
-        };
+        recordEvent(deps.db, {
+          eventType: "review_correlated_provider",
+          ticketLinearId: args.issue.id,
+          payload: { round, role, provider: active },
+        });
       }
     }
+
+    const settled = await Promise.all(
+      roleRuns.map(async ({ role, glm }) => {
+        const run = (): Promise<ReviewerResult> =>
+          runReviewer({
+            db: deps.db,
+            glm,
+            executor: ctx.executor,
+            ticket,
+            issueLinearId: args.issue.id,
+            fingerprint: ctx.fingerprint,
+            round,
+            role,
+            diff,
+            runLog: lastRunLog,
+            precheckFindings: precheck,
+            previousFindings,
+            worktreePath: ctx.worktreePath,
+            ruleDocs,
+            iterationCap: deps.review.iterationCap,
+            timeoutMs: deps.review.timeoutMs,
+          });
+        let out = await run();
+        if (out.kind === "failed") {
+          log.warn("reviewer pass failed; retrying once", {
+            issue: args.issue.identifier,
+            round,
+            role,
+            reason: out.reason,
+          });
+          out = await run();
+        }
+        return { role, out, provider: glm.lastProviderUsed() };
+      }),
+    );
+
+    const succeeded: RoleReview[] = [];
+    const failed: RoleFailure[] = [];
+    for (const s of settled) {
+      if (s.out.kind === "verdict") {
+        succeeded.push({ role: s.role, review: s.out.review });
+      } else {
+        failed.push({ role: s.role, reason: s.out.reason });
+        recordEvent(deps.db, {
+          eventType: "review_role_failed",
+          ticketLinearId: args.issue.id,
+          payload: { round, role: s.role, reason: s.out.reason },
+        });
+      }
+    }
+
+    // Only default-approve when EVERY role failed. A surviving role is a
+    // real review, and shipping unreviewed because one mandate timed out
+    // would be strictly worse than the single-reviewer behavior this
+    // replaced.
+    if (succeeded.length === 0) {
+      recordEvent(deps.db, {
+        eventType: "review_failed",
+        ticketLinearId: args.issue.id,
+        payload: { round, reason: failed.map((f) => `${f.role}:${f.reason}`).join(",") },
+      });
+      log.warn("all reviewer roles failed twice; default-approving", {
+        issue: args.issue.identifier,
+        round,
+      });
+      return {
+        kind: "approved",
+        verificationReport: "_reviewer pass unavailable for this PR_",
+      };
+    }
+
+    const merged = mergeReviews(succeeded, failed);
+    const review = merged.review;
 
     recordEvent(deps.db, {
       eventType: "review_decision",
       ticketLinearId: args.issue.id,
       payload: {
         round,
-        verdict: outcome.review.verdict,
-        finding_count: outcome.review.findings.length,
+        verdict: review.verdict,
+        finding_count: review.findings.length,
         author_providers: authorProviders.join(","),
-        reviewer_provider: reviewerGlm.lastProviderUsed(),
+        roles_succeeded: merged.succeeded.join(","),
+        roles_failed: failed.map((f) => f.role).join(","),
+        reviewer_providers: settled.map((s) => `${s.role}=${s.provider ?? "?"}`).join(","),
       },
     });
 
-    if (outcome.review.verdict === "approve") {
-      const report = outcome.review.verificationReport.trim();
+    if (review.verdict === "approve") {
+      const report = review.verificationReport.trim();
       return {
         kind: "approved",
         verificationReport:
           report.length > 0
-            ? outcome.review.verificationReport
+            ? review.verificationReport
             : "(no verification report — reviewer approved without findings)",
       };
     }
@@ -1145,7 +1176,7 @@ async function runReviewLoop(
     // changes_needed
     if (round >= deps.review.maxRounds) {
       const body = synthesizeReviewRejectedBody({
-        finalFindings: outcome.review.findings.map((f) => ({
+        finalFindings: review.findings.map((f) => ({
           title: f.title,
           bugClass: f.bugClass,
         })),
@@ -1169,7 +1200,7 @@ async function runReviewLoop(
     }
 
     // Re-run the primary with findings as a fixup task.
-    const fixupTask = renderReviewerFixupTask(outcome.review.findings);
+    const fixupTask = renderReviewerFixupTask(review.findings);
     const primarySystem = composeSystemPrompt({
       taskInstructions: CODE_TASK_INSTRUCTIONS,
     });
@@ -1199,7 +1230,7 @@ async function runReviewLoop(
       iterations: fixup.iterations,
     });
     lastRunLog = fixup.runLog;
-    previousFindings = outcome.review.findings.map((f) => ({
+    previousFindings = review.findings.map((f) => ({
       title: f.title,
       detail: f.detail,
       bugClass: f.bugClass,

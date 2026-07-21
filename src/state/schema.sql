@@ -91,6 +91,7 @@ CREATE TABLE IF NOT EXISTS review_passes (
   fingerprint     TEXT NOT NULL,
   round           INTEGER NOT NULL,
   verdict         TEXT NOT NULL,
+  role            TEXT NOT NULL DEFAULT 'correctness',
   finding_count   INTEGER NOT NULL,
   advisory_count  INTEGER NOT NULL,
   provider_used   TEXT,

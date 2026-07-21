@@ -8,6 +8,7 @@ import {
   type ProviderConfig,
   type ProviderName,
 } from "./providers.ts";
+import { parseReviewRoles, type ReviewRole } from "./review/roles.ts";
 
 const expandHome = (p: string): string =>
   p.startsWith("~") ? resolve(homedir(), p.slice(2)) : resolve(p);
@@ -146,6 +147,8 @@ export interface ReviewConfig {
   maxRounds: number;
   iterationCap: number;
   timeoutMs: number;
+  /** Reviewer mandates run in parallel each round. */
+  roles: readonly ReviewRole[];
 }
 
 const KNOWN_PROVIDERS: ReadonlySet<string> = new Set(["z.ai", "kimi", "deepseek"]);
@@ -197,6 +200,7 @@ export function loadReviewConfig(): ReviewConfig {
     maxRounds: intFromEnv("GARY_REVIEW_MAX_ROUNDS", 3),
     iterationCap: intFromEnv("GARY_REVIEW_ITERATION_CAP", 15),
     timeoutMs: intFromEnv("GARY_REVIEW_TIMEOUT_MS", 300_000),
+    roles: parseReviewRoles(optionalString("GARY_REVIEW_ROLES")),
   };
 }
 
