@@ -140,6 +140,14 @@ export interface RuntimeConfig {
   agentLoopTimeoutMs: number;
   /** How long an idle, CI-green PR can sit before nudge_reviewer fires. */
   stalePrAfterMs: number;
+  /**
+   * Hard ceiling on tickets dispatched per tick, independent of how many
+   * providers are unarmed. Provider count alone is not a governor: with
+   * three unarmed providers Gary opened three tickets a tick and churned
+   * through an entire assigned backlog, tripping Kimi's quota. When gates
+   * then arm, slots collapse to zero and throughput stops entirely.
+   */
+  maxInFlight: number;
 }
 
 export interface ReviewConfig {
@@ -423,6 +431,7 @@ export function loadRuntimeConfig(): RuntimeConfig {
     agentLoopMaxIterations: intFromEnv("AGENT_LOOP_MAX_ITERATIONS", 50),
     agentLoopTimeoutMs: intFromEnv("AGENT_LOOP_TIMEOUT_MS", 900_000),
     stalePrAfterMs: intFromEnv("STALE_PR_HOURS", 72) * 60 * 60 * 1000,
+    maxInFlight: Math.max(1, intFromEnv("GARY_MAX_IN_FLIGHT", 3)),
   };
 }
 

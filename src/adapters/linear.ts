@@ -45,6 +45,42 @@ export type WorkflowStateType =
  * keeps load light while bounding staleness for `setStateByType`. */
 const TEAM_STATES_TTL_MS = 30 * 60_000;
 
+/**
+ * Whether the assignment pipeline should skip a workflow state type.
+ * See `LinearAdapter.DEFAULT_SKIPPED_STATE_TYPES` for the rationale.
+ *
+ * An unknown/missing state type is NEVER skipped — failing open keeps Gary
+ * working when Linear returns a shape we don't recognize, which matches the
+ * pre-existing behavior for null states.
+ *
+ * Exported for tests.
+ */
+export function isSkippedStateType(
+  stateType: string | undefined,
+  skipped: readonly string[] = resolveSkippedStateTypes(),
+): boolean {
+  if (stateType === undefined) return false;
+  return skipped.includes(stateType);
+}
+
+/**
+ * Read the skip list from `GARY_SKIP_STATE_TYPES`, falling back to the
+ * defaults. Read per call rather than cached at module init so the mini can
+ * be retuned with a restart instead of a deploy. An empty value means "skip
+ * nothing extra" but still drops terminal states — losing the
+ * completed/canceled guard to a stray env var would make Gary re-work
+ * finished tickets.
+ */
+export function resolveSkippedStateTypes(): readonly string[] {
+  const raw = process.env.GARY_SKIP_STATE_TYPES?.trim();
+  if (raw === undefined) return LinearAdapter.DEFAULT_SKIPPED_STATE_TYPES;
+  const parsed = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return [...new Set(["completed", "canceled", ...parsed])];
+}
+
 const RETRY_BACKOFFS_MS = [500, 1500, 4000] as const;
 
 function isTransientLinearError(err: unknown): boolean {
@@ -118,6 +154,37 @@ export class LinearAdapter {
     };
   }
 
+  /**
+   * State types the assignment pipeline refuses to pick up.
+   *
+   * `completed`/`canceled` are terminal. `backlog` is the staging gate: a
+   * ticket parked in Backlog is deliberately not ready — typically because a
+   * predecessor hasn't merged yet. Before this filter existed, assignment was
+   * the ONLY gate, so decomposing an epic into a dependency chain and parking
+   * the dependents in Backlog did nothing: Gary pulled all of them into In
+   * Progress at once and the dependents built against a main missing their
+   * predecessors' code (burning quota to fail typecheck).
+   *
+   * Deliberately a denylist, not an `unstarted`/`started` allowlist — an
+   * allowlist silently drops any state type Linear adds later, and going
+   * dark on new tickets is a worse failure than picking up one too many.
+   *
+   * Triage is intentionally still worked: a ticket lands in Triage
+   * unassigned, so Gary holding it means a human assigned it on purpose.
+   *
+   * Note this gates the ASSIGNMENT pipeline only. `fetchMentionedIssues` is
+   * deliberately unfiltered, so an explicit `@gary` overrides the parking
+   * brake — "park in Backlog, @mention when the predecessor lands" is a
+   * clean staging workflow that needs no unassign/reassign dance.
+   *
+   * Override with `GARY_SKIP_STATE_TYPES` (comma-separated) without a deploy.
+   */
+  static readonly DEFAULT_SKIPPED_STATE_TYPES: readonly string[] = [
+    "completed",
+    "canceled",
+    "backlog",
+  ];
+
   async fetchAssignedIssues(): Promise<AssignedIssue[]> {
     // Single raw GraphQL roundtrip — the SDK's lazy resolvers (`issue.state`,
     // `issue.team`, `issue.creator`) each cost a network call, which adds up
@@ -166,10 +233,7 @@ export class LinearAdapter {
     );
 
     return data.issues.nodes
-      .filter(
-        (n) =>
-          n.state?.type !== "completed" && n.state?.type !== "canceled",
-      )
+      .filter((n) => !isSkippedStateType(n.state?.type))
       .map((n) => ({
         id: n.id,
         identifier: n.identifier,

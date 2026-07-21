@@ -63,6 +63,7 @@ async function main(): Promise<void> {
     maxAttemptsPerTicket: cfg.runtime.maxAttemptsPerTicket,
     circuitBreakerWindowHours: cfg.runtime.circuitBreakerWindowHours,
     stalePrAfterMs: cfg.runtime.stalePrAfterMs,
+    maxInFlight: cfg.runtime.maxInFlight,
     review: cfg.review,
     routing: cfg.routing,
     intervalMs: cfg.runtime.pollIntervalMs,

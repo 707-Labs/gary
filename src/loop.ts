@@ -78,6 +78,8 @@ export interface LoopDeps {
   maxAttemptsPerTicket: number;
   circuitBreakerWindowHours: number;
   stalePrAfterMs: number;
+  /** Hard ceiling on tickets dispatched per tick. See RuntimeConfig. */
+  maxInFlight: number;
   /** Reviewer pass config — threaded into runCodeHandler. */
   review: ReviewConfig;
   /** Per-action-type provider preference (main work vs PR follow-ups). */
@@ -95,6 +97,30 @@ const PR_FOLLOWUP_ACTIONS: ReadonlySet<ActionType> = new Set([
   "respond_to_pr_review",
   "nudge_reviewer",
 ]);
+
+/**
+ * How many tickets to dispatch this tick.
+ *
+ * Three independent bounds, all necessary:
+ * - `unarmedProviders` — concurrency can't exceed available capacity.
+ * - `candidates` — can't dispatch work that doesn't exist.
+ * - `maxInFlight` — the governor. The first two let Gary open as many
+ *   tickets as he has providers, every tick, until the whole assigned set
+ *   is in progress; that burst is what tripped Kimi's quota, and once gates
+ *   arm `unarmedProviders` drops to 0 and throughput stops entirely.
+ *
+ * Exported for tests.
+ */
+export function dispatchSlots(args: {
+  unarmedProviders: number;
+  candidates: number;
+  maxInFlight: number;
+}): number {
+  return Math.max(
+    0,
+    Math.min(args.unarmedProviders, args.candidates, args.maxInFlight),
+  );
+}
 
 /** Exported for tests. */
 export function providerOrderForAction(
@@ -260,7 +286,16 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
   // throttle that scales concurrency down as quotas burn out.
   const sorted = [...candidates].sort((a, b) => a.priority - b.priority);
   const unarmed = deps.glm.chain.providers.filter((p) => !p.gate.isArmed());
-  const slots = Math.min(unarmed.length, sorted.length);
+  // Provider count alone is not a governor — it caps concurrency, not how
+  // much work Gary opens. With three unarmed providers he pulled three
+  // tickets a tick through an entire assigned backlog and tripped Kimi's
+  // quota; once gates arm, `unarmed.length` hits 0 and throughput stops
+  // dead. The explicit ceiling paces him so the burst never happens.
+  const slots = dispatchSlots({
+    unarmedProviders: unarmed.length,
+    candidates: sorted.length,
+    maxInFlight: deps.maxInFlight,
+  });
   if (slots === 0) {
     return { candidatesConsidered: candidates.length, actionsTaken: [] };
   }
