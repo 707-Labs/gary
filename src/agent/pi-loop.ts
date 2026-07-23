@@ -194,6 +194,10 @@ export async function runPiLoop(args: PiLoopArgs): Promise<AgentLoopResult> {
       cwd: args.worktreePath,
       env: { ...process.env },
       signal: controller.signal,
+      // stdin MUST be ignored: with node's default pipe, `pi -p` blocks on an
+      // open stdin and emits nothing until the timeout aborts it (surfaced as
+      // a ~15-min no-op stall on the daemon during the first supervised run).
+      stdio: ["ignore", "pipe", "pipe"],
     });
     child.stdout.on("data", (c) => (stdout += c.toString()));
     child.stderr.on("data", (c) => (stderr += c.toString()));
