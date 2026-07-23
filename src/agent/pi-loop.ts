@@ -33,6 +33,19 @@ const PI_AUTH = resolve(homedir(), ".pi/agent/auth.json");
  */
 const PI_CODING_TOOLS = process.env.GARY_PI_TOOLS ?? "read,bash,edit,write";
 
+/**
+ * PATH pi is spawned with. The pi-hypa extension routes pi's `bash` tool
+ * through `hypa` in ~/.local/bin; the launchd daemon inherits a bare PATH
+ * (~/.bun/bin only), so daemon-spawned pi fails EVERY command with
+ * `hypa: command not found` and can't run `bun run check`/tests to self-verify
+ * (interactive pi works only because the user's shell PATH has ~/.local/bin).
+ * Prepend the user bin dirs so hypa + bun resolve regardless of launch context.
+ */
+function piSpawnPath(): string {
+  const userBins = [resolve(homedir(), ".local/bin"), resolve(homedir(), ".bun/bin")];
+  return [...userBins, process.env.PATH ?? ""].filter(Boolean).join(":");
+}
+
 export interface PiLoopArgs {
   /** Absolute path to the ticket worktree pi runs inside. */
   worktreePath: string;
@@ -292,7 +305,7 @@ export async function runPiLoop(args: PiLoopArgs): Promise<AgentLoopResult> {
     }
     const child = spawn(PI_BIN, piArgs, {
       cwd: args.worktreePath,
-      env: { ...process.env },
+      env: { ...process.env, PATH: piSpawnPath() },
       signal: controller.signal,
       // stdin MUST be ignored: with node's default pipe, `pi -p` blocks on an
       // open stdin and emits nothing until the timeout aborts it (surfaced as
