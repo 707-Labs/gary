@@ -679,6 +679,8 @@ async function runRespondToPrReview(
       workspacesDir: deps.workspacesDir,
       agentLoopMaxIterations: deps.agentLoopMaxIterations,
       agentLoopTimeoutMs: deps.agentLoopTimeoutMs,
+      codingEngine: deps.codingEngine,
+      piModel: deps.piModel,
     },
     {
       issue,
@@ -770,6 +772,8 @@ async function runFixCiFailure(
       agentLoopMaxIterations: deps.agentLoopMaxIterations,
       agentLoopTimeoutMs: deps.agentLoopTimeoutMs,
       maxCiAttempts: deps.maxCiAttempts,
+      codingEngine: deps.codingEngine,
+      piModel: deps.piModel,
     },
     {
       issue,

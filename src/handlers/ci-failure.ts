@@ -5,6 +5,7 @@ import type { CheckRunDetail, GitHubClient } from "../adapters/github.ts";
 import type { GLMClient } from "../adapters/glm.ts";
 import type { AssignedIssue, LinearAdapter } from "../adapters/linear.ts";
 import { runAgentLoop } from "../agent/loop.ts";
+import { runCodingEngine } from "../agent/pi-loop.ts";
 import { composeSystemPrompt } from "../agent/prompts.ts";
 import { LocalExecutor } from "../executors/local.ts";
 import {
@@ -46,6 +47,8 @@ export interface CiFailureHandlerDeps {
   agentLoopMaxIterations: number;
   agentLoopTimeoutMs: number;
   maxCiAttempts: number;
+  codingEngine: "glm" | "pi";
+  piModel: string;
 }
 
 export interface CiFailureHandlerArgs {
@@ -135,24 +138,39 @@ export async function runCiFailureHandler(
     ? `${projectSection}\n\n---\n\n${failureMessage}`
     : failureMessage;
 
-  const loopResult = await runAgentLoop({
-    glm: deps.glm,
-    executor,
-    systemPrompt: system,
-    task: taskMessage,
-    maxIterations: deps.agentLoopMaxIterations,
-    timeoutMs: deps.agentLoopTimeoutMs,
-    temperature: 0.3,
-    linear: deps.linear,
-    currentIssue: {
-      id: args.issue.id,
-      identifier: args.issue.identifier,
-      teamId: args.issue.teamId,
+  // pi (when enabled) or GLM. pi commits its own fix (allowCommit) so the
+  // headIsPast() push detection below works.
+  const loopResult = await runCodingEngine(
+    {
+      codingEngine: deps.codingEngine,
+      piModel: deps.piModel,
+      worktreePath,
+      systemPrompt: system,
+      task: taskMessage,
+      timeoutMs: deps.agentLoopTimeoutMs,
+      finishGateCommand: "bun run check",
+      allowCommit: true,
     },
-    github: deps.github,
-    defaultRepo: args.repo,
-    ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
-  });
+    () =>
+      runAgentLoop({
+        glm: deps.glm,
+        executor,
+        systemPrompt: system,
+        task: taskMessage,
+        maxIterations: deps.agentLoopMaxIterations,
+        timeoutMs: deps.agentLoopTimeoutMs,
+        temperature: 0.3,
+        linear: deps.linear,
+        currentIssue: {
+          id: args.issue.id,
+          identifier: args.issue.identifier,
+          teamId: args.issue.teamId,
+        },
+        github: deps.github,
+        defaultRepo: args.repo,
+        ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
+      }),
+  );
 
   log.info("ci fix agent loop done", {
     issue: args.issue.identifier,

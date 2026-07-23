@@ -8,7 +8,7 @@ import type {
 import { GLMClient } from "../adapters/glm.ts";
 import type { AssignedIssue, IssueComment, LinearAdapter } from "../adapters/linear.ts";
 import { type PhaseSpec, runAgentLoop, type RunLogEntry } from "../agent/loop.ts";
-import { piAvailable, runPiLoop } from "../agent/pi-loop.ts";
+import { piAvailable, runPiLoop, runCodingEngine } from "../agent/pi-loop.ts";
 import { composeSystemPrompt } from "../agent/prompts.ts";
 import {
   createWorktree,
@@ -935,25 +935,39 @@ async function ensurePostFinishCheckPasses(
   });
 
   const fixupTask = renderCheckFixupTask(first);
-  const fixupResult = await runAgentLoop({
-    glm: deps.glm,
-    executor: ctx.executor,
-    systemPrompt: ctx.system,
-    task: fixupTask,
-    maxIterations: FIXUP_MAX_ITERATIONS,
-    timeoutMs: deps.agentLoopTimeoutMs,
-    temperature: 0.3,
-    linear: deps.linear,
-    currentIssue: {
-      id: args.issue.id,
-      identifier: args.issue.identifier,
-      teamId: args.issue.teamId,
+  // pi (allowCommit: it commits its own fix) or GLM.
+  const fixupResult = await runCodingEngine(
+    {
+      codingEngine: deps.codingEngine,
+      piModel: deps.piModel,
+      worktreePath: resolve(deps.workspacesDir, args.issue.identifier),
+      systemPrompt: ctx.system,
+      task: fixupTask,
+      timeoutMs: deps.agentLoopTimeoutMs,
+      finishGateCommand: CHECK_COMMAND,
+      allowCommit: true,
     },
-    github: deps.github,
-    defaultRepo: args.repo,
-    finishGateCommand: CHECK_COMMAND,
-    ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
-  });
+    () =>
+      runAgentLoop({
+        glm: deps.glm,
+        executor: ctx.executor,
+        systemPrompt: ctx.system,
+        task: fixupTask,
+        maxIterations: FIXUP_MAX_ITERATIONS,
+        timeoutMs: deps.agentLoopTimeoutMs,
+        temperature: 0.3,
+        linear: deps.linear,
+        currentIssue: {
+          id: args.issue.id,
+          identifier: args.issue.identifier,
+          teamId: args.issue.teamId,
+        },
+        github: deps.github,
+        defaultRepo: args.repo,
+        finishGateCommand: CHECK_COMMAND,
+        ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
+      }),
+  );
   log.info("fixup loop done", {
     issue: args.issue.identifier,
     status: fixupResult.status,
@@ -1279,25 +1293,39 @@ async function runReviewLoop(
     const primarySystem = composeSystemPrompt({
       taskInstructions: CODE_TASK_INSTRUCTIONS,
     });
-    const fixup = await runAgentLoop({
-      glm: deps.glm,
-      executor: ctx.executor,
-      systemPrompt: primarySystem,
-      task: fixupTask,
-      maxIterations: FIXUP_MAX_ITERATIONS,
-      timeoutMs: deps.agentLoopTimeoutMs,
-      temperature: 0.3,
-      linear: deps.linear,
-      currentIssue: {
-        id: args.issue.id,
-        identifier: args.issue.identifier,
-        teamId: args.issue.teamId,
+    // pi (allowCommit: it commits its own fix) or GLM.
+    const fixup = await runCodingEngine(
+      {
+        codingEngine: deps.codingEngine,
+        piModel: deps.piModel,
+        worktreePath: ctx.worktreePath,
+        systemPrompt: primarySystem,
+        task: fixupTask,
+        timeoutMs: deps.agentLoopTimeoutMs,
+        finishGateCommand: CHECK_COMMAND,
+        allowCommit: true,
       },
-      github: deps.github,
-      defaultRepo: args.repo,
-      finishGateCommand: CHECK_COMMAND,
-      ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
-    });
+      () =>
+        runAgentLoop({
+          glm: deps.glm,
+          executor: ctx.executor,
+          systemPrompt: primarySystem,
+          task: fixupTask,
+          maxIterations: FIXUP_MAX_ITERATIONS,
+          timeoutMs: deps.agentLoopTimeoutMs,
+          temperature: 0.3,
+          linear: deps.linear,
+          currentIssue: {
+            id: args.issue.id,
+            identifier: args.issue.identifier,
+            teamId: args.issue.teamId,
+          },
+          github: deps.github,
+          defaultRepo: args.repo,
+          finishGateCommand: CHECK_COMMAND,
+          ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
+        }),
+    );
     log.info("reviewer-driven fixup loop done", {
       issue: args.issue.identifier,
       round,

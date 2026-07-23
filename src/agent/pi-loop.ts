@@ -62,6 +62,14 @@ export interface PiLoopArgs {
    * the equivalent of runAgentLoop's finishGateCommand. pi self-verifies.
    */
   finishGateCommand?: string;
+  /**
+   * Whether pi should commit its own work. The main coding path leaves changes
+   * uncommitted (Gary commits them via commitPiWorktree for a clean authored
+   * commit). The fix-up / PR-review / CI-failure paths instead detect a push by
+   * a HEAD change, so pi MUST commit there — matching the GLM agent's behavior
+   * on those paths. Default false.
+   */
+  allowCommit?: boolean;
 }
 
 /**
@@ -85,7 +93,10 @@ function buildPrompt(args: PiLoopArgs): string {
   const gate = args.finishGateCommand
     ? `\n\n## Verification gate\nBefore you finish, you MUST run \`${args.finishGateCommand}\` and it must exit 0. Do not claim completion otherwise.`
     : "";
-  return `${args.task}${gate}\n\nDo not commit, push, open a PR, or deploy. Leave changes in the working tree.`;
+  const git = args.allowCommit
+    ? `\n\nWhen you're done and the verification gate passes, commit your changes with \`git add -A && git commit --no-verify -m "<message>"\` (the --no-verify avoids a slow pre-commit hook; Gary's gate already verified the work). Do not push, open a PR, or deploy.`
+    : `\n\nDo not commit, push, open a PR, or deploy. Leave changes in the working tree.`;
+  return `${args.task}${gate}${git}`;
 }
 
 /**
@@ -380,4 +391,40 @@ export async function runPiLoop(args: PiLoopArgs): Promise<AgentLoopResult> {
       }
     });
   });
+}
+
+/**
+ * Engine selector shared by every coding call site (main coding + fix-ups +
+ * PR-review + CI-failure). When `codingEngine` is "pi" and pi is available,
+ * run the task through pi; otherwise fall back to the GLM loop the caller
+ * supplies. Centralizing this keeps the pi/GLM branch identical everywhere and
+ * means a pi outage degrades every path uniformly instead of halting Gary.
+ */
+export async function runCodingEngine(
+  opts: {
+    codingEngine: "glm" | "pi";
+    piModel: string;
+    worktreePath: string;
+    systemPrompt: string;
+    task: string;
+    timeoutMs: number;
+    finishGateCommand?: string;
+    allowCommit?: boolean;
+    signal?: AbortSignal;
+  },
+  glmFallback: () => Promise<AgentLoopResult>,
+): Promise<AgentLoopResult> {
+  if (opts.codingEngine === "pi" && (await piAvailable())) {
+    return runPiLoop({
+      worktreePath: opts.worktreePath,
+      model: opts.piModel,
+      systemPrompt: opts.systemPrompt,
+      task: opts.task,
+      timeoutMs: opts.timeoutMs,
+      ...(opts.finishGateCommand ? { finishGateCommand: opts.finishGateCommand } : {}),
+      ...(opts.allowCommit ? { allowCommit: opts.allowCommit } : {}),
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    });
+  }
+  return glmFallback();
 }

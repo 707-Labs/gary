@@ -1,5 +1,18 @@
 import { describe, expect, it } from "bun:test";
-import { createPiParser, parsePiJsonl } from "./pi-loop.ts";
+import { createPiParser, parsePiJsonl, runCodingEngine } from "./pi-loop.ts";
+import type { AgentLoopResult } from "./loop.ts";
+
+const GLM_RESULT: AgentLoopResult = {
+  status: "finished",
+  summary: "glm did it",
+  iterations: 1,
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheCreationTokens: 0,
+  cacheReadTokens: 0,
+  phase: "single",
+  runLog: [],
+};
 
 // Fixture distilled from a real `pi -p --mode json --approve` run (2026-07-23):
 // one bash tool call (echo) followed by a final "done" text turn.
@@ -117,5 +130,27 @@ describe("createPiParser (incremental streaming)", () => {
     const noNewline = REAL_RUN; // REAL_RUN has no trailing "\n"
     parser.push(noNewline);
     expect(parser.finish().settled).toBe(true);
+  });
+});
+
+describe("runCodingEngine", () => {
+  it("uses the GLM fallback when codingEngine is glm and never spawns pi", async () => {
+    let fallbackCalled = false;
+    const result = await runCodingEngine(
+      {
+        codingEngine: "glm",
+        piModel: "openai-codex/gpt-5.6-sol",
+        worktreePath: "/tmp/does-not-matter",
+        systemPrompt: "s",
+        task: "t",
+        timeoutMs: 1000,
+      },
+      async () => {
+        fallbackCalled = true;
+        return GLM_RESULT;
+      },
+    );
+    expect(fallbackCalled).toBe(true);
+    expect(result).toBe(GLM_RESULT);
   });
 });
