@@ -180,7 +180,7 @@ Rules:
 - If you can't make it pass after a few iterations, call finish() with a one-sentence summary of what's still broken so a human can take over.`;
 }
 
-const CODE_TASK_INSTRUCTIONS = `You are working on a Linear ticket for 707 Labs. Own it end-to-end: solve the real problem behind the ticket, not just the literal sentence in the title, and take a design swing when the ticket leaves room for one.
+export const CODE_TASK_INSTRUCTIONS = `You are working on a Linear ticket for 707 Labs. Own it end-to-end: solve the real problem behind the ticket, not just the literal sentence in the title, and take a design swing when the ticket leaves room for one.
 
 You can use tools to read, edit, run bash commands, and commit. When you're done, call finish() with a short summary.
 
@@ -317,6 +317,33 @@ export function buildBranchName(
   return `${identifier}-${slug}`;
 }
 
+/**
+ * Stage and commit whatever pi left in the working tree. pi edits but is told
+ * not to commit (see runPiLoop's prompt), so the pi path relies on Gary to
+ * create the commit the PR is built from. No-op when the tree is clean (the
+ * downstream has-commits check then reports "no changes" as usual). The
+ * worktree already has user.name/email/gpgsign configured by createWorktree.
+ */
+async function commitPiWorktree(
+  worktreePath: string,
+  args: CodeHandlerArgs,
+  summary: string | null,
+): Promise<void> {
+  const status = await gitMust(["status", "--porcelain"], { cwd: worktreePath });
+  if (!status.stdout.trim()) return; // nothing pi changed
+  await gitMust(["add", "-A"], { cwd: worktreePath });
+  const type =
+    args.changeType && KNOWN_CHANGE_TYPES.has(args.changeType) ? args.changeType : "chore";
+  const subject = `${type}(${args.issue.identifier}): ${args.issue.title}`;
+  const body = (summary ?? "").trim().slice(0, 2000);
+  const messageArgs = body ? ["-m", subject, "-m", body] : ["-m", subject];
+  await gitMust(["commit", "--no-gpg-sign", ...messageArgs], { cwd: worktreePath });
+  log.info("committed pi worktree changes", {
+    issue: args.issue.identifier,
+    subject,
+  });
+}
+
 export async function runCodeHandler(
   deps: CodeHandlerDeps,
   args: CodeHandlerArgs,
@@ -426,6 +453,14 @@ export async function runCodeHandler(
     cacheCreationTokens: loopResult.cacheCreationTokens,
     cacheReadTokens: loopResult.cacheReadTokens,
   });
+
+  // The GLM loop commits its own work via the `commit` tool. pi is told NOT to
+  // commit (it just edits the working tree), so Gary owns git for the pi path:
+  // stage and commit whatever pi left behind before the has-commits check,
+  // otherwise a finished pi run reads as "no changes" and never opens a PR.
+  if (usePi) {
+    await commitPiWorktree(worktreePath, args, loopResult.summary);
+  }
 
   const baseRef = BASE_BRANCH;
   const hasCommits = await hasCommitsAhead(worktreePath, baseRef);

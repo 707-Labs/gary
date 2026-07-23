@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { parsePiJsonl } from "./pi-loop.ts";
+import { createPiParser, parsePiJsonl } from "./pi-loop.ts";
 
 // Fixture distilled from a real `pi -p --mode json --approve` run (2026-07-23):
 // one bash tool call (echo) followed by a final "done" text turn.
@@ -80,5 +80,42 @@ describe("parsePiJsonl", () => {
 
   it("tolerates non-JSON noise lines", () => {
     expect(parsePiJsonl("not json\n" + REAL_RUN).finalText).toBe("done");
+  });
+});
+
+describe("createPiParser (incremental streaming)", () => {
+  it("parses identically when the stream is split at arbitrary chunk boundaries", () => {
+    const parser = createPiParser();
+    // Feed one char at a time — splits every line mid-way — to prove the
+    // partial-line buffer reassembles events across chunk boundaries.
+    for (const ch of REAL_RUN) parser.push(ch);
+    const p = parser.finish();
+    expect(p.finalText).toBe("done");
+    expect(p.turns).toBe(2);
+    expect(p.settled).toBe(true);
+    expect(p.runLog).toHaveLength(1);
+  });
+
+  it("discards high-volume delta noise without retaining it (the OOM regression)", () => {
+    // A real heavy-reasoning run emits tens of MB of thinking/message_update/
+    // toolcall_delta events per turn that the parser must drop. Interleave a
+    // large burst of them and confirm only the settled events survive.
+    const noise = Array.from({ length: 20000 }, (_, i) =>
+      JSON.stringify({ type: "thinking", text: `t${i}`.repeat(20) }),
+    ).join("\n");
+    const parser = createPiParser();
+    parser.push(noise + "\n");
+    parser.push(REAL_RUN);
+    const p = parser.finish();
+    expect(p.finalText).toBe("done");
+    expect(p.turns).toBe(2);
+    expect(p.runLog).toHaveLength(1);
+  });
+
+  it("flushes a trailing line with no terminating newline", () => {
+    const parser = createPiParser();
+    const noNewline = REAL_RUN; // REAL_RUN has no trailing "\n"
+    parser.push(noNewline);
+    expect(parser.finish().settled).toBe(true);
   });
 });
