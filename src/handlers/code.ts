@@ -323,25 +323,39 @@ export function buildBranchName(
  * create the commit the PR is built from. No-op when the tree is clean (the
  * downstream has-commits check then reports "no changes" as usual). The
  * worktree already has user.name/email/gpgsign configured by createWorktree.
+ *
+ * Uses --no-verify: the target repo's pre-commit hook (e.g. mulligan's
+ * `bunx lint-staged`) can fail or hang on partial/unformatted work and would
+ * otherwise throw and crash the handler mid-run. Gary's real gates are the
+ * post-finish `bun run check` and the pre-push hook, so skipping the local
+ * pre-commit here is safe. Never throws — a commit failure degrades to "no
+ * commit" so the caller's has-commits check escalates cleanly instead of
+ * killing the run.
  */
 async function commitPiWorktree(
   worktreePath: string,
   args: CodeHandlerArgs,
   summary: string | null,
 ): Promise<void> {
-  const status = await gitMust(["status", "--porcelain"], { cwd: worktreePath });
-  if (!status.stdout.trim()) return; // nothing pi changed
-  await gitMust(["add", "-A"], { cwd: worktreePath });
-  const type =
-    args.changeType && KNOWN_CHANGE_TYPES.has(args.changeType) ? args.changeType : "chore";
-  const subject = `${type}(${args.issue.identifier}): ${args.issue.title}`;
-  const body = (summary ?? "").trim().slice(0, 2000);
-  const messageArgs = body ? ["-m", subject, "-m", body] : ["-m", subject];
-  await gitMust(["commit", "--no-gpg-sign", ...messageArgs], { cwd: worktreePath });
-  log.info("committed pi worktree changes", {
-    issue: args.issue.identifier,
-    subject,
-  });
+  try {
+    const status = await gitMust(["status", "--porcelain"], { cwd: worktreePath });
+    if (!status.stdout.trim()) return; // nothing pi changed
+    await gitMust(["add", "-A"], { cwd: worktreePath });
+    const type =
+      args.changeType && KNOWN_CHANGE_TYPES.has(args.changeType) ? args.changeType : "chore";
+    const subject = `${type}(${args.issue.identifier}): ${args.issue.title}`;
+    const body = (summary ?? "").trim().slice(0, 2000);
+    const messageArgs = body ? ["-m", subject, "-m", body] : ["-m", subject];
+    await gitMust(["commit", "--no-gpg-sign", "--no-verify", ...messageArgs], {
+      cwd: worktreePath,
+    });
+    log.info("committed pi worktree changes", { issue: args.issue.identifier, subject });
+  } catch (err) {
+    log.warn("failed to commit pi worktree changes; leaving uncommitted", {
+      issue: args.issue.identifier,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 export async function runCodeHandler(

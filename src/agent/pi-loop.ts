@@ -21,12 +21,17 @@ import type { AgentLoopResult, RunLogEntry } from "./loop.ts";
 const PI_BIN = process.env.GARY_PI_BIN ?? "pi";
 const PI_AUTH = resolve(homedir(), ".pi/agent/auth.json");
 /**
- * Allowlist of pi tools for a Gary coding run: the read/write/exec primitives
- * plus the read-only search helpers (off by default, so named explicitly).
- * Deliberately excludes extension tools like `workflow` (nested agent fleets)
- * and `ask_question` (blocks a headless run). Override via GARY_PI_TOOLS.
+ * Allowlist of pi tools for a Gary coding run: just the read/write/exec
+ * primitives. Deliberately excludes:
+ *  - extension tools like `workflow` (spawns nested agent fleets that never
+ *    return inside the budget) and `ask_question` (blocks a headless run);
+ *  - pi's dedicated `grep`/`find`/`ls` tools — their in-process walkers accept
+ *    an absolute path and, given one outside the worktree (pi searched all of
+ *    `/Users/tanner` once), scan the entire tree and hang the run. `bash`
+ *    already covers search scoped to the worktree cwd, so they add only risk.
+ * Override via GARY_PI_TOOLS.
  */
-const PI_CODING_TOOLS = process.env.GARY_PI_TOOLS ?? "read,bash,edit,write,grep,find,ls";
+const PI_CODING_TOOLS = process.env.GARY_PI_TOOLS ?? "read,bash,edit,write";
 
 export interface PiLoopArgs {
   /** Absolute path to the ticket worktree pi runs inside. */
@@ -242,13 +247,11 @@ export async function runPiLoop(args: PiLoopArgs): Promise<AgentLoopResult> {
     "--model",
     args.model,
     "--approve",
-    // Restrict pi to core coding primitives. Left unrestricted, gpt-5.6-sol on
-    // a real ticket escalates to its `workflow` extension tool — spawning a
-    // nested multi-agent fleet that never returns inside Gary's time budget
-    // (observed: one workflow tool call ran the full timeout, 0 turns settled).
-    // Gary wants pi to code directly in-worktree, not orchestrate a sub-fleet,
-    // and this also excludes input-blocking tools (ask_question) that would
-    // hang a headless run. grep/find/ls are off-by-default, so name them.
+    // Restrict pi to core coding primitives (see PI_CODING_TOOLS). Left
+    // unrestricted, gpt-5.6-sol on a real ticket escalates to its `workflow`
+    // extension tool — a nested agent fleet that never returns inside the
+    // budget — and its grep/find/ls walkers can scan outside the worktree and
+    // hang. Gary wants pi to code directly in-worktree via read/bash/edit/write.
     "--tools",
     PI_CODING_TOOLS,
     "--append-system-prompt",
