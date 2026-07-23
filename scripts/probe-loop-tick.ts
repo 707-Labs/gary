@@ -40,6 +40,9 @@ const result = await tick({
   maxAttemptsPerTicket: cfg.runtime.maxAttemptsPerTicket,
   circuitBreakerWindowHours: cfg.runtime.circuitBreakerWindowHours,
   stalePrAfterMs: cfg.runtime.stalePrAfterMs,
+  maxInFlight: cfg.runtime.maxInFlight,
+  codingEngine: cfg.runtime.codingEngine,
+  piModel: cfg.runtime.piModel,
   review: cfg.review,
   routing: cfg.routing,
 });

@@ -8,6 +8,7 @@ import type {
 import { GLMClient } from "../adapters/glm.ts";
 import type { AssignedIssue, IssueComment, LinearAdapter } from "../adapters/linear.ts";
 import { type PhaseSpec, runAgentLoop, type RunLogEntry } from "../agent/loop.ts";
+import { piAvailable, runPiLoop } from "../agent/pi-loop.ts";
 import { composeSystemPrompt } from "../agent/prompts.ts";
 import {
   createWorktree,
@@ -252,6 +253,10 @@ export interface CodeHandlerDeps {
   workspacesDir: string;
   agentLoopMaxIterations: number;
   agentLoopTimeoutMs: number;
+  /** Coding engine: "glm" = in-process loop, "pi" = delegate to pi harness. */
+  codingEngine: "glm" | "pi";
+  /** Model pattern pi runs when codingEngine === "pi". */
+  piModel: string;
   /** Reviewer pass config — provider order, max rounds, per-round caps. */
   review: ReviewConfig;
 }
@@ -368,27 +373,48 @@ export async function runCodeHandler(
     ? `${projectSection}\n\n---\n\n${ticketMessage}`
     : ticketMessage;
 
-  const loopResult = await runAgentLoop({
-    glm: deps.glm,
-    executor,
-    systemPrompt: system,
-    task: taskMessage,
-    maxIterations: deps.agentLoopMaxIterations,
-    phases: buildCodePhases(args.scope),
-    timeoutMs:
-      deps.agentLoopTimeoutMs * (args.scope === "L" ? L_TIMEOUT_MULTIPLIER : 1),
-    temperature: 0.3,
-    linear: deps.linear,
-    currentIssue: {
-      id: args.issue.id,
-      identifier: args.issue.identifier,
-      teamId: args.issue.teamId,
-    },
-    github: deps.github,
-    defaultRepo: args.repo,
-    finishGateCommand: CHECK_COMMAND,
-    ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
-  });
+  // ERT: pi coding engine. When enabled and available, delegate the whole
+  // coding step to the pi harness; otherwise run the in-process GLM loop.
+  // pi manages its own phases/tools, so the GLM-specific args are dropped.
+  // A pi outage falls back to GLM — it must degrade Gary, not halt him.
+  const codeTimeoutMs =
+    deps.agentLoopTimeoutMs * (args.scope === "L" ? L_TIMEOUT_MULTIPLIER : 1);
+  const usePi = deps.codingEngine === "pi" && (await piAvailable());
+  if (deps.codingEngine === "pi" && !usePi) {
+    log.warn("pi unavailable — falling back to glm loop", {
+      issue: args.issue.identifier,
+    });
+  }
+
+  const loopResult = usePi
+    ? await runPiLoop({
+        worktreePath,
+        model: deps.piModel,
+        systemPrompt: system,
+        task: taskMessage,
+        timeoutMs: codeTimeoutMs,
+        finishGateCommand: CHECK_COMMAND,
+      })
+    : await runAgentLoop({
+        glm: deps.glm,
+        executor,
+        systemPrompt: system,
+        task: taskMessage,
+        maxIterations: deps.agentLoopMaxIterations,
+        phases: buildCodePhases(args.scope),
+        timeoutMs: codeTimeoutMs,
+        temperature: 0.3,
+        linear: deps.linear,
+        currentIssue: {
+          id: args.issue.id,
+          identifier: args.issue.identifier,
+          teamId: args.issue.teamId,
+        },
+        github: deps.github,
+        defaultRepo: args.repo,
+        finishGateCommand: CHECK_COMMAND,
+        ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
+      });
 
   log.info("agent loop done", {
     issue: args.issue.identifier,
