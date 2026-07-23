@@ -138,6 +138,14 @@ export interface RuntimeConfig {
   maxCiAttempts: number;
   agentLoopMaxIterations: number;
   agentLoopTimeoutMs: number;
+  /**
+   * Which engine runs the coding step. "glm" = Gary's in-process loop on the
+   * budget provider chain (legacy). "pi" = delegate to the pi harness
+   * (frontier model + plan/scout/impl/validate). See docs/pi-integration-plan.md.
+   */
+  codingEngine: "glm" | "pi";
+  /** Model pattern pi runs when codingEngine === "pi". */
+  piModel: string;
   /** How long an idle, CI-green PR can sit before nudge_reviewer fires. */
   stalePrAfterMs: number;
   /**
@@ -432,6 +440,8 @@ export function loadRuntimeConfig(): RuntimeConfig {
     agentLoopTimeoutMs: intFromEnv("AGENT_LOOP_TIMEOUT_MS", 900_000),
     stalePrAfterMs: intFromEnv("STALE_PR_HOURS", 72) * 60 * 60 * 1000,
     maxInFlight: Math.max(1, intFromEnv("GARY_MAX_IN_FLIGHT", 3)),
+    codingEngine: stringFromEnv("GARY_CODING_ENGINE", "glm") === "pi" ? "pi" : "glm",
+    piModel: stringFromEnv("GARY_PI_MODEL", "openai-codex/gpt-5.6-sol"),
   };
 }
 

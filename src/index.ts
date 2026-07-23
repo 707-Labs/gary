@@ -59,6 +59,8 @@ async function main(): Promise<void> {
     workspacesDir: cfg.gary.workspacesDir,
     agentLoopMaxIterations: cfg.runtime.agentLoopMaxIterations,
     agentLoopTimeoutMs: cfg.runtime.agentLoopTimeoutMs,
+    codingEngine: cfg.runtime.codingEngine,
+    piModel: cfg.runtime.piModel,
     maxCiAttempts: cfg.runtime.maxCiAttempts,
     maxAttemptsPerTicket: cfg.runtime.maxAttemptsPerTicket,
     circuitBreakerWindowHours: cfg.runtime.circuitBreakerWindowHours,

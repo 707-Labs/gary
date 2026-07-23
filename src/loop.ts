@@ -74,6 +74,10 @@ export interface LoopDeps {
   workspacesDir: string;
   agentLoopMaxIterations: number;
   agentLoopTimeoutMs: number;
+  /** Coding engine: "glm" = in-process loop, "pi" = delegate to pi harness. */
+  codingEngine: "glm" | "pi";
+  /** Model pattern pi runs when codingEngine === "pi". */
+  piModel: string;
   maxCiAttempts: number;
   maxAttemptsPerTicket: number;
   circuitBreakerWindowHours: number;
@@ -808,6 +812,8 @@ async function runStartCoding(
       workspacesDir: deps.workspacesDir,
       agentLoopMaxIterations: deps.agentLoopMaxIterations,
       agentLoopTimeoutMs: deps.agentLoopTimeoutMs,
+      codingEngine: deps.codingEngine,
+      piModel: deps.piModel,
       review: deps.review,
     },
     { issue, comments, repo, scope, ...(changeType ? { changeType } : {}) },
