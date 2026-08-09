@@ -332,10 +332,8 @@ const DEFAULT_OBSERVABILITY_WORKERS = [
   "mulligan-labs-discord-bot",
 ];
 
-const DEFAULT_D1_DATABASES: Readonly<Record<string, string>> = {
-  // ID copied from ertai/wrangler.json; same UUID is used by all envs.
-  "mulligan-labs": "d0d963f1-53dd-4f57-b24d-b3fb3da56753",
-};
+// No baked-in default: set CLOUDFLARE_D1_DATABASES (alias=uuid pairs).
+const DEFAULT_D1_DATABASES: Readonly<Record<string, string>> = {};
 
 /**
  * Cloudflare config is optional — Gary runs without it, just without log
