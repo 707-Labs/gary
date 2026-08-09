@@ -55,3 +55,23 @@ ssh mini 'launchctl bootout gui/$(id -u)/com.707labs.gary'
 ssh mini 'launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.707labs.gary.plist'
 ssh mini 'launchctl print gui/$(id -u)/com.707labs.gary | head'
 ```
+
+## security
+
+gary is a weekend project that runs in production for exactly one linear
+workspace (two humans). read this before running your own:
+
+- **no sandbox.** the docker executor is a stub; model-generated bash runs
+  directly on the host via `LocalExecutor` with normal shell access.
+- **full env inheritance.** spawned commands see the parent `process.env`,
+  including every key in `.env`. run gary under a dedicated user with a
+  minimal env if that bothers you (it should).
+- **acts immediately.** `bun run start` polls linear and acts on real tickets
+  assigned to gary right away. point him at a test team first.
+- **prompt injection is the threat model.** ticket text and `fetch_url` page
+  content flow into the agent prompt, and `fetch_url` has no ssrf or
+  private-ip guard. anyone who can write tickets in your workspace can steer
+  gary; keep that set small.
+- **log redaction is narrow.** only `x-access-token:` urls are scrubbed from
+  logs; secrets echoed in bash output are not.
+- the mention allowlist defaults closed — unknown senders are ignored.

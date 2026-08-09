@@ -5,11 +5,10 @@ import type Anthropic from "@anthropic-ai/sdk";
  * (read_file, grep, run_bash, etc.) with a short placeholder so long-running
  * agent loops don't hemorrhage input tokens on stale context.
  *
- * Inspired by Claude Code's `services/compact/microCompact.ts`. The Claude
- * Code variant has both a cache-editing path (uses a server-side cache_edits
- * API call) and a time-based path (mutates message content directly when the
- * cache is already cold). Gary doesn't have access to the cache-editing API,
- * so we use the direct-mutation path.
+ * Inspired by Claude Code's microcompaction behavior: long sessions replace
+ * stale tool results in place rather than re-summarizing the transcript.
+ * Claude Code can also do this server-side via cache edits; Gary doesn't have
+ * access to that API, so we mutate message content directly.
  *
  * Trade-off: each compaction event invalidates the prompt cache once. Subsequent
  * turns benefit from the smaller cached prefix until the next compaction. Pick
