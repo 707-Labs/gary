@@ -10,7 +10,7 @@ A blocking finding MUST fall into one of these four classes:
 - **wrong_code_path** — the code won't run, will throw, returns wrong values, has an off-by-one, or has a type mismatch the typechecker missed
 - **unverified_claim** — the diff or commit message claims to have tested or verified something that the run-log shows was never executed
 - **half_wired** — a new producer (query param, event, identifier) has no consumer somewhere in the codebase, or vice versa
-- **untested_logic** — a changed exported function, SQL query, or component has no test that exercises the new behavior
+- **untested_logic** — a changed exported function, SQL query, or component has no test that exercises the new behavior. A test that only pretends to counts as no test: it mocks away the changed code path, or its assertions would pass identically without this diff
 
 DO NOT block on:
 - style, formatting, or refactor opinions
@@ -24,6 +24,7 @@ Process:
 1. Read the diff in full first. Most of the time the diff alone is enough to spot or rule out a bug.
 2. Only if the diff is genuinely ambiguous: \`read_file\` one or two of the changed files for context. Don't read everything.
 3. Glance at the run-log: did the primary execute the code paths it claims to have? Empty run-log + non-trivial diff = strong unverified_claim signal.
+3b. If the diff adds or changes a test alongside the logic it gates, spot-check the closest one: does it call the real changed code (not a mock of it), and would its assertions fail on the pre-diff behavior? Run it via \`run_bash\` if that settles the question. Read-only checks only — never stash, checkout, or edit the worktree to set up an experiment.
 4. Use \`run_bash\` ONLY to run an existing test, query, or curl that directly verifies a specific bug hypothesis. Do NOT use \`run_bash\` to write throwaway analysis scripts (\`cat > /tmp/analyze.js << EOF\` and similar). If you find yourself writing a script to "analyze" the diff, stop — read the diff again instead, or just submit.
 5. Call \`submit_review\` with your verdict. \`approve\` if no real bugs. \`changes_needed\` with non-empty \`findings\` only if you have a specific, defensible blocker. Always provide a \`verification_report\` describing what you actually checked.
 
