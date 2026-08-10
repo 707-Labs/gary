@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { gitMust, gitRun, rebaseOntoFreshBase } from "../src/git.ts";
 
 async function init(dir: string, bare = false) {
-  await gitMust(bare ? ["init", "--bare", dir] : ["init", dir]);
+  // -b main: don't depend on the machine's init.defaultBranch
+  await gitMust(bare ? ["init", "--bare", "-b", "main", dir] : ["init", "-b", "main", dir]);
   if (!bare) {
     await gitMust(["config", "user.email", "t@t"], { cwd: dir });
     await gitMust(["config", "user.name", "t"], { cwd: dir });
