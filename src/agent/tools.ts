@@ -656,10 +656,15 @@ function getLinearIssueTool(linear: LinearAdapter): ToolHandler {
           `creator: ${issue.creatorName ?? "?"}`,
           `url: ${issue.url}`,
           `created: ${issue.createdAt}  updated: ${issue.updatedAt}`,
-          "",
-          "description:",
-          issue.description ?? "(empty)",
         ];
+        if (issue.blockedBy.length > 0) {
+          lines.push(
+            `blocked by: ${issue.blockedBy
+              .map((b) => `${b.identifier} (${b.stateName}${b.isOpen ? "" : ", done"})`)
+              .join(", ")}`,
+          );
+        }
+        lines.push("", "description:", issue.description ?? "(empty)");
         if (include_comments !== false) {
           const comments = await linear.fetchComments(issue.id, 10);
           lines.push("");

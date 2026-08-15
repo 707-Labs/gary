@@ -37,6 +37,7 @@ describe("get_linear_issue tool", () => {
         creatorName: "tanner",
         teamId: "team-1",
         teamKey: "ERT",
+        blockedBy: [],
       }),
       fetchComments: async () => [
         {

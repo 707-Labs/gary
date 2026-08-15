@@ -186,12 +186,20 @@ export interface CountSinceArgs {
   sinceHoursAgo: number;
 }
 
+/**
+ * Attempt count for the circuit breaker (and CI-attempt cap).
+ * `wait_for_blocker` is excluded: it's a hold, not an attempt, and it can
+ * legitimately re-fire on every human comment while a ticket sits blocked —
+ * five comments in six hours must not read as thrashing and trigger a
+ * bogus "i'm stuck" escalation.
+ */
 export function countActionsSince(db: DB, args: CountSinceArgs): number {
   const row = db
     .query<{ n: number }, { id: string; cutoff: string }>(
       `SELECT COUNT(*) AS n FROM actions
        WHERE ticket_linear_id = $id
-         AND started_at >= $cutoff`,
+         AND started_at >= $cutoff
+         AND action_type != 'wait_for_blocker'`,
     )
     .get({
       id: args.ticketLinearId,

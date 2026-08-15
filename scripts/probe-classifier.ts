@@ -25,6 +25,7 @@ const fixtures: AssignedIssue[] = [
     creatorName: "Tanner",
     teamId: "t-ert",
     teamKey: "ERT",
+    blockedBy: [],
   },
   {
     id: "fixture-2",
@@ -41,6 +42,7 @@ const fixtures: AssignedIssue[] = [
     creatorName: "Ben",
     teamId: "t-ert",
     teamKey: "ERT",
+    blockedBy: [],
   },
   {
     id: "fixture-3",
@@ -57,6 +59,7 @@ const fixtures: AssignedIssue[] = [
     creatorName: "Tanner",
     teamId: "t-ert",
     teamKey: "ERT",
+    blockedBy: [],
   },
 ];
 

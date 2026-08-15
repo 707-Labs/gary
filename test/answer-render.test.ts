@@ -16,6 +16,7 @@ const issue: AssignedIssue = {
   creatorName: "Tanner",
   teamId: "t-ert",
   teamKey: "ERT",
+  blockedBy: [],
 };
 
 const garyId = "u-gary";

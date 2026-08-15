@@ -10,6 +10,7 @@ import {
   generateClassificationComment,
 } from "./handlers/classifier.ts";
 import { runAnswerHandler } from "./handlers/answer.ts";
+import { runWaitForBlocker } from "./handlers/blocked.ts";
 import { runBounceHandler } from "./handlers/bounce.ts";
 import { runCiFailureHandler } from "./handlers/ci-failure.ts";
 import { runCodeHandler } from "./handlers/code.ts";
@@ -494,6 +495,12 @@ async function dispatch(deps: LoopDeps, action: CandidateAction): Promise<void> 
       return;
     case "start_coding":
       await runStartCoding(deps, action);
+      return;
+    case "wait_for_blocker":
+      await runWaitForBlocker(
+        { db: deps.db, linear: deps.linear },
+        { issue: action.issue },
+      );
       return;
     case "fix_ci_failure":
       await runFixCiFailure(deps, action);
