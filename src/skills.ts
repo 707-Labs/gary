@@ -29,6 +29,8 @@ export interface ProjectSkill {
 export interface ProjectContext {
   claudeMd: string | null;
   agentsMd: string | null;
+  /** True when the repo has a beads tracker (`.beads/` directory). */
+  hasBeads: boolean;
 }
 
 const PROJECT_FILE_MAX_BYTES = 12_000;
@@ -76,6 +78,7 @@ export function loadProjectContext(workspaceRoot: string): ProjectContext {
   return {
     claudeMd: readIfExists(workspaceRoot, "CLAUDE.md"),
     agentsMd: readIfExists(workspaceRoot, "AGENTS.md"),
+    hasBeads: existsSync(resolve(workspaceRoot, ".beads")),
   };
 }
 
@@ -96,6 +99,17 @@ export function formatProjectContext(
   if (context.agentsMd) {
     sections.push("# AGENTS.md (agent guidance)");
     sections.push(context.agentsMd);
+  }
+  if (context.hasBeads) {
+    sections.push("# Beads tracker present");
+    sections.push(
+      "This repo tracks some work in beads (`.beads/` directory, `bd` CLI). " +
+        "Treat it as read-only context: `.beads/issues.jsonl` (or `bd list` / `bd show <id>` if installed) " +
+        "may describe in-flight or planned work related to your ticket — check it before designing a change. " +
+        "Never run `bd` commands that mutate state, and never commit changes under `.beads/`; " +
+        "your ticket's source of truth stays Linear. If your PR completes or affects a beads issue, " +
+        "say so in the PR body instead of editing beads.",
+    );
   }
   if (skills.length > 0) {
     sections.push("# Project skills");

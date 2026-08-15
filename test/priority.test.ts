@@ -21,6 +21,7 @@ const issue: AssignedIssue = {
   creatorName: "Tanner",
   teamId: "t",
   teamKey: "ERT",
+  blockedBy: [],
 };
 
 const baseState: DerivedState = {
@@ -211,6 +212,85 @@ describe("pickActionForTicket", () => {
         lastRespondedHumanSignature: "sig-old",
       });
       expect(action?.type).toBe("respond_to_pr_review");
+    });
+  });
+
+  describe("wait_for_blocker", () => {
+    const openBlocker = {
+      id: "b-1",
+      identifier: "ERT-2353",
+      stateName: "In Progress",
+      stateType: "started",
+      isOpen: true,
+    };
+    const doneBlocker = {
+      id: "b-2",
+      identifier: "ERT-2000",
+      stateName: "Done",
+      stateType: "completed",
+      isOpen: false,
+    };
+
+    it("holds a CODE ticket with an open blocker instead of start_coding", () => {
+      const action = pickActionForTicket({
+        issue: { ...issue, blockedBy: [openBlocker] },
+        state: { ...baseState, classification: { classification: "CODE" } },
+      });
+      expect(action?.type).toBe("wait_for_blocker");
+      expect(action?.priority).toBe(4);
+    });
+
+    it("starts coding when every blocker is completed/canceled", () => {
+      const action = pickActionForTicket({
+        issue: { ...issue, blockedBy: [doneBlocker] },
+        state: { ...baseState, classification: { classification: "CODE" } },
+      });
+      expect(action?.type).toBe("start_coding");
+    });
+
+    it("holds when any one of several blockers is still open", () => {
+      const action = pickActionForTicket({
+        issue: { ...issue, blockedBy: [doneBlocker, openBlocker] },
+        state: { ...baseState, classification: { classification: "CODE" } },
+      });
+      expect(action?.type).toBe("wait_for_blocker");
+    });
+
+    it("still classifies an unclassified blocked ticket (blockers only gate coding)", () => {
+      const action = pickActionForTicket({
+        issue: { ...issue, blockedBy: [openBlocker] },
+        state: baseState,
+      });
+      expect(action?.type).toBe("classify");
+    });
+
+    it("does not gate ANSWER tickets", () => {
+      const action = pickActionForTicket({
+        issue: { ...issue, blockedBy: [openBlocker] },
+        state: { ...baseState, classification: { classification: "ANSWER" } },
+      });
+      expect(action?.type).toBe("write_answer");
+    });
+
+    it("does not gate work on an existing PR (fix_ci_failure proceeds)", () => {
+      const action = pickActionForTicket({
+        issue: { ...issue, blockedBy: [openBlocker] },
+        state: {
+          ...baseState,
+          classification: { classification: "CODE" },
+          pr: {
+            number: 5,
+            state: "open",
+            merged: false,
+            isDraft: false,
+            headSha: "x",
+            ciStatus: "red",
+            prCommentSignature: "empty",
+            openedAt: "2099-01-01T00:00:00Z",
+          },
+        },
+      });
+      expect(action?.type).toBe("fix_ci_failure");
     });
   });
 

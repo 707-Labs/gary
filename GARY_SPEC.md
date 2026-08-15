@@ -158,7 +158,8 @@ Highest priority first. Gary does one action per tick, then re-polls (gives new 
 | 1 | Gary has an open PR with CI failing, and Gary hasn't already attempted to fix this specific failure | `fix_ci_failure` |
 | 2 | Gary has an open PR with unaddressed human review comments (Weekend 2) | `respond_to_review` |
 | 3 | Ticket is newly assigned to Gary and has no classification yet | `classify` |
-| 4 | Ticket is classified as `CODE` and has no PR yet | `start_coding` |
+| 4 | Ticket is classified as `CODE`, has no PR yet, and no open Linear "blocked by" relation | `start_coding` |
+| 4 | Ticket is classified as `CODE`, has no PR yet, but a "blocked by" relation points at an unfinished issue | `wait_for_blocker` (one hold comment, then dormant until the blocker completes or the relation is removed) |
 | 5 | Ticket is classified as `ANSWER` and Gary hasn't responded yet | `write_answer` |
 | 6 | Ticket is classified as `BOUNCE` and Gary hasn't reassigned yet | `bounce` |
 | 7 | Gary has a PR that's been idle and CI green for > `STALE_PR_HOURS` | `nudge_reviewer` (Weekend 2+) |

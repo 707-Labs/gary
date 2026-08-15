@@ -12,6 +12,7 @@ export type ActionType =
   | "revisit_code"
   | "classify"
   | "start_coding"
+  | "wait_for_blocker"
   | "answer_mention"
   | "write_answer"
   | "bounce"
@@ -105,8 +106,23 @@ export function pickActionForTicket(
     return { type: "classify", priority: 3, issue, state };
   }
 
-  // 4. start_coding — CODE classification, no PR yet
+  // 4. start_coding — CODE classification, no PR yet. Gated on Linear
+  //    "blocked by" relations: coding against a base the blocker hasn't
+  //    landed in produces a PR written against pre-blocker code (ERT-2354).
+  //    wait_for_blocker posts a one-time hold comment instead.
+  //
+  //    Blocker state is deliberately NOT in fingerprintDerivedState's
+  //    canonical — adding a field there would shift every existing
+  //    fingerprint and dump the whole action cache (re-answering ANSWER
+  //    tickets, re-nudging stale PRs). Idempotence still holds: the hold
+  //    comment dedupes via the action cache on the unchanged fingerprint
+  //    (plus a comment scan in the handler for fingerprint churn), and
+  //    unblocking flips the emitted type to start_coding, which has its
+  //    own cache row.
   if (state.classification.classification === "CODE" && state.pr === null) {
+    if (issue.blockedBy.some((b) => b.isOpen)) {
+      return { type: "wait_for_blocker", priority: 4, issue, state };
+    }
     return { type: "start_coding", priority: 4, issue, state };
   }
 

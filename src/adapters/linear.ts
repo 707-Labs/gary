@@ -2,6 +2,20 @@ import { LinearClient } from "@linear/sdk";
 import type { Config } from "../config.ts";
 import { log } from "../logger.ts";
 
+export interface BlockerRef {
+  id: string;
+  identifier: string;
+  stateName: string;
+  stateType: string;
+  /**
+   * True unless the blocker is completed/canceled. A relation we can't
+   * interpret (missing issue or state — e.g. Gary lacks access) counts as
+   * OPEN: the safe failure here is "wait and say why", not "start coding
+   * against a base that isn't there yet".
+   */
+  isOpen: boolean;
+}
+
 export interface AssignedIssue {
   id: string;
   identifier: string;
@@ -16,6 +30,8 @@ export interface AssignedIssue {
   creatorName: string | null;
   teamId: string;
   teamKey: string;
+  /** Issues that block this one ("blocks" inverse relations). */
+  blockedBy: BlockerRef[];
 }
 
 export interface IssueComment {
@@ -44,6 +60,97 @@ export type WorkflowStateType =
 /** Workflow states change rarely (team workflow restructuring). 30 min
  * keeps load light while bounding staleness for `setStateByType`. */
 const TEAM_STATES_TTL_MS = 30 * 60_000;
+
+/**
+ * Shared GraphQL selection for the three issue fetchers, so a field added to
+ * one (like `inverseRelations`) can't silently be missing from the others.
+ * `inverseRelations` is where "X blocks Y" lands on Y's side — `issue` on the
+ * relation node is the blocker.
+ */
+const ISSUE_NODE_SELECTION = `
+  id
+  identifier
+  title
+  description
+  url
+  createdAt
+  updatedAt
+  state { name type }
+  team { id key }
+  creator { id name }
+  inverseRelations(first: 20) {
+    nodes {
+      type
+      issue { id identifier state { name type } }
+    }
+  }
+`;
+
+interface RawRelationNode {
+  type: string;
+  issue: {
+    id: string;
+    identifier: string;
+    state: { name: string; type: string } | null;
+  } | null;
+}
+
+interface RawIssueNode {
+  id: string;
+  identifier: string;
+  title: string;
+  description: string | null;
+  url: string;
+  createdAt: string;
+  updatedAt: string;
+  state: { name: string; type: string } | null;
+  team: { id: string; key: string } | null;
+  creator: { id: string; name: string } | null;
+  inverseRelations: { nodes: RawRelationNode[] } | null;
+  assignee?: { id: string } | null;
+}
+
+/**
+ * Derive the blocked-by list from an issue's inverse relations. Only "blocks"
+ * relations count; duplicates/related are ignored. Relations whose issue or
+ * state we can't read are kept as open blockers (fail closed) — the ERT-2354
+ * incident came from treating uninterpretable relations as "not blocked".
+ */
+export function mapBlockedBy(
+  nodes: readonly RawRelationNode[],
+): BlockerRef[] {
+  return nodes
+    .filter((r) => r.type === "blocks")
+    .map((r) => {
+      const stateType = r.issue?.state?.type ?? "unknown";
+      return {
+        id: r.issue?.id ?? "",
+        identifier: r.issue?.identifier ?? "(inaccessible)",
+        stateName: r.issue?.state?.name ?? "unknown",
+        stateType,
+        isOpen: stateType !== "completed" && stateType !== "canceled",
+      };
+    });
+}
+
+function mapIssueNode(n: RawIssueNode): AssignedIssue {
+  return {
+    id: n.id,
+    identifier: n.identifier,
+    title: n.title,
+    description: n.description ?? null,
+    url: n.url,
+    stateName: n.state?.name ?? "",
+    stateType: n.state?.type ?? "",
+    createdAt: n.createdAt,
+    updatedAt: n.updatedAt,
+    creatorId: n.creator?.id ?? null,
+    creatorName: n.creator?.name ?? null,
+    teamId: n.team?.id ?? "",
+    teamKey: n.team?.key ?? "",
+    blockedBy: mapBlockedBy(n.inverseRelations?.nodes ?? []),
+  };
+}
 
 export class LinearAdapter {
   private readonly client: LinearClient;
@@ -88,38 +195,12 @@ export class LinearAdapter {
           filter: { assignee: { id: { eq: $userId } } },
           first: $first
         ) {
-          nodes {
-            id
-            identifier
-            title
-            description
-            url
-            createdAt
-            updatedAt
-            state { name type }
-            team { id key }
-            creator { id name }
-          }
+          nodes { ${ISSUE_NODE_SELECTION} }
         }
       }
     `;
     const data = await this.client.client.request<
-      {
-        issues: {
-          nodes: {
-            id: string;
-            identifier: string;
-            title: string;
-            description: string | null;
-            url: string;
-            createdAt: string;
-            updatedAt: string;
-            state: { name: string; type: string } | null;
-            team: { id: string; key: string } | null;
-            creator: { id: string; name: string } | null;
-          }[];
-        };
-      },
+      { issues: { nodes: RawIssueNode[] } },
       { userId: string; first: number }
     >(query, { userId: this.userId, first: 50 });
 
@@ -128,21 +209,7 @@ export class LinearAdapter {
         (n) =>
           n.state?.type !== "completed" && n.state?.type !== "canceled",
       )
-      .map((n) => ({
-        id: n.id,
-        identifier: n.identifier,
-        title: n.title,
-        description: n.description ?? null,
-        url: n.url,
-        stateName: n.state?.name ?? "",
-        stateType: n.state?.type ?? "",
-        createdAt: n.createdAt,
-        updatedAt: n.updatedAt,
-        creatorId: n.creator?.id ?? null,
-        creatorName: n.creator?.name ?? null,
-        teamId: n.team?.id ?? "",
-        teamKey: n.team?.key ?? "",
-      }));
+      .map(mapIssueNode);
   }
 
   /**
@@ -161,39 +228,14 @@ export class LinearAdapter {
           first: $first
         ) {
           nodes {
-            id
-            identifier
-            title
-            description
-            url
-            createdAt
-            updatedAt
-            state { name type }
-            team { id key }
-            creator { id name }
+            ${ISSUE_NODE_SELECTION}
             assignee { id }
           }
         }
       }
     `;
     const data = await this.client.client.request<
-      {
-        issues: {
-          nodes: {
-            id: string;
-            identifier: string;
-            title: string;
-            description: string | null;
-            url: string;
-            createdAt: string;
-            updatedAt: string;
-            state: { name: string; type: string } | null;
-            team: { id: string; key: string } | null;
-            creator: { id: string; name: string } | null;
-            assignee: { id: string } | null;
-          }[];
-        };
-      },
+      { issues: { nodes: RawIssueNode[] } },
       { userId: string; first: number }
     >(query, { userId: this.userId, first: 50 });
 
@@ -203,21 +245,7 @@ export class LinearAdapter {
         (n) =>
           n.state?.type !== "completed" && n.state?.type !== "canceled",
       )
-      .map((n) => ({
-        id: n.id,
-        identifier: n.identifier,
-        title: n.title,
-        description: n.description ?? null,
-        url: n.url,
-        stateName: n.state?.name ?? "",
-        stateType: n.state?.type ?? "",
-        createdAt: n.createdAt,
-        updatedAt: n.updatedAt,
-        creatorId: n.creator?.id ?? null,
-        creatorName: n.creator?.name ?? null,
-        teamId: n.team?.id ?? "",
-        teamKey: n.team?.key ?? "",
-      }));
+      .map(mapIssueNode);
   }
 
   /**
@@ -225,32 +253,26 @@ export class LinearAdapter {
    * issue matches. Same shape as fetchAssignedIssues entries.
    */
   async fetchByIdentifier(identifier: string): Promise<AssignedIssue | null> {
-    const result = await this.client.issues({
-      filter: { number: { eq: parseIdentifierNumber(identifier) }, team: { key: { eq: parseIdentifierTeamKey(identifier) } } },
-      first: 1,
+    // Raw query like the other fetchers (the SDK path cost 4 roundtrips via
+    // lazy resolvers and couldn't share ISSUE_NODE_SELECTION).
+    const query = `
+      query IssueByIdentifier($filter: IssueFilter!) {
+        issues(filter: $filter, first: 1) {
+          nodes { ${ISSUE_NODE_SELECTION} }
+        }
+      }
+    `;
+    const data = await this.client.client.request<
+      { issues: { nodes: RawIssueNode[] } },
+      { filter: unknown }
+    >(query, {
+      filter: {
+        number: { eq: parseIdentifierNumber(identifier) },
+        team: { key: { eq: parseIdentifierTeamKey(identifier) } },
+      },
     });
-    const issue = result.nodes[0];
-    if (!issue) return null;
-    const [state, team, creator] = await Promise.all([
-      issue.state,
-      issue.team,
-      issue.creator,
-    ]);
-    return {
-      id: issue.id,
-      identifier: issue.identifier,
-      title: issue.title,
-      description: issue.description ?? null,
-      url: issue.url,
-      stateName: state?.name ?? "",
-      stateType: state?.type ?? "",
-      createdAt: issue.createdAt.toISOString(),
-      updatedAt: issue.updatedAt.toISOString(),
-      creatorId: creator?.id ?? null,
-      creatorName: creator?.name ?? null,
-      teamId: team?.id ?? "",
-      teamKey: team?.key ?? "",
-    };
+    const node = data.issues.nodes[0];
+    return node ? mapIssueNode(node) : null;
   }
 
   /**

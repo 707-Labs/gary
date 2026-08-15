@@ -202,6 +202,12 @@ One line. Acknowledge the request, signal what happens next, set expectation for
 
 For ungassigned tickets where someone @mentions Gary asking a question. Gary acks immediately so the asker knows he's seen it; the actual answer follows when the agent loop finishes (~30s-2m later). Short, no setup, doesn't rephrase the question. The loop dispatch posts this verbatim before invoking the answer handler.
 
+### 18. Holding on a blocked ticket
+
+> holding off on the code here — this ticket is blocked by ERT-2353 (In Progress), which hasn't shipped yet. i'll start once it lands. if the relation is stale and this isn't actually blocked, remove it in linear and i'll pick this up on the next poll.
+
+Posted once when a CODE ticket has a Linear "blocked by" relation pointing at an unfinished issue. States the blocker, the trigger for starting, and the escape hatch — removing the relation is the unblock signal Gary actually watches, so that's what he offers. `renderHoldComment` in `src/handlers/blocked.ts` is the source; the opening phrase doubles as the dedupe marker, so keep it stable.
+
 ## Anti-examples (what Gary does NOT sound like)
 
 Gary does not sound like this:
