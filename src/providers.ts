@@ -226,11 +226,26 @@ export class AllProvidersExhaustedError extends Error {
  * RateLimitError class for status 429 — we rely on the `status` field
  * because instanceof checks across multiple imports of the SDK are
  * fragile.
+ *
+ * Some providers (e.g. Kimi) return 403 or 402 instead of 429 for
+ * usage-limit / insufficient-balance errors. We treat those as rate limits
+ * so the chain falls through to the next provider rather than crashing.
  */
 export function isRateLimitError(err: unknown): boolean {
   if (typeof err !== "object" || err === null) return false;
   const status = (err as { status?: unknown }).status;
-  return status === 429;
+  if (status === 429) return true;
+  if (status === 402) return true;
+  if (status === 403) {
+    const msg =
+      typeof err === "object" && err !== null && "message" in err
+        ? String((err as { message?: unknown }).message)
+        : String(err);
+    return /usage limit|quota|permission_error|billing cycle|insufficient balance/i.test(
+      msg,
+    );
+  }
+  return false;
 }
 
 /**

@@ -195,6 +195,24 @@ describe("isRateLimitError", () => {
     expect(isRateLimitError({ status: 429 })).toBe(true);
   });
 
+  it("matches 402 insufficient balance", () => {
+    expect(isRateLimitError({ status: 402 })).toBe(true);
+  });
+
+  it("matches 403 with quota/usage-limit message", () => {
+    expect(
+      isRateLimitError({
+        status: 403,
+        message:
+          '403 {"error":{"type":"permission_error","message":"You\'ve reached your usage limit for this billing cycle."}}',
+      }),
+    ).toBe(true);
+  });
+
+  it("doesn't match 403 without quota message", () => {
+    expect(isRateLimitError({ status: 403, message: "forbidden" })).toBe(false);
+  });
+
   it("doesn't match other status codes", () => {
     expect(isRateLimitError({ status: 500 })).toBe(false);
     expect(isRateLimitError({ status: 400 })).toBe(false);

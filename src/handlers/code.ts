@@ -536,7 +536,7 @@ async function composePrTitle(
     temperature: 0.2,
     maxTokens: 128,
   });
-  return raw.trim().split("\n")[0]?.trim() ?? args.issue.title;
+  return raw.trim().split("\n")[0]?.trim() || args.issue.title;
 }
 
 interface FixupContext {
