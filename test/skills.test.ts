@@ -67,7 +67,13 @@ describe("loadProjectContext", () => {
     expect(loadProjectContext(workspace)).toEqual({
       claudeMd: null,
       agentsMd: null,
+      hasBeads: false,
     });
+  });
+
+  it("detects a beads tracker directory", () => {
+    mkdirSync(resolve(workspace, ".beads"));
+    expect(loadProjectContext(workspace).hasBeads).toBe(true);
   });
 
   it("reads CLAUDE.md and AGENTS.md", () => {
@@ -89,12 +95,17 @@ describe("loadProjectContext", () => {
 
 describe("formatProjectContext", () => {
   it("returns empty string when nothing applies", () => {
-    expect(formatProjectContext({ claudeMd: null, agentsMd: null }, [])).toBe("");
+    expect(
+      formatProjectContext(
+        { claudeMd: null, agentsMd: null, hasBeads: false },
+        [],
+      ),
+    ).toBe("");
   });
 
   it("composes all three sections in order", () => {
     const out = formatProjectContext(
-      { claudeMd: "# CM", agentsMd: "# AG" },
+      { claudeMd: "# CM", agentsMd: "# AG", hasBeads: false },
       [{ name: "tdd", description: "do tdd", path: ".claude/skills/tdd/SKILL.md" }],
     );
     const cmIdx = out.indexOf("CLAUDE.md (project instructions)");
@@ -108,11 +119,22 @@ describe("formatProjectContext", () => {
 
   it("omits empty sections cleanly", () => {
     const out = formatProjectContext(
-      { claudeMd: "# CM", agentsMd: null },
+      { claudeMd: "# CM", agentsMd: null, hasBeads: false },
       [],
     );
     expect(out).toContain("CLAUDE.md");
     expect(out).not.toContain("AGENTS.md");
     expect(out).not.toContain("Project skills");
+    expect(out).not.toContain("Beads");
+  });
+
+  it("adds a read-only beads note when the repo has a tracker", () => {
+    const out = formatProjectContext(
+      { claudeMd: "# CM", agentsMd: null, hasBeads: true },
+      [],
+    );
+    expect(out).toContain("Beads tracker present");
+    expect(out).toContain("read-only");
+    expect(out).toContain("never commit changes under `.beads/`");
   });
 });
