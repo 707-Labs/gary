@@ -5,6 +5,7 @@ import type { GitHubClient } from "../adapters/github.ts";
 import type { LinearAdapter, WorkflowStateType } from "../adapters/linear.ts";
 import type { Executor } from "../executors/index.ts";
 import { redactGitHubTokens } from "../redact.ts";
+import { fetchPublicUrl } from "../safe-fetch.ts";
 import type { RunLogEntry } from "./loop.ts";
 
 export interface ToolHandler {
@@ -548,21 +549,11 @@ function fetchUrlTool(): ToolHandler {
     },
     async run(input) {
       const { url } = fetchUrlSchema.parse(input);
-      let parsed: URL;
-      try {
-        parsed = new URL(url);
-      } catch {
-        return `error: invalid url`;
-      }
-      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-        return `error: only http(s) urls are allowed (got ${parsed.protocol})`;
-      }
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), FETCH_URL_TIMEOUT_MS);
       try {
-        const res = await fetch(url, {
+        const res = await fetchPublicUrl(url, {
           headers: { "User-Agent": "gary-707-labs (https://github.com/707-Labs/gary)" },
-          redirect: "follow",
           signal: controller.signal,
         });
         const text = await res.text();

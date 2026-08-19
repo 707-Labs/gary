@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Executor } from "../executors/index.ts";
 import type { RunLogEntry } from "../agent/loop.ts";
 import { redactGitHubTokens } from "../redact.ts";
+import { fetchPublicUrl } from "../safe-fetch.ts";
 
 export type BugClass =
   | "wrong_code_path"
@@ -222,23 +223,13 @@ function fetchUrlTool(): ReviewerToolHandler {
     },
     async run(input) {
       const { url } = fetchUrlSchema.parse(input);
-      let parsed: URL;
-      try {
-        parsed = new URL(url);
-      } catch {
-        return "error: invalid url";
-      }
-      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-        return `error: only http(s) urls are allowed (got ${parsed.protocol})`;
-      }
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
       try {
-        const res = await fetch(url, {
+        const res = await fetchPublicUrl(url, {
           headers: {
             "User-Agent": "gary-707-labs (https://github.com/707-Labs/gary)",
           },
-          redirect: "follow",
           signal: controller.signal,
         });
         const text = await res.text();

@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { loadReviewConfig, parseRepoMap } from "../src/config.ts";
+import {
+  loadReviewConfig,
+  parseRepoMap,
+  validateProviderRoute,
+} from "../src/config.ts";
 
 describe("parseRepoMap", () => {
   it("parses a single entry", () => {
@@ -115,5 +119,42 @@ describe("loadReviewConfig", () => {
   it("throws on non-integer values", () => {
     setEnv("GARY_REVIEW_MAX_ROUNDS", "two");
     expect(() => loadReviewConfig()).toThrow(/integer/);
+  });
+});
+
+describe("validateProviderRoute", () => {
+  it("accepts Gary's direct, bounded model routes", () => {
+    expect(() =>
+      validateProviderRoute("z.ai", "https://api.z.ai/api/anthropic", "glm-5.3"),
+    ).not.toThrow();
+    expect(() =>
+      validateProviderRoute("kimi", "https://api.kimi.com/coding", "k3"),
+    ).not.toThrow();
+    expect(() =>
+      validateProviderRoute(
+        "deepseek",
+        "https://api.deepseek.com/anthropic",
+        "deepseek-v4-pro",
+      ),
+    ).not.toThrow();
+  });
+
+  it("rejects OpenRouter and arbitrary proxy endpoints", () => {
+    expect(() =>
+      validateProviderRoute(
+        "deepseek",
+        "https://openrouter.ai/api/v1",
+        "deepseek-v4-pro",
+      ),
+    ).toThrow(/disallowed.*host/i);
+    expect(() =>
+      validateProviderRoute("kimi", "http://api.kimi.com/coding", "k3"),
+    ).toThrow(/https/i);
+  });
+
+  it("rejects unreviewed model overrides", () => {
+    expect(() =>
+      validateProviderRoute("z.ai", "https://api.z.ai/api/anthropic", "glm-premium"),
+    ).toThrow(/disallowed.*model/i);
   });
 });

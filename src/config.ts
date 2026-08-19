@@ -247,7 +247,7 @@ export function loadGLMConfig(): GLMConfig {
   return {
     apiKey: stringFromEnv("Z_AI_API_KEY"),
     baseUrl: stringFromEnv("Z_AI_BASE_URL", "https://api.z.ai/api/anthropic"),
-    model: stringFromEnv("Z_AI_MODEL", "glm-4.6"),
+    model: stringFromEnv("Z_AI_MODEL", "glm-5.3"),
   };
 }
 
@@ -283,16 +283,65 @@ const PROVIDER_ENV_PREFIX: Record<ProviderName, string> = {
   deepseek: "DEEPSEEK",
 };
 
+export const APPROVED_PROVIDER_ROUTES: Readonly<
+  Record<ProviderName, { hosts: ReadonlySet<string>; models: ReadonlySet<string> }>
+> = {
+  "z.ai": {
+    hosts: new Set(["api.z.ai"]),
+    models: new Set(["glm-5.3"]),
+  },
+  kimi: {
+    hosts: new Set(["api.kimi.com"]),
+    models: new Set(["k3", "kimi-for-coding"]),
+  },
+  deepseek: {
+    hosts: new Set(["api.deepseek.com"]),
+    models: new Set(["deepseek-v4-flash", "deepseek-v4-pro"]),
+  },
+};
+
+export function validateProviderRoute(
+  name: ProviderName,
+  baseUrl: string,
+  model: string,
+): void {
+  const policy = APPROVED_PROVIDER_ROUTES[name];
+  let host: string;
+  try {
+    const parsed = new URL(baseUrl);
+    if (parsed.protocol !== "https:") {
+      throw new Error("provider endpoint must use https");
+    }
+    host = parsed.hostname;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(`Invalid ${name} base URL: ${detail}`);
+  }
+  if (!policy.hosts.has(host)) {
+    throw new Error(
+      `Disallowed ${name} endpoint host ${host}; approved: ${[...policy.hosts].join(", ")}`,
+    );
+  }
+  if (!policy.models.has(model)) {
+    throw new Error(
+      `Disallowed ${name} model ${model}; approved: ${[...policy.models].join(", ")}`,
+    );
+  }
+}
+
 function loadProviderConfig(name: ProviderName): ProviderConfig | null {
   const defaults = PROVIDER_DEFAULTS[name];
   const apiKey = optionalString(defaults.apiKeyEnv);
   if (!apiKey) return null;
   const prefix = PROVIDER_ENV_PREFIX[name];
+  const baseUrl = stringFromEnv(`${prefix}_BASE_URL`, defaults.baseUrl);
+  const model = stringFromEnv(`${prefix}_MODEL`, defaults.model);
+  validateProviderRoute(name, baseUrl, model);
   return {
     name,
     apiKey,
-    baseUrl: stringFromEnv(`${prefix}_BASE_URL`, defaults.baseUrl),
-    model: stringFromEnv(`${prefix}_MODEL`, defaults.model),
+    baseUrl,
+    model,
     defaultBackoffMs: intFromEnv(
       `${prefix}_DEFAULT_BACKOFF_MS`,
       defaults.defaultBackoffMs,

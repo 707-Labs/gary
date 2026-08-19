@@ -6,7 +6,7 @@ import type { GLMClient } from "../adapters/glm.ts";
 import type { AssignedIssue, LinearAdapter } from "../adapters/linear.ts";
 import { runAgentLoop } from "../agent/loop.ts";
 import { composeSystemPrompt } from "../agent/prompts.ts";
-import { LocalExecutor } from "../executors/local.ts";
+import { createWorkspaceExecutor } from "../executors/factory.ts";
 import {
   createWorktree,
   ensureBareClone,
@@ -122,7 +122,7 @@ export async function runCiFailureHandler(
     });
   }
 
-  const executor = new LocalExecutor(worktreePath);
+  const executor = createWorkspaceExecutor(worktreePath);
   const system = composeSystemPrompt({ taskInstructions: CI_FIX_TASK_INSTRUCTIONS });
   const projectSection = formatProjectContext(
     loadProjectContext(worktreePath),

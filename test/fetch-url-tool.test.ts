@@ -35,7 +35,7 @@ describe("fetch_url tool", () => {
   it("fetches an https url and returns headers + body", async () => {
     const tools = makeToolset(noopExecutor);
     const fetchUrl = tools.handlers.fetch_url!;
-    const out = await fetchUrl.run({ url: "https://example.com/foo" });
+    const out = await fetchUrl.run({ url: "https://93.184.216.34/foo" });
     expect(out).toContain("status: 200");
     expect(out).toContain("content-type: text/plain");
     expect(out).toContain("hello world");
@@ -48,6 +48,34 @@ describe("fetch_url tool", () => {
     const out = await fetchUrl.run({ url: "file:///etc/passwd" });
     expect(out).toMatch(/only http\(s\)/);
     expect(captured).toHaveLength(0);
+  });
+
+  it("rejects local, private, metadata, and tailnet targets", async () => {
+    const tools = makeToolset(noopExecutor);
+    const fetchUrl = tools.handlers.fetch_url!;
+    for (const url of [
+      "http://localhost:3000",
+      "http://127.0.0.1",
+      "http://10.0.0.1",
+      "http://169.254.169.254/latest/meta-data",
+      "http://100.104.13.106:9222",
+      "http://[::1]",
+    ]) {
+      expect(await fetchUrl.run({ url })).toMatch(/private|local|non-routable/);
+    }
+    expect(captured).toHaveLength(0);
+  });
+
+  it("validates redirect targets before following them", async () => {
+    globalThis.fetch = (async () =>
+      new Response(null, {
+        status: 302,
+        headers: { location: "http://169.254.169.254/latest/meta-data" },
+      })) as unknown as typeof fetch;
+    const tools = makeToolset(noopExecutor);
+    const fetchUrl = tools.handlers.fetch_url!;
+    const out = await fetchUrl.run({ url: "https://93.184.216.34/start" });
+    expect(out).toMatch(/private|non-routable/);
   });
 
   it("rejects malformed input via zod", async () => {
@@ -65,7 +93,7 @@ describe("fetch_url tool", () => {
 
     const tools = makeToolset(noopExecutor);
     const fetchUrl = tools.handlers.fetch_url!;
-    const out = await fetchUrl.run({ url: "https://example.com/big" });
+    const out = await fetchUrl.run({ url: "https://93.184.216.34/big" });
     expect(out).toContain("truncated to 200000");
   });
 });

@@ -536,7 +536,7 @@ GITHUB_APP_USERNAME=gary[bot]
 # GLM via Z.ai
 Z_AI_API_KEY=<key>
 Z_AI_BASE_URL=https://api.z.ai/api/anthropic
-Z_AI_MODEL=glm-4.6
+Z_AI_MODEL=glm-5.3
 
 # Runtime
 POLL_INTERVAL_MS=60000

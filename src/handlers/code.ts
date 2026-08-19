@@ -16,7 +16,8 @@ import {
   rebaseOntoFreshBase,
   slugify,
 } from "../git.ts";
-import { LocalExecutor } from "../executors/local.ts";
+import { createWorkspaceExecutor } from "../executors/factory.ts";
+import type { Executor } from "../executors/index.ts";
 import { log } from "../logger.ts";
 import {
   formatProjectContext,
@@ -225,7 +226,7 @@ export async function runCodeHandler(
     authorEmail,
   });
 
-  const executor = new LocalExecutor(worktreePath);
+  const executor = createWorkspaceExecutor(worktreePath);
   const system = composeSystemPrompt({ taskInstructions: CODE_TASK_INSTRUCTIONS });
   const projectSection = formatProjectContext(
     loadProjectContext(worktreePath),
@@ -540,7 +541,7 @@ async function composePrTitle(
 }
 
 interface FixupContext {
-  executor: LocalExecutor;
+  executor: Executor;
   system: string;
 }
 
@@ -700,7 +701,7 @@ async function escalateToReporter(
 }
 
 interface ReviewLoopCtx {
-  executor: LocalExecutor;
+  executor: Executor;
   primaryRunLog: readonly RunLogEntry[];
   reviewerGlm: GLMClient;
   fingerprint: string;

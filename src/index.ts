@@ -4,6 +4,7 @@ import { GLMClient } from "./adapters/glm.ts";
 import { makeGitHubClient } from "./adapters/github.ts";
 import { LinearAdapter } from "./adapters/linear.ts";
 import { loadConfig } from "./config.ts";
+import { executorMode } from "./executors/factory.ts";
 import { log } from "./logger.ts";
 import { runLoop } from "./loop.ts";
 import { createProvider, createProviderChain } from "./providers.ts";
@@ -36,6 +37,7 @@ async function main(): Promise<void> {
     pollIntervalMs: cfg.runtime.pollIntervalMs,
     repoMap: Object.fromEntries(cfg.gary.repoMap),
     mentionAllowlistSize: cfg.gary.allowlistedMentionUserIds.length,
+    executor: executorMode(),
   });
 
   const controller = new AbortController();
