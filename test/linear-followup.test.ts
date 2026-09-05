@@ -3,15 +3,18 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
-import type { GLMClient } from "../src/adapters/glm.ts";
+import { GLMClient } from "../src/adapters/glm.ts";
 import type { GitHubClient, PullRequestDetail } from "../src/adapters/github.ts";
 import type { AssignedIssue, IssueComment, LinearAdapter } from "../src/adapters/linear.ts";
 import { gitMust, restorePrWorktree } from "../src/git.ts";
 import { runLinearFollowup } from "../src/handlers/linear-followup.ts";
+import { tick, type LoopDeps } from "../src/loop.ts";
+import { AllProvidersExhaustedError, createProviderChain, type LLMProvider } from "../src/providers.ts";
+import { createRateLimitGate } from "../src/rate-limit.ts";
 import { type PrReviewHandlerDeps } from "../src/handlers/pr-review.ts";
 import { computeHumanInputSignature } from "../src/state-fingerprint.ts";
 import { closeDb, openDb, type DB } from "../src/state/db.ts";
-import { getRevisitMark, setRevisitMark, upsertTicket } from "../src/state/queries.ts";
+import { getRevisitMark, recordPr, setClassification, setRevisitMark, upsertTicket } from "../src/state/queries.ts";
 
 let dir: string, remote: string, workspace: string, db: DB;
 let replies: string[], classifications: string[], toolsSeen: string[][];
@@ -147,4 +150,65 @@ describe("safe PR worktree restoration", () => {
     expect(results.filter(r => r.status === "fulfilled")).toHaveLength(1);
     expect(await git(restore.worktreePath, "rev-parse", "HEAD")).toBe(restore.expectedHead);
   });
+});
+
+describe("paid retry bounds through the real tick/dispatch/accounting path", () => {
+  async function setup(path: "malformed" | "answer_failed" | "reply_failed" | "write_answer" | "classify" | "mention" | "quota" | "stale" | "success") {
+    let calls = 0, reassignments = 0;
+    const comments = path === "mention" ? [old, { ...request, body: "@gary why does it retry?" }] : [old, request];
+    const classification = path === "write_answer" || path === "mention" ? "ANSWER" : "CODE";
+    if (path !== "classify") setClassification(db, { linearId: issue.id, classification, confidence: 1, scope: "S" });
+    if (classification === "CODE" && path !== "classify") recordPr(db, { githubId: 1, ticketLinearId: issue.id, repo: "example/test", prNumber: 2, branch: "task" });
+    if (classification === "ANSWER") {
+      const answer = `${workspace}-answer`; await git(dir, "clone", "-b", "task", remote, answer);
+    }
+    const github = Object.assign(deps.github, {
+      async getPullRequest() { return { ...await deps.github.getPullRequestDetail("example", "test", 2), isDraft: false, createdAt: new Date().toISOString() }; },
+      async aggregateCiStatus() { return "green"; }, async getPullRequestComments() { return []; },
+    });
+    const linear = Object.assign(deps.linear, {
+      async fetchAssignedIssues() { return path === "mention" ? [] : [issue]; },
+      async fetchMentionedIssues() { return [issue]; },
+      async fetchCommentMeta() { return comments; },
+      async fetchComments() { return path === "stale" ? [...comments, { ...request, id: "arrived-later" }] : comments; },
+      async reassign() { reassignments++; }, async unassign() { reassignments++; },
+    });
+    failReply = path === "reply_failed";
+    const provider = {
+      name: "z.ai", model: "offline-test", gate: createRateLimitGate(), defaultBackoffMs: 1000, parse429: () => null,
+      client: { messages: { async create(input: { tools?: Anthropic.Tool[] }) {
+        calls++;
+        if (path === "quota") throw new AllProvidersExhaustedError(null);
+        if (!input.tools) return { ...tool("finish", {}), content: [{ type: "text", text: path === "malformed" || path === "classify" ? "invalid JSON" : '{"mode":"answer","confidence":1}' }], stop_reason: "end_turn" } as Anthropic.Message;
+        if (path === "answer_failed" || path === "write_answer" || path === "mention") return { ...tool("finish", {}), content: [{ type: "text", text: "unfinished" }], stop_reason: "end_turn" } as Anthropic.Message;
+        return tool("finish", { summary: "answer" });
+      } } },
+    } as unknown as LLMProvider;
+    const loopDeps = { ...deps, github, linear, glm: new GLMClient(createProviderChain([provider])), repoMap: new Map([["TEST", "example/test"]]), allowlistedMentionUserIds: path === "mention" ? ["person"] : [],
+      maxAttemptsPerTicket: 5, circuitBreakerWindowHours: 6, maxCiAttempts: 3, stalePrAfterMs: 86400000, review: { providerOrder: ["z.ai"], maxRounds: 1, iterationCap: 1, timeoutMs: 1000 } } as LoopDeps;
+    return { loopDeps, calls: () => calls, reassignments: () => reassignments };
+  }
+  for (const path of ["malformed", "answer_failed", "reply_failed", "write_answer", "classify", "mention"] as const) {
+    it(`bounds ${path} to five failed paid attempts on unchanged input`, async () => {
+      const harness = await setup(path);
+      for (let i = 0; i < 5; i++) await tick(harness.loopDeps);
+      const paidCalls = harness.calls(); expect(paidCalls).toBeGreaterThanOrEqual(5);
+      expect(db.query("SELECT COUNT(*) AS n FROM actions WHERE success=0 AND failure_kind='work'").get()).toEqual({ n: 5 });
+      expect(getRevisitMark(db, issue.id)).toBe(signature([old]));
+      await tick(harness.loopDeps);
+      expect(harness.calls()).toBe(paidCalls);
+      expect(harness.reassignments()).toBe(path === "mention" ? 0 : 1);
+    });
+  }
+  for (const path of ["quota", "stale", "success"] as const) {
+    it(`does not count ${path} as failed paid handling`, async () => {
+      const harness = await setup(path);
+      for (let i = 0; i < 6; i++) await tick(harness.loopDeps);
+      expect(db.query("SELECT COUNT(*) AS n FROM actions WHERE success=0 AND failure_kind='work'").get()).toEqual({ n: 0 });
+      expect(harness.reassignments()).toBe(0);
+      if (path === "stale") expect(harness.calls()).toBe(0);
+      if (path === "success") expect(harness.calls()).toBe(2);
+      else expect(getRevisitMark(db, issue.id)).toBe(signature([old]));
+    });
+  }
 });

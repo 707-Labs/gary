@@ -17,7 +17,7 @@ import { runCodeHandler } from "./handlers/code.ts";
 import { runNudgeReviewer } from "./handlers/nudge-reviewer.ts";
 import { runPickupHandler } from "./handlers/pickup.ts";
 import { runPrReviewHandler } from "./handlers/pr-review.ts";
-import { ReadOnlyFollowupError, runLinearFollowup } from "./handlers/linear-followup.ts";
+import { StaleFollowupInputError, runLinearFollowup } from "./handlers/linear-followup.ts";
 import { analyzeMentions } from "./mention.ts";
 import { log } from "./logger.ts";
 import {
@@ -339,7 +339,7 @@ async function runOne(
       id: actionId,
       success: false,
       errorMessage: message,
-      failureKind: isWorkAction(action.type) && !(err instanceof ReadOnlyFollowupError) ? "work" : "nonwork",
+      failureKind: isWorkAction(action.type) && !(err instanceof StaleFollowupInputError) ? "work" : "nonwork",
     });
     return action.type;
   }
@@ -445,6 +445,14 @@ async function collectMentionCandidates(
         actionType: candidate.type,
       })
     ) {
+      continue;
+    }
+    // Mention-only questions can spend tokens too, but Gary does not own their
+    // assignment. Bound retries without reassigning the other person's issue.
+    if (isWorkAction(candidate.type) && countConsecutiveWorkFailures(deps.db, {
+      ticketLinearId: issue.id, sinceHoursAgo: deps.circuitBreakerWindowHours, stateFingerprint: fp,
+    }) >= deps.maxAttemptsPerTicket) {
+      log.warn("mention handling failure limit reached; waiting for new input or failure window to clear", { issue: issue.identifier });
       continue;
     }
     candidates.push(candidate);
@@ -648,7 +656,7 @@ async function runWriteAnswer(
     },
     { issue, comments, repo },
   );
-  if (result.status !== "answered") throw new ReadOnlyFollowupError("Answer did not finish; input remains pending");
+  if (result.status !== "answered") throw new Error("Answer did not finish; input remains pending");
 }
 
 async function runFixCiFailure(

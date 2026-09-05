@@ -7,7 +7,7 @@ import { LinearAdapter, type IssueComment } from "../src/adapters/linear.ts";
 import { parseFollowupIntent, pendingLinearComments } from "../src/handlers/linear-followup.ts";
 import { computeHumanInputSignature } from "../src/state-fingerprint.ts";
 import { closeDb, openDb, type DB } from "../src/state/db.ts";
-import { countCiAttemptsSince, countConsecutiveWorkFailures, recordActionEnd, recordActionStart, upsertTicket } from "../src/state/queries.ts";
+import { countCiAttemptsSince, countConsecutiveWorkFailures, isWorkAction, recordActionEnd, recordActionStart, upsertTicket } from "../src/state/queries.ts";
 
 let dir: string;
 let db: DB;
@@ -26,6 +26,10 @@ function action(type: string, success?: boolean, kind?: "work" | "quota" | "nonw
 const failures = (fp = "input") => countConsecutiveWorkFailures(db, { ticketLinearId: "ticket", sinceHoursAgo: 6, stateFingerprint: fp });
 
 describe("work failure accounting", () => {
+  it("accounts for every model-using action, including questions and nudges", () => {
+    for (const type of ["classify", "start_coding", "fix_ci_failure", "respond_to_pr_review", "revisit_code", "write_answer", "answer_mention", "nudge_reviewer"]) expect(isWorkAction(type)).toBe(true);
+    for (const type of ["wait_for_blocker", "pickup_ticket", "bounce"]) expect(isWorkAction(type)).toBe(false);
+  });
   it("does not bounce healthy discussion or count quota/holds/in-flight work", () => {
     for (let i = 0; i < 6; i++) {
       action("classify", true); action("write_answer", true); action("revisit_code", true);

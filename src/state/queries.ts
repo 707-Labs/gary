@@ -208,13 +208,13 @@ export function countCiAttemptsSince(db: DB, args: CountSinceArgs): number {
 }
 
 export function isWorkAction(type: string): boolean {
-  return ["start_coding", "fix_ci_failure", "respond_to_pr_review", "revisit_code"].includes(type);
+  return ["classify", "start_coding", "fix_ci_failure", "respond_to_pr_review", "revisit_code", "write_answer", "answer_mention", "nudge_reviewer"].includes(type);
 }
 
 /**
- * Only consecutive completed failures of work on the current input can trip
+ * Only consecutive completed failures of paid handling on the current input can trip
  * the breaker. A changed head/input or successful work/follow-up resets it.
- * Quota waits, failed read-only answers, holds and actions still running neither count nor reset.
+ * Quota waits, pre-request stale-input deferrals, holds and actions still running neither count nor reset.
  * Legacy rows are inferred conservatively from their type and quota message.
  */
 export function countConsecutiveWorkFailures(

@@ -5,7 +5,8 @@ import { computeHumanInputSignature } from "../state-fingerprint.ts";
 import { getRevisitMark, setRevisitMark } from "../state/queries.ts";
 import { runPrReviewHandler, type PrReviewHandlerArgs, type PrReviewHandlerDeps } from "./pr-review.ts";
 
-export class ReadOnlyFollowupError extends Error {}
+/** No model request ran; retry only needs a fresh input snapshot. */
+export class StaleFollowupInputError extends Error {}
 
 const Intent = z.object({ mode: z.enum(["change", "answer"]), confidence: z.number().min(0).max(1) });
 
@@ -38,7 +39,7 @@ export async function runLinearFollowup(
   const previousSignature = getRevisitMark(deps.db, args.issue.id);
   if (previousSignature === args.humanInputSignature) return;
   const actualSignature = computeHumanInputSignature({ description: args.issue.description, comments: args.comments, garyUserId: deps.linear.linearUserId });
-  if (actualSignature !== args.humanInputSignature) throw new ReadOnlyFollowupError("Linear input changed during selection; retry with fresh input");
+  if (actualSignature !== args.humanInputSignature) throw new StaleFollowupInputError("Linear input changed during selection; retry with fresh input");
   const pending = pendingLinearComments({ description: args.issue.description, comments: args.comments, garyUserId: deps.linear.linearUserId, previousSignature });
   if (pending === null) {
     await deps.linear.postComment(args.issue.id, "the issue context changed, but i can't identify a new code request from the previous handled input. i haven't changed the PR. add the concrete follow-up as a new comment and i'll pick it up on this same branch.");
@@ -58,17 +59,10 @@ Use change only when at least one comment explicitly asks Gary to implement a co
       mode = parseFollowupIntent(raw);
     } catch (error) {
       if (error instanceof AllProvidersExhaustedError) throw error;
-      throw new ReadOnlyFollowupError(`Could not classify Linear follow-up: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(`Could not classify Linear follow-up: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  try {
-    await runPrReviewHandler(deps, { ...args, linearFollowup: { comments: pending, mode } });
-  } catch (error) {
-    if (mode === "answer" && !(error instanceof AllProvidersExhaustedError)) {
-      throw new ReadOnlyFollowupError(error instanceof Error ? error.message : String(error));
-    }
-    throw error;
-  }
+  await runPrReviewHandler(deps, { ...args, linearFollowup: { comments: pending, mode } });
   // Errors leave both this signature and the action cache retryable.
   setRevisitMark(deps.db, args.issue.id, args.humanInputSignature);
 }
