@@ -87,8 +87,8 @@ export function pickActionForTicket(
 
   // 2.5. revisit_code — CODE ticket has new human input on the Linear side
   //    since Gary last acted (start_coding or a previous revisit). Re-reads
-  //    the comment thread and posts a follow-up answer. Read-only for now —
-  //    push-on-unambiguous-ask is a v2 like pr-review.
+  //    the comment thread, answers questions read-only, and routes explicit
+  //    changes through the existing PR branch before replying on Linear.
   if (
     state.classification?.classification === "CODE" &&
     state.pr &&

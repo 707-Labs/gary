@@ -104,18 +104,20 @@ export function recordActionStart(
 
 export function recordActionEnd(
   db: DB,
-  args: { id: number; success: boolean; errorMessage?: string },
+  args: { id: number; success: boolean; errorMessage?: string; failureKind?: "work" | "quota" | "nonwork" },
 ): void {
   db.query(
     `UPDATE actions
      SET completed_at = datetime('now'),
          success = $success,
-         error_message = $err
+         error_message = $err,
+         failure_kind = $kind
      WHERE id = $id`,
   ).run({
     id: args.id,
     success: args.success ? 1 : 0,
     err: args.errorMessage ?? null,
+    kind: args.success ? null : args.failureKind ?? null,
   });
 }
 
@@ -186,26 +188,55 @@ export interface CountSinceArgs {
   sinceHoursAgo: number;
 }
 
-/**
- * Attempt count for the circuit breaker (and CI-attempt cap).
- * `wait_for_blocker` is excluded: it's a hold, not an attempt, and it can
- * legitimately re-fire on every human comment while a ticket sits blocked —
- * five comments in six hours must not read as thrashing and trigger a
- * bogus "i'm stuck" escalation.
- */
-export function countActionsSince(db: DB, args: CountSinceArgs): number {
+/** CI retries count completed CI work, never classification, holds or quota skips. */
+export function countCiAttemptsSince(db: DB, args: CountSinceArgs): number {
   const row = db
     .query<{ n: number }, { id: string; cutoff: string }>(
       `SELECT COUNT(*) AS n FROM actions
        WHERE ticket_linear_id = $id
-         AND started_at >= $cutoff
-         AND action_type != 'wait_for_blocker'`,
+         AND datetime(started_at) >= datetime($cutoff)
+         AND action_type = 'fix_ci_failure'
+         AND completed_at IS NOT NULL
+         AND COALESCE(failure_kind, '') != 'quota'
+         AND COALESCE(error_message, '') NOT LIKE 'all providers armed;%'`,
     )
     .get({
       id: args.ticketLinearId,
       cutoff: new Date(Date.now() - args.sinceHoursAgo * 3_600_000).toISOString(),
     });
   return row?.n ?? 0;
+}
+
+export function isWorkAction(type: string): boolean {
+  return ["start_coding", "fix_ci_failure", "respond_to_pr_review", "revisit_code"].includes(type);
+}
+
+/**
+ * Only consecutive completed failures of work on the current input can trip
+ * the breaker. A changed head/input or successful work/follow-up resets it.
+ * Quota waits, failed read-only answers, holds and actions still running neither count nor reset.
+ * Legacy rows are inferred conservatively from their type and quota message.
+ */
+export function countConsecutiveWorkFailures(
+  db: DB,
+  args: CountSinceArgs & { stateFingerprint: string },
+): number {
+  const rows = db.query<{
+    action_type: string; state_fingerprint: string; success: number;
+    failure_kind: string | null; error_message: string | null;
+  }, { id: string; cutoff: string }>(
+    `SELECT action_type, state_fingerprint, success, failure_kind, error_message
+     FROM actions WHERE ticket_linear_id = $id
+       AND datetime(started_at) >= datetime($cutoff) AND completed_at IS NOT NULL
+     ORDER BY id DESC`,
+  ).all({ id: args.ticketLinearId, cutoff: new Date(Date.now() - args.sinceHoursAgo * 3_600_000).toISOString() });
+  let count = 0;
+  for (const row of rows) {
+    if (!isWorkAction(row.action_type) || row.failure_kind === "quota" || row.failure_kind === "nonwork" || row.error_message?.startsWith("all providers armed;")) continue;
+    if (row.state_fingerprint !== args.stateFingerprint || row.success === 1) break;
+    if (row.success === 0) count++;
+  }
+  return count;
 }
 
 export function recordPr(

@@ -46,6 +46,9 @@ function applyMigrations(db: DB): void {
   if (!cols.has("model")) {
     db.exec("ALTER TABLE actions ADD COLUMN model TEXT");
   }
+  if (!cols.has("failure_kind")) {
+    db.exec("ALTER TABLE actions ADD COLUMN failure_kind TEXT");
+  }
 }
 
 export function closeDb(db: DB): void {
