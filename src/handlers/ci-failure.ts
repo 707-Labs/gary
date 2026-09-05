@@ -10,7 +10,6 @@ import { createWorkspaceExecutor } from "../executors/factory.ts";
 import {
   createWorktree,
   ensureBareClone,
-  hasCommitsAhead,
   pushBranch,
 } from "../git.ts";
 import { log } from "../logger.ts";
@@ -20,9 +19,7 @@ import {
   loadSkillIndex,
 } from "../skills.ts";
 import type { DB } from "../state/db.ts";
-import { countActionsSince, setTerminalState } from "../state/queries.ts";
-
-const BASE_BRANCH = "main";
+import { countCiAttemptsSince, setTerminalState } from "../state/queries.ts";
 
 const CI_FIX_TASK_INSTRUCTIONS = `Your PR's CI is failing. Read the failing check output below, figure out the cause, fix it locally, commit, and call finish.
 
@@ -66,7 +63,7 @@ export async function runCiFailureHandler(
   args: CiFailureHandlerArgs,
 ): Promise<CiFailureHandlerResult> {
   // Count prior fix attempts on this PR within the rolling window.
-  const attemptsSoFar = countActionsSince(deps.db, {
+  const attemptsSoFar = countCiAttemptsSince(deps.db, {
     ticketLinearId: args.issue.id,
     sinceHoursAgo: 24,
   });
@@ -158,8 +155,6 @@ export async function runCiFailureHandler(
     iterations: loopResult.iterations,
   });
 
-  const baseRef = BASE_BRANCH;
-  const hasNewCommits = await hasCommitsAhead(worktreePath, baseRef);
   // We need to check whether the LATEST commit is past args.headSha — but
   // `hasCommitsAhead` against base only tells us there are PR commits at
   // all (which there will be even if the agent did nothing). Better: check
@@ -178,7 +173,7 @@ export async function runCiFailureHandler(
       // at MAX_CI_ATTEMPTS yet.
     }
     return {
-      status: hasNewCommits ? "agent_failed" : "no_changes",
+      status: "agent_failed",
       attempts: attemptsSoFar + 1,
       summary: loopResult.summary,
     };

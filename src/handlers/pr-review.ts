@@ -7,14 +7,15 @@ import type {
   PullRequestDetail,
 } from "../adapters/github.ts";
 import type { GLMClient } from "../adapters/glm.ts";
-import type { AssignedIssue, LinearAdapter } from "../adapters/linear.ts";
+import type { AssignedIssue, IssueComment, LinearAdapter } from "../adapters/linear.ts";
 import { runAgentLoop } from "../agent/loop.ts";
 import { composeSystemPrompt } from "../agent/prompts.ts";
 import { createWorkspaceExecutor } from "../executors/factory.ts";
 import {
-  createWorktree,
   ensureBareClone,
+  gitMust,
   pushBranch,
+  restorePrWorktree,
 } from "../git.ts";
 import { log } from "../logger.ts";
 import {
@@ -23,7 +24,7 @@ import {
   loadSkillIndex,
 } from "../skills.ts";
 import type { DB } from "../state/db.ts";
-import { markPrCommentsResponded } from "../state/queries.ts";
+import { getRespondedPrCommentIds, markPrCommentsResponded } from "../state/queries.ts";
 
 const PR_REVIEW_TASK_INSTRUCTIONS = `A reviewer has left comments on your open PR. Your job: read the comments, decide whether each is a question/discussion or a concrete change request, then respond.
 
@@ -74,6 +75,8 @@ export interface PrReviewHandlerArgs {
   prGithubId: number;
   prNumber: number;
   branch: string;
+  /** Requests routed from Linear reply on that same issue, not on the PR. */
+  linearFollowup?: { comments: readonly IssueComment[]; mode: "change" | "answer" };
 }
 
 export interface PrReviewHandlerResult {
@@ -94,19 +97,25 @@ export async function runPrReviewHandler(
   // it's possible a new comment landed between candidate selection and now.
   // Filter to human authors only — Gary, linear[bot] linkbacks, and other
   // automation aren't review feedback he should respond to.
-  const allComments = await deps.github.getPullRequestComments(
+  const allComments = args.linearFollowup ? [] : await deps.github.getPullRequestComments(
     owner,
     name,
     args.prNumber,
   );
-  const pending = allComments.filter((c) => c.authorType === "User");
-  if (pending.length === 0) {
+  const responded = new Set(getRespondedPrCommentIds(deps.db, args.prGithubId));
+  const pending = allComments.filter((c) => c.authorType === "User" && c.authorLogin !== garyLogin && !responded.has(c.id));
+  if (!args.linearFollowup && pending.length === 0) {
     log.info("pr-review: nothing pending after handler-time fetch", {
       issue: args.issue.identifier,
       pr: args.prNumber,
     });
     return { status: "skipped", pendingCommentCount: 0, summary: null };
   }
+
+  // Fail closed before granting a writable session: this exact PR must still
+  // be open on the recorded branch. Never reset or replace existing local work.
+  const prDetail = await deps.github.getPullRequestDetail(owner, name, args.prNumber);
+  assertOpenBranch(prDetail, args.branch);
 
   // Recreate worktree if missing.
   const worktreePath = resolve(deps.workspacesDir, args.issue.identifier);
@@ -123,34 +132,35 @@ export async function runPrReviewHandler(
       reposDir: deps.reposDir,
       freshTokenUrl: freshUrl,
     });
-    await createWorktree({
+    await restorePrWorktree({
       bareDir,
       worktreePath,
       branch: args.branch,
-      baseBranch: args.branch,
+      expectedHead: prDetail.headSha,
+      freshTokenUrl: freshUrl,
       authorName: garyLogin,
       authorEmail,
     });
   }
 
   const headBefore = await readHead(worktreePath);
+  await assertWorkspace(worktreePath, args.branch);
+  if (headBefore !== prDetail.headSha) throw new Error("Follow-up worktree differs from the live PR head; preserved local progress for reconciliation");
 
-  const executor = createWorkspaceExecutor(worktreePath);
-  const system = composeSystemPrompt({ taskInstructions: PR_REVIEW_TASK_INSTRUCTIONS });
+  const readOnly = args.linearFollowup?.mode === "answer";
+  const executor = createWorkspaceExecutor(worktreePath, { readOnly });
+  const instructions = args.linearFollowup
+    ? PR_REVIEW_TASK_INSTRUCTIONS + `\n\nThese requests came from the Linear issue. Your finish() summary will be posted on that issue. Work only on this existing PR and branch; do not open another PR, merge, deploy or rewrite history. ${readOnly ? "This is a question: read-only investigation and answer, no code or administrative changes." : "An explicit code change was requested. Implement only its concrete safe changes, and explain any unresolved items."}`
+    : PR_REVIEW_TASK_INSTRUCTIONS;
+  const system = composeSystemPrompt({ taskInstructions: instructions });
   const projectSection = formatProjectContext(
     loadProjectContext(worktreePath),
     loadSkillIndex(worktreePath),
   );
 
-  let prDetail: PullRequestDetail | null = null;
-  try {
-    prDetail = await deps.github.getPullRequestDetail(owner, name, args.prNumber);
-  } catch (err) {
-    log.warn("could not fetch PR detail for review prompt", {
-      error: err instanceof Error ? err.message : String(err),
-    });
-  }
-  const reviewMessage = renderReviewForAgent(args, prDetail, pending);
+  const reviewMessage = args.linearFollowup
+    ? `Ticket: ${args.issue.identifier} — ${args.issue.title}\nRepo: ${args.repo}\nPR: #${args.prNumber} (${args.branch})\nDescription (context, not a new request):\n${args.issue.description ?? ""}\n\nCurrent Linear follow-up:\n${args.linearFollowup.comments.map(c => `${c.userName ?? "?"} (${c.createdAt}): ${c.body}`).join("\n\n")}\n\n${readOnly ? "Answer using the current PR code." : "Address the explicit request on this existing branch."} Call finish() with the response for the Linear issue.`
+    : renderReviewForAgent(args, prDetail, pending);
   const taskMessage = projectSection
     ? `${projectSection}\n\n---\n\n${reviewMessage}`
     : reviewMessage;
@@ -163,6 +173,8 @@ export async function runPrReviewHandler(
     maxIterations: deps.agentLoopMaxIterations,
     timeoutMs: deps.agentLoopTimeoutMs,
     temperature: 0.3,
+    readOnly,
+    ...(readOnly ? { phases: [{ name: "answer", maxIter: Math.min(deps.agentLoopMaxIterations, 20), allowedTools: new Set(["read_file", "grep", "list_files", "fetch_url", "get_pr", "get_linear_issue", "finish"]) }] } : {}),
     linear: deps.linear,
     currentIssue: {
       id: args.issue.id,
@@ -192,24 +204,30 @@ export async function runPrReviewHandler(
   }
 
   const headAfter = await readHead(worktreePath);
+  await assertWorkspace(worktreePath, args.branch);
   const pushed = headBefore !== null && headAfter !== null && headAfter !== headBefore;
 
   if (pushed) {
+    if (readOnly) throw new Error("Read-only follow-up changed HEAD; refusing to push");
+    await gitMust(["merge-base", "--is-ancestor", headBefore, headAfter], { cwd: worktreePath });
+    const current = await deps.github.getPullRequestDetail(owner, name, args.prNumber);
+    assertOpenBranch(current, args.branch);
+    if (current.headSha !== headBefore) throw new Error("PR head advanced during follow-up; preserved local commits without pushing");
     const freshUrl = await deps.github.cloneUrl(owner, name);
     await pushBranch({
       worktreePath,
       freshTokenUrl: freshUrl,
       branch: args.branch,
+      fastForwardOnly: true,
     });
   }
 
-  // Always post the agent's reply on the PR.
-  try {
+  // A failed reply must remain retryable. Never consume a request on a
+  // best-effort post, including when the code push has already succeeded.
+  if (args.linearFollowup) {
+    await deps.linear.postComment(args.issue.id, loopResult.summary);
+  } else {
     await deps.github.comment(owner, name, args.prNumber, loopResult.summary);
-  } catch (err) {
-    log.warn("could not post pr-review comment", {
-      error: err instanceof Error ? err.message : String(err),
-    });
   }
 
   // Mark every pending comment as responded so the next tick's signature
@@ -225,6 +243,18 @@ export async function runPrReviewHandler(
     pendingCommentCount: pending.length,
     summary: loopResult.summary,
   };
+}
+
+function assertOpenBranch(pr: PullRequestDetail, branch: string): void {
+  if (pr.state !== "open" || pr.merged || pr.headRef !== branch) {
+    throw new Error("Follow-up requires the original open PR and branch");
+  }
+}
+
+async function assertWorkspace(path: string, branch: string): Promise<void> {
+  const currentBranch = (await gitMust(["branch", "--show-current"], { cwd: path })).stdout.trim();
+  const dirty = (await gitMust(["status", "--porcelain"], { cwd: path })).stdout.trim();
+  if (currentBranch !== branch || dirty) throw new Error("Follow-up worktree has a different branch or uncommitted work; preserved for reconciliation");
 }
 
 function renderReviewForAgent(

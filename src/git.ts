@@ -185,6 +185,31 @@ export interface RebaseOntoBaseArgs {
   baseBranch: string;
 }
 
+/** Restore an existing PR checkout without resetting a retained local branch. */
+export async function restorePrWorktree(args: Omit<CreateWorktreeArgs, "baseBranch"> & {
+  freshTokenUrl: string;
+  expectedHead: string;
+}): Promise<void> {
+  await withBareLock(args.bareDir, async () => {
+    if (existsSync(args.worktreePath)) throw new Error("PR worktree appeared during restoration; preserved for refresh");
+    const ref = `refs/heads/${args.branch}`;
+    const local = await gitRun(["rev-parse", "--verify", ref], { cwd: args.bareDir });
+    if (local.exitCode === 0 && local.stdout.trim() !== args.expectedHead) {
+      throw new Error("Retained local PR branch differs from the remote; preserved local commits");
+    }
+    await gitMust(["fetch", args.freshTokenUrl, ref], { cwd: args.bareDir });
+    const fetched = (await gitMust(["rev-parse", "FETCH_HEAD"], { cwd: args.bareDir })).stdout.trim();
+    if (fetched !== args.expectedHead) throw new Error("PR head changed during restoration; retry after refresh");
+    await mkdir(dirname(args.worktreePath), { recursive: true });
+    await gitMust(local.exitCode === 0
+      ? ["worktree", "add", args.worktreePath, args.branch]
+      : ["worktree", "add", "-b", args.branch, args.worktreePath, args.expectedHead], { cwd: args.bareDir });
+    await gitMust(["config", "user.name", args.authorName], { cwd: args.worktreePath });
+    await gitMust(["config", "user.email", args.authorEmail], { cwd: args.worktreePath });
+    await gitMust(["config", "commit.gpgsign", "false"], { cwd: args.worktreePath });
+  });
+}
+
 export type RebaseOutcome =
   | { kind: "clean"; preRebaseSha: string; postRebaseSha: string }
   | { kind: "no_op"; sha: string }
@@ -231,7 +256,13 @@ export async function pushBranch(args: {
   worktreePath: string;
   freshTokenUrl: string;
   branch: string;
+  /** Existing-PR follow-ups must never rewrite published history. */
+  fastForwardOnly?: boolean;
 }): Promise<void> {
+  if (args.fastForwardOnly) {
+    await gitMust(["push", args.freshTokenUrl, `HEAD:refs/heads/${args.branch}`], { cwd: args.worktreePath });
+    return;
+  }
   // `--force-with-lease` (no value) compares against the local remote-tracking
   // ref. Bare clones with worktrees never populate `refs/remotes/origin/*`, so
   // that form refuses every push with "stale info" once the branch exists on

@@ -275,92 +275,44 @@ export class LinearAdapter {
     return node ? mapIssueNode(node) : null;
   }
 
-  /**
-   * Fetch only id + author + createdAt for an issue's comments. Uses one raw
-   * GraphQL call (vs `fetchComments` which lazily resolves user records and
-   * incurs N+1 round trips). Used in the loop to compute the human-input
-   * signature without blowing the Linear rate limit.
-   */
-  async fetchCommentMeta(
-    issueId: string,
-    limit = 50,
-  ): Promise<{ id: string; userId: string | null; createdAt: string }[]> {
-    const query = `
-      query CommentMeta($id: String!, $first: Int!) {
-        issue(id: $id) {
-          comments(first: $first) {
-            nodes {
-              id
-              createdAt
-              user { id }
-            }
-          }
-        }
-      }
-    `;
-    const data = await this.client.client.request<
-      {
-        issue: {
-          comments: {
-            nodes: {
-              id: string;
-              createdAt: string;
-              user: { id: string } | null;
-            }[];
-          };
-        } | null;
-      },
-      { id: string; first: number }
-    >(query, { id: issueId, first: limit });
-    const nodes = data.issue?.comments?.nodes ?? [];
-    return nodes.map((n) => ({
-      id: n.id,
-      createdAt: n.createdAt,
-      userId: n.user?.id ?? null,
-    }));
+  /** Same complete, bounded snapshot for fingerprints and handler bodies. */
+  async fetchCommentMeta(issueId: string, pageSize = 50): Promise<{ id: string; userId: string | null; createdAt: string }[]> {
+    return this.fetchCommentSnapshot(issueId, false, pageSize);
   }
 
-  async fetchComments(issueId: string, limit = 20): Promise<IssueComment[]> {
-    // Single roundtrip vs the SDK's N+2 (issue lookup + comments page + per-
-    // comment user resolve). Same shape; trades the SDK's typed wrappers for
-    // a one-shot GraphQL response.
-    const query = `
-      query IssueComments($id: String!, $first: Int!) {
-        issue(id: $id) {
-          comments(first: $first) {
-            nodes {
-              id
-              body
-              createdAt
-              user { id name }
-            }
-          }
+  async fetchComments(issueId: string, pageSize = 50): Promise<IssueComment[]> {
+    return this.fetchCommentSnapshot(issueId, true, pageSize);
+  }
+
+  private async fetchCommentSnapshot(issueId: string, includeBody: boolean, pageSize: number): Promise<IssueComment[]> {
+    if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100) throw new Error("Invalid comment page size");
+    const query = `query CommentSnapshot($id: String!, $first: Int!, $after: String) {
+      issue(id: $id) {
+        comments(first: $first, after: $after, orderBy: createdAt) {
+          nodes { id createdAt ${includeBody ? "body" : ""} user { id ${includeBody ? "name" : ""} } }
+          pageInfo { hasNextPage endCursor }
         }
       }
-    `;
-    const data = await this.client.client.request<
-      {
-        issue: {
-          comments: {
-            nodes: {
-              id: string;
-              body: string;
-              createdAt: string;
-              user: { id: string; name: string } | null;
-            }[];
-          };
-        } | null;
-      },
-      { id: string; first: number }
-    >(query, { id: issueId, first: limit });
-    const nodes = data.issue?.comments?.nodes ?? [];
-    return nodes.map((n) => ({
-      id: n.id,
-      body: n.body,
-      createdAt: n.createdAt,
-      userId: n.user?.id ?? null,
-      userName: n.user?.name ?? null,
-    }));
+    }`;
+    type Page = { nodes: { id: string; createdAt: string; body?: string; user: { id: string; name?: string } | null }[];
+      pageInfo: { hasNextPage: boolean; endCursor: string | null } };
+    const comments: IssueComment[] = [];
+    const ids = new Set<string>();
+    let after: string | null = null;
+    for (let page = 0; page < 10; page++) {
+      const data: { issue: { comments: Page } | null } = await this.client.client.request<{ issue: { comments: Page } | null }, { id: string; first: number; after: string | null }>(query, { id: issueId, first: pageSize, after });
+      const current: Page | undefined = data.issue?.comments;
+      if (!current?.pageInfo) throw new Error("Cannot verify complete Linear comment snapshot");
+      for (const node of current.nodes) {
+        if (ids.has(node.id)) throw new Error("Linear comments changed during pagination; retry snapshot");
+        ids.add(node.id);
+        comments.push({ id: node.id, createdAt: node.createdAt, body: node.body ?? "", userId: node.user?.id ?? null, userName: node.user?.name ?? null });
+      }
+      if (!current.pageInfo.hasNextPage) return comments;
+      if (!current.pageInfo.endCursor || current.pageInfo.endCursor === after) throw new Error("Invalid Linear comment pagination cursor");
+      after = current.pageInfo.endCursor;
+    }
+    throw new Error("Linear comment history exceeds bounded snapshot; refusing to acknowledge partial input");
   }
 
   async postComment(issueId: string, body: string): Promise<string> {

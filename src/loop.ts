@@ -17,6 +17,7 @@ import { runCodeHandler } from "./handlers/code.ts";
 import { runNudgeReviewer } from "./handlers/nudge-reviewer.ts";
 import { runPickupHandler } from "./handlers/pickup.ts";
 import { runPrReviewHandler } from "./handlers/pr-review.ts";
+import { StaleFollowupInputError, runLinearFollowup } from "./handlers/linear-followup.ts";
 import { analyzeMentions } from "./mention.ts";
 import { log } from "./logger.ts";
 import {
@@ -40,7 +41,8 @@ import type { DB } from "./state/db.ts";
 import {
   clearClassification,
   clearTerminalState,
-  countActionsSince,
+  countConsecutiveWorkFailures,
+  isWorkAction,
   getPrForTicket,
   getRespondedPrCommentIds,
   getRevisitMark,
@@ -135,25 +137,6 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
       ticketRow = getTicket(deps.db, issue.id);
     }
 
-    // Circuit breaker: if Gary has thrashed on this ticket too many times in
-    // the rolling window, escalate and stop.
-    const recentAttempts = countActionsSince(deps.db, {
-      ticketLinearId: issue.id,
-      sinceHoursAgo: deps.circuitBreakerWindowHours,
-    });
-    if (recentAttempts >= deps.maxAttemptsPerTicket) {
-      log.warn("circuit breaker tripped", {
-        issue: issue.identifier,
-        attempts: recentAttempts,
-        windowHours: deps.circuitBreakerWindowHours,
-      });
-      await escalate(
-        { db: deps.db, linear: deps.linear },
-        { issue, reason: "circuit_breaker" },
-      );
-      continue;
-    }
-
     const classification = ticketRow?.classification
       ? {
           classification: ticketRow.classification,
@@ -209,6 +192,14 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
       stateFingerprint: fp,
       actionType: candidate.type,
     })) {
+      continue;
+    }
+    const recentFailures = countConsecutiveWorkFailures(deps.db, {
+      ticketLinearId: issue.id, sinceHoursAgo: deps.circuitBreakerWindowHours, stateFingerprint: fp,
+    });
+    if (isWorkAction(candidate.type) && recentFailures >= deps.maxAttemptsPerTicket) {
+      log.warn("work failure circuit breaker tripped", { issue: issue.identifier, failures: recentFailures });
+      await escalate({ db: deps.db, linear: deps.linear }, { issue, reason: "circuit_breaker" });
       continue;
     }
     candidates.push(candidate);
@@ -333,6 +324,7 @@ async function runOne(
         id: actionId,
         success: false,
         errorMessage: `all providers armed; earliest reset ${err.earliestReset?.toISOString() ?? "unknown"}`,
+        failureKind: "quota",
       });
       return null;
     }
@@ -347,6 +339,7 @@ async function runOne(
       id: actionId,
       success: false,
       errorMessage: message,
+      failureKind: isWorkAction(action.type) && !(err instanceof StaleFollowupInputError) ? "work" : "nonwork",
     });
     return action.type;
   }
@@ -452,6 +445,14 @@ async function collectMentionCandidates(
         actionType: candidate.type,
       })
     ) {
+      continue;
+    }
+    // Mention-only questions can spend tokens too, but Gary does not own their
+    // assignment. Bound retries without reassigning the other person's issue.
+    if (isWorkAction(candidate.type) && countConsecutiveWorkFailures(deps.db, {
+      ticketLinearId: issue.id, sinceHoursAgo: deps.circuitBreakerWindowHours, stateFingerprint: fp,
+    }) >= deps.maxAttemptsPerTicket) {
+      log.warn("mention handling failure limit reached; waiting for new input or failure window to clear", { issue: issue.identifier });
       continue;
     }
     candidates.push(candidate);
@@ -642,7 +643,7 @@ async function runWriteAnswer(
     return;
   }
   const comments = await deps.linear.fetchComments(issue.id);
-  await runAnswerHandler(
+  const result = await runAnswerHandler(
     {
       linear: deps.linear,
       github: deps.github,
@@ -655,6 +656,7 @@ async function runWriteAnswer(
     },
     { issue, comments, repo },
   );
+  if (result.status !== "answered") throw new Error("Answer did not finish; input remains pending");
 }
 
 async function runFixCiFailure(
@@ -671,7 +673,7 @@ async function runFixCiFailure(
       `fix_ci_failure: no PR row for ticket ${issue.identifier}`,
     );
   }
-  await runCiFailureHandler(
+  const result = await runCiFailureHandler(
     {
       db: deps.db,
       linear: deps.linear,
@@ -692,6 +694,7 @@ async function runFixCiFailure(
       headSha: action.state.pr.headSha,
     },
   );
+  if (result.status === "agent_failed") throw new Error("CI repair did not finish; attempt remains retryable");
 }
 
 async function runStartCoding(
@@ -738,10 +741,14 @@ async function runRevisitCode(
   deps: LoopDeps,
   action: CandidateAction,
 ): Promise<void> {
-  // Reuses the answer handler — read-only investigation + Linear comment.
-  // Push-on-unambiguous-ask is deferred (mirrors pr-review's reply-default).
-  await runWriteAnswer(deps, action);
-  setRevisitMark(deps.db, action.issue.id, action.state.humanInputSignature);
+  const pr = getPrForTicket(deps.db, action.issue.id);
+  if (!pr || !action.state.pr) throw new Error("Linear follow-up requires its recorded PR");
+  const comments = await deps.linear.fetchComments(action.issue.id);
+  await runLinearFollowup(deps, {
+    issue: action.issue, comments, repo: pr.repo, prGithubId: pr.github_id,
+    prNumber: pr.pr_number, branch: pr.branch,
+    humanInputSignature: action.state.humanInputSignature,
+  });
 }
 
 async function runClassify(
