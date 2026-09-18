@@ -65,10 +65,14 @@ export async function runCiFailureHandler(
   deps: CiFailureHandlerDeps,
   args: CiFailureHandlerArgs,
 ): Promise<CiFailureHandlerResult> {
-  // Count prior fix attempts on this PR within the rolling window.
+  // Count prior CI-fix attempts on this ticket within the rolling window.
+  // Only fix_ci_failure rows: the classify and start_coding actions that
+  // precede the first CI failure are not fix attempts, and counting them
+  // would trip the cap on the first try for most tickets.
   const attemptsSoFar = countActionsSince(deps.db, {
     ticketLinearId: args.issue.id,
     sinceHoursAgo: 24,
+    actionType: "fix_ci_failure",
   });
 
   if (attemptsSoFar >= deps.maxCiAttempts) {

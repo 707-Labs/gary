@@ -222,6 +222,28 @@ export class AllProvidersExhaustedError extends Error {
 }
 
 /**
+ * A provider answered 200 with no text content. The SDK does not treat that
+ * as an error, so the chain has to: Z.ai returned 425 consecutive empty
+ * classifier completions for one ticket on 2026-08-31 while serving other
+ * tickets normally (mb-b2tw). Per-request, not a quota signal, so the
+ * provider's gate is not armed; the call just moves to the next provider.
+ */
+export class EmptyCompletionError extends Error {
+  readonly provider: string;
+  readonly model: string;
+  readonly stopReason: string | null;
+  constructor(provider: string, model: string, stopReason: string | null) {
+    super(
+      `empty completion from ${provider} (${model}); stop_reason=${stopReason ?? "null"}`,
+    );
+    this.name = "EmptyCompletionError";
+    this.provider = provider;
+    this.model = model;
+    this.stopReason = stopReason;
+  }
+}
+
+/**
  * Detect a 429 response from an Anthropic SDK error. The SDK exposes a
  * RateLimitError class for status 429 — we rely on the `status` field
  * because instanceof checks across multiple imports of the SDK are

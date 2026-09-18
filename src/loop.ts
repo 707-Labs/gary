@@ -46,6 +46,7 @@ import {
   getRevisitMark,
   getTicket,
   hasActedOn,
+  markPrClosed,
   recordActionEnd,
   recordActionStart,
   recordEvent,
@@ -137,9 +138,13 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
 
     // Circuit breaker: if Gary has thrashed on this ticket too many times in
     // the rolling window, escalate and stop.
+    // Failed attempts only: a ticket that legitimately moves through
+    // classify, code, CI fix and review replies inside one window is making
+    // progress, not spinning. Successes never count toward the breaker.
     const recentAttempts = countActionsSince(deps.db, {
       ticketLinearId: issue.id,
       sinceHoursAgo: deps.circuitBreakerWindowHours,
+      failedOnly: true,
     });
     if (recentAttempts >= deps.maxAttemptsPerTicket) {
       log.warn("circuit breaker tripped", {
@@ -810,6 +815,9 @@ async function derivePr(
       error: err instanceof Error ? err.message : String(err),
     });
     return null;
+  }
+  if (pr.state === "closed") {
+    markPrClosed(deps.db, { githubId: row.github_id, merged: pr.merged });
   }
   const ciStatus = await deps.github.aggregateCiStatus(owner, name, pr.headSha);
 

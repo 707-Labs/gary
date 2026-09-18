@@ -184,6 +184,23 @@ export function clearClassification(db: DB, linearId: string): void {
 export interface CountSinceArgs {
   ticketLinearId: string;
   sinceHoursAgo: number;
+  /** Count only attempts that did not succeed: failed, or never completed. */
+  failedOnly?: boolean;
+  /** Restrict to one action type, e.g. "fix_ci_failure". */
+  actionType?: string;
+  /** Clock override for tests; defaults to the current time. */
+  now?: Date;
+}
+
+/**
+ * Format a Date the way `datetime('now')` writes it: "YYYY-MM-DD HH:MM:SS"
+ * in UTC. Every timestamp column in this schema is written by SQLite, so
+ * any cutoff compared against them has to use this shape. SQLite compares
+ * TEXT bytewise and an ISO string ("2026-08-31T13:00:00.000Z") sorts after
+ * every row from the same day because " " < "T".
+ */
+export function sqliteTimestamp(d: Date): string {
+  return d.toISOString().slice(0, 19).replace("T", " ");
 }
 
 /**
@@ -192,18 +209,33 @@ export interface CountSinceArgs {
  * legitimately re-fire on every human comment while a ticket sits blocked —
  * five comments in six hours must not read as thrashing and trigger a
  * bogus "i'm stuck" escalation.
+ *
+ * Until 2026-09 the cutoff was an ISO string, so this only ever counted rows
+ * from *earlier UTC days* than the cutoff and the circuit breaker could not
+ * trip inside its own window; it fired twice in five months, both times just
+ * after midnight UTC, while one ticket burned 425 failed classify attempts in
+ * a day (mb-b2tw). Keep the cutoff in `sqliteTimestamp` form.
  */
 export function countActionsSince(db: DB, args: CountSinceArgs): number {
   const row = db
-    .query<{ n: number }, { id: string; cutoff: string }>(
+    .query<
+      { n: number },
+      { id: string; cutoff: string; type: string | null; failedOnly: number }
+    >(
       `SELECT COUNT(*) AS n FROM actions
        WHERE ticket_linear_id = $id
          AND started_at >= $cutoff
-         AND action_type != 'wait_for_blocker'`,
+         AND action_type != 'wait_for_blocker'
+         AND ($type IS NULL OR action_type = $type)
+         AND ($failedOnly = 0 OR success IS NULL OR success = 0)`,
     )
     .get({
       id: args.ticketLinearId,
-      cutoff: new Date(Date.now() - args.sinceHoursAgo * 3_600_000).toISOString(),
+      cutoff: sqliteTimestamp(
+        new Date((args.now ?? new Date()).getTime() - args.sinceHoursAgo * 3_600_000),
+      ),
+      type: args.actionType ?? null,
+      failedOnly: args.failedOnly ? 1 : 0,
     });
   return row?.n ?? 0;
 }
@@ -233,6 +265,25 @@ export function recordPr(
     num: args.prNumber,
     branch: args.branch,
   });
+}
+
+/**
+ * Record that GitHub reports the PR closed. `closed_at` keeps the first
+ * observation; `merged` is whatever GitHub says now. Gary only learns this
+ * while the ticket is still assigned and polled, so a PR closed after
+ * hand-off stays open here: these columns are an observation log, not a
+ * mirror of GitHub. Before 2026-09 nothing wrote them at all (mb-b2tw).
+ */
+export function markPrClosed(
+  db: DB,
+  args: { githubId: number; merged: boolean },
+): void {
+  db.query(
+    `UPDATE prs
+     SET closed_at = COALESCE(closed_at, datetime('now')),
+         merged = $merged
+     WHERE github_id = $id`,
+  ).run({ id: args.githubId, merged: args.merged ? 1 : 0 });
 }
 
 export interface PrRow {

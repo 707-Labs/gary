@@ -3,6 +3,7 @@ import { log } from "../logger.ts";
 import {
   AllProvidersExhaustedError,
   armOnRateLimit,
+  EmptyCompletionError,
   isRateLimitError,
   type LLMProvider,
   type ProviderChain,
@@ -143,23 +144,34 @@ export class GLMClient {
 
   /**
    * Single-turn text completion (classifier, PR title/body, etc.).
-   * Loops through providers on 429.
+   * Loops through providers on 429, and on an empty completion: every
+   * caller of `complete` needs text back, so a 200 with no text is a
+   * failed call for this provider, not an answer. `createMessage` is
+   * deliberately different — a tool-use turn legitimately has no text.
    */
   async complete(args: CompleteArgs): Promise<string> {
-    const response = await this.runWithFallback((provider) =>
-      provider.client.messages.create({
+    return await this.runWithFallback(async (provider) => {
+      const response = await provider.client.messages.create({
         model: provider.model,
         max_tokens: args.maxTokens ?? DEFAULT_MAX_TOKENS,
         ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
         system: args.system,
         messages: [{ role: "user", content: args.user }],
         ...(args.stopSequences ? { stop_sequences: [...args.stopSequences] } : {}),
-      }),
-    );
-    return response.content
-      .filter((b): b is Anthropic.TextBlock => b.type === "text")
-      .map((b) => b.text)
-      .join("\n");
+      });
+      const text = response.content
+        .filter((b): b is Anthropic.TextBlock => b.type === "text")
+        .map((b) => b.text)
+        .join("\n");
+      if (text.trim() === "") {
+        throw new EmptyCompletionError(
+          provider.name,
+          provider.model,
+          response.stop_reason,
+        );
+      }
+      return text;
+    });
   }
 
   /**
@@ -185,21 +197,32 @@ export class GLMClient {
    * Throws `AllProvidersExhaustedError` if every provider is armed before
    * we can find one that succeeds.
    *
-   * Non-429 errors propagate unchanged; we don't want to mask 5xx or
+   * An `EmptyCompletionError` thrown by `call` also moves to the next
+   * provider, but only for this call: the provider is skipped, not armed.
+   * If every provider came back empty, the last such error is rethrown so
+   * the action is recorded as a failure (and counts toward the circuit
+   * breaker) rather than as an "all providers armed" pause.
+   *
+   * Other non-429 errors propagate unchanged; we don't want to mask 5xx or
    * malformed-request errors as if they were caps.
    */
   private async runWithFallback<T>(
     call: (provider: LLMProvider) => Promise<T>,
   ): Promise<T> {
     let attempt = 0;
+    const skipped = new Set<LLMProvider>();
+    let lastEmpty: EmptyCompletionError | null = null;
     // Bound the loop by the number of providers — once each has had a turn,
     // the chain is exhausted regardless of arming state.
     const max = this.chain.providers.length;
     while (attempt++ < max) {
-      const provider = this.chain.active();
-      if (!provider) {
-        throw new AllProvidersExhaustedError(this.chain.earliestReset());
-      }
+      const provider =
+        skipped.size === 0
+          ? this.chain.active()
+          : (this.chain.providers.find(
+              (p) => !skipped.has(p) && !p.gate.isArmed(),
+            ) ?? null);
+      if (!provider) break;
       try {
         const out = await call(provider);
         if (attempt > 1) {
@@ -210,12 +233,23 @@ export class GLMClient {
         }
         return out;
       } catch (err) {
+        if (err instanceof EmptyCompletionError) {
+          skipped.add(provider);
+          lastEmpty = err;
+          log.warn("empty completion; trying next provider", {
+            provider: provider.name,
+            model: provider.model,
+            stopReason: err.stopReason,
+          });
+          continue;
+        }
         if (!isRateLimitError(err)) throw err;
         const message = err instanceof Error ? err.message : String(err);
         armOnRateLimit(provider, message);
         // Loop continues — next iteration picks the next-priority provider.
       }
     }
+    if (lastEmpty) throw lastEmpty;
     throw new AllProvidersExhaustedError(this.chain.earliestReset());
   }
 }
