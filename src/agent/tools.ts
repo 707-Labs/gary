@@ -52,6 +52,8 @@ export interface AgentTools {
 }
 
 export interface ToolsetOptions extends DeadlineOptions {
+  /** Trusted host transport override; defaults to the existing SSRF-safe fetcher. */
+  fetchPublicUrl?: typeof fetchPublicUrl;
   /** When set, exposes Cloudflare Workers Observability tools. */
   cloudflare?: CloudflareClient;
   /** When set, exposes Linear read tools (e.g. `get_linear_issue`). */
@@ -131,7 +133,7 @@ export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): Agen
     register(commitTool(executor));
   }
   register(todoWriteTool(out));
-  register(fetchUrlTool(opts));
+  register(fetchUrlTool(opts, opts.fetchPublicUrl));
   if (linear) {
     register(getLinearIssueTool(linear));
     if (opts.currentIssue && !opts.readOnly) {
@@ -561,7 +563,7 @@ const fetchUrlSchema = z.object({
 });
 const FETCH_URL_TIMEOUT_MS = 30_000;
 const FETCH_URL_MAX_BYTES = 200_000;
-function fetchUrlTool(options: DeadlineOptions = {}): ToolHandler {
+function fetchUrlTool(options: DeadlineOptions = {}, fetcher = fetchPublicUrl): ToolHandler {
   return {
     definition: {
       name: "fetch_url",
@@ -583,12 +585,12 @@ function fetchUrlTool(options: DeadlineOptions = {}): ToolHandler {
       const budget = createDeadline({ ...options, timeoutMs: FETCH_URL_TIMEOUT_MS });
       try {
         budget.throwIfExpired();
-        const res = await fetchPublicUrl(url, {
+        const res = await fetcher(url, {
           headers: { "User-Agent": "gary-707-labs (https://github.com/707-Labs/gary)" },
           signal: budget.signal,
         });
         const text = await res.text();
-        const truncated = text.length > FETCH_URL_MAX_BYTES;
+        const truncated = text.length > FETCH_URL_MAX_BYTES || res.headers.get('x-gary-body-truncated') === 'true';
         const body = truncated ? text.slice(0, FETCH_URL_MAX_BYTES) : text;
         const header = `status: ${res.status}\ncontent-type: ${res.headers.get("content-type") ?? ""}\nbytes: ${text.length}${truncated ? ` (truncated to ${FETCH_URL_MAX_BYTES})` : ""}`;
         return `${header}\n\n${body}`;

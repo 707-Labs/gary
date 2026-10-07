@@ -92,11 +92,15 @@ export function formatProjectContext(
   skills: ProjectSkill[],
 ): string {
   const sections: string[] = [];
-  if (context.claudeMd) {
+  if (context.claudeMd && context.claudeMd === context.agentsMd) {
+    // Exact loaded-body equality only; preserve both sources and every byte.
+    sections.push("# CLAUDE.md and AGENTS.md (project instructions and agent guidance)");
+    sections.push(context.claudeMd);
+  } else if (context.claudeMd) {
     sections.push("# CLAUDE.md (project instructions)");
     sections.push(context.claudeMd);
   }
-  if (context.agentsMd) {
+  if (context.agentsMd && context.agentsMd !== context.claudeMd) {
     sections.push("# AGENTS.md (agent guidance)");
     sections.push(context.agentsMd);
   }

@@ -4,16 +4,32 @@ import { isIP } from "node:net";
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const MAX_REDIRECTS = 5;
 
-export async function fetchPublicUrl(url: string, init: RequestInit = {}): Promise<Response> {
+/** Optional trusted-host policy; existing callers keep the same public-only rules. */
+export interface PublicFetchGuards {
+  authorizeUrl?: (url: URL) => void;
+  assertActive?: () => void;
+  /** Offline test seams. These are never exposed to model inputs. */
+  resolve?: (hostname: string) => Promise<readonly { address: string }[]>;
+  fetch?: (url: URL, init: RequestInit) => Promise<Response>;
+}
+
+export async function fetchPublicUrl(url: string, init: RequestInit = {}, guards: PublicFetchGuards = {}): Promise<Response> {
   let current = validatePublicHttpUrl(url);
 
   for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
-    await assertPublicResolution(current.hostname);
-    const response = await fetch(current, { ...init, redirect: "manual" });
+    guards.assertActive?.();
+    guards.authorizeUrl?.(new URL(current));
+    await assertPublicResolution(current.hostname, guards.resolve);
+    guards.assertActive?.();
+    const response = await (guards.fetch ?? fetch)(current, { ...init, redirect: "manual" });
+    try { guards.assertActive?.(); }
+    catch (error) { await response.body?.cancel(); throw error; }
     if (!REDIRECT_STATUSES.has(response.status)) return response;
 
     const location = response.headers.get("location");
     if (!location) return response;
+    await response.body?.cancel();
+    guards.assertActive?.();
     if (redirects === MAX_REDIRECTS) throw new Error(`too many redirects (max ${MAX_REDIRECTS})`);
     current = validatePublicHttpUrl(new URL(location, current).toString());
   }
@@ -43,10 +59,10 @@ export function validatePublicHttpUrl(raw: string): URL {
   return url;
 }
 
-async function assertPublicResolution(hostnameWithBrackets: string): Promise<void> {
+async function assertPublicResolution(hostnameWithBrackets: string, resolve: PublicFetchGuards['resolve']): Promise<void> {
   const hostname = stripIpv6Brackets(hostnameWithBrackets);
   if (isIP(hostname) !== 0) return;
-  const addresses = await lookup(hostname, { all: true, verbatim: true });
+  const addresses = await (resolve ? resolve(hostname) : lookup(hostname, { all: true, verbatim: true }));
   if (addresses.length === 0) throw new Error(`URL host did not resolve: ${hostname}`);
   for (const { address } of addresses) {
     if (!isPublicIp(address)) {

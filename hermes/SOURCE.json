@@ -1,0 +1,11 @@
+{
+  "gary_revision": "2f56d9f98bd3b0f5bb5d68b916dfcba6df382868",
+  "hermes_revision": "9664e386f67965ec8bec5cf3db9d411f2c2b6cc0",
+  "live_source_modified": false,
+  "activation": "disabled",
+  "live_ledger_access": false,
+  "vendored_gary_changes": [],
+  "receipt_patch": "Superseded historical narrow proposal; candidate now uses complete deployed Gary PR10 including diagnostics and atomic settlement.",
+  "vendored_hermes_changes": [],
+  "source_integrity_note": "Recorded revisions are provenance, not a runtime filesystem integrity proof; verify tree/image hashes before activation."
+}

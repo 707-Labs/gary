@@ -1,0 +1,450 @@
+{
+  "actualNativeHermes": true,
+  "pinnedRevision": "9664e386f67965ec8bec5cf3db9d411f2c2b6cc0",
+  "transport": "stdio",
+  "passed": true,
+  "scenarios": [
+    {
+      "scenario": "successful_round_trip",
+      "passed": true,
+      "result": {
+        "status": "finished",
+        "publicationApproved": false,
+        "text": "Offline stdio fixture verified.",
+        "taskId": "stdio-fixture-task",
+        "requestId": "stdio-fixture-successful_round_trip",
+        "nativeCompleted": true,
+        "finishSummary": "offline stdio fixture verified",
+        "modelAttempts": 3
+      },
+      "childExit": 0,
+      "orderedRequests": [
+        {
+          "id": 1,
+          "path": "/v1/chat/completions",
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "authorizationMatched": true
+        },
+        {
+          "id": 2,
+          "path": "/tools/execute",
+          "bodyKeys": [
+            "arguments",
+            "callId",
+            "name",
+            "ownerEpoch",
+            "taskId",
+            "token"
+          ],
+          "authorizationMatched": true,
+          "callId": "stdio_fixture_call_1",
+          "name": "run_bash"
+        },
+        {
+          "id": 3,
+          "path": "/v1/chat/completions",
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "authorizationMatched": true
+        },
+        {
+          "id": 4,
+          "path": "/tools/execute",
+          "bodyKeys": [
+            "arguments",
+            "callId",
+            "name",
+            "ownerEpoch",
+            "taskId",
+            "token"
+          ],
+          "authorizationMatched": true,
+          "callId": "stdio_fixture_call_2",
+          "name": "finish"
+        },
+        {
+          "id": 5,
+          "path": "/v1/chat/completions",
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "authorizationMatched": true
+        },
+        {
+          "id": 6,
+          "path": "/tools/state",
+          "bodyKeys": [
+            "ownerEpoch",
+            "taskId"
+          ],
+          "authorizationMatched": true
+        }
+      ],
+      "modelRequestShapes": [
+        {
+          "model": "deepseek-v4-pro",
+          "max_tokens": 128,
+          "temperature": 0.3,
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "toolNames": [
+            "finish",
+            "run_bash"
+          ],
+          "messageRoles": [
+            "system",
+            "user"
+          ],
+          "toolResultCallIds": [],
+          "bodySha256": "6f522c4d9b413d4c37727f9cd48ac42035d825a88d8a43327bc8fa7298c07345"
+        },
+        {
+          "model": "deepseek-v4-pro",
+          "max_tokens": 128,
+          "temperature": 0.3,
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "toolNames": [
+            "finish",
+            "run_bash"
+          ],
+          "messageRoles": [
+            "system",
+            "user",
+            "assistant",
+            "tool"
+          ],
+          "toolResultCallIds": [
+            "stdio_fixture_call_1"
+          ],
+          "bodySha256": "de924a3b60127913be4f796f8ae315d1149f47b529bc9608924ea0ccb9f212a3"
+        },
+        {
+          "model": "deepseek-v4-pro",
+          "max_tokens": 128,
+          "temperature": 0.3,
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "toolNames": [
+            "finish",
+            "run_bash"
+          ],
+          "messageRoles": [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool"
+          ],
+          "toolResultCallIds": [
+            "stdio_fixture_call_1",
+            "stdio_fixture_call_2"
+          ],
+          "bodySha256": "dc4c712a963844d829bc96587b00bd95b891e798fa800f4a670d382357becac7"
+        }
+      ],
+      "toolCalls": [
+        {
+          "callId": "stdio_fixture_call_1",
+          "name": "run_bash",
+          "arguments": {
+            "command": "bun run check"
+          }
+        },
+        {
+          "callId": "stdio_fixture_call_2",
+          "name": "finish",
+          "arguments": {
+            "summary": "offline stdio fixture verified"
+          }
+        }
+      ],
+      "maxPhysicalModelRequests": 4,
+      "observedPhysicalModelRequests": 3,
+      "isolation": {
+        "network_and_subprocess_denial_active": true,
+        "blocked_operations": [
+          "socket.bind",
+          "socket.create_connection",
+          "socket.create_connection",
+          "socket.create_connection",
+          "socket.create_connection",
+          "subprocess.Popen",
+          "socket.create_connection",
+          "socket.create_connection",
+          "socket.create_connection",
+          "socket.create_connection",
+          "socket.getaddrinfo",
+          "socket.getaddrinfo"
+        ]
+      }
+    },
+    {
+      "scenario": "authority_rejected",
+      "passed": true,
+      "result": {
+        "status": "error",
+        "publicationApproved": false,
+        "text": "",
+        "taskId": "stdio-fixture-task",
+        "requestId": "stdio-fixture-authority_rejected",
+        "reason": "rpc_authority_rejected"
+      },
+      "childExit": 1,
+      "orderedRequests": [
+        {
+          "id": 1,
+          "path": "/v1/chat/completions",
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "authorizationMatched": true
+        }
+      ],
+      "modelRequestShapes": [
+        {
+          "model": "deepseek-v4-pro",
+          "max_tokens": 128,
+          "temperature": 0.3,
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "toolNames": [
+            "finish",
+            "run_bash"
+          ],
+          "messageRoles": [
+            "system",
+            "user"
+          ],
+          "toolResultCallIds": [],
+          "bodySha256": "02cb200bcf41cad1e0be85826343057c7ff798740d3664c90aa5d8f221bf60f9"
+        }
+      ],
+      "toolCalls": [],
+      "maxPhysicalModelRequests": 4,
+      "observedPhysicalModelRequests": 1,
+      "isolation": {
+        "network_and_subprocess_denial_active": true,
+        "blocked_operations": [
+          "socket.bind",
+          "socket.create_connection",
+          "socket.create_connection",
+          "socket.create_connection",
+          "socket.create_connection",
+          "subprocess.Popen"
+        ]
+      }
+    },
+    {
+      "scenario": "forced_iteration_cap",
+      "passed": true,
+      "result": {
+        "status": "iteration_cap",
+        "publicationApproved": false,
+        "text": "Iteration limit reached; no additional model request was made.",
+        "taskId": "stdio-fixture-task",
+        "requestId": "stdio-fixture-forced_iteration_cap",
+        "nativeCompleted": false,
+        "reason": "model_iteration_limit",
+        "modelAttempts": 2
+      },
+      "childExit": 0,
+      "orderedRequests": [
+        {
+          "id": 1,
+          "path": "/v1/chat/completions",
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "authorizationMatched": true
+        },
+        {
+          "id": 2,
+          "path": "/tools/execute",
+          "bodyKeys": [
+            "arguments",
+            "callId",
+            "name",
+            "ownerEpoch",
+            "taskId",
+            "token"
+          ],
+          "authorizationMatched": true,
+          "callId": "stdio_fixture_call_1",
+          "name": "run_bash"
+        },
+        {
+          "id": 3,
+          "path": "/v1/chat/completions",
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "authorizationMatched": true
+        },
+        {
+          "id": 4,
+          "path": "/tools/execute",
+          "bodyKeys": [
+            "arguments",
+            "callId",
+            "name",
+            "ownerEpoch",
+            "taskId",
+            "token"
+          ],
+          "authorizationMatched": true,
+          "callId": "stdio_fixture_call_2",
+          "name": "run_bash"
+        },
+        {
+          "id": 5,
+          "path": "/tools/state",
+          "bodyKeys": [
+            "ownerEpoch",
+            "taskId"
+          ],
+          "authorizationMatched": true
+        }
+      ],
+      "modelRequestShapes": [
+        {
+          "model": "deepseek-v4-pro",
+          "max_tokens": 128,
+          "temperature": 0.3,
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "toolNames": [
+            "finish",
+            "run_bash"
+          ],
+          "messageRoles": [
+            "system",
+            "user"
+          ],
+          "toolResultCallIds": [],
+          "bodySha256": "a88e307e4b9b71a2a1867000a667c8c5a641e349142965fbba5812bedc4e585c"
+        },
+        {
+          "model": "deepseek-v4-pro",
+          "max_tokens": 128,
+          "temperature": 0.3,
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "toolNames": [
+            "finish",
+            "run_bash"
+          ],
+          "messageRoles": [
+            "system",
+            "user",
+            "assistant",
+            "tool"
+          ],
+          "toolResultCallIds": [
+            "stdio_fixture_call_1"
+          ],
+          "bodySha256": "259077278e97543db20a4f205a85f1e520fbf84d25e4a43893298e98146d7958"
+        }
+      ],
+      "toolCalls": [
+        {
+          "callId": "stdio_fixture_call_1",
+          "name": "run_bash",
+          "arguments": {
+            "command": "bun run check"
+          }
+        },
+        {
+          "callId": "stdio_fixture_call_2",
+          "name": "run_bash",
+          "arguments": {
+            "command": "bun run check"
+          }
+        }
+      ],
+      "maxPhysicalModelRequests": 2,
+      "observedPhysicalModelRequests": 2,
+      "isolation": {
+        "network_and_subprocess_denial_active": true,
+        "blocked_operations": [
+          "socket.bind",
+          "socket.create_connection",
+          "socket.create_connection",
+          "socket.create_connection",
+          "socket.create_connection",
+          "subprocess.Popen",
+          "socket.create_connection",
+          "socket.create_connection",
+          "socket.create_connection",
+          "socket.create_connection",
+          "socket.getaddrinfo",
+          "socket.getaddrinfo"
+        ]
+      }
+    }
+  ],
+  "realProviderCalls": 0,
+  "realExecutorCalls": 0,
+  "listenersOpened": 0,
+  "executedAdapterSha256": "ef469cf49b99786ad4c4d16765cd72ea2acd77fe44b937a4929ba911b71183d8",
+  "executedFixtureSha256": "86a173c7e710cd0b8ce7feab82c80fa66217cc1609644152b0c0dc81fb652aa9",
+  "remoteBundleSha256": "02ca47dc98c2cff074318a09a47d90ebe33c2e2edbbbe66aeca4e16679df1c1a"
+}

@@ -13,6 +13,7 @@ import * as skills from "../src/skills.ts";
 import { openDb } from "../src/state/db.ts";
 import { getTicket, upsertTicket } from "../src/state/queries.ts";
 import { recordReviewPass } from "../src/state/review-queries.ts";
+import { SpendLedger } from "../src/spend.ts";
 
 const issue: AssignedIssue = {
   id: "offline-issue", identifier: "FIX-1", title: "Offline handler fixture", description: "Small fixture change",
@@ -365,5 +366,130 @@ describe("CODE handler shared deadline", () => {
     expect(f.run).not.toHaveBeenCalled();
     expect(f.review).not.toHaveBeenCalled();
     expectNoDelivery();
+  });
+});
+
+describe("CODE handler admitted loop dependency", () => {
+  it("routes primary and both fixups through the supplied runner with unchanged contracts", async () => {
+    const admitted = mock<typeof agent.runAgentLoop>(async () => loopResult("finished"));
+    f.deps.runAdmittedAgentLoop = admitted;
+    f.run.mockResolvedValueOnce(checkResult(1)).mockResolvedValue(checkResult());
+    f.review.mockResolvedValueOnce(reviewResult("changes_needed")).mockResolvedValue(reviewResult());
+    expect((await f.invoke({ draftPr: true })).status).toBe("pr_opened");
+    expect(admitted).toHaveBeenCalledTimes(3);
+    expect(f.primary).not.toHaveBeenCalled();
+    expect(f.run).toHaveBeenCalledTimes(3);
+    expect(f.review).toHaveBeenCalledTimes(2);
+    expect(f.openPr.mock.calls[0]?.[0].draft).toBe(true);
+    const calls = admitted.mock.calls.map(([args]) => args);
+    expect(calls[0]!.phases?.map(phase => ({ name: phase.name, maxIter: phase.maxIter }))).toEqual([
+      { name: "investigate", maxIter: 8 }, { name: "implement", maxIter: 20 },
+    ]);
+    expect(calls[1]!.phases).toBeUndefined(); expect(calls[1]!.maxIterations).toBe(15);
+    expect(calls[2]!.phases).toBeUndefined(); expect(calls[2]!.maxIterations).toBe(15);
+    for (const call of calls) {
+      expect(call.glm).toBe(f.deps.glm); expect(call.executor).toBe(calls[0]!.executor);
+      expect(call.deadlineMs).toBe(1_001_000); expect(call.signal).toBe(calls[0]!.signal);
+      expect(call.linear).toBe(f.deps.linear); expect(call.github).toBe(f.deps.github);
+      expect(call.currentIssue).toEqual({ id: issue.id, identifier: issue.identifier, teamId: issue.teamId });
+      expect(call.defaultRepo).toBe("fixture/repo"); expect(call.finishGateCommand).toBe("bun run check");
+      // The seam does not quietly strip unsupported integrations or subagent policy.
+      expect(call.disableSubagent).toBeUndefined();
+    }
+    for (const [review] of f.review.mock.calls) {
+      expect(review.deadlineMs).toBe(calls[0]!.deadlineMs); expect(review.signal).toBe(calls[0]!.signal);
+    }
+  });
+
+  it("leaves the legacy incomplete-with-commits path unchanged when no runner is injected", async () => {
+    f.primary.mockResolvedValueOnce(loopResult("no_finish"));
+    expect((await f.invoke()).status).toBe("pr_opened");
+    expect(f.primary).toHaveBeenCalledTimes(1); expect(f.run).toHaveBeenCalledTimes(1);
+    expect(f.review).toHaveBeenCalledTimes(1); expect(f.push).toHaveBeenCalledTimes(1);
+  });
+
+  it("never falls back to the default runner when the admitted runner throws", async () => {
+    const failure = new Error("Offline admission refused");
+    const admitted = mock<typeof agent.runAgentLoop>(async () => { throw failure; });
+    f.deps.runAdmittedAgentLoop = admitted;
+    await expect(f.invoke()).rejects.toBe(failure);
+    expect(admitted).toHaveBeenCalledTimes(1); expect(f.primary).not.toHaveBeenCalled();
+    expect(f.hasCommits).not.toHaveBeenCalled(); expect(f.run).not.toHaveBeenCalled();
+    expect(f.review).not.toHaveBeenCalled(); expect(f.complete).not.toHaveBeenCalled();
+    expect(f.push).not.toHaveBeenCalled(); expect(f.openPr).not.toHaveBeenCalled();
+    expect(f.db.query("SELECT * FROM prs").all()).toEqual([]);
+  });
+
+  for (const status of ["error", "no_finish", "iteration_cap"] as const) {
+    it(`does not salvage existing commits after an admitted primary ${status}`, async () => {
+      const admitted = mock<typeof agent.runAgentLoop>(async () => loopResult(status));
+      f.deps.runAdmittedAgentLoop = admitted;
+      await expect(f.invoke()).rejects.toThrow(`Admitted code loop did not finish (${status})`);
+      expect(f.primary).not.toHaveBeenCalled(); expect(f.hasCommits).not.toHaveBeenCalled();
+      expect(f.run).not.toHaveBeenCalled(); expect(f.review).not.toHaveBeenCalled();
+      expect(f.complete).not.toHaveBeenCalled(); expect(f.push).not.toHaveBeenCalled(); expect(f.openPr).not.toHaveBeenCalled();
+      expect(f.db.query("SELECT * FROM prs").all()).toEqual([]);
+    });
+
+    it(`does not recheck or publish after an admitted check-fixup ${status}`, async () => {
+      const admitted = mock<typeof agent.runAgentLoop>()
+        .mockResolvedValueOnce(loopResult("finished")).mockResolvedValueOnce(loopResult(status));
+      f.deps.runAdmittedAgentLoop = admitted; f.run.mockResolvedValueOnce(checkResult(1));
+      await expect(f.invoke()).rejects.toThrow(`Admitted code loop did not finish (${status})`);
+      expect(admitted).toHaveBeenCalledTimes(2); expect(f.primary).not.toHaveBeenCalled();
+      expect(f.run).toHaveBeenCalledTimes(1); expect(f.review).not.toHaveBeenCalled();
+      expect(f.complete).not.toHaveBeenCalled(); expect(f.push).not.toHaveBeenCalled(); expect(f.openPr).not.toHaveBeenCalled();
+      expect(f.db.query("SELECT * FROM prs").all()).toEqual([]);
+    });
+
+    it(`does not recheck or publish after an admitted reviewer-fixup ${status}`, async () => {
+      const admitted = mock<typeof agent.runAgentLoop>()
+        .mockResolvedValueOnce(loopResult("finished")).mockResolvedValueOnce(loopResult(status));
+      f.deps.runAdmittedAgentLoop = admitted;
+      f.review.mockResolvedValueOnce(reviewResult("changes_needed"));
+      await expect(f.invoke()).rejects.toThrow(`Admitted code loop did not finish (${status})`);
+      expect(admitted).toHaveBeenCalledTimes(2); expect(f.primary).not.toHaveBeenCalled();
+      expect(f.run).toHaveBeenCalledTimes(1); expect(f.review).toHaveBeenCalledTimes(1);
+      expect(f.complete).not.toHaveBeenCalled(); expect(f.push).not.toHaveBeenCalled(); expect(f.openPr).not.toHaveBeenCalled();
+      expect(f.db.query("SELECT * FROM prs").all()).toEqual([]);
+    });
+  }
+
+  it("retains blocked escalation and never publishes an injected blocked result", async () => {
+    f.deps.runAdmittedAgentLoop = mock<typeof agent.runAgentLoop>(async () => loopResult("blocked", "Offline runtime unavailable"));
+    expect((await f.invoke()).status).toBe("blocked"); expect(f.primary).not.toHaveBeenCalled();
+    expect(f.hasCommits).not.toHaveBeenCalled(); expect(f.review).not.toHaveBeenCalled(); expectNoDelivery();
+  });
+
+  it("keeps the original deadline when an injected result arrives late", async () => {
+    f.deps.runAdmittedAgentLoop = mock<typeof agent.runAgentLoop>(async () => { f.expire(); return loopResult("finished"); });
+    expect((await f.invoke()).status).toBe("timeout"); expect(f.primary).not.toHaveBeenCalled();
+    expect(f.run).not.toHaveBeenCalled(); expect(f.review).not.toHaveBeenCalled(); expectNoDelivery();
+  });
+
+  it("still fails closed when independent review is unavailable after injected success", async () => {
+    const admitted = mock<typeof agent.runAgentLoop>(async () => loopResult("finished"));
+    f.deps.runAdmittedAgentLoop = admitted;
+    scriptReviews([{ kind: "failed", reason: "offline first failure" }, { kind: "failed", reason: "offline second failure" }]);
+    expect((await f.invoke()).status).toBe("review_failed"); expect(admitted).toHaveBeenCalledTimes(1);
+    expect(f.primary).not.toHaveBeenCalled(); expect(f.run).toHaveBeenCalledTimes(1); expect(f.review).toHaveBeenCalledTimes(2);
+    expectNoDelivery();
+  });
+
+  it("preserves the existing publication guard and real ledger after injected success", async () => {
+    const spend = new SpendLedger(":memory:");
+    try {
+      spend.createCampaign("offline-admitted-loop", 5); spend.enrollTicket("offline-admitted-loop", issue.id, 5);
+      f.deps.assertCanPublish = () => {
+        if (spend.status(issue.id)?.state !== "active") throw new Error("spend allocation closed before publication");
+      };
+      f.deps.runAdmittedAgentLoop = mock<typeof agent.runAgentLoop>(async () => {
+        spend.markTerminal(issue.id, "offline_operator_stopped"); return loopResult("finished");
+      });
+      await expect(f.invoke({ draftPr: true })).rejects.toThrow("spend allocation closed before publication");
+      expect(f.primary).not.toHaveBeenCalled(); expect(f.run).toHaveBeenCalledTimes(1); expect(f.review).toHaveBeenCalledTimes(1);
+      expect(f.push).not.toHaveBeenCalled(); expect(f.openPr).not.toHaveBeenCalled();
+      expect(spend.status(issue.id)?.state).toBe("closed"); expect(spend.status(issue.id)?.attemptCount).toBe(0);
+    } finally { spend.close(); }
   });
 });

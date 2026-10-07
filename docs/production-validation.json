@@ -1,0 +1,166 @@
+{
+  "verified_at_utc": "2026-10-07T22:46:10.967949+00:00",
+  "state": "IMPLEMENTED_NATIVE_E2E_VERIFIED_DISABLED",
+  "worktree": "/Users/tanner/Developer/gary-worktrees/hermes-runtime",
+  "branch": "codex/hermes-runtime",
+  "gary_base_revision": "2f56d9f98bd3b0f5bb5d68b916dfcba6df382868",
+  "hermes_revision": "9664e386f67965ec8bec5cf3db9d411f2c2b6cc0",
+  "native_image_digest": "sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab",
+  "readonly_executor_image_digest": "sha256:e77edfc6e20402c7ed9f447dca81dc61e277c2a39199963f455a37a03dfcedf4",
+  "wrapper_sha256": "f1629fa2fcea6ef584010550427c7bdd2af516a28599c173941a3106683739a2",
+  "source_attestation": "sha256:32588b7d59c5914bd094ac9e9ace50b823898b6257f1dced5feaf96e5f09cf26",
+  "validation": {
+    "offline_bun": {
+      "passed": 923,
+      "skipped": 9,
+      "failed": 0,
+      "assertions": 3709,
+      "files": 76,
+      "log": "/Users/tanner/Documents/Codex/2026-10-07/task-4/final-offline-validation.log"
+    },
+    "native_docker": {
+      "passed": 4,
+      "failed": 0,
+      "assertions": 89,
+      "log": "/Users/tanner/Documents/Codex/2026-10-07/task-4/final-native-validation.log",
+      "cases": [
+        "production phase completion with real fixture Git/check/ledger/trace",
+        "full M15+35 exactly50 requests, no extra summary",
+        "parent and read-only child share canonical action/ledger/deadline",
+        "actual filesystem/network/credential/symlink/cancellation containment"
+      ]
+    },
+    "python": {
+      "passed": 71,
+      "failed": 0,
+      "log": "/Users/tanner/Documents/Codex/2026-10-07/task-4/python-worktree-tests.log"
+    },
+    "typecheck": "passed",
+    "diff_check": "passed",
+    "remaining_test_containers": []
+  },
+  "live": {
+    "activated": false,
+    "paid_provider_calls": 0,
+    "live_database_migrated": false,
+    "credentials_changed": false,
+    "docker_settings_changed": false,
+    "new_intake_owner_created": false,
+    "original_checkout_clean": true,
+    "original_checkout_revision": "2f56d9f98bd3b0f5bb5d68b916dfcba6df382868"
+  },
+  "remaining_differences": [
+    "512-message/512KiB strict history cap instead of lossy microcompaction",
+    "single explicitly priced/admitted route; no automatic legacy fallback",
+    "token fields unavailable placeholders; ledger is authoritative",
+    "coding loop only; other Gary handlers and independent reviewer retained"
+  ],
+  "later_decisions": [
+    "Select per-task policies, private trace directory and existing approved host route",
+    "Drain owner, backup canonical state and rehearse crash recovery/rollback before activation",
+    "Explicit owner allocation for any paid canary; available pool is not permission"
+  ],
+  "runtime_source_manifest": [
+    {
+      "path": "hermes/python/gary_runtime.py",
+      "sha256": "f1629fa2fcea6ef584010550427c7bdd2af516a28599c173941a3106683739a2"
+    },
+    {
+      "path": "src/agent/tools.ts",
+      "sha256": "ebc9c087a0c54f034b99d3191b24cb231b4ba5cae197c4d78fbc530b9ae9051f"
+    },
+    {
+      "path": "src/handlers/code.ts",
+      "sha256": "cd96127f169a2c8d1b43b24fc63488ddc42e8c4db31555820280533348278239"
+    },
+    {
+      "path": "src/hermes/audit-trace.ts",
+      "sha256": "ed7e9c0eb6f5387b74ba11e8aac18cf6f8890367d5ebb37bd51607a017e1562e"
+    },
+    {
+      "path": "src/hermes/canonical-admission.ts",
+      "sha256": "c5bfcaf652e8f5e2570da7456efa5eec0dd32641a099b359091035ef75f2702e"
+    },
+    {
+      "path": "src/hermes/container-spec.ts",
+      "sha256": "61c23b71fa3e87368724b867d1f78c909a76b6247216a513f58394b818ccf232"
+    },
+    {
+      "path": "src/hermes/conversation.ts",
+      "sha256": "604b7e4731e05c4e920ee162a5b8a8eb4986cd213c3f3dd925adf363bdfbe0cf"
+    },
+    {
+      "path": "src/hermes/docker-launcher.ts",
+      "sha256": "e945068fc5aadccd4ea739a51bebdf9043e162f4d8425af3773070a6c06aa935"
+    },
+    {
+      "path": "src/hermes/executor-bridge.ts",
+      "sha256": "8c4466fcb43f623b562992cc05602cc38177daad88662da29a160ae31b62b37b"
+    },
+    {
+      "path": "src/hermes/gary-loop-adapter.ts",
+      "sha256": "ccf8f9b24b0cf92705812dd1c075af3fd819c3013ab0804632a646b17350f8fc"
+    },
+    {
+      "path": "src/hermes/model-transport.ts",
+      "sha256": "41f4e243e881a290e5d363aa6a8c665dbe692e583d1db2f93f89e22989ed2915"
+    },
+    {
+      "path": "src/hermes/phase-coordinator.ts",
+      "sha256": "7325e17f61e23a66f1ac10042818a96f530356d2aed4c97ba3215824460b68f7"
+    },
+    {
+      "path": "src/hermes/production-evidence.ts",
+      "sha256": "3aeca9f792bace155c88c5af0ab3bf2ac4ce565a9baa2a8faf6496fe626079b2"
+    },
+    {
+      "path": "src/hermes/production-runtime.ts",
+      "sha256": "b3c08361a5cfd6fa30e56ae55cbdc3c9b362a112ad0e1a50b5a231655f773cec"
+    },
+    {
+      "path": "src/hermes/progress-guard.ts",
+      "sha256": "d0de845c2cf41aa0d3278900c9085e18afc686b92a82db1c770ad6d871293f0f"
+    },
+    {
+      "path": "src/hermes/readonly-child.ts",
+      "sha256": "d71a99f91cda41d3398b85c753922e31b1789ff64e3724c74f539f7e9111fefe"
+    },
+    {
+      "path": "src/hermes/scoped-integrations.ts",
+      "sha256": "4a2136eb6cbff1fef9f72a85ade2971a329448eb7ed963cdc48214bf527fff1e"
+    },
+    {
+      "path": "src/hermes/session-host.ts",
+      "sha256": "27eae68ff1cc768daa982753dc23220d61d24450b27f20ebac0763203e96fade"
+    },
+    {
+      "path": "src/hermes/source-attestation.ts",
+      "sha256": "16cf9af888e1d6a6ab9e688c672dc0fa6ac38a29a8b49d8c5f1a1b107784fdea"
+    },
+    {
+      "path": "src/hermes/stdio-launcher.ts",
+      "sha256": "02f4b3d9e0d16484152c90253c89260e1c1b38230c894d9be21712c63160a554"
+    },
+    {
+      "path": "src/hermes/task-context.ts",
+      "sha256": "1ebed9f94a2306adbe42e4d4009369742e5757fa4589a2b18269f4c40a106d7a"
+    },
+    {
+      "path": "src/loop.ts",
+      "sha256": "0021863650c2a4fd5d5729b06bbb1cd3c07577b696e388e6b07cdf86714196a2"
+    },
+    {
+      "path": "src/safe-fetch.ts",
+      "sha256": "eec77ce647c049c1082b6c77b2142d2644fab3f0e22943e57e043deb18f30d7d"
+    },
+    {
+      "path": "src/skills.ts",
+      "sha256": "981ecf0b632baf068a13d999211cd634738940e775dfc75522cf08f15cd1abb1"
+    },
+    {
+      "path": "src/state/schema.sql",
+      "sha256": "480dddd659c6e90d93b327b5e435737ae10785f6e2eea13f72e1b98d71d1304f"
+    }
+  ],
+  "runtime_source_manifest_sha256": "efbf2fd79512385628a0e4c27527c4a7bba6a0be23b935c4437c0684cb270669"
+}

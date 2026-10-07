@@ -3,7 +3,7 @@ import type { CloudflareClient } from "../adapters/cloudflare.ts";
 import type { GitHubClient } from "../adapters/github.ts";
 import { GLMClient } from "../adapters/glm.ts";
 import type { AssignedIssue, IssueComment, LinearAdapter } from "../adapters/linear.ts";
-import { type PhaseSpec, runAgentLoop, type RunLogEntry } from "../agent/loop.ts";
+import { type AgentLoopArgs, type AgentLoopResult, type PhaseSpec, runAgentLoop, type RunLogEntry } from "../agent/loop.ts";
 import { composeSystemPrompt } from "../agent/prompts.ts";
 import {
   createWorktree,
@@ -18,7 +18,7 @@ import {
 } from "../git.ts";
 import { createWorkspaceExecutor } from "../executors/factory.ts";
 import { bindExecutorDeadline, type Executor } from "../executors/index.ts";
-import { createDeadline, DeadlineExceededError, type DeadlineOptions } from "../deadline.ts";
+import { createDeadline, DeadlineExceededError, throwIfExpired, type DeadlineOptions } from "../deadline.ts";
 import { log } from "../logger.ts";
 import {
   formatProjectContext,
@@ -158,6 +158,8 @@ Examples:
 \`fix(scryfall): split rate limiter into interactive and batch queues (ERT-1610)\`
 \`refactor(delta): audit PlayerStateDelta against PlayerGameState (ERT-1613)\``;
 
+export type AdmittedCodeLoopRunner = typeof runAgentLoop;
+
 export interface CodeHandlerDeps {
   db: DB;
   linear: LinearAdapter;
@@ -168,6 +170,13 @@ export interface CodeHandlerDeps {
   workspacesDir: string;
   agentLoopMaxIterations: number;
   agentLoopTimeoutMs: number;
+  /**
+   * Optional runner supplied by a host that admits each invocation against the
+   * existing owner, executor, ledger and shared deadline. Used for the primary
+   * loop and both fix-up stages. Omission keeps the current runner unchanged.
+   * An injected failure never falls back or publishes partially completed work.
+   */
+  runAdmittedAgentLoop?: AdmittedCodeLoopRunner;
   /** Reviewer pass config — provider order, max rounds, per-round caps. */
   review: ReviewConfig;
   /** Optional run-level guard checked before publishing any branch or PR. */
@@ -195,6 +204,23 @@ export interface CodeHandlerResult {
   prNumber?: number;
   branch: string;
   summary: string | null;
+}
+
+/** The optional seam changes no credentials, providers, intake or publication authority. */
+async function runCodeAgentLoop(deps: CodeHandlerDeps, args: AgentLoopArgs): Promise<AgentLoopResult> {
+  const admitted = deps.runAdmittedAgentLoop;
+  if (admitted) throwIfExpired(args);
+  const result = await (admitted ?? runAgentLoop)(args);
+  if (admitted) {
+    throwIfExpired(args);
+    // The legacy runner may salvage commits after an incomplete loop. A newly
+    // admitted runtime must finish explicitly before checks/review/publication
+    // proceed. Keep blocked/timeout handling in the existing caller branches.
+    if (result.status !== "finished" && result.status !== "blocked" && result.status !== "timeout") {
+      throw new Error(`Admitted code loop did not finish (${result.status})`);
+    }
+  }
+  return result;
 }
 
 export async function runCodeHandler(
@@ -277,7 +303,7 @@ async function runCodeHandlerWithinDeadline(
     ? `${projectSection}\n\n---\n\n${ticketMessage}`
     : ticketMessage;
 
-  const loopResult = await runAgentLoop({
+  const loopResult = await runCodeAgentLoop(deps, {
     glm: deps.glm,
     executor,
     systemPrompt: system,
@@ -650,7 +676,7 @@ async function ensurePostFinishCheckPasses(
   });
 
   const fixupTask = renderCheckFixupTask(first);
-  const fixupResult = await runAgentLoop({
+  const fixupResult = await runCodeAgentLoop(deps, {
     glm: deps.glm,
     executor: ctx.executor,
     systemPrompt: ctx.system,
@@ -962,7 +988,7 @@ async function runReviewLoop(
     const primarySystem = composeSystemPrompt({
       taskInstructions: CODE_TASK_INSTRUCTIONS,
     });
-    const fixup = await runAgentLoop({
+    const fixup = await runCodeAgentLoop(deps, {
       glm: deps.glm,
       executor: ctx.executor,
       systemPrompt: primarySystem,

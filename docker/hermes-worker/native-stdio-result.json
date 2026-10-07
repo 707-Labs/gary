@@ -1,0 +1,851 @@
+{
+  "actualNativeHermes": true,
+  "pinnedRevision": "9664e386f67965ec8bec5cf3db9d411f2c2b6cc0",
+  "transport": "stdio",
+  "passed": true,
+  "scenarios": [
+    {
+      "scenario": "successful_round_trip",
+      "passed": true,
+      "result": {
+        "status": "finished",
+        "publicationApproved": false,
+        "text": "Offline stdio fixture verified.",
+        "taskId": "stdio-fixture-task",
+        "requestId": "stdio-fixture-successful_round_trip",
+        "nativeCompleted": true,
+        "finishSummary": "offline stdio fixture verified",
+        "modelAttempts": 3,
+        "history": [
+          {
+            "role": "user",
+            "content": "Use run_bash to verify the fixture, then finish with a concise summary."
+          },
+          {
+            "role": "assistant",
+            "content": "  Fixture tool request.\n",
+            "tool_calls": [
+              {
+                "id": "stdio_fixture_call_1",
+                "type": "function",
+                "function": {
+                  "arguments": "{\"command\": \"bun run check\"}",
+                  "name": "run_bash"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "  fixture operation acknowledged\n\n",
+            "tool_call_id": "stdio_fixture_call_1",
+            "name": "run_bash"
+          },
+          {
+            "role": "assistant",
+            "content": "  Fixture tool request.\n",
+            "tool_calls": [
+              {
+                "id": "stdio_fixture_call_2",
+                "type": "function",
+                "function": {
+                  "arguments": "{\"summary\": \"offline stdio fixture verified\"}",
+                  "name": "finish"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "  fixture operation acknowledged\n\n",
+            "tool_call_id": "stdio_fixture_call_2",
+            "name": "finish"
+          },
+          {
+            "role": "assistant",
+            "content": "Offline stdio fixture verified."
+          }
+        ]
+      },
+      "childExit": 0,
+      "exactTranscriptVerified": true,
+      "orderedRequests": [
+        {
+          "id": 1,
+          "path": "/v1/chat/completions",
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "authorizationMatched": true
+        },
+        {
+          "id": 2,
+          "path": "/tools/execute",
+          "bodyKeys": [
+            "arguments",
+            "callId",
+            "name",
+            "ownerEpoch",
+            "taskId",
+            "token"
+          ],
+          "authorizationMatched": true,
+          "callId": "stdio_fixture_call_1",
+          "name": "run_bash"
+        },
+        {
+          "id": 3,
+          "path": "/v1/chat/completions",
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "authorizationMatched": true
+        },
+        {
+          "id": 4,
+          "path": "/tools/execute",
+          "bodyKeys": [
+            "arguments",
+            "callId",
+            "name",
+            "ownerEpoch",
+            "taskId",
+            "token"
+          ],
+          "authorizationMatched": true,
+          "callId": "stdio_fixture_call_2",
+          "name": "finish"
+        },
+        {
+          "id": 5,
+          "path": "/v1/chat/completions",
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "authorizationMatched": true
+        },
+        {
+          "id": 6,
+          "path": "/tools/state",
+          "bodyKeys": [
+            "ownerEpoch",
+            "taskId"
+          ],
+          "authorizationMatched": true
+        }
+      ],
+      "modelRequestShapes": [
+        {
+          "model": "deepseek-v4-pro",
+          "max_tokens": 128,
+          "temperature": 0.3,
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "toolNames": [
+            "finish",
+            "run_bash"
+          ],
+          "messageRoles": [
+            "system",
+            "user"
+          ],
+          "toolResultCallIds": [],
+          "bodySha256": "dad23e3e973f1a01ca1bee6b84db1d87a0a0fe513fa9578fd8a5fb30eabc92ea"
+        },
+        {
+          "model": "deepseek-v4-pro",
+          "max_tokens": 128,
+          "temperature": 0.3,
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "toolNames": [
+            "finish",
+            "run_bash"
+          ],
+          "messageRoles": [
+            "system",
+            "user",
+            "assistant",
+            "tool"
+          ],
+          "toolResultCallIds": [
+            "stdio_fixture_call_1"
+          ],
+          "bodySha256": "4279933c06cdfe3da352cafe9ae765b70cf4677f6b6d79ccad630012ff47bc20"
+        },
+        {
+          "model": "deepseek-v4-pro",
+          "max_tokens": 128,
+          "temperature": 0.3,
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "toolNames": [
+            "finish",
+            "run_bash"
+          ],
+          "messageRoles": [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool"
+          ],
+          "toolResultCallIds": [
+            "stdio_fixture_call_1",
+            "stdio_fixture_call_2"
+          ],
+          "bodySha256": "6800384eabdce3e16ac8f0944c2391bbb9219b52b33d70ccb058e7520958438d"
+        }
+      ],
+      "toolCalls": [
+        {
+          "callId": "stdio_fixture_call_1",
+          "name": "run_bash",
+          "arguments": {
+            "command": "bun run check"
+          }
+        },
+        {
+          "callId": "stdio_fixture_call_2",
+          "name": "finish",
+          "arguments": {
+            "summary": "offline stdio fixture verified"
+          }
+        }
+      ],
+      "maxPhysicalModelRequests": 4,
+      "observedPhysicalModelRequests": 3,
+      "isolation": {
+        "mode": "reviewed_container_spec",
+        "network": "none",
+        "rootFilesystem": "read-only",
+        "sourceMounts": false,
+        "credentialMounts": false,
+        "workerEnvironmentInherited": false,
+        "subprocessMonkeypatch": false,
+        "containerName": "gary-hermes-worker-010c351d-301f-48a2-b591-8631e5490fe9"
+      }
+    },
+    {
+      "scenario": "authority_rejected",
+      "passed": true,
+      "result": {
+        "status": "error",
+        "publicationApproved": false,
+        "text": "",
+        "taskId": "stdio-fixture-task",
+        "requestId": "stdio-fixture-authority_rejected",
+        "reason": "rpc_authority_rejected"
+      },
+      "childExit": 1,
+      "exactTranscriptVerified": false,
+      "orderedRequests": [
+        {
+          "id": 1,
+          "path": "/v1/chat/completions",
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "authorizationMatched": true
+        }
+      ],
+      "modelRequestShapes": [
+        {
+          "model": "deepseek-v4-pro",
+          "max_tokens": 128,
+          "temperature": 0.3,
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "toolNames": [
+            "finish",
+            "run_bash"
+          ],
+          "messageRoles": [
+            "system",
+            "user"
+          ],
+          "toolResultCallIds": [],
+          "bodySha256": "4c0d32636db850fc31bb60d94150e039adfccfec9976591150828951c130b1b3"
+        }
+      ],
+      "toolCalls": [],
+      "maxPhysicalModelRequests": 4,
+      "observedPhysicalModelRequests": 1,
+      "isolation": {
+        "mode": "reviewed_container_spec",
+        "network": "none",
+        "rootFilesystem": "read-only",
+        "sourceMounts": false,
+        "credentialMounts": false,
+        "workerEnvironmentInherited": false,
+        "subprocessMonkeypatch": false,
+        "containerName": "gary-hermes-worker-010c351d-301f-48a2-b591-8631e5490fe9"
+      }
+    },
+    {
+      "scenario": "forced_iteration_cap",
+      "passed": true,
+      "result": {
+        "status": "iteration_cap",
+        "publicationApproved": false,
+        "text": "Iteration limit reached; no additional model request was made.",
+        "taskId": "stdio-fixture-task",
+        "requestId": "stdio-fixture-forced_iteration_cap",
+        "nativeCompleted": false,
+        "reason": "model_iteration_limit",
+        "modelAttempts": 2,
+        "history": [
+          {
+            "role": "user",
+            "content": "Use run_bash to verify the fixture, then finish with a concise summary."
+          },
+          {
+            "role": "assistant",
+            "content": "  Fixture tool request.\n",
+            "tool_calls": [
+              {
+                "id": "stdio_fixture_call_1",
+                "type": "function",
+                "function": {
+                  "arguments": "{\"command\": \"bun run check\"}",
+                  "name": "run_bash"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "  fixture operation acknowledged\n\n",
+            "tool_call_id": "stdio_fixture_call_1",
+            "name": "run_bash"
+          },
+          {
+            "role": "assistant",
+            "content": "  Fixture tool request.\n",
+            "tool_calls": [
+              {
+                "id": "stdio_fixture_call_2",
+                "type": "function",
+                "function": {
+                  "arguments": "{\"command\": \"bun run check\"}",
+                  "name": "run_bash"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "  fixture operation acknowledged\n\n",
+            "tool_call_id": "stdio_fixture_call_2",
+            "name": "run_bash"
+          }
+        ]
+      },
+      "childExit": 0,
+      "exactTranscriptVerified": true,
+      "orderedRequests": [
+        {
+          "id": 1,
+          "path": "/v1/chat/completions",
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "authorizationMatched": true
+        },
+        {
+          "id": 2,
+          "path": "/tools/execute",
+          "bodyKeys": [
+            "arguments",
+            "callId",
+            "name",
+            "ownerEpoch",
+            "taskId",
+            "token"
+          ],
+          "authorizationMatched": true,
+          "callId": "stdio_fixture_call_1",
+          "name": "run_bash"
+        },
+        {
+          "id": 3,
+          "path": "/v1/chat/completions",
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "authorizationMatched": true
+        },
+        {
+          "id": 4,
+          "path": "/tools/execute",
+          "bodyKeys": [
+            "arguments",
+            "callId",
+            "name",
+            "ownerEpoch",
+            "taskId",
+            "token"
+          ],
+          "authorizationMatched": true,
+          "callId": "stdio_fixture_call_2",
+          "name": "run_bash"
+        },
+        {
+          "id": 5,
+          "path": "/tools/state",
+          "bodyKeys": [
+            "ownerEpoch",
+            "taskId"
+          ],
+          "authorizationMatched": true
+        }
+      ],
+      "modelRequestShapes": [
+        {
+          "model": "deepseek-v4-pro",
+          "max_tokens": 128,
+          "temperature": 0.3,
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "toolNames": [
+            "finish",
+            "run_bash"
+          ],
+          "messageRoles": [
+            "system",
+            "user"
+          ],
+          "toolResultCallIds": [],
+          "bodySha256": "4910208fef4fce84d4fddc35cdbdfe923014dc3ade0c243921c75b0fb7a31177"
+        },
+        {
+          "model": "deepseek-v4-pro",
+          "max_tokens": 128,
+          "temperature": 0.3,
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "toolNames": [
+            "finish",
+            "run_bash"
+          ],
+          "messageRoles": [
+            "system",
+            "user",
+            "assistant",
+            "tool"
+          ],
+          "toolResultCallIds": [
+            "stdio_fixture_call_1"
+          ],
+          "bodySha256": "8bd9a6e60d9a20ca7417b090c409214aa155f401ed5796e13811d91da2adcf18"
+        }
+      ],
+      "toolCalls": [
+        {
+          "callId": "stdio_fixture_call_1",
+          "name": "run_bash",
+          "arguments": {
+            "command": "bun run check"
+          }
+        },
+        {
+          "callId": "stdio_fixture_call_2",
+          "name": "run_bash",
+          "arguments": {
+            "command": "bun run check"
+          }
+        }
+      ],
+      "maxPhysicalModelRequests": 2,
+      "observedPhysicalModelRequests": 2,
+      "isolation": {
+        "mode": "reviewed_container_spec",
+        "network": "none",
+        "rootFilesystem": "read-only",
+        "sourceMounts": false,
+        "credentialMounts": false,
+        "workerEnvironmentInherited": false,
+        "subprocessMonkeypatch": false,
+        "containerName": "gary-hermes-worker-010c351d-301f-48a2-b591-8631e5490fe9"
+      }
+    },
+    {
+      "scenario": "history_continuation",
+      "passed": true,
+      "result": {
+        "status": "finished",
+        "publicationApproved": false,
+        "text": "Offline stdio fixture verified.",
+        "taskId": "stdio-fixture-task",
+        "requestId": "stdio-fixture-history_continuation",
+        "nativeCompleted": true,
+        "finishSummary": "offline stdio fixture verified",
+        "modelAttempts": 3,
+        "history": [
+          {
+            "role": "user",
+            "content": "Use run_bash to verify the fixture, then finish with a concise summary."
+          },
+          {
+            "role": "assistant",
+            "content": "  Fixture tool request.\n",
+            "tool_calls": [
+              {
+                "id": "stdio_fixture_call_1",
+                "type": "function",
+                "function": {
+                  "arguments": "{\"command\": \"bun run check\"}",
+                  "name": "run_bash"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "  fixture operation acknowledged\n\n",
+            "tool_call_id": "stdio_fixture_call_1",
+            "name": "run_bash"
+          },
+          {
+            "role": "assistant",
+            "content": "  Fixture tool request.\n",
+            "tool_calls": [
+              {
+                "id": "stdio_fixture_call_2",
+                "type": "function",
+                "function": {
+                  "arguments": "{\"command\": \"bun run check\"}",
+                  "name": "run_bash"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "  fixture operation acknowledged\n\n",
+            "tool_call_id": "stdio_fixture_call_2",
+            "name": "run_bash"
+          },
+          {
+            "role": "user",
+            "content": "Continue implementation using the previous phase's verified tool observations."
+          },
+          {
+            "role": "assistant",
+            "content": "  Fixture tool request.\n",
+            "tool_calls": [
+              {
+                "id": "stdio_continuation_call_1",
+                "type": "function",
+                "function": {
+                  "arguments": "{\"command\": \"bun run check\"}",
+                  "name": "run_bash"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "  fixture operation acknowledged\n\n",
+            "tool_call_id": "stdio_continuation_call_1",
+            "name": "run_bash"
+          },
+          {
+            "role": "assistant",
+            "content": "  Fixture tool request.\n",
+            "tool_calls": [
+              {
+                "id": "stdio_continuation_call_2",
+                "type": "function",
+                "function": {
+                  "arguments": "{\"summary\": \"offline stdio fixture verified\"}",
+                  "name": "finish"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "  fixture operation acknowledged\n\n",
+            "tool_call_id": "stdio_continuation_call_2",
+            "name": "finish"
+          },
+          {
+            "role": "assistant",
+            "content": "Offline stdio fixture verified."
+          }
+        ]
+      },
+      "childExit": 0,
+      "exactTranscriptVerified": true,
+      "orderedRequests": [
+        {
+          "id": 1,
+          "path": "/v1/chat/completions",
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "authorizationMatched": true
+        },
+        {
+          "id": 2,
+          "path": "/tools/execute",
+          "bodyKeys": [
+            "arguments",
+            "callId",
+            "name",
+            "ownerEpoch",
+            "taskId",
+            "token"
+          ],
+          "authorizationMatched": true,
+          "callId": "stdio_continuation_call_1",
+          "name": "run_bash"
+        },
+        {
+          "id": 3,
+          "path": "/v1/chat/completions",
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "authorizationMatched": true
+        },
+        {
+          "id": 4,
+          "path": "/tools/execute",
+          "bodyKeys": [
+            "arguments",
+            "callId",
+            "name",
+            "ownerEpoch",
+            "taskId",
+            "token"
+          ],
+          "authorizationMatched": true,
+          "callId": "stdio_continuation_call_2",
+          "name": "finish"
+        },
+        {
+          "id": 5,
+          "path": "/v1/chat/completions",
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "authorizationMatched": true
+        },
+        {
+          "id": 6,
+          "path": "/tools/state",
+          "bodyKeys": [
+            "ownerEpoch",
+            "taskId"
+          ],
+          "authorizationMatched": true
+        }
+      ],
+      "modelRequestShapes": [
+        {
+          "model": "deepseek-v4-pro",
+          "max_tokens": 128,
+          "temperature": 0.3,
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "toolNames": [
+            "finish",
+            "run_bash"
+          ],
+          "messageRoles": [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+            "user"
+          ],
+          "toolResultCallIds": [
+            "stdio_fixture_call_1",
+            "stdio_fixture_call_2"
+          ],
+          "bodySha256": "7622855f195ca7ca49a8d67c33786380ff9f52879ef1982afbca99c90d35cd11"
+        },
+        {
+          "model": "deepseek-v4-pro",
+          "max_tokens": 128,
+          "temperature": 0.3,
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "toolNames": [
+            "finish",
+            "run_bash"
+          ],
+          "messageRoles": [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+            "user",
+            "assistant",
+            "tool"
+          ],
+          "toolResultCallIds": [
+            "stdio_fixture_call_1",
+            "stdio_fixture_call_2",
+            "stdio_continuation_call_1"
+          ],
+          "bodySha256": "d4d04bfeb1459257a2679dffec6fd75e60ad6a8a9d067ad8c4c0d686decf66bc"
+        },
+        {
+          "model": "deepseek-v4-pro",
+          "max_tokens": 128,
+          "temperature": 0.3,
+          "bodyKeys": [
+            "max_tokens",
+            "messages",
+            "model",
+            "temperature",
+            "tools"
+          ],
+          "toolNames": [
+            "finish",
+            "run_bash"
+          ],
+          "messageRoles": [
+            "system",
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool"
+          ],
+          "toolResultCallIds": [
+            "stdio_fixture_call_1",
+            "stdio_fixture_call_2",
+            "stdio_continuation_call_1",
+            "stdio_continuation_call_2"
+          ],
+          "bodySha256": "783ebb7ae80becbfa45a48bd6d1fbbd4204926fbdc241a623ddb637601f0c49b"
+        }
+      ],
+      "toolCalls": [
+        {
+          "callId": "stdio_continuation_call_1",
+          "name": "run_bash",
+          "arguments": {
+            "command": "bun run check"
+          }
+        },
+        {
+          "callId": "stdio_continuation_call_2",
+          "name": "finish",
+          "arguments": {
+            "summary": "offline stdio fixture verified"
+          }
+        }
+      ],
+      "maxPhysicalModelRequests": 4,
+      "observedPhysicalModelRequests": 3,
+      "isolation": {
+        "mode": "reviewed_container_spec",
+        "network": "none",
+        "rootFilesystem": "read-only",
+        "sourceMounts": false,
+        "credentialMounts": false,
+        "workerEnvironmentInherited": false,
+        "subprocessMonkeypatch": false,
+        "containerName": "gary-hermes-worker-010c351d-301f-48a2-b591-8631e5490fe9"
+      }
+    }
+  ],
+  "realProviderCalls": 0,
+  "realExecutorCalls": 0,
+  "listenersOpened": null,
+  "imageDigest": "sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab",
+  "wrapperSha256": "f1629fa2fcea6ef584010550427c7bdd2af516a28599c173941a3106683739a2",
+  "fixtureSha256": "bd30ac9deedea60f3cc33d7d4b29a5e1c929b116901f2d8f3140423fe090294d",
+  "scope": "standalone native protocol; combined host E2E recorded separately"
+}

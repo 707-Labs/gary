@@ -1,0 +1,61 @@
+{
+  "allContainersAbsentAfterCleanup": true,
+  "freshTmpfsOnSecondRun": true,
+  "imageDigest": "sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab",
+  "passed": true,
+  "realProviderCalls": 0,
+  "scenarios": [
+    {
+      "capEff": 0,
+      "childExit": 0,
+      "cleanupAfterInterrupt": false,
+      "containerName": "gary-hermes-worker-f50f8e03-3e3d-4d6c-8d6e-a3e08177a7c4",
+      "egressError": 101,
+      "envKeys": [
+        "HOME",
+        "LC_CTYPE",
+        "PATH"
+      ],
+      "hostPathsAbsent": true,
+      "noNewPrivileges": true,
+      "rootWriteErrors": {
+        "/etc/gary-probe": 30,
+        "/opt/gary-hermes-runtime/python/gary_runtime.py": 13,
+        "/workspace/gary-probe": 2
+      },
+      "seccomp": 2,
+      "tmpNoexec": true,
+      "tmpWritable": true,
+      "uid": 65532
+    },
+    {
+      "capEff": 0,
+      "childExit": 0,
+      "cleanupAfterInterrupt": false,
+      "containerName": "gary-hermes-worker-126624b3-98d6-4c38-a571-ba58729eafd3",
+      "egressError": 101,
+      "envKeys": [
+        "HOME",
+        "LC_CTYPE",
+        "PATH"
+      ],
+      "hostPathsAbsent": true,
+      "noNewPrivileges": true,
+      "rootWriteErrors": {
+        "/etc/gary-probe": 30,
+        "/opt/gary-hermes-runtime/python/gary_runtime.py": 13,
+        "/workspace/gary-probe": 2
+      },
+      "seccomp": 2,
+      "tmpNoexec": true,
+      "tmpWritable": true,
+      "uid": 65532
+    },
+    {
+      "childExit": 143,
+      "cleanupAfterInterrupt": true,
+      "containerName": "gary-hermes-worker-dd39188e-3e13-4016-bc03-f0739eca463b",
+      "ready": true
+    }
+  ]
+}

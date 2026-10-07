@@ -13,7 +13,8 @@ import { runAnswerHandler } from "./handlers/answer.ts";
 import { runWaitForBlocker } from "./handlers/blocked.ts";
 import { runBounceHandler } from "./handlers/bounce.ts";
 import { runCiFailureHandler } from "./handlers/ci-failure.ts";
-import { runCodeHandler } from "./handlers/code.ts";
+import { runCodeHandler, type AdmittedCodeLoopRunner } from "./handlers/code.ts";
+import { bindCanonicalCodeAction, type CodeActionAdmission } from "./hermes/canonical-admission.ts";
 import { runNudgeReviewer } from "./handlers/nudge-reviewer.ts";
 import { runPickupHandler } from "./handlers/pickup.ts";
 import { runPrReviewHandler } from "./handlers/pr-review.ts";
@@ -62,6 +63,8 @@ export interface LoopDeps {
   db: DB;
   /** Production intake requires a funded, explicitly enrolled ticket. */
   spend?: SpendLedger;
+  /** Optional migration runner. Omitted keeps existing production behavior. */
+  createAdmittedCodeLoop?: (admission: CodeActionAdmission) => AdmittedCodeLoopRunner;
   linear: LinearAdapter;
   github: GitHubClient;
   glm: GLMClient;
@@ -315,11 +318,19 @@ async function runOne(
   // Each parallel slot needs its own glm so 429-driven primary swaps don't
   // bleed across slots. Everything else in deps is shared (DB, adapters).
   const slotDeps: LoopDeps = { ...deps, glm };
+  let codeBinding: ReturnType<typeof bindCanonicalCodeAction> | undefined;
 
   try {
+    let codeLoop: AdmittedCodeLoopRunner | undefined;
+    if (action.type === "start_coding" && deps.createAdmittedCodeLoop) {
+      if (!deps.spend) throw new Error("Hermes requires the canonical spending ledger");
+      codeBinding = bindCanonicalCodeAction({ db:deps.db, ledger:deps.spend, actionId,
+        fingerprint:fp, issue:action.issue, provider, model, repo:deps.repoMap.get(action.issue.teamKey) ?? "" });
+      codeLoop = deps.createAdmittedCodeLoop(codeBinding.admission);
+    }
     const result = deps.spend
-      ? await deps.spend.withSpendScope(action.issue.id, () => dispatch(slotDeps, action))
-      : await dispatch(slotDeps, action);
+      ? await deps.spend.withSpendScope(action.issue.id, () => dispatch(slotDeps, action, codeLoop, codeBinding?.admission.assertActive))
+      : await dispatch(slotDeps, action, codeLoop, codeBinding?.admission.assertActive);
     // A completed call may leave less than the next reservation requires.
     // That alone must not relabel successful work or prevent publication.
     const exhausted = deps.spend && deps.spend.status(action.issue.id)?.state !== "active";
@@ -381,6 +392,8 @@ async function runOne(
       errorMessage: message,
     });
     return action.type;
+  } finally {
+    codeBinding?.close();
   }
 }
 
@@ -521,13 +534,13 @@ function reopenTicket(
   clearTerminalState(db, issue.id);
 }
 
-async function dispatch(deps: LoopDeps, action: CandidateAction): Promise<ActionOutcome | void> {
+async function dispatch(deps: LoopDeps, action: CandidateAction, codeLoop?: AdmittedCodeLoopRunner, assertCodeAction?: () => void): Promise<ActionOutcome | void> {
   switch (action.type) {
     case "classify":
       await runClassify(deps, action);
       return;
     case "start_coding":
-      return runStartCoding(deps, action);
+      return runStartCoding(deps, action, codeLoop, assertCodeAction);
     case "wait_for_blocker":
       await runWaitForBlocker(
         { db: deps.db, linear: deps.linear },
@@ -739,6 +752,8 @@ async function runFixCiFailure(
 async function runStartCoding(
   deps: LoopDeps,
   action: CandidateAction,
+  codeLoop?: AdmittedCodeLoopRunner,
+  assertCodeAction?: () => void,
 ): Promise<ActionOutcome> {
   const issue = action.issue;
   const repo = deps.repoMap.get(issue.teamKey);
@@ -767,7 +782,9 @@ async function runStartCoding(
       agentLoopMaxIterations: deps.agentLoopMaxIterations,
       agentLoopTimeoutMs: deps.agentLoopTimeoutMs,
       review: deps.review,
+      ...(codeLoop ? { runAdmittedAgentLoop: codeLoop } : {}),
       ...publicationGuard(deps, issue.id),
+      ...(assertCodeAction ? {assertCanPublish:()=>{assertCodeAction();publicationGuard(deps,issue.id).assertCanPublish?.();}} : {}),
     },
     { issue, comments, repo, scope, draftPr: deps.spend?.status(issue.id)?.draftPr ?? false },
   );

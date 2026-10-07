@@ -106,3 +106,10 @@ CREATE TABLE IF NOT EXISTS review_passes (
 
 CREATE INDEX IF NOT EXISTS idx_review_passes_issue ON review_passes(issue_id);
 CREATE INDEX IF NOT EXISTS idx_review_passes_verdict ON review_passes(verdict, created_at);
+
+-- Optional Hermes runtime ownership. One immutable owner per admitted action.
+-- A crashed action is never reclaimed; the existing dispatcher must admit a new action.
+CREATE TABLE IF NOT EXISTS hermes_action_owners (
+  action_id INTEGER PRIMARY KEY REFERENCES actions(id),
+  owner_epoch TEXT NOT NULL
+);

@@ -1,0 +1,9 @@
+{
+  "archiveSha256": "9551e0c2ea7c6feaea6d03362fb1344af7742bfb4980397bcfecffcdf2f427fb",
+  "caseCollisionPreserved": true,
+  "digest": "sha256:32588b7d59c5914bd094ac9e9ace50b823898b6257f1dced5feaf96e5f09cf26",
+  "files": 9645,
+  "scope": "gary-hermes-wrapper-and-archive-v1",
+  "status": "review-only-unapproved",
+  "wrapperSha256": "f1629fa2fcea6ef584010550427c7bdd2af516a28599c173941a3106683739a2"
+}
