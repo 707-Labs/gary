@@ -101,11 +101,14 @@ PY`);
       const executor = bindExecutorDeadline(new DockerExecutor(workspace, { image: image! }), budget);
       await executor.writeFile("runtime-probe/package.json", JSON.stringify({ scripts: { probe: "runtime-probe" } }));
       await executor.writeFile("runtime-probe/node_modules/.bin/runtime-probe", `#!/usr/bin/env node
-console.log(JSON.stringify({ node: process.versions.node, bun: process.versions.bun ?? null }));
+console.log(JSON.stringify({ node: process.versions.node, bun: process.versions.bun ?? null, heapLimit: require("node:v8").getHeapStatistics().heap_size_limit }));
 `);
       const result = await executor.run("chmod +x node_modules/.bin/runtime-probe && bun run probe", { cwd: "runtime-probe" });
       expectCommandSucceeded(result);
-      expect(JSON.parse(result.stdout.trim())).toEqual({ node: "24.21.0", bun: null });
+      const runtime = JSON.parse(result.stdout.trim());
+      expect(runtime).toMatchObject({ node: "24.21.0", bun: null });
+      expect(runtime.heapLimit).toBeGreaterThanOrEqual(8 * 1024 ** 3);
+      expect(runtime.heapLimit).toBeLessThan(9 * 1024 ** 3);
     } finally {
       budget.dispose();
     }

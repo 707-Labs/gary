@@ -38,6 +38,10 @@ RUN groupadd --gid 10001 gary \
     && mkdir -p /source /workspace \
     && chown gary:gary /source /workspace
 
+# Mulligan's Svelte/TypeScript checks exceed Node's default ~2 GiB heap. This
+# stays within the executor's existing 12 GiB cgroup memory cap.
+ENV NODE_OPTIONS=--max-old-space-size=8192
+
 USER gary
 WORKDIR /workspace
 CMD ["bash"]
