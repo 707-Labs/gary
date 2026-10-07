@@ -7,6 +7,7 @@ import { tick, type LoopDeps } from "../src/loop.ts";
 import { AllProvidersExhaustedError, createProvider, createProviderChain } from "../src/providers.ts";
 import { openDb, type DB } from "../src/state/db.ts";
 import { getRevisitMark, getTicket, setClassification, setTerminalState, upsertTicket } from "../src/state/queries.ts";
+import { openSpendLedger, spendReservationMicros, type SpendLedger } from "../src/spend.ts";
 
 const issue: AssignedIssue = {
   id: "issue-1", identifier: "ERT-1", title: "Offline fixture", description: "A fixed description",
@@ -18,6 +19,7 @@ const issue: AssignedIssue = {
 let db: DB;
 let deps: LoopDeps;
 let coding: ReturnType<typeof spyOn<typeof codeHandler, "runCodeHandler">>;
+let spend: SpendLedger | undefined;
 
 beforeEach(() => {
   db = openDb(":memory:");
@@ -50,7 +52,79 @@ beforeEach(() => {
 
 afterEach(() => {
   coding.mockRestore();
+  spend?.close();
+  spend = undefined;
   db.close();
+});
+
+describe("bounded ticket dispatch", () => {
+  function enroll(cap = 3): SpendLedger {
+    spend = openSpendLedger(":memory:");
+    spend.createCampaign("offline", cap);
+    spend.enrollTicket("offline", issue.id, cap, { draftPr: true });
+    deps.spend = spend;
+    return spend;
+  }
+
+  function unknownFetch(ledger: SpendLedger): () => Promise<Response> {
+    const guarded = ledger.guardedFetch("z.ai", (async () => new Response("{}", { status: 200 })) as unknown as typeof fetch);
+    return () => guarded("https://api.z.ai/api/anthropic/v1/messages", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "glm-5.3", max_tokens: 8192, messages: [{ role: "user", content: "offline" }] }),
+    });
+  }
+
+  it("does not dispatch an unenrolled ticket", async () => {
+    spend = openSpendLedger(":memory:");
+    deps.spend = spend;
+    expect((await tick(deps)).actionsTaken).toEqual([]);
+    expect(coding).not.toHaveBeenCalled();
+    expect(actionRows()).toHaveLength(0);
+  });
+
+  it("inherits ticket scope and permits draft publication after the last affordable call", async () => {
+    const ledger = enroll(spendReservationMicros("z.ai") / 1_000_000);
+    const request = unknownFetch(ledger);
+    coding.mockImplementation(async (handlerDeps, args) => {
+      expect(args.draftPr).toBe(true);
+      await request();
+      expect(ledger.canDispatch(issue.id)).toBe(false);
+      expect(ledger.status(issue.id)?.state).toBe("active");
+      expect(() => handlerDeps.assertCanPublish!()).not.toThrow();
+      return { status: "pr_opened", branch: "fixture", summary: "offline" };
+    });
+    await tick(deps);
+    expect(actionRows()[0]?.outcome).toBe("pr_opened");
+    expect(ledger.status(issue.id)?.attemptCount).toBe(1);
+    expect(ledger.status(issue.id)?.terminalReason).toBe("pr_opened");
+    await tick(deps);
+    expect(coding).toHaveBeenCalledTimes(1);
+  });
+
+  it("records exhausted reservations even when a handler converts the error to a result", async () => {
+    const ledger = enroll(spendReservationMicros("z.ai") / 1_000_000);
+    const request = unknownFetch(ledger);
+    coding.mockImplementation(async (handlerDeps) => {
+      await request();
+      await expect(request()).rejects.toThrow("allocation exhausted");
+      expect(() => handlerDeps.assertCanPublish!()).toThrow("closed before publication");
+      return { status: "agent_failed", branch: "fixture", summary: "offline" };
+    });
+    await tick(deps);
+    expect(actionRows()[0]?.outcome).toBe("budget_exhausted");
+    expect(ledger.status(issue.id)?.attemptCount).toBe(1);
+    await tick(deps);
+    expect(coding).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps terminal coding failures closed across subsequent polls", async () => {
+    const ledger = enroll();
+    coding.mockResolvedValue({ status: "check_failed", branch: "fixture", summary: "offline" });
+    await tick(deps);
+    expect(ledger.status(issue.id)?.terminalReason).toBe("check_failed");
+    await tick(deps);
+    expect(coding).toHaveBeenCalledTimes(1);
+  });
 });
 
 function actionRows(): Array<{ success: number; outcome: string; error_message: string | null }> {

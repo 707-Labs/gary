@@ -66,6 +66,8 @@ export interface PrReviewHandlerDeps {
   workspacesDir: string;
   agentLoopMaxIterations: number;
   agentLoopTimeoutMs: number;
+  /** Optional run-level guard checked before publishing a fix or reply. */
+  assertCanPublish?: () => void;
 }
 
 export interface PrReviewHandlerArgs {
@@ -196,6 +198,7 @@ export async function runPrReviewHandler(
 
   if (pushed) {
     const freshUrl = await deps.github.cloneUrl(owner, name);
+    deps.assertCanPublish?.();
     await pushBranch({
       worktreePath,
       freshTokenUrl: freshUrl,
@@ -204,6 +207,7 @@ export async function runPrReviewHandler(
   }
 
   // Always post the agent's reply on the PR.
+  deps.assertCanPublish?.();
   try {
     await deps.github.comment(owner, name, args.prNumber, loopResult.summary);
   } catch (err) {

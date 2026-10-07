@@ -170,6 +170,8 @@ export interface CodeHandlerDeps {
   agentLoopTimeoutMs: number;
   /** Reviewer pass config — provider order, max rounds, per-round caps. */
   review: ReviewConfig;
+  /** Optional run-level guard checked before publishing any branch or PR. */
+  assertCanPublish?: () => void;
 }
 
 export interface CodeHandlerArgs {
@@ -183,6 +185,8 @@ export interface CodeHandlerArgs {
    * without scope info default to M.
    */
   scope?: "S" | "M" | "L";
+  /** Publish this ticket's PR as a draft; existing intake defaults to ready. */
+  draftPr?: boolean;
 }
 
 export interface CodeHandlerResult {
@@ -442,8 +446,10 @@ async function runCodeHandlerWithinDeadline(
   });
 
   budget.throwIfExpired();
+  deps.assertCanPublish?.();
   await pushBranch({ worktreePath, freshTokenUrl: freshUrlForPush, branch, deadlineMs: budget.deadlineMs, signal: budget.signal });
   budget.throwIfExpired();
+  deps.assertCanPublish?.();
   const pr = await deps.github.openPullRequest({
     owner,
     repo: name,
@@ -451,7 +457,7 @@ async function runCodeHandlerWithinDeadline(
     base: BASE_BRANCH,
     title: prTitle,
     body: prBody,
-    draft: false,
+    draft: args.draftPr ?? false,
   });
 
   recordPr(deps.db, {

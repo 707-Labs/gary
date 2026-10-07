@@ -119,6 +119,7 @@ export type ActionOutcome =
   | "review_failed"
   | "escalated"
   | "rate_limited"
+  | "budget_exhausted"
   | "error";
 
 export function recordActionEnd(

@@ -10,6 +10,8 @@ import { runLoop } from "./loop.ts";
 import { createProvider, createProviderChain } from "./providers.ts";
 import { closeDb, openDb } from "./state/db.ts";
 import { recordEvent } from "./state/queries.ts";
+import { openSpendLedger } from "./spend.ts";
+import { resolve } from "node:path";
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -20,11 +22,16 @@ async function main(): Promise<void> {
   mkdirSync(cfg.gary.workspacesDir, { recursive: true });
 
   const db = openDb(cfg.gary.dbPath);
+  const spend = openSpendLedger(resolve(cfg.gary.stateDir, "spend.db"));
   recordEvent(db, { eventType: "boot", payload: { version: "0.0.1" } });
 
   const linear = new LinearAdapter({ gary: cfg.gary, linear: cfg.linear });
   const github = makeGitHubClient(cfg.github);
-  const chain = createProviderChain(cfg.providers.map((p) => createProvider(p)));
+  // This bounded campaign uses the existing, priced DeepSeek API balance.
+  // Z.ai plan eligibility for Gary and Kimi Extra Usage pricing are unverified;
+  // neither is silently treated as subscription-covered or a paid fallback.
+  const chain = createProviderChain(cfg.providers.filter((p) => p.name === "deepseek")
+    .map((p) => createProvider(p, { fetch: spend.guardedFetch(p.name) })));
   const glm = new GLMClient(chain);
   const cloudflare = cfg.cloudflare ? new CloudflareClient(cfg.cloudflare) : null;
 
@@ -50,6 +57,7 @@ async function main(): Promise<void> {
 
   await runLoop({
     db,
+    spend,
     linear,
     github,
     glm,
@@ -70,6 +78,7 @@ async function main(): Promise<void> {
   });
 
   closeDb(db);
+  spend.close();
 }
 
 main().catch((err) => {

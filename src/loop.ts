@@ -37,6 +37,7 @@ import {
   PR_COMMENT_SIGNATURE_EMPTY,
 } from "./state-fingerprint.ts";
 import type { DB } from "./state/db.ts";
+import type { SpendLedger } from "./spend.ts";
 import {
   clearClassification,
   clearTerminalState,
@@ -59,6 +60,8 @@ import {
 
 export interface LoopDeps {
   db: DB;
+  /** Production intake requires a funded, explicitly enrolled ticket. */
+  spend?: SpendLedger;
   linear: LinearAdapter;
   github: GitHubClient;
   glm: GLMClient;
@@ -125,6 +128,7 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
   const candidates: CandidateAction[] = [];
   for (const issue of issues) {
     upsertTicket(deps.db, { linearId: issue.id, identifier: issue.identifier });
+    if (deps.spend && !deps.spend.canDispatch(issue.id)) continue;
 
     let ticketRow = getTicket(deps.db, issue.id);
     if (ticketRow?.terminal_state) {
@@ -289,6 +293,8 @@ async function runOne(
   glm: GLMClient,
   slot: number,
 ): Promise<string | null> {
+  // Recheck admission immediately before dispatch, after async state reads.
+  if (deps.spend && !deps.spend.canDispatch(action.issue.id)) return null;
   const fp = fingerprintDerivedState(action.state);
   const primary = glm.chain.providers[0]!;
   const provider = primary.name;
@@ -311,10 +317,19 @@ async function runOne(
   const slotDeps: LoopDeps = { ...deps, glm };
 
   try {
-    const outcome = (await dispatch(slotDeps, action)) ?? "handled";
+    const result = deps.spend
+      ? await deps.spend.withSpendScope(action.issue.id, () => dispatch(slotDeps, action))
+      : await dispatch(slotDeps, action);
+    // A completed call may leave less than the next reservation requires.
+    // That alone must not relabel successful work or prevent publication.
+    const exhausted = deps.spend && deps.spend.status(action.issue.id)?.state !== "active";
+    const outcome = result === "pr_opened" ? result : exhausted ? "budget_exhausted" : result ?? "handled";
     // Keep normal handled outcomes cached, including escalations. The
     // independent outcome field is the delivery metric, not success=1.
     recordActionEnd(deps.db, { id: actionId, success: true, outcome });
+    if (deps.spend && outcome !== "handled") {
+      deps.spend.markTerminal(action.issue.id, outcome);
+    }
     log.info("action complete", {
       action: action.type,
       issue: action.issue.identifier,
@@ -325,6 +340,12 @@ async function runOne(
     return action.type;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    if (deps.spend && deps.spend.status(action.issue.id)?.state !== "active") {
+      deps.spend.markTerminal(action.issue.id, "budget_exhausted");
+      recordActionEnd(deps.db, { id: actionId, success: false, outcome: "budget_exhausted", errorMessage: "spend allocation unavailable; no further paid attempts allowed" });
+      recordEvent(deps.db, { eventType: "budget_exhausted", ticketLinearId: action.issue.id });
+      return action.type;
+    }
     if (err instanceof AllProvidersExhaustedError) {
       log.warn("action paused; all providers armed", {
         action: action.type,
@@ -405,6 +426,7 @@ async function collectMentionCandidates(
   stats.mentionOnly = mentionOnly.length;
 
   for (const issue of mentionOnly) {
+    if (deps.spend && !deps.spend.canDispatch(issue.id)) continue;
     upsertTicket(deps.db, { linearId: issue.id, identifier: issue.identifier });
     const ticketRow = getTicket(deps.db, issue.id);
     if (ticketRow?.terminal_state) continue;
@@ -577,6 +599,13 @@ function firstName(full: string | null): string | null {
   return first ? first.toLowerCase() : null;
 }
 
+function publicationGuard(deps: LoopDeps, ticketId: string): { assertCanPublish?: () => void } {
+  const spend = deps.spend;
+  return spend ? { assertCanPublish: () => {
+    if (spend.status(ticketId)?.state !== "active") throw new Error("spend allocation closed before publication");
+  } } : {};
+}
+
 async function runRespondToPrReview(
   deps: LoopDeps,
   action: CandidateAction,
@@ -593,6 +622,7 @@ async function runRespondToPrReview(
   }
   await runPrReviewHandler(
     {
+      ...publicationGuard(deps, issue.id),
       db: deps.db,
       linear: deps.linear,
       github: deps.github,
@@ -654,6 +684,7 @@ async function runWriteAnswer(
   const comments = await deps.linear.fetchComments(issue.id);
   await runAnswerHandler(
     {
+      ...publicationGuard(deps, issue.id),
       linear: deps.linear,
       github: deps.github,
       glm: deps.glm,
@@ -683,6 +714,7 @@ async function runFixCiFailure(
   }
   await runCiFailureHandler(
     {
+      ...publicationGuard(deps, issue.id),
       db: deps.db,
       linear: deps.linear,
       github: deps.github,
@@ -735,8 +767,9 @@ async function runStartCoding(
       agentLoopMaxIterations: deps.agentLoopMaxIterations,
       agentLoopTimeoutMs: deps.agentLoopTimeoutMs,
       review: deps.review,
+      ...publicationGuard(deps, issue.id),
     },
-    { issue, comments, repo, scope },
+    { issue, comments, repo, scope, draftPr: deps.spend?.status(issue.id)?.draftPr ?? false },
   );
   // Mark this signature as the last input Gary acted on. Subsequent comments
   // bump the signature and revisit_code fires; without comments it stays

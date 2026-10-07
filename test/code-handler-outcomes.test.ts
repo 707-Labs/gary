@@ -6,7 +6,7 @@ import * as agent from "../src/agent/loop.ts";
 import * as executorFactory from "../src/executors/factory.ts";
 import type { ExecResult, Executor } from "../src/executors/index.ts";
 import * as git from "../src/git.ts";
-import { runCodeHandler, type CodeHandlerDeps } from "../src/handlers/code.ts";
+import { runCodeHandler, type CodeHandlerArgs, type CodeHandlerDeps } from "../src/handlers/code.ts";
 import { createProvider, createProviderChain } from "../src/providers.ts";
 import * as reviewer from "../src/review/runner.ts";
 import * as skills from "../src/skills.ts";
@@ -95,7 +95,7 @@ function makeFixture() {
   return {
     db, deps, run, hasCommits, primary, review, complete, push, openPr, rebase, postComment, pr,
     expire() { now += 1001; },
-    invoke: () => runCodeHandler(deps, { issue, comments: [], repo: "fixture/repo", scope: "S" }),
+    invoke: (options: Pick<CodeHandlerArgs, "draftPr"> = {}) => runCodeHandler(deps, { issue, comments: [], repo: "fixture/repo", scope: "S", ...options }),
   };
 }
 
@@ -143,6 +143,42 @@ function reviewRows(): Array<{ round: number; verdict: string; escalated: number
     "SELECT round, verdict, escalated FROM review_passes ORDER BY id",
   ).all();
 }
+
+describe("CODE handler PR publication", () => {
+  it("preserves ready PRs when draft mode is omitted", async () => {
+    expect((await f.invoke()).status).toBe("pr_opened");
+    expect(f.openPr.mock.calls[0]?.[0].draft).toBe(false);
+  });
+
+  it("publishes a draft when the ticket opts into draft mode", async () => {
+    expect((await f.invoke({ draftPr: true })).status).toBe("pr_opened");
+    expect(f.openPr.mock.calls[0]?.[0].draft).toBe(true);
+  });
+
+  it("preserves an explicit ready PR request", async () => {
+    expect((await f.invoke({ draftPr: false })).status).toBe("pr_opened");
+    expect(f.openPr.mock.calls[0]?.[0].draft).toBe(false);
+  });
+
+  it("stops before pushing when the run-level publication guard fails", async () => {
+    f.deps.assertCanPublish = () => { throw new Error("Fixture spending limit exhausted"); };
+    await expect(f.invoke({ draftPr: true })).rejects.toThrow("Fixture spending limit exhausted");
+    expect(f.push).not.toHaveBeenCalled();
+    expect(f.openPr).not.toHaveBeenCalled();
+    expect(f.db.query("SELECT * FROM prs").all()).toEqual([]);
+  });
+
+  it("rechecks the publication guard before opening the PR", async () => {
+    f.deps.assertCanPublish = mock(() => {
+      if (f.push.mock.calls.length > 0) throw new Error("Fixture spending limit exhausted");
+    });
+    await expect(f.invoke({ draftPr: true })).rejects.toThrow("Fixture spending limit exhausted");
+    expect(f.deps.assertCanPublish).toHaveBeenCalledTimes(2);
+    expect(f.push).toHaveBeenCalledTimes(1);
+    expect(f.openPr).not.toHaveBeenCalled();
+    expect(f.db.query("SELECT * FROM prs").all()).toEqual([]);
+  });
+});
 
 describe("CODE handler blocked exits", () => {
   it("stops primary blocked work even when the branch has commits", async () => {

@@ -40,6 +40,8 @@ export interface AnswerHandlerDeps {
   workspacesDir: string;
   agentLoopMaxIterations: number;
   agentLoopTimeoutMs: number;
+  /** Optional run-level guard checked immediately before publishing the answer. */
+  assertCanPublish?: () => void;
 }
 
 export interface AnswerHandlerArgs {
@@ -124,6 +126,7 @@ export async function runAnswerHandler(
     return { status: "skipped", followup: null };
   }
 
+  deps.assertCanPublish?.();
   await deps.linear.postComment(args.issue.id, loopResult.summary);
   return { status: "answered", followup: loopResult.summary };
 }

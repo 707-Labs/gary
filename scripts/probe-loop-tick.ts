@@ -13,19 +13,24 @@ import { loadConfig } from "../src/config.ts";
 import { tick } from "../src/loop.ts";
 import { createProvider, createProviderChain } from "../src/providers.ts";
 import { closeDb, openDb } from "../src/state/db.ts";
+import { openSpendLedger } from "../src/spend.ts";
+import { resolve } from "node:path";
 
 const cfg = loadConfig();
 mkdirSync(cfg.gary.stateDir, { recursive: true });
 const db = openDb(cfg.gary.dbPath);
+const spend = openSpendLedger(resolve(cfg.gary.stateDir, "spend.db"));
 
 const linear = new LinearAdapter({ gary: cfg.gary, linear: cfg.linear });
 const github = makeGitHubClient(cfg.github);
-const chain = createProviderChain(cfg.providers.map((p) => createProvider(p)));
+const chain = createProviderChain(cfg.providers.filter((p) => p.name === "deepseek")
+  .map((p) => createProvider(p, { fetch: spend.guardedFetch(p.name) })));
 const glm = new GLMClient(chain);
 const cloudflare = cfg.cloudflare ? new CloudflareClient(cfg.cloudflare) : null;
 
 const result = await tick({
   db,
+  spend,
   linear,
   github,
   glm,
@@ -45,3 +50,4 @@ const result = await tick({
 
 console.log("\nresult:", result);
 closeDb(db);
+spend.close();
