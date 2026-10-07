@@ -1,0 +1,33 @@
+{
+  "source": "gary-synthetic-paid-validation-resumed.json, calls 2-5, 2026-10-07",
+  "note": "Exact saved usage objects only. Original response envelopes, response IDs and returned model names were not preserved. Tests construct a synthetic valid envelope around these usage objects.",
+  "endpoint": "https://api.deepseek.com/anthropic/v1/messages",
+  "requestedModel": "deepseek-v4-pro",
+  "maxTokens": 2048,
+  "calls": [
+    {
+      "call": 2,
+      "startedAt": "2026-10-07T01:08:45.464Z",
+      "usage": { "input_tokens": 887, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 212, "service_tier": "standard" },
+      "expectedChargedMicros": 9281
+    },
+    {
+      "call": 3,
+      "startedAt": "2026-10-07T01:08:47.811Z",
+      "usage": { "input_tokens": 119, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 1024, "output_tokens": 64, "service_tier": "standard" },
+      "expectedChargedMicros": 9619
+    },
+    {
+      "call": 4,
+      "startedAt": "2026-10-07T01:08:49.184Z",
+      "usage": { "input_tokens": 878, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 160, "service_tier": "standard" },
+      "expectedChargedMicros": 9270
+    },
+    {
+      "call": 5,
+      "startedAt": "2026-10-07T01:08:51.727Z",
+      "usage": { "input_tokens": 48, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 1024, "output_tokens": 174, "service_tier": "standard" },
+      "expectedChargedMicros": 9526
+    }
+  ]
+}
