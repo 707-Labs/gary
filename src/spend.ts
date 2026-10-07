@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { Database } from "bun:sqlite";
@@ -83,6 +84,30 @@ function tokenCount(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
+const USAGE_COUNTERS = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"] as const;
+type ReceiptReason = "accepted" | "envelope" | "model_mismatch" | "stop_reason" | "content" | "usage_missing" | "usage_fields" | "service_tier" | "usage_counters" | "token_bounds" | "transport_error" | "http_error" | "redirect" | "invalid_json" | "ticket_closed";
+type ReceiptCheck = { reason: "accepted"; inputTokens: number } | { reason: Exclude<ReceiptReason, "accepted"> };
+
+// Correlate receipts without persisting arbitrary provider strings, response
+// content, or headers. Counter presence distinguishes null/omitted from zero.
+function receiptDetails(body: unknown, policy: Policy, response?: Response): string {
+  const envelope = record(body) ? body : {};
+  const usage = record(envelope.usage) ? envelope.usage : {};
+  const hash = (value: unknown): string | null => typeof value === "string" ? createHash("sha256").update(value).digest("hex") : null;
+  return JSON.stringify({
+    responseIdHash: hash(envelope.id),
+    requestIdHash: hash(response?.headers.get("request-id") ?? response?.headers.get("x-request-id")),
+    responseModelHash: hash(envelope.model),
+    modelMatches: envelope.model === policy.model,
+    serviceTier: !Object.hasOwn(usage, "service_tier") ? "missing" : usage.service_tier === "standard" ? "standard" : "unrecognized",
+    unknownUsageFields: Object.keys(usage).filter((key) => ![...USAGE_COUNTERS, "service_tier"].includes(key)).length,
+    counters: Object.fromEntries(USAGE_COUNTERS.map((key) => [key,
+      tokenCount(usage[key]) ? { state: "integer", value: usage[key] }
+        : { state: !Object.hasOwn(usage, key) ? "missing" : usage[key] === null ? "null" : "invalid" },
+    ])),
+  });
+}
+
 // Check only protocol structure, not arbitrary JSON inside local tool inputs or
 // schemas. Provider-native tools, remote content, modalities and future request
 // fields require an explicit pricing review before becoming eligible.
@@ -137,14 +162,23 @@ async function validateRequest(provider: string, request: Request): Promise<{ po
  * counters overestimate rather than undercount. Unknown usage fields/formats,
  * missing counters and error responses keep the entire original reservation.
  */
-function receiptInput(body: unknown, policy: Policy, maxTokens: number): number | null {
-  if (!record(body) || body.type !== "message" || body.role !== "assistant" || body.model !== policy.model || typeof body.id !== "string" || !["end_turn", "tool_use", "max_tokens", "stop_sequence"].includes(String(body.stop_reason)) || !validateContent(body.content) || !record(body.usage)) return null;
+function receiptInput(body: unknown, policy: Policy, maxTokens: number): ReceiptCheck {
+  if (!record(body) || body.type !== "message" || body.role !== "assistant" || typeof body.id !== "string") return { reason: "envelope" };
+  if (body.model !== policy.model) return { reason: "model_mismatch" };
+  if (!["end_turn", "tool_use", "max_tokens", "stop_sequence"].includes(String(body.stop_reason))) return { reason: "stop_reason" };
+  if (!validateContent(body.content)) return { reason: "content" };
+  if (!record(body.usage)) return { reason: "usage_missing" };
   const usage = body.usage;
-  if (!onlyKeys(usage, ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"])) return null;
-  if (![usage.input_tokens, usage.cache_read_input_tokens, usage.cache_creation_input_tokens, usage.output_tokens].every(tokenCount)) return null;
+  // Same-route DeepSeek receipts preserved on 2026-10-07 include this response
+  // metadata. Only this known standard tier is priced; request service_tier,
+  // other tiers, and all other new usage fields remain ineligible.
+  const allowedFields = policy === POLICIES.deepseek ? [...USAGE_COUNTERS, "service_tier"] : USAGE_COUNTERS;
+  if (!onlyKeys(usage, allowedFields)) return { reason: "usage_fields" };
+  if (Object.hasOwn(usage, "service_tier") && usage.service_tier !== "standard") return { reason: "service_tier" };
+  if (!USAGE_COUNTERS.every((key) => tokenCount(usage[key]))) return { reason: "usage_counters" };
   const input = (usage.input_tokens as number) + (usage.cache_read_input_tokens as number) + (usage.cache_creation_input_tokens as number);
-  if (input > SPEND_CONTEXT_TOKENS || (usage.output_tokens as number) > maxTokens) throw new SpendLimitError("receipt exceeds reserved token bounds");
-  return input;
+  if (input > SPEND_CONTEXT_TOKENS || (usage.output_tokens as number) > maxTokens) return { reason: "token_bounds" };
+  return { reason: "accepted", inputTokens: input };
 }
 
 export class SpendLedger {
@@ -158,6 +192,7 @@ export class SpendLedger {
       CREATE TABLE IF NOT EXISTS spend_campaigns (id TEXT PRIMARY KEY, cap_micros INTEGER NOT NULL CHECK(cap_micros>0), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
       CREATE TABLE IF NOT EXISTS spend_tickets (ticket_id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL REFERENCES spend_campaigns(id), cap_micros INTEGER NOT NULL CHECK(cap_micros>0), draft_pr INTEGER NOT NULL CHECK(draft_pr IN (0,1)), state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','exhausted','closed')), terminal_reason TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
       CREATE TABLE IF NOT EXISTS spend_attempts (id INTEGER PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES spend_tickets(ticket_id), provider TEXT NOT NULL, model TEXT NOT NULL, max_tokens INTEGER NOT NULL, reserved_micros INTEGER NOT NULL, charged_micros INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'reserved' CHECK(state IN ('reserved','unknown','settled')), input_tokens INTEGER, http_status INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, settled_at TEXT);
+      CREATE TABLE IF NOT EXISTS spend_receipts (attempt_id INTEGER PRIMARY KEY REFERENCES spend_attempts(id), reason TEXT NOT NULL, details_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
       CREATE INDEX IF NOT EXISTS spend_attempts_ticket ON spend_attempts(ticket_id);`);
   }
 
@@ -240,33 +275,51 @@ export class SpendLedger {
       try {
         response = await inner(request);
       } catch (error) {
+        this.recordReceipt(attempt, "transport_error", policy);
         this.unknown(attempt, null);
         throw error;
       }
-      this.assertResponseActive(ticketId, attempt, response.status);
+      this.assertResponseActive(ticketId, attempt, policy, response);
       if (response.status >= 300 && response.status < 400) {
+        this.recordReceipt(attempt, "redirect", policy, response);
         this.unknown(attempt, response.status);
         throw new SpendLimitError("provider redirect rejected");
       }
-      if (!response.ok) { this.unknown(attempt, response.status); return response; }
-      let body: unknown;
-      try { body = await response.clone().json(); } catch {
+      if (!response.ok) {
+        this.recordReceipt(attempt, "http_error", policy, response);
         this.unknown(attempt, response.status);
-        this.assertResponseActive(ticketId, attempt, response.status);
         return response;
       }
-      this.assertResponseActive(ticketId, attempt, response.status);
-      let inputTokens: number | null;
-      try { inputTokens = receiptInput(body, policy, maxTokens); } catch (error) {
+      let body: unknown;
+      try { body = await response.clone().json(); } catch {
+        this.recordReceipt(attempt, "invalid_json", policy, response);
         this.unknown(attempt, response.status);
-        this.markTerminal(ticketId, "receipt_exceeds_bounds");
-        throw error;
+        this.assertResponseActive(ticketId, attempt, policy, response);
+        return response;
       }
-      if (inputTokens === null) { this.unknown(attempt, response.status); return response; }
-      // Always keep full output cost; usage.output_tokens may omit reasoning on
-      // a compatibility endpoint. The unused input portion alone is released.
-      const charged = costMicros(policy, inputTokens, maxTokens);
-      this.db.query("UPDATE spend_attempts SET charged_micros=?, state='settled', input_tokens=?, http_status=?, settled_at=CURRENT_TIMESTAMP WHERE id=? AND state='reserved'").run(charged, inputTokens, response.status, attempt);
+      const receipt = receiptInput(body, policy, maxTokens);
+      // A different connection may close/exhaust this ticket while we read the
+      // response. Take the writer lock before checking and keep it through the
+      // refund; a waiting receipt write must never refund a now-closed ticket.
+      const settlementError = this.db.transaction((): SpendLimitError | null => {
+        if (this.ticket(ticketId)?.state !== "active") {
+          this.recordReceipt(attempt, "ticket_closed", policy, response, body);
+          this.unknown(attempt, response.status);
+          return new SpendLimitError("ticket closed while request was in flight");
+        }
+        this.recordReceipt(attempt, receipt.reason, policy, response, body);
+        if (receipt.reason === "token_bounds") {
+          this.unknown(attempt, response.status);
+          this.markTerminal(ticketId, "receipt_exceeds_bounds");
+          return new SpendLimitError("receipt exceeds reserved token bounds");
+        }
+        if (receipt.reason !== "accepted") { this.unknown(attempt, response.status); return null; }
+        // Always keep full output cost; compatibility usage may omit reasoning.
+        const charged = costMicros(policy, receipt.inputTokens, maxTokens);
+        this.db.query("UPDATE spend_attempts SET charged_micros=?, state='settled', input_tokens=?, http_status=?, settled_at=CURRENT_TIMESTAMP WHERE id=? AND state='reserved'").run(charged, receipt.inputTokens, response.status, attempt);
+        return null;
+      }).immediate();
+      if (settlementError) throw settlementError;
       return response;
     }) as typeof fetch;
   }
@@ -292,9 +345,14 @@ export class SpendLedger {
   private unknown(id: number, status: number | null): void {
     this.db.query("UPDATE spend_attempts SET state='unknown',http_status=? WHERE id=? AND state='reserved'").run(status, id);
   }
-  private assertResponseActive(ticketId: string, attempt: number, status: number): void {
+  private recordReceipt(attempt: number, reason: ReceiptReason, policy: Policy, response?: Response, body?: unknown): void {
+    // New attempts only. No replay/reconciliation of historical unknown rows.
+    this.db.query("INSERT OR IGNORE INTO spend_receipts(attempt_id,reason,details_json) VALUES(?,?,?)").run(attempt, reason, receiptDetails(body, policy, response));
+  }
+  private assertResponseActive(ticketId: string, attempt: number, policy: Policy, response: Response): void {
     if (this.ticket(ticketId)?.state !== "active") {
-      this.unknown(attempt, status);
+      this.recordReceipt(attempt, "ticket_closed", policy, response);
+      this.unknown(attempt, response.status);
       throw new SpendLimitError("ticket closed while request was in flight");
     }
   }
