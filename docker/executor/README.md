@@ -11,6 +11,20 @@ Build on the current host:
 docker build -t gary-executor:ubuntu24.04 docker/executor
 ```
 
+The image pins Bun 1.3.14 and Node 24.21.0. Node is copied from the official
+`node:24.21.0-bookworm-slim` multi-architecture image at digest
+`sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20`.
+The build executes both runtimes to check shared-library compatibility with
+Ubuntu. Bun installs dependencies and launches package scripts; Node-shebang
+tools such as Vitest run under Node. Do not force them onto Bun with `--bun`.
+
+Run the sandbox and runtime integration checks against the newly built image:
+
+```sh
+GARY_DOCKER_TEST_IMAGE="$(docker image inspect --format '{{.Id}}' gary-executor:ubuntu24.04)" \
+  bun test test/docker-executor.test.ts
+```
+
 After the integration smoke test passes, enable it in Gary's mode-0600
 environment file:
 
@@ -28,14 +42,37 @@ outside the container. Warm the credential-free Linux package cache from an
 operator-reviewed lockfile, then Gary mounts that Docker volume read-only:
 
 ```sh
-docker/executor/warm-bun-cache.sh ~/.gary/workspaces/ERT-1234
+# Review package.json and bun.lock at this exact commit before running.
+reviewed_commit="$(git -C /absolute/project/repository rev-parse HEAD)"
+GARY_BUN_CACHE_VOLUME=gary-bun-cache-candidate \
+  docker/executor/warm-bun-cache.sh /absolute/project/repository "$reviewed_commit"
 ```
 
-The warm-up container sees only `package.json` and `bun.lock`, disables package
-lifecycle scripts, and has network only for the duration of the explicit
-operator action. A new worktree can then run `bun install --offline
---ignore-scripts` without gaining network access. Packages absent from that
-cache must be admitted by an operator before the run;
+The helper requires an explicit reviewed Git commit. It streams only that
+commit's `package.json` and `bun.lock` into a temporary container; uncommitted
+worktree changes and other repository files are never mounted. The local
+executor image is resolved to its immutable image ID before warm-up. The
+output records that ID, the source commit, both manifest SHA-256 hashes, and
+runtime versions. The frozen install disables package lifecycle scripts and
+has network only for the duration of this explicit operator action.
+
+Use a fresh cache volume for each candidate deployment and keep the preceding
+image ID and cache volume for rollback. Only select the new volume in Gary's
+environment after frozen offline installation and the relevant repository
+tests succeed in a disposable snapshot of the same commit, through the normal
+`DockerExecutor` with `networkMode: "none"`. Gary mounts the selected cache
+read-only. For ERT-3189, the readiness commands inside that executor are:
+
+```sh
+bun install --offline --ignore-scripts --frozen-lockfile
+bun run test:run tests/dev-prod-party.test.ts --project=src-node
+bun run check
+```
+
+Generate `.svelte-kit` metadata using the repository's normal tooling if its
+check command requires it. The offline baseline must actually run and pass;
+a successful networked warm-up alone is not readiness evidence. Packages
+absent from the cache must be admitted by an operator before the run;
 do not switch to `bridge` until the Docker host has an egress policy that blocks
 private, link-local, metadata, and tailnet ranges.
 

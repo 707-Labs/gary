@@ -45,6 +45,8 @@ export interface CiFailureHandlerDeps {
   agentLoopMaxIterations: number;
   agentLoopTimeoutMs: number;
   maxCiAttempts: number;
+  /** Optional run-level guard checked immediately before publishing a fix. */
+  assertCanPublish?: () => void;
 }
 
 export interface CiFailureHandlerArgs {
@@ -190,6 +192,7 @@ export async function runCiFailureHandler(
 
   // Push the fix.
   const freshUrl = await deps.github.cloneUrl(owner, name);
+  deps.assertCanPublish?.();
   await pushBranch({
     worktreePath,
     freshTokenUrl: freshUrl,

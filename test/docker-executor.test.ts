@@ -95,6 +95,22 @@ PY`);
     }
   }, 30_000);
 
+  dockerIt("runs Node-shebang test tools through Bun's script launcher", async () => {
+    const budget = createDeadline({ timeoutMs: TEST_DEADLINE_MS });
+    try {
+      const executor = bindExecutorDeadline(new DockerExecutor(workspace, { image: image! }), budget);
+      await executor.writeFile("runtime-probe/package.json", JSON.stringify({ scripts: { probe: "runtime-probe" } }));
+      await executor.writeFile("runtime-probe/node_modules/.bin/runtime-probe", `#!/usr/bin/env node
+console.log(JSON.stringify({ node: process.versions.node, bun: process.versions.bun ?? null }));
+`);
+      const result = await executor.run("chmod +x node_modules/.bin/runtime-probe && bun run probe", { cwd: "runtime-probe" });
+      expectCommandSucceeded(result);
+      expect(JSON.parse(result.stdout.trim())).toEqual({ node: "24.21.0", bun: null });
+    } finally {
+      budget.dispose();
+    }
+  }, 30_000);
+
   dockerIt("enforces read-only worktree mounts", async () => {
     const budget = createDeadline({ timeoutMs: TEST_DEADLINE_MS });
     try {
