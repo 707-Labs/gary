@@ -28,6 +28,23 @@ function fakeExecutor(runImpl?: (cmd: string) => ExecResult): Executor {
 }
 
 describe("finish gate", () => {
+  it("reports a blocker despite a failing check without claiming success", async () => {
+    const tools = makeToolset(fakeExecutor(() => ({
+      stdout: "", stderr: "dependency unavailable offline", exitCode: 1, timedOut: false,
+    })), { finishGateCommand: "bun run check" });
+    await tools.handlers["run_bash"]!.run({ command: "bun run check" });
+    expect(await tools.handlers["finish"]!.run({ summary: "partial work" })).toMatch(/cannot finish/);
+    expect(await tools.handlers["report_blocked"]!.run({ reason: "dependency unavailable offline; need cache admission" })).toBe("blocked");
+    expect(tools.blockedReason).toBe("dependency unavailable offline; need cache admission");
+    expect(tools.finishSummary).toBeNull();
+    expect(tools.finishGateMet).toBe(false);
+  });
+
+  it("rejects an empty blocker instead of losing the handoff evidence", async () => {
+    const tools = makeToolset(fakeExecutor());
+    await expect(tools.handlers["report_blocked"]!.run({ reason: "  " })).rejects.toThrow();
+    expect(tools.blockedReason).toBeNull();
+  });
   it("without a gate command, finish() succeeds immediately", async () => {
     const tools = makeToolset(fakeExecutor());
     const result = await tools.handlers["finish"]!.run({ summary: "did stuff" });

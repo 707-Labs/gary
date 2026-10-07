@@ -1,3 +1,4 @@
+import { createDeadline, DeadlineExceededError, type Deadline } from "../deadline.ts";
 import type Anthropic from "@anthropic-ai/sdk";
 import type { CloudflareClient } from "../adapters/cloudflare.ts";
 import type { GitHubClient } from "../adapters/github.ts";
@@ -20,6 +21,7 @@ import {
 
 export type AgentLoopStatus =
   | "finished"
+  | "blocked"
   | "iteration_cap"
   | "timeout"
   | "no_finish"
@@ -105,6 +107,8 @@ export interface AgentLoopArgs {
    */
   maxIterations: number;
   timeoutMs: number;
+  /** Shared absolute deadline, also used by parent checks/repairs/reviews. */
+  deadlineMs?: number;
   /**
    * Optional sequence of phases. When omitted, the loop runs as a single
    * phase using `maxIterations` and the default global nudge. Provided by
@@ -161,7 +165,7 @@ const MICROCOMPACT_AFTER = 12;
 const MICROCOMPACT_EVERY = 6;
 
 const DEFAULT_NUDGE =
-  "you're approaching the iteration cap. wrap up: commit what you have, then call finish() with a brief summary (or a partial-progress note if you're stuck).";
+  "you're approaching the iteration cap. wrap up: commit verified work, then call finish() with a brief summary. If blocked or checks still fail, call report_blocked({reason}) with the blocker and evidence.";
 
 /** Append `text` as a user message, merging into the last user message if
  * the conversation already ends in one (Anthropic disallows consecutive
@@ -203,9 +207,16 @@ function appendUserText(
  */
 export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult> {
   const runLog: RunLogEntry[] = [];
-  const start = Date.now();
-  const deadline = start + args.timeoutMs;
-  const toolsetOpts: ToolsetOptions = {};
+  const budget = createDeadline(args);
+  try {
+    return await runWithinDeadline(args, budget, runLog);
+  } finally {
+    budget.dispose();
+  }
+}
+
+async function runWithinDeadline(args: AgentLoopArgs, budget: Deadline, runLog: RunLogEntry[]): Promise<AgentLoopResult> {
+  const toolsetOpts: ToolsetOptions = { deadlineMs: budget.deadlineMs, signal: budget.signal };
   if (args.cloudflare) toolsetOpts.cloudflare = args.cloudflare;
   if (args.linear) toolsetOpts.linear = args.linear;
   if (args.currentIssue) toolsetOpts.currentIssue = args.currentIssue;
@@ -218,7 +229,7 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
     // Sub-agent gets the parent's *remaining* budget (capped at 5 min) so it
     // can't run past the parent's deadline while the parent is await-blocked.
     toolsetOpts.subagentRunner = (task) =>
-      runSubagent(args, task, Math.max(0, deadline - Date.now()));
+      runSubagent(args, task, budget);
   }
   const tools = makeToolset(args.executor, toolsetOpts);
 
@@ -263,6 +274,14 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
     return errorMessage !== undefined ? { ...base, errorMessage } : base;
   };
 
+  const cancellation = (phase: string): AgentLoopResult | null => {
+    try { budget.throwIfExpired(); return null; } catch (err) {
+      return err instanceof DeadlineExceededError
+        ? done("timeout", null, phase)
+        : done("error", null, phase, "aborted");
+    }
+  };
+
   for (let phaseIdx = 0; phaseIdx < phases.length; phaseIdx++) {
     const phase = phases[phaseIdx]!;
     const isLastPhase = phaseIdx === phases.length - 1;
@@ -284,12 +303,8 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
     let phaseEndedVoluntarily = false;
 
     while (phaseIter < phase.maxIter) {
-      if (args.signal?.aborted) {
-        return done("error", null, phase.name, "aborted");
-      }
-      if (Date.now() > deadline) {
-        return done("timeout", null, phase.name);
-      }
+      const cancelled = cancellation(phase.name);
+      if (cancelled) return cancelled;
 
       if (!nudgeFired && phaseIter + 1 === nudgeAt && phase.nudgeMessage) {
         appendUserText(messages, phase.nudgeMessage);
@@ -312,8 +327,10 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
           system: args.systemPrompt,
           tools: phaseDefs,
           messages,
-        });
+        }, budget);
       } catch (err) {
+        const cancelled = cancellation(phase.name);
+        if (cancelled) return cancelled;
         // Per-provider 429s are handled inside `glm.createMessage` (it falls
         // through to the next provider). The only rate-limit case that
         // reaches here is "every provider is armed" — propagate so the tick
@@ -334,6 +351,10 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
         });
         return done("error", null, phase.name, message);
       }
+
+      // Never dispatch late model output (including a late finish/mutation).
+      const afterModel = cancellation(phase.name);
+      if (afterModel) return afterModel;
 
       // SDK 0.32.1 doesn't model the cache fields on Usage; they ship in the
       // wire format and our providers populate them. Widen via cast.
@@ -379,7 +400,13 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
 
       const toolResults: Anthropic.ToolResultBlockParam[] = [];
       for (const call of toolCalls) {
+        const beforeTool = cancellation(phase.name);
+        if (beforeTool) return beforeTool;
         toolResults.push(await executTool(tools, call, phase));
+        const afterTool = cancellation(phase.name);
+        if (afterTool) return afterTool;
+        if (tools.blockedReason !== null) return done("blocked", tools.blockedReason, phase.name);
+        if (tools.finishSummary !== null) return done("finished", tools.finishSummary, phase.name);
       }
       const userBlocks: (Anthropic.ToolResultBlockParam | Anthropic.TextBlockParam)[] =
         [...toolResults];
@@ -416,6 +443,7 @@ export async function runAgentLoop(args: AgentLoopArgs): Promise<AgentLoopResult
           });
           messages.length = 0;
           messages.push(...result.messages);
+          for (const path of result.compactedReadPaths) tools.readCache.delete(path);
         }
       }
     }
@@ -505,9 +533,8 @@ Rules:
  * parent's GLM client, executor, and read-only contextual deps. Sub-agents
  * can't spawn their own sub-agents (1-deep guard via `disableSubagent`).
  *
- * `remainingMs` is the parent's remaining wall-clock budget; the sub-agent's
- * timeout is the lesser of that and 5 min so the parent can't blow past its
- * own deadline while await-blocked here.
+ * The sub-agent shares the parent's absolute deadline and cancellation
+ * signal, with a local cap of 5 minutes.
  *
  * The sub-agent gets a dedicated system prompt (voice + sub-agent task
  * instructions), NOT the parent's prompt — the parent's instructions tell
@@ -517,7 +544,7 @@ Rules:
 async function runSubagent(
   parent: AgentLoopArgs,
   task: string,
-  remainingMs: number,
+  parentBudget: Deadline,
 ): Promise<{ status: AgentLoopStatus; summary: string | null; iterations: number }> {
   const subArgs: AgentLoopArgs = {
     glm: parent.glm,
@@ -527,7 +554,9 @@ async function runSubagent(
     }),
     task,
     maxIterations: 15,
-    timeoutMs: Math.min(remainingMs, 5 * 60_000),
+    timeoutMs: 5 * 60_000,
+    deadlineMs: parentBudget.deadlineMs,
+    signal: parentBudget.signal,
     temperature: parent.temperature ?? DEFAULT_TEMPERATURE,
     disableSubagent: true,
     readOnly: true,

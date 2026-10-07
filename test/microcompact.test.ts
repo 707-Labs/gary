@@ -6,11 +6,11 @@ import {
   microcompactMessages,
 } from "../src/agent/microcompact.ts";
 
-function asstToolUse(id: string, name: string): Anthropic.MessageParam {
+function asstToolUse(id: string, name: string, input: unknown = {}): Anthropic.MessageParam {
   return {
     role: "assistant",
     content: [
-      { type: "tool_use", id, name, input: {} },
+      { type: "tool_use", id, name, input },
     ],
   };
 }
@@ -33,6 +33,7 @@ describe("microcompactMessages", () => {
     const result = microcompactMessages(messages);
     expect(result.cleared).toBe(0);
     expect(result.messages).toEqual(messages);
+    expect(result.compactedReadPaths).toEqual([]);
   });
 
   it("keeps the most recent N compactable tool_results untouched", () => {
@@ -124,5 +125,80 @@ describe("microcompactMessages", () => {
     expect(COMPACTABLE_TOOLS.has("commit")).toBe(false);
     expect(COMPACTABLE_TOOLS.has("todo_write")).toBe(false);
     expect(COMPACTABLE_TOOLS.has("finish")).toBe(false);
+  });
+
+  it("reports only removed file contents, with original paths deduplicated", () => {
+    const messages: Anthropic.MessageParam[] = [
+      asstToolUse("a", "read_file", { path: "./src/a.ts" }),
+      userToolResult("a", "old contents"),
+      asstToolUse("b", "read_file", { path: "./src/a.ts" }),
+      userToolResult("b", "new contents after an edit"),
+      asstToolUse("c", "grep", { path: "src/search.ts" }),
+      userToolResult("c", "search result"),
+      asstToolUse("d", "read_file", { path: "src/retained.ts" }),
+      userToolResult("d", "retained contents"),
+    ];
+
+    const result = microcompactMessages(messages, { keepRecent: 1 });
+    expect(result.compactedReadPaths).toEqual(["./src/a.ts"]);
+    const second = microcompactMessages(result.messages, { keepRecent: 1 });
+    expect(second.cleared).toBe(0);
+    expect(second.compactedReadPaths).toEqual([]);
+  });
+
+  it("invalidates a removed read even when a duplicate pointer survives", () => {
+    const path = "src/a.ts";
+    const pointer = `(already read \`${path}\` earlier in this conversation; refer to your prior tool_result. write_file/edit_file on this path invalidates the cache and a fresh read returns updated content.)`;
+    const messages: Anthropic.MessageParam[] = [
+      asstToolUse("a", "read_file", { path }),
+      userToolResult("a", "actual contents"),
+      asstToolUse("b", "read_file", { path }),
+      userToolResult("b", pointer),
+    ];
+
+    const result = microcompactMessages(messages, { keepRecent: 1 });
+    expect(result.compactedReadPaths).toEqual([path]);
+    expect(result.messages[3]).toEqual(messages[3]);
+
+    // The pointer later being removed is not another removal of file contents.
+    const next = microcompactMessages([
+      ...result.messages,
+      asstToolUse("c", "grep"),
+      userToolResult("c", "new search result"),
+    ], { keepRecent: 1 });
+    expect(next.cleared).toBe(1);
+    expect(next.compactedReadPaths).toEqual([]);
+  });
+
+  it("does not report unsuccessful reads or malformed read arguments", () => {
+    const messages: Anthropic.MessageParam[] = [
+      asstToolUse("a", "read_file", { path: "missing.ts" }),
+      userToolResult("a", "error in read_file: not found"),
+      asstToolUse("b", "read_file", { path: "failed.ts" }),
+      {
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: "b", is_error: true, content: "failed" }],
+      },
+      asstToolUse("c", "read_file", { path: 42 }),
+      userToolResult("c", "invalid arguments"),
+      asstToolUse("d", "read_file", null),
+      userToolResult("d", "invalid arguments"),
+      asstToolUse("e", "grep"),
+      userToolResult("e", "retained"),
+    ];
+    expect(microcompactMessages(messages, { keepRecent: 1 }).compactedReadPaths).toEqual([]);
+  });
+
+  it("reports an empty file and content that merely resembles a read pointer", () => {
+    const messages: Anthropic.MessageParam[] = [
+      asstToolUse("a", "read_file", { path: "empty.ts" }),
+      userToolResult("a", ""),
+      asstToolUse("b", "read_file", { path: "notes.md" }),
+      userToolResult("b", "(already read `notes.md` in another program)"),
+      asstToolUse("c", "grep"),
+      userToolResult("c", "retained"),
+    ];
+    expect(microcompactMessages(messages, { keepRecent: 1 }).compactedReadPaths)
+      .toEqual(["empty.ts", "notes.md"]);
   });
 });

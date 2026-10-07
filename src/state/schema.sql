@@ -20,7 +20,10 @@ CREATE TABLE IF NOT EXISTS actions (
   state_fingerprint TEXT NOT NULL,
   started_at TEXT NOT NULL,
   completed_at TEXT,
+  -- Dispatch/idempotency signal; a handled escalation can still be success=1.
   success INTEGER,
+  -- Delivery result is separate. Historical actions remain unknown.
+  outcome TEXT NOT NULL DEFAULT 'unknown',
   error_message TEXT,
   provider TEXT,
   model TEXT,

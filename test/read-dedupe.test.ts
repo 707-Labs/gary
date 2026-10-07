@@ -27,6 +27,17 @@ function fakeExecutor(initial: Record<string, string> = {}): Executor {
 }
 
 describe("read_file dedupe", () => {
+  it("shell commands invalidate reads even if the command partially edits then fails", async () => {
+    const executor = fakeExecutor({ "x.ts": "old" });
+    executor.run = async () => {
+      await executor.writeFile("x.ts", "new");
+      return { stdout: "", stderr: "later step failed", exitCode: 1, timedOut: false };
+    };
+    const tools = makeToolset(executor);
+    expect(await tools.handlers["read_file"]!.run({ path: "x.ts" })).toBe("old");
+    await tools.handlers["run_bash"]!.run({ command: "edit then fail" });
+    expect(await tools.handlers["read_file"]!.run({ path: "x.ts" })).toBe("new");
+  });
   it("first read returns full contents and adds the path to the cache", async () => {
     const tools = makeToolset(fakeExecutor({ "x.ts": "the contents" }));
     const r = await tools.handlers["read_file"]!.run({ path: "x.ts" });

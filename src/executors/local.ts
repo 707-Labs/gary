@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { throwIfExpired, type DeadlineOptions } from "../deadline.ts";
+import { runProcess } from "./process.ts";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import type {
@@ -29,18 +30,22 @@ export class LocalExecutor implements Executor {
     this.workspaceRoot = resolve(workspaceRoot);
   }
 
-  async readFile(path: string): Promise<string> {
+  async readFile(path: string, opts: DeadlineOptions = {}): Promise<string> {
+    throwIfExpired(opts);
     const abs = this.resolveInside(path);
-    return await readFile(abs, "utf8");
+    return await readFile(abs, { encoding: "utf8", ...(opts.signal ? { signal: opts.signal } : {}) });
   }
 
-  async writeFile(path: string, content: string): Promise<void> {
+  async writeFile(path: string, content: string, opts: DeadlineOptions = {}): Promise<void> {
+    throwIfExpired(opts);
     const abs = this.resolveInside(path);
     await mkdir(dirname(abs), { recursive: true });
-    await writeFile(abs, content, "utf8");
+    throwIfExpired(opts);
+    await writeFile(abs, content, { encoding: "utf8", ...(opts.signal ? { signal: opts.signal } : {}) });
   }
 
-  async listFiles(pattern: string): Promise<string[]> {
+  async listFiles(pattern: string, opts: DeadlineOptions = {}): Promise<string[]> {
+    throwIfExpired(opts);
     const glob = new Bun.Glob(pattern);
     const out: string[] = [];
     for await (const match of glob.scan({
@@ -48,23 +53,27 @@ export class LocalExecutor implements Executor {
       onlyFiles: true,
       dot: false,
     })) {
+      throwIfExpired(opts);
       out.push(match);
     }
     return out.sort();
   }
 
-  async grep(pattern: string, pathGlob = "**/*"): Promise<GrepMatch[]> {
+  async grep(pattern: string, pathGlob = "**/*", opts: DeadlineOptions = {}): Promise<GrepMatch[]> {
+    throwIfExpired(opts);
     const re = new RegExp(pattern);
     const matches: GrepMatch[] = [];
-    const files = await this.listFiles(pathGlob);
+    const files = await this.listFiles(pathGlob, opts);
     const skip = new Set([".git", "node_modules", ".gary", "dist"]);
     for (const rel of files) {
+      throwIfExpired(opts);
       const top = rel.split(sep)[0];
       if (top !== undefined && skip.has(top)) continue;
       let content: string;
       try {
-        content = await readFile(resolve(this.workspaceRoot, rel), "utf8");
+        content = await this.readFile(rel, opts);
       } catch {
+        throwIfExpired(opts);
         continue; // binary, missing, permission — skip
       }
       const lines = content.split("\n");
@@ -80,49 +89,11 @@ export class LocalExecutor implements Executor {
   }
 
   async run(command: string, opts: RunOpts = {}): Promise<ExecResult> {
-    const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const cwd = opts.cwd ? this.resolveInside(opts.cwd) : this.workspaceRoot;
-    const env: NodeJS.ProcessEnv = { ...process.env, ...(opts.env ?? {}) };
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-    const child = spawn("bash", ["-lc", command], {
-      cwd,
-      env,
-      signal: controller.signal,
-    });
-
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    return await new Promise<ExecResult>((resolveResult) => {
-      child.on("close", (code, signal) => {
-        clearTimeout(timer);
-        const timedOut = controller.signal.aborted;
-        resolveResult({
-          stdout,
-          stderr,
-          exitCode: code ?? (signal !== null ? 128 : -1),
-          timedOut,
-        });
-      });
-      child.on("error", (err) => {
-        clearTimeout(timer);
-        const timedOut = controller.signal.aborted;
-        resolveResult({
-          stdout,
-          stderr: stderr + (stderr ? "\n" : "") + (err.message ?? String(err)),
-          exitCode: -1,
-          timedOut,
-        });
-      });
+    return await runProcess("bash", ["-lc", command], {
+      ...opts,
+      timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      cwd: opts.cwd ? this.resolveInside(opts.cwd) : this.workspaceRoot,
+      env: { ...process.env, ...(opts.env ?? {}) },
     });
   }
 

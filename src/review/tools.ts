@@ -4,6 +4,7 @@ import type { Executor } from "../executors/index.ts";
 import type { RunLogEntry } from "../agent/loop.ts";
 import { redactGitHubTokens } from "../redact.ts";
 import { fetchPublicUrl } from "../safe-fetch.ts";
+import { createDeadline, type DeadlineOptions } from "../deadline.ts";
 
 export type BugClass =
   | "wrong_code_path"
@@ -40,7 +41,7 @@ export interface ReviewerToolHandler {
   run(input: unknown): Promise<string>;
 }
 
-export interface MakeReviewerToolsetOptions {
+export interface MakeReviewerToolsetOptions extends DeadlineOptions {
   runLog?: RunLogEntry[];
 }
 
@@ -63,7 +64,7 @@ export function makeReviewerToolset(
   register(grepTool(executor));
   register(listFilesTool(executor));
   register(runBashTool(executor, out));
-  register(fetchUrlTool());
+  register(fetchUrlTool(opts));
   register(submitReviewTool(out));
   return out;
 }
@@ -209,7 +210,7 @@ function runBashTool(executor: Executor, tools: ReviewerTools): ReviewerToolHand
 const fetchUrlSchema = z.object({ url: z.string().url() });
 const FETCH_TIMEOUT_MS = 30_000;
 const FETCH_MAX_BYTES = 200_000;
-function fetchUrlTool(): ReviewerToolHandler {
+function fetchUrlTool(options: DeadlineOptions = {}): ReviewerToolHandler {
   return {
     definition: {
       name: "fetch_url",
@@ -223,14 +224,14 @@ function fetchUrlTool(): ReviewerToolHandler {
     },
     async run(input) {
       const { url } = fetchUrlSchema.parse(input);
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+      const budget = createDeadline({ ...options, timeoutMs: FETCH_TIMEOUT_MS });
       try {
+        budget.throwIfExpired();
         const res = await fetchPublicUrl(url, {
           headers: {
             "User-Agent": "gary-707-labs (https://github.com/707-Labs/gary)",
           },
-          signal: controller.signal,
+          signal: budget.signal,
         });
         const text = await res.text();
         const body =
@@ -242,7 +243,7 @@ function fetchUrlTool(): ReviewerToolHandler {
         }
         return formatError("fetch_url", err);
       } finally {
-        clearTimeout(timer);
+        budget.dispose();
       }
     },
   };

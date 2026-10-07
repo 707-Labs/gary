@@ -1,4 +1,6 @@
-import { spawn } from "node:child_process";
+import { throwIfExpired, type DeadlineOptions } from "../deadline.ts";
+import { runProcess } from "./process.ts";
+import { log } from "../logger.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { Executor, ExecResult, GrepMatch, RunOpts } from "./index.ts";
@@ -18,7 +20,7 @@ export interface DockerExecutorOptions {
   bunCacheVolume?: string;
 }
 
-interface InvocationOptions {
+interface InvocationOptions extends DeadlineOptions {
   timeoutMs?: number;
   cwd?: string;
   env?: Record<string, string>;
@@ -68,13 +70,13 @@ export class DockerExecutor implements Executor {
     }
   }
 
-  async readFile(path: string): Promise<string> {
-    const result = await this.invoke(["cat", "--", this.containerPath(path)]);
+  async readFile(path: string, opts: DeadlineOptions = {}): Promise<string> {
+    const result = await this.invoke(["cat", "--", this.containerPath(path)], opts);
     if (result.exitCode !== 0) throw invocationError("readFile", result);
     return result.stdout;
   }
 
-  async writeFile(path: string, content: string): Promise<void> {
+  async writeFile(path: string, content: string, opts: DeadlineOptions = {}): Promise<void> {
     if (this.readOnly) throw new Error("DockerExecutor is read-only");
     const result = await this.invoke(
       [
@@ -84,12 +86,12 @@ export class DockerExecutor implements Executor {
         "gary-write",
         this.containerPath(path),
       ],
-      { stdin: content },
+      { ...opts, stdin: content },
     );
     if (result.exitCode !== 0) throw invocationError("writeFile", result);
   }
 
-  async listFiles(pattern: string): Promise<string[]> {
+  async listFiles(pattern: string, opts: DeadlineOptions = {}): Promise<string[]> {
     const result = await this.invoke([
       "rg",
       "--files",
@@ -97,13 +99,13 @@ export class DockerExecutor implements Executor {
       pattern,
       "--glob",
       "!.git/**",
-    ]);
+    ], opts);
     if (result.exitCode === 1 && result.stdout.length === 0) return [];
     if (result.exitCode !== 0) throw invocationError("listFiles", result);
     return result.stdout.split("\n").map((line) => line.trim()).filter(Boolean).sort();
   }
 
-  async grep(pattern: string, pathGlob = "**/*"): Promise<GrepMatch[]> {
+  async grep(pattern: string, pathGlob = "**/*", opts: DeadlineOptions = {}): Promise<GrepMatch[]> {
     const result = await this.invoke([
       "rg",
       "--line-number",
@@ -118,7 +120,7 @@ export class DockerExecutor implements Executor {
       "--regexp",
       pattern,
       ".",
-    ]);
+    ], opts);
     if (result.exitCode === 1 && result.stdout.length === 0) return [];
     if (result.exitCode !== 0) throw invocationError("grep", result);
     const matches: GrepMatch[] = [];
@@ -142,9 +144,8 @@ export class DockerExecutor implements Executor {
         ]
       : ["bash", "-lc", command];
     return await this.invoke(invocation, {
+      ...opts,
       cwd,
-      ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
-      ...(opts.env !== undefined ? { env: opts.env } : {}),
     });
   }
 
@@ -219,37 +220,35 @@ export class DockerExecutor implements Executor {
     }
     args.push("--workdir", opts.cwd ?? "/workspace", this.image, ...command);
 
-    const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const child = spawn(this.dockerBinary, args, { stdio: ["pipe", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    child.stdout.on("data", (chunk) => (stdout += chunk.toString()));
-    child.stderr.on("data", (chunk) => (stderr += chunk.toString()));
-    if (opts.stdin !== undefined) child.stdin.end(opts.stdin);
-    else child.stdin.end();
-
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-      const cleanup = spawn(this.dockerBinary, ["rm", "-f", name], { stdio: "ignore" });
-      cleanup.unref();
-    }, timeoutMs);
-
-    return await new Promise<ExecResult>((resolveResult) => {
-      let settled = false;
-      const finish = (exitCode: number) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolveResult({ stdout, stderr, exitCode: timedOut ? 124 : exitCode, timedOut });
-      };
-      child.on("close", (code, signal) => finish(code ?? (signal ? 128 : -1)));
-      child.on("error", (err) => {
-        stderr += `${stderr ? "\n" : ""}${err.message}`;
-        finish(-1);
-      });
+    throwIfExpired(opts);
+    const result = await runProcess(this.dockerBinary, args, {
+      ...(opts.signal ? { signal: opts.signal } : {}),
+      ...(opts.deadlineMs !== undefined ? { deadlineMs: opts.deadlineMs } : {}),
+      ...(opts.stdin !== undefined ? { stdin: opts.stdin } : {}),
+      // opts.cwd/env belong to the container, not the Docker client process.
+      cwd: this.workspaceRoot,
+      timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     });
+    if (result.timedOut) {
+      // Killing the Docker client does not stop the container. Await removal
+      // before returning; cleanup has a separate, strictly bounded grace period.
+      const cleanup = await runProcess(this.dockerBinary, ["rm", "-f", name], {
+        timeoutMs: 5_000,
+      });
+      if (cleanup.exitCode !== 0) {
+        const detail = cleanup.stderr || cleanup.stdout || String(cleanup.exitCode);
+        result.stderr += `\ncontainer cleanup failed for ${name}: ${detail}`;
+        // A caller may replace this result with the shared deadline error.
+        // Preserve cleanup evidence in operational logs as well.
+        log.error("container cleanup failed", {
+          container: name,
+          exitCode: cleanup.exitCode,
+          timedOut: cleanup.timedOut,
+          detail,
+        });
+      }
+    }
+    return result;
   }
 }
 

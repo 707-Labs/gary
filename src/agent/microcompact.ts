@@ -52,6 +52,17 @@ export interface MicrocompactOptions {
 
 export const DEFAULT_KEEP_RECENT = 6;
 
+export interface MicrocompactResult {
+  messages: Anthropic.MessageParam[];
+  cleared: number;
+  /**
+   * Original read_file input paths whose contents were removed in this pass.
+   * Callers must invalidate these using the same path normalization as their
+   * read cache. A retained duplicate-read pointer does not preserve contents.
+   */
+  compactedReadPaths: string[];
+}
+
 /**
  * Returns a (possibly new) messages array with old compactable tool_results
  * cleared. Returns the input array unchanged if nothing was eligible.
@@ -59,19 +70,27 @@ export const DEFAULT_KEEP_RECENT = 6;
 export function microcompactMessages(
   messages: readonly Anthropic.MessageParam[],
   options: MicrocompactOptions = { keepRecent: DEFAULT_KEEP_RECENT },
-): { messages: Anthropic.MessageParam[]; cleared: number } {
-  const compactableIds = collectCompactableToolIds(messages);
+): MicrocompactResult {
+  const compactableCalls = collectCompactableToolCalls(messages);
+  const compactableIds = compactableCalls.map((call) => call.id);
+  const readPathsById = new Map<string, string>();
+  for (const call of compactableCalls) {
+    if (call.name !== "read_file" || !call.input || typeof call.input !== "object") continue;
+    const path = (call.input as { path?: unknown }).path;
+    if (typeof path === "string" && path.length > 0) readPathsById.set(call.id, path);
+  }
   if (compactableIds.length === 0) {
-    return { messages: [...messages], cleared: 0 };
+    return { messages: [...messages], cleared: 0, compactedReadPaths: [] };
   }
   const keep = Math.max(1, options.keepRecent);
   const keepSet = new Set(compactableIds.slice(-keep));
   const clearSet = new Set(compactableIds.filter((id) => !keepSet.has(id)));
   if (clearSet.size === 0) {
-    return { messages: [...messages], cleared: 0 };
+    return { messages: [...messages], cleared: 0, compactedReadPaths: [] };
   }
 
   let cleared = 0;
+  const compactedReadPaths = new Set<string>();
   const out = messages.map((msg): Anthropic.MessageParam => {
     if (msg.role !== "user" || !Array.isArray(msg.content)) return msg;
     let touched = false;
@@ -83,6 +102,10 @@ export function microcompactMessages(
       ) {
         touched = true;
         cleared += 1;
+        const path = readPathsById.get(block.tool_use_id);
+        if (path !== undefined && isReadFileContent(block, path)) {
+          compactedReadPaths.add(path);
+        }
         return { ...block, content: TOOL_RESULT_CLEARED };
       }
       return block;
@@ -91,22 +114,33 @@ export function microcompactMessages(
     return { ...msg, content: newContent };
   });
 
-  return { messages: out, cleared };
+  return { messages: out, cleared, compactedReadPaths: [...compactedReadPaths] };
 }
 
-function collectCompactableToolIds(
+function collectCompactableToolCalls(
   messages: readonly Anthropic.MessageParam[],
-): string[] {
-  const ids: string[] = [];
+): Anthropic.ToolUseBlock[] {
+  const calls: Anthropic.ToolUseBlock[] = [];
   for (const msg of messages) {
     if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
     for (const block of msg.content) {
       if (block.type === "tool_use" && COMPACTABLE_TOOLS.has(block.name)) {
-        ids.push(block.id);
+        calls.push(block);
       }
     }
   }
-  return ids;
+  return calls;
+}
+
+function isReadFileContent(block: Anthropic.ToolResultBlockParam, path: string): boolean {
+  if (block.is_error || block.content === undefined) return false;
+  if (typeof block.content !== "string") return block.content.length > 0;
+  if (block.content.startsWith("error in read_file: ")) return false;
+  // Match the tool's complete generated pointer, not an arbitrary file that
+  // happens to contain the words "already read". Pointers cannot keep a read
+  // cache entry valid after the original content has left the conversation.
+  return block.content !==
+    `(already read \`${path}\` earlier in this conversation; refer to your prior tool_result. write_file/edit_file on this path invalidates the cache and a fresh read returns updated content.)`;
 }
 
 function isAlreadyCleared(

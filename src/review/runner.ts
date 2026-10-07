@@ -1,3 +1,5 @@
+import { createDeadline, DeadlineExceededError, type Deadline } from "../deadline.ts";
+import { bindExecutorDeadline } from "../executors/index.ts";
 import type Anthropic from "@anthropic-ai/sdk";
 import type { GLMClient } from "../adapters/glm.ts";
 import type { Executor } from "../executors/index.ts";
@@ -41,14 +43,25 @@ export interface RunReviewerArgs {
   worktreePath: string;
   iterationCap: number;
   timeoutMs: number;
+  deadlineMs?: number;
+  signal?: AbortSignal;
 }
 
 const DEFAULT_TEMPERATURE = 0.2;
 const DEFAULT_MAX_TOKENS = 4096;
 
 export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult> {
+  const budget = createDeadline(args);
+  try {
+    return await runWithinDeadline(args, budget);
+  } finally {
+    budget.dispose();
+  }
+}
+
+async function runWithinDeadline(args: RunReviewerArgs, budget: Deadline): Promise<ReviewerResult> {
   const start = Date.now();
-  const tools = makeReviewerToolset(args.executor);
+  const tools = makeReviewerToolset(bindExecutorDeadline(args.executor, budget), budget);
   const system = composeReviewerSystemPrompt();
   const task = renderReviewTask({
     ticket: args.ticket,
@@ -60,11 +73,17 @@ export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult
   });
 
   const messages: Anthropic.MessageParam[] = [{ role: "user", content: task }];
-  const deadline = start + args.timeoutMs;
   let providerName: string | null = null;
   let inputTokens = 0;
   let outputTokens = 0;
   let failureReason: string | null = null;
+
+  const cancelled = (): boolean => {
+    try { budget.throwIfExpired(); return false; } catch (err) {
+      failureReason = err instanceof DeadlineExceededError ? "timeout" : "aborted";
+      return true;
+    }
+  };
 
   // Inject a forcing nudge near the iteration cap so a wandering reviewer
   // commits a verdict instead of running out of turns. Mirrors the primary
@@ -74,10 +93,7 @@ export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult
 
   let iteration = 0;
   while (iteration < args.iterationCap) {
-    if (Date.now() > deadline) {
-      failureReason = "timeout";
-      break;
-    }
+    if (cancelled()) break;
     if (!nudgeFired && iteration + 1 === nudgeAt) {
       messages.push({
         role: "user",
@@ -93,28 +109,16 @@ export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult
     }
     iteration++;
     let response: Anthropic.Message;
-    const remainingMs = deadline - Date.now();
-    const timeoutSentinel = Symbol("timeout");
-    const timeoutPromise = new Promise<typeof timeoutSentinel>((resolve) =>
-      setTimeout(() => resolve(timeoutSentinel), remainingMs),
-    );
     try {
-      const raceResult = await Promise.race([
-        args.glm.createMessage({
-          max_tokens: DEFAULT_MAX_TOKENS,
-          temperature: DEFAULT_TEMPERATURE,
-          system,
-          tools: tools.definitions,
-          messages,
-        }),
-        timeoutPromise,
-      ]);
-      if (raceResult === timeoutSentinel) {
-        failureReason = "timeout";
-        break;
-      }
-      response = raceResult as Anthropic.Message;
+      response = await args.glm.createMessage({
+        max_tokens: DEFAULT_MAX_TOKENS,
+        temperature: DEFAULT_TEMPERATURE,
+        system,
+        tools: tools.definitions,
+        messages,
+      }, budget);
     } catch (err) {
+      if (cancelled()) break;
       if (err instanceof AllProvidersExhaustedError) {
         failureReason = "providers_exhausted";
         break;
@@ -130,6 +134,7 @@ export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult
       break;
     }
 
+    if (cancelled()) break;
     if (providerName === null) {
       try {
         providerName = args.glm.chain.providers[0]?.name ?? null;
@@ -152,6 +157,7 @@ export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult
     );
     const toolResults: Anthropic.ToolResultBlockParam[] = [];
     for (const call of toolCalls) {
+      if (cancelled()) break;
       const handler = tools.handlers[call.name];
       if (!handler) {
         toolResults.push({
@@ -179,13 +185,14 @@ export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult
         });
       }
     }
+    if (cancelled()) break;
     messages.push({ role: "user", content: toolResults });
     if (tools.review) break;
   }
 
   const durationMs = Date.now() - start;
 
-  if (tools.review) {
+  if (tools.review && !failureReason) {
     persist({
       db: args.db,
       args,

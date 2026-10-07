@@ -46,6 +46,11 @@ function applyMigrations(db: DB): void {
   if (!cols.has("model")) {
     db.exec("ALTER TABLE actions ADD COLUMN model TEXT");
   }
+  if (!cols.has("outcome")) {
+    // success only tells us dispatch returned normally. Do not infer a
+    // delivery result for historical rows, including successful escalations.
+    db.exec("ALTER TABLE actions ADD COLUMN outcome TEXT NOT NULL DEFAULT 'unknown'");
+  }
 }
 
 export function closeDb(db: DB): void {

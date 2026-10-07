@@ -4,6 +4,8 @@ import type { CloudflareClient } from "../adapters/cloudflare.ts";
 import type { GitHubClient } from "../adapters/github.ts";
 import type { LinearAdapter, WorkflowStateType } from "../adapters/linear.ts";
 import type { Executor } from "../executors/index.ts";
+import { bindExecutorDeadline } from "../executors/index.ts";
+import { createDeadline, guardAdapterCalls, type DeadlineOptions } from "../deadline.ts";
 import { redactGitHubTokens } from "../redact.ts";
 import { fetchPublicUrl } from "../safe-fetch.ts";
 import type { RunLogEntry } from "./loop.ts";
@@ -27,6 +29,8 @@ export interface AgentTools {
   handlers: Record<string, ToolHandler>;
   /** Set when the agent calls finish. */
   finishSummary: string | null;
+  /** A deliberate unsuccessful stop; never satisfies the verification gate. */
+  blockedReason: string | null;
   /**
    * Flipped to true once a run_bash invocation of `finishGateCommand`
    * exits with code 0. Read by `finish` to gate completion.
@@ -35,9 +39,8 @@ export interface AgentTools {
   /**
    * Paths the model has already read in this conversation. `read_file`
    * short-circuits duplicate reads to a pointer; `write_file` / `edit_file`
-   * remove the path so the next read returns fresh content. `run_bash` is
-   * NOT tracked — the model is responsible for re-reading after running
-   * codegen-style commands.
+   * remove the path so the next read returns fresh content. Shell commands
+   * invalidate all paths because they may modify files even on failure.
    */
   readCache: Set<string>;
   /**
@@ -48,7 +51,7 @@ export interface AgentTools {
   todos: TodoItem[];
 }
 
-export interface ToolsetOptions {
+export interface ToolsetOptions extends DeadlineOptions {
   /** When set, exposes Cloudflare Workers Observability tools. */
   cloudflare?: CloudflareClient;
   /** When set, exposes Linear read tools (e.g. `get_linear_issue`). */
@@ -97,10 +100,15 @@ export interface SubagentRunnerResult {
 
 /** Builds the toolset bound to an Executor. The agent loop drives this. */
 export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): AgentTools {
+  executor = bindExecutorDeadline(executor, opts);
+  const linear = opts.linear ? guardAdapterCalls(opts.linear, opts) : undefined;
+  const github = opts.github ? guardAdapterCalls(opts.github, opts) : undefined;
+  const cloudflare = opts.cloudflare ? guardAdapterCalls(opts.cloudflare, opts) : undefined;
   const out: AgentTools = {
     definitions: [],
     handlers: {},
     finishSummary: null,
+    blockedReason: null,
     finishGateMet: false,
     readCache: new Set<string>(),
     todos: [],
@@ -123,27 +131,28 @@ export function makeToolset(executor: Executor, opts: ToolsetOptions = {}): Agen
     register(commitTool(executor));
   }
   register(todoWriteTool(out));
-  register(fetchUrlTool());
-  if (opts.linear) {
-    register(getLinearIssueTool(opts.linear));
+  register(fetchUrlTool(opts));
+  if (linear) {
+    register(getLinearIssueTool(linear));
     if (opts.currentIssue && !opts.readOnly) {
-      register(unassignSelfTool(opts.linear, opts.currentIssue));
-      register(setTicketStateTool(opts.linear, opts.currentIssue));
-      register(updateTicketDescriptionTool(opts.linear, opts.currentIssue));
+      register(unassignSelfTool(linear, opts.currentIssue));
+      register(setTicketStateTool(linear, opts.currentIssue, opts));
+      register(updateTicketDescriptionTool(linear, opts.currentIssue));
     }
   }
-  if (opts.github) {
-    register(getPrTool(opts.github, opts.defaultRepo));
+  if (github) {
+    register(getPrTool(github, opts.defaultRepo));
   }
-  if (opts.cloudflare) {
-    register(queryCloudflareLogsTool(opts.cloudflare));
-    register(listCloudflareInvocationsTool(opts.cloudflare));
-    register(d1QueryTool(opts.cloudflare));
+  if (cloudflare) {
+    register(queryCloudflareLogsTool(cloudflare));
+    register(listCloudflareInvocationsTool(cloudflare));
+    register(d1QueryTool(cloudflare));
   }
   if (opts.subagentRunner) {
     register(dispatchSubagentTool(opts.subagentRunner));
   }
   register(finishTool(out, opts.finishGateCommand));
+  register(reportBlockedTool(out));
 
   return out;
 }
@@ -154,7 +163,7 @@ function readFileTool(executor: Executor, tools: AgentTools): ToolHandler {
     definition: {
       name: "read_file",
       description:
-        "Read the contents of a file in the workspace. Repeat reads of the same path return a short pointer instead of the contents — refer to your earlier tool_result. Modifying the file via write_file/edit_file invalidates this and the next read returns fresh content.",
+        "Read the contents of a file in the workspace. Repeat reads may return a pointer to retained content. Compaction, file edits, and shell commands invalidate cached reads so the next read returns fresh content.",
       input_schema: {
         type: "object",
         properties: { path: { type: "string", description: "Path relative to the workspace root." } },
@@ -378,6 +387,8 @@ function runBashTool(
         return parts.join("\n");
       } catch (err) {
         return formatError("run_bash", err);
+      } finally {
+        tools.readCache.clear();
       }
     },
   };
@@ -417,6 +428,26 @@ function commitTool(executor: Executor): ToolHandler {
 }
 
 const finishSchema = z.object({ summary: z.string().min(1) });
+const blockedSchema = z.object({ reason: z.string().trim().min(1) });
+function reportBlockedTool(out: AgentTools): ToolHandler {
+  return {
+    definition: {
+      name: "report_blocked",
+      description:
+        "Stop without claiming success when you cannot complete or verify the task. Include the concrete blocker, relevant error, partial work, and what a human must resolve. This exits even when the check fails; it never approves or ships the work.",
+      input_schema: {
+        type: "object",
+        properties: { reason: { type: "string" } },
+        required: ["reason"],
+      },
+    },
+    async run(input) {
+      const { reason } = blockedSchema.parse(input);
+      out.blockedReason = reason;
+      return "blocked";
+    },
+  };
+}
 function finishTool(
   out: AgentTools,
   finishGateCommand: string | undefined,
@@ -530,7 +561,7 @@ const fetchUrlSchema = z.object({
 });
 const FETCH_URL_TIMEOUT_MS = 30_000;
 const FETCH_URL_MAX_BYTES = 200_000;
-function fetchUrlTool(): ToolHandler {
+function fetchUrlTool(options: DeadlineOptions = {}): ToolHandler {
   return {
     definition: {
       name: "fetch_url",
@@ -549,12 +580,12 @@ function fetchUrlTool(): ToolHandler {
     },
     async run(input) {
       const { url } = fetchUrlSchema.parse(input);
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), FETCH_URL_TIMEOUT_MS);
+      const budget = createDeadline({ ...options, timeoutMs: FETCH_URL_TIMEOUT_MS });
       try {
+        budget.throwIfExpired();
         const res = await fetchPublicUrl(url, {
           headers: { "User-Agent": "gary-707-labs (https://github.com/707-Labs/gary)" },
-          signal: controller.signal,
+          signal: budget.signal,
         });
         const text = await res.text();
         const truncated = text.length > FETCH_URL_MAX_BYTES;
@@ -567,7 +598,7 @@ function fetchUrlTool(): ToolHandler {
         }
         return formatError("fetch_url", err);
       } finally {
-        clearTimeout(timer);
+        budget.dispose();
       }
     },
   };
@@ -714,6 +745,7 @@ function unassignSelfTool(
 function setTicketStateTool(
   linear: LinearAdapter,
   current: { id: string; identifier: string; teamId: string },
+  options: DeadlineOptions = {},
 ): ToolHandler {
   return {
     definition: {
@@ -746,6 +778,7 @@ function setTicketStateTool(
           current.id,
           current.teamId,
           type as WorkflowStateType,
+          options,
         );
         return `moved ${current.identifier} to "${result.stateName}" (${type})`;
       } catch (err) {

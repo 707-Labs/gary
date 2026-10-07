@@ -56,9 +56,13 @@ On changes_needed, the primary re-enters its loop with the findings
 as the new task. After `GARY_REVIEW_MAX_ROUNDS` (default 3) rejected
 rounds, the ticket is escalated via review_rejected.
 
-On reviewer crash/timeout, retry once. On second failure, default-
-approve with a placeholder verification report. Calibration is via
-the `review_passes` table.
+On reviewer crash/timeout, retry once within the shared execution deadline.
+If both attempts fail, escalate as `review_failed` with failure class
+`review_unavailable`, preserve the work, and require human review before
+publication. A failed review supplies no verdict and must not synthesize
+code findings or trigger another fixup. Record both failed attempts in
+`review_passes` and mark the round escalated. Only an actual approval allows
+publication; calibration is via the `review_passes` table.
 
 Files: `src/review/{precheck.ts, tools.ts, prompts.ts, runner.ts}`,
 `src/state/review-queries.ts`. Wired in `src/handlers/code.ts` between

@@ -1,5 +1,6 @@
 import { LinearClient } from "@linear/sdk";
 import type { Config } from "../config.ts";
+import { throwIfExpired, type DeadlineOptions } from "../deadline.ts";
 import { log } from "../logger.ts";
 
 export interface BlockerRef {
@@ -404,8 +405,11 @@ export class LinearAdapter {
     issueId: string,
     teamId: string,
     type: WorkflowStateType,
+    options: DeadlineOptions = {},
   ): Promise<{ stateName: string }> {
+    throwIfExpired(options);
     const states = await this.fetchTeamStates(teamId);
+    throwIfExpired(options);
     const match = states.find((s) => s.type === type);
     if (!match) {
       const known = states.map((s) => `${s.name} (${s.type})`).join(", ");

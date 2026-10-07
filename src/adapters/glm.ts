@@ -1,3 +1,4 @@
+import { createDeadline, type Deadline, type DeadlineOptions } from "../deadline.ts";
 import type Anthropic from "@anthropic-ai/sdk";
 import { log } from "../logger.ts";
 import {
@@ -99,7 +100,7 @@ function withCacheOnLastMessage(
   return out;
 }
 
-export interface CompleteArgs {
+export interface CompleteArgs extends DeadlineOptions {
   system: string;
   user: string;
   temperature?: number;
@@ -150,28 +151,33 @@ export class GLMClient {
    * deliberately different — a tool-use turn legitimately has no text.
    */
   async complete(args: CompleteArgs): Promise<string> {
-    return await this.runWithFallback(async (provider) => {
-      const response = await provider.client.messages.create({
-        model: provider.model,
-        max_tokens: args.maxTokens ?? DEFAULT_MAX_TOKENS,
-        ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
-        system: args.system,
-        messages: [{ role: "user", content: args.user }],
-        ...(args.stopSequences ? { stop_sequences: [...args.stopSequences] } : {}),
-      });
-      const text = response.content
-        .filter((b): b is Anthropic.TextBlock => b.type === "text")
-        .map((b) => b.text)
-        .join("\n");
-      if (text.trim() === "") {
-        throw new EmptyCompletionError(
-          provider.name,
-          provider.model,
-          response.stop_reason,
-        );
-      }
-      return text;
-    });
+    const budget = createDeadline(args);
+    try {
+      return await this.runWithFallback(async (provider) => {
+        const response = await provider.client.messages.create({
+          model: provider.model,
+          max_tokens: args.maxTokens ?? DEFAULT_MAX_TOKENS,
+          ...(args.temperature !== undefined ? { temperature: args.temperature } : {}),
+          system: args.system,
+          messages: [{ role: "user", content: args.user }],
+          ...(args.stopSequences ? { stop_sequences: [...args.stopSequences] } : {}),
+        }, requestOptions(budget));
+        const text = response.content
+          .filter((b): b is Anthropic.TextBlock => b.type === "text")
+          .map((b) => b.text)
+          .join("\n");
+        if (text.trim() === "") {
+          throw new EmptyCompletionError(
+            provider.name,
+            provider.model,
+            response.stop_reason,
+          );
+        }
+        return text;
+      }, budget);
+    } finally {
+      budget.dispose();
+    }
   }
 
   /**
@@ -182,14 +188,21 @@ export class GLMClient {
    */
   async createMessage(
     args: Omit<Anthropic.MessageCreateParamsNonStreaming, "model" | "stream">,
+    options: DeadlineOptions = {},
   ): Promise<Anthropic.Message> {
     const cached = withCacheControl(args);
-    return await this.runWithFallback((provider) =>
-      provider.client.messages.create({
-        ...cached,
-        model: provider.model,
-      }),
-    );
+    const budget = createDeadline(options);
+    try {
+      return await this.runWithFallback((provider) =>
+        provider.client.messages.create({
+          ...cached,
+          model: provider.model,
+        }, requestOptions(budget)),
+        budget,
+      );
+    } finally {
+      budget.dispose();
+    }
   }
 
   /**
@@ -208,6 +221,7 @@ export class GLMClient {
    */
   private async runWithFallback<T>(
     call: (provider: LLMProvider) => Promise<T>,
+    budget: Deadline,
   ): Promise<T> {
     let attempt = 0;
     const skipped = new Set<LLMProvider>();
@@ -216,6 +230,7 @@ export class GLMClient {
     // the chain is exhausted regardless of arming state.
     const max = this.chain.providers.length;
     while (attempt++ < max) {
+      budget.throwIfExpired();
       const provider =
         skipped.size === 0
           ? this.chain.active()
@@ -225,6 +240,7 @@ export class GLMClient {
       if (!provider) break;
       try {
         const out = await call(provider);
+        budget.throwIfExpired();
         if (attempt > 1) {
           log.info("provider fallback succeeded", {
             provider: provider.name,
@@ -233,6 +249,7 @@ export class GLMClient {
         }
         return out;
       } catch (err) {
+        budget.throwIfExpired();
         if (err instanceof EmptyCompletionError) {
           skipped.add(provider);
           lastEmpty = err;
@@ -252,4 +269,18 @@ export class GLMClient {
     if (lastEmpty) throw lastEmpty;
     throw new AllProvidersExhaustedError(this.chain.earliestReset());
   }
+}
+
+function requestOptions(budget: Deadline) {
+  budget.throwIfExpired();
+  return {
+    signal: budget.signal,
+    // SDK retry sleeps are not abortable in the installed SDK. During a
+    // budgeted run, disable hidden retries; provider fallback remains bounded
+    // by this same signal/deadline. Unbudgeted callers retain SDK defaults.
+    ...(Number.isFinite(budget.deadlineMs) ? {
+      maxRetries: 0,
+      timeout: Math.max(1, Math.min(600_000, budget.remainingMs())),
+    } : {}),
+  };
 }

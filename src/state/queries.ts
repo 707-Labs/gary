@@ -102,19 +102,46 @@ export function recordActionStart(
   return Number(result.lastInsertRowid);
 }
 
+/**
+ * Explicit delivery/handling result, independent of the success flag used
+ * by hasActedOn and the retry circuit breaker. `handled` makes no delivery
+ * claim for handlers that do not yet report a specific outcome.
+ */
+export type ActionOutcome =
+  | "unknown"
+  | "handled"
+  | "pr_opened"
+  | "no_changes"
+  | "agent_failed"
+  | "blocked"
+  | "timeout"
+  | "check_failed"
+  | "review_failed"
+  | "escalated"
+  | "rate_limited"
+  | "error";
+
 export function recordActionEnd(
   db: DB,
-  args: { id: number; success: boolean; errorMessage?: string },
+  args: {
+    id: number;
+    /** Whether dispatch returned normally, not whether a deliverable exists. */
+    success: boolean;
+    outcome?: ActionOutcome;
+    errorMessage?: string;
+  },
 ): void {
   db.query(
     `UPDATE actions
      SET completed_at = datetime('now'),
          success = $success,
+         outcome = $outcome,
          error_message = $err
      WHERE id = $id`,
   ).run({
     id: args.id,
     success: args.success ? 1 : 0,
+    outcome: args.outcome ?? "unknown",
     err: args.errorMessage ?? null,
   });
 }

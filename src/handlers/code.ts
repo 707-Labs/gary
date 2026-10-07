@@ -17,7 +17,8 @@ import {
   slugify,
 } from "../git.ts";
 import { createWorkspaceExecutor } from "../executors/factory.ts";
-import type { Executor } from "../executors/index.ts";
+import { bindExecutorDeadline, type Executor } from "../executors/index.ts";
+import { createDeadline, DeadlineExceededError, type DeadlineOptions } from "../deadline.ts";
 import { log } from "../logger.ts";
 import {
   formatProjectContext,
@@ -57,6 +58,7 @@ const INVESTIGATE_ALLOWED_TOOLS: ReadonlySet<string> = new Set([
   "d1_query",
   "todo_write",
   "dispatch_subagent",
+  "report_blocked",
 ]);
 
 /**
@@ -91,9 +93,9 @@ function buildCodePhases(scope: "S" | "M" | "L" = "M"): readonly PhaseSpec[] {
       name: "implement",
       maxIter: implement,
       entryMessage:
-        "good — you've explored. now: (1) write a 3-5 bullet plan of the changes you'll make, (2) implement them with write_file/edit_file/run_bash and commit your work, (3) run `bun run check` and fix anything you broke, (4) call finish() with a 1-2 sentence summary. if at any point you realize the change is bigger than expected or you're stuck, call finish() with a brief partial-progress note and a human will pick it up.",
+        "good — you've explored. now: (1) write a 3-5 bullet plan, (2) implement the change and commit, (3) run `bun run check` and fix anything you broke, (4) call finish() after verification passes. If you're stuck or cannot verify, call report_blocked with the concrete error, partial work, and needed human action. After two attempts reproduce the same failure without new evidence, stop and report the blocker.",
       nudgeMessage:
-        "you're approaching the iteration cap. wrap up: commit what you have, then call finish() with a brief summary (or a partial-progress note if you're stuck). a partial-progress finish is much better than running out of iterations mid-stream.",
+        "you're approaching the iteration cap. If verified, commit and call finish(). Otherwise call report_blocked with partial progress and the specific unresolved error; do not claim verification passed.",
     },
   ];
 }
@@ -105,7 +107,8 @@ Rules:
 - Only fix what's broken — don't refactor unrelated code.
 - If the failure is in code you didn't touch, investigate before assuming it's pre-existing. The pre-push hook runs the same command, so anything failing here will block your push.
 - Commit your fix-up changes before calling finish.
-- If you can't make the check pass after a few iterations, call finish() with a one-sentence summary of what's still broken so a human can take over.`;
+- First distinguish a changed-code failure from an existing repository failure or unavailable tooling/dependencies. Cite the first actionable error; do not change unrelated code to bypass an environment problem.
+- After two attempts reproduce the same failure without new evidence, call report_blocked with the error and partial progress. A blocked exit does not require a passing check.`;
 
 const CODE_TASK_INSTRUCTIONS = `You are working on a Linear ticket for 707 Labs. Make the smallest change that solves the ticket and stop.
 
@@ -117,7 +120,7 @@ Rules:
 - BEFORE calling finish, run \`bun run check\` (the project's typecheck/svelte-check command). If there are errors caused by your changes, fix them and re-run. The repo has a pre-push hook that runs the same command — your push will be rejected if it fails.
 - Run other tests if there's an obvious command for the area you touched (look at package.json scripts and tests in the changed file's directory). If tests fail, try to fix them.
 - If the ticket is ambiguous, make a reasonable choice and note it in finish()'s summary.
-- If you realize the ticket is bigger than you can handle, call finish() with a summary explaining what you got done and what's left. Escalation will happen automatically.
+- If you cannot complete or verify the task, call report_blocked with the concrete blocker, partial work, and what a human must resolve. Do not use finish() for partial progress.
 - Don't install new dependencies unless the ticket clearly requires it.
 - Commit your changes before calling finish.`;
 
@@ -130,7 +133,7 @@ The Summary describes what the diff actually does, not what you originally plann
 Required sections, in order:
 1. \`## Summary\` — 1-3 short paragraphs and/or bullets explaining what changed and why. Lead with the most important change.
 2. \`## Things i'm less sure about\` — only if there's genuine uncertainty. Skip the section entirely if the change is small and confident.
-3. \`## Verification\` — paste the reviewer's verification report verbatim. Do not edit, summarize, or paraphrase. If you were given the placeholder text "_reviewer pass unavailable for this PR_", use that.
+3. \`## Verification\` — paste the reviewer's verification report verbatim. Do not edit, summarize, or paraphrase.
 4. \`## Test plan\` — markdown checklist. Each line is \`- [x] <command>\` for things you ran, \`- [ ] <thing>\` for things still to verify (always include \`- [ ] CI green\`). At minimum include the typecheck command you ran (\`bun run check\` or equivalent).
 5. \`## Follow-ups\` — only if there are genuine related tasks not in scope here.
 6. A blank line, then \`closes [<TICKET-ID>]\` (uppercase).
@@ -183,7 +186,7 @@ export interface CodeHandlerArgs {
 }
 
 export interface CodeHandlerResult {
-  status: "pr_opened" | "no_changes" | "agent_failed";
+  status: "pr_opened" | "no_changes" | "agent_failed" | "blocked" | "timeout" | "check_failed" | "review_failed";
   prUrl?: string;
   prNumber?: number;
   branch: string;
@@ -194,6 +197,30 @@ export async function runCodeHandler(
   deps: CodeHandlerDeps,
   args: CodeHandlerArgs,
 ): Promise<CodeHandlerResult> {
+  const budget = createDeadline({ timeoutMs: deps.agentLoopTimeoutMs });
+  try {
+    return await runCodeHandlerWithinDeadline(deps, args, budget);
+  } catch (err) {
+    if (!(err instanceof DeadlineExceededError) && !budget.signal.aborted) throw err;
+    await escalateToReporter(deps, args, "timeout");
+    return {
+      status: "timeout",
+      branch: `${args.issue.identifier}-${slugify(args.issue.title)}`,
+      summary: "Shared execution deadline exhausted; remaining work was stopped.",
+    };
+  } finally {
+    budget.dispose();
+  }
+}
+
+type CodeBudget = ReturnType<typeof createDeadline>;
+
+async function runCodeHandlerWithinDeadline(
+  deps: CodeHandlerDeps,
+  args: CodeHandlerArgs,
+  budget: CodeBudget,
+): Promise<CodeHandlerResult> {
+  budget.throwIfExpired();
   const [owner, name] = args.repo.split("/") as [string, string];
 
   const branch = `${args.issue.identifier}-${slugify(args.issue.title)}`;
@@ -207,14 +234,18 @@ export async function runCodeHandler(
   });
 
   const freshUrl = await deps.github.cloneUrl(owner, name);
+  budget.throwIfExpired();
   const bareDir = await ensureBareClone({
     owner,
     repo: name,
     reposDir: deps.reposDir,
     freshTokenUrl: freshUrl,
+    deadlineMs: budget.deadlineMs,
+    signal: budget.signal,
   });
 
   const viewer = await deps.github.getViewer();
+  budget.throwIfExpired();
   const authorEmail = `${viewer.login}@users.noreply.github.com`;
 
   await createWorktree({
@@ -224,9 +255,11 @@ export async function runCodeHandler(
     baseBranch: BASE_BRANCH,
     authorName: viewer.login,
     authorEmail,
+    deadlineMs: budget.deadlineMs,
+    signal: budget.signal,
   });
 
-  const executor = createWorkspaceExecutor(worktreePath);
+  const executor = bindExecutorDeadline(createWorkspaceExecutor(worktreePath), budget);
   const system = composeSystemPrompt({ taskInstructions: CODE_TASK_INSTRUCTIONS });
   const projectSection = formatProjectContext(
     loadProjectContext(worktreePath),
@@ -248,6 +281,8 @@ export async function runCodeHandler(
     maxIterations: deps.agentLoopMaxIterations,
     phases: buildCodePhases(args.scope),
     timeoutMs: deps.agentLoopTimeoutMs,
+    deadlineMs: budget.deadlineMs,
+    signal: budget.signal,
     temperature: 0.3,
     linear: deps.linear,
     currentIssue: {
@@ -272,8 +307,15 @@ export async function runCodeHandler(
     cacheReadTokens: loopResult.cacheReadTokens,
   });
 
+  if (loopResult.status === "blocked") {
+    await escalateToReporter(deps, args, "blocked", loopResult.summary);
+    return { status: "blocked", branch, summary: loopResult.summary };
+  }
+  budget.throwIfExpired();
+  if (loopResult.status === "timeout") throw new DeadlineExceededError();
+
   const baseRef = BASE_BRANCH;
-  const hasCommits = await hasCommitsAhead(worktreePath, baseRef);
+  const hasCommits = await hasCommitsAhead(worktreePath, baseRef, budget);
 
   if (loopResult.status !== "finished") {
     if (hasCommits) {
@@ -307,9 +349,10 @@ export async function runCodeHandler(
   const checkPassed = await ensurePostFinishCheckPasses(deps, args, {
     executor,
     system,
+    budget,
   });
-  if (!checkPassed) {
-    return { status: "agent_failed", branch, summary: loopResult.summary };
+  if (checkPassed !== "passed") {
+    return { status: checkPassed, branch, summary: loopResult.summary };
   }
 
   // ===== reviewer pass =====
@@ -323,9 +366,14 @@ export async function runCodeHandler(
     reviewerGlm,
     fingerprint: reviewFingerprint,
     worktreePath,
+    budget,
   });
   if (reviewOutcome.kind === "escalated") {
-    return { status: "agent_failed", branch, summary: loopResult.summary };
+    return {
+      status: reviewOutcome.status ?? "review_failed",
+      branch,
+      summary: reviewOutcome.summary ?? loopResult.summary,
+    };
   }
   const verificationReport = reviewOutcome.verificationReport;
 
@@ -333,11 +381,14 @@ export async function runCodeHandler(
   // gracefully: conflict → push un-rebased; check fails after rebase →
   // revert and push pre-rebase. Never fails the run.
   const freshUrlForPush = await deps.github.cloneUrl(owner, name);
+  budget.throwIfExpired();
   const rebase = await rebaseOntoFreshBase({
     bareDir,
     worktreePath,
     freshTokenUrl: freshUrlForPush,
     baseBranch: BASE_BRANCH,
+    deadlineMs: budget.deadlineMs,
+    signal: budget.signal,
   });
   if (rebase.kind === "conflict") {
     log.warn("rebase onto main conflicted; pushing un-rebased branch", {
@@ -356,6 +407,8 @@ export async function runCodeHandler(
       });
       await gitMust(["reset", "--hard", rebase.preRebaseSha], {
         cwd: worktreePath,
+        deadlineMs: budget.deadlineMs,
+        signal: budget.signal,
       });
     } else {
       log.info("rebased onto fresh main", {
@@ -367,10 +420,8 @@ export async function runCodeHandler(
     }
   }
 
-  await pushBranch({ worktreePath, freshTokenUrl: freshUrlForPush, branch });
-
-  const diff = await getDiff(worktreePath, baseRef);
-  const log_ = await getCommitLog(worktreePath, baseRef);
+  const diff = await getDiff(worktreePath, baseRef, budget);
+  const log_ = await getCommitLog(worktreePath, baseRef, budget);
 
   const prBody = await composePrBody(deps, {
     issue: args.issue,
@@ -379,13 +430,20 @@ export async function runCodeHandler(
     diff,
     commitLog: log_,
     verificationReport,
+    deadlineMs: budget.deadlineMs,
+    signal: budget.signal,
   });
   const prTitle = await composePrTitle(deps, {
     issue: args.issue,
     summary: loopResult.summary,
     diff,
+    deadlineMs: budget.deadlineMs,
+    signal: budget.signal,
   });
 
+  budget.throwIfExpired();
+  await pushBranch({ worktreePath, freshTokenUrl: freshUrlForPush, branch, deadlineMs: budget.deadlineMs, signal: budget.signal });
+  budget.throwIfExpired();
   const pr = await deps.github.openPullRequest({
     owner,
     repo: name,
@@ -404,6 +462,18 @@ export async function runCodeHandler(
     branch,
   });
 
+  // PR creation is a legacy non-cancellable API call. Once its response arrives,
+  // preserve the real delivery outcome even if it crossed the execution deadline.
+  // Do not start follow-up remote writes after expiry.
+  const published: CodeHandlerResult = {
+    status: "pr_opened", prUrl: pr.url, prNumber: pr.number, branch,
+    summary: loopResult.summary,
+  };
+  const publicationExpired = () => budget.signal.aborted || Date.now() >= budget.deadlineMs;
+  if (publicationExpired()) {
+    log.warn("PR recorded after deadline; skipping Linear follow-up", { issue: args.issue.identifier, pr: pr.url });
+    return published;
+  }
   try {
     await deps.linear.addPrAttachment(args.issue.id, pr.url, prTitle);
   } catch (err) {
@@ -412,24 +482,25 @@ export async function runCodeHandler(
     // we get "Duplicate attachment for duplicate url" — non-fatal; the
     // attachment exists either way.
     const message = err instanceof Error ? err.message : String(err);
-    if (!/duplicate/i.test(message)) throw err;
-    log.debug("attachment already exists (Linear auto-detected)", {
+    if (!/duplicate/i.test(message)) log.warn("PR opened but Linear attachment failed", {
+      issue: args.issue.identifier, pr: pr.url, error: message,
+    });
+    else log.debug("attachment already exists (Linear auto-detected)", {
       issue: args.issue.identifier,
       pr: pr.url,
     });
   }
-  await deps.linear.postComment(
-    args.issue.id,
-    `pr is up: ${pr.url}\n\n${loopResult.summary ?? ""}`.trim(),
-  );
-
-  return {
-    status: "pr_opened",
-    prUrl: pr.url,
-    prNumber: pr.number,
-    branch,
-    summary: loopResult.summary,
-  };
+  if (!publicationExpired()) {
+    try {
+      await deps.linear.postComment(args.issue.id, `pr is up: ${pr.url}\n\n${loopResult.summary ?? ""}`.trim());
+    } catch (err) {
+      log.warn("PR opened but Linear notification failed", {
+        issue: args.issue.identifier, pr: pr.url,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return published;
 }
 
 interface RenderTicketOpts {
@@ -465,7 +536,7 @@ function renderTicketForAgent(
   return sections.join("\n");
 }
 
-interface ComposePrBodyArgs {
+interface ComposePrBodyArgs extends DeadlineOptions {
   issue: AssignedIssue;
   branch: string;
   summary: string | null;
@@ -504,10 +575,12 @@ async function composePrBody(
     user,
     temperature: 0.4,
     maxTokens: 1024,
+    ...(args.deadlineMs !== undefined ? { deadlineMs: args.deadlineMs } : {}),
+    ...(args.signal ? { signal: args.signal } : {}),
   });
 }
 
-interface ComposePrTitleArgs {
+interface ComposePrTitleArgs extends DeadlineOptions {
   issue: AssignedIssue;
   summary: string | null;
   diff: string;
@@ -536,6 +609,8 @@ async function composePrTitle(
     user,
     temperature: 0.2,
     maxTokens: 128,
+    ...(args.deadlineMs !== undefined ? { deadlineMs: args.deadlineMs } : {}),
+    ...(args.signal ? { signal: args.signal } : {}),
   });
   return raw.trim().split("\n")[0]?.trim() || args.issue.title;
 }
@@ -543,23 +618,24 @@ async function composePrTitle(
 interface FixupContext {
   executor: Executor;
   system: string;
+  budget: CodeBudget;
 }
 
 /**
  * Run `bun run check`. If it fails, feed the failure back to the agent for
- * one fix-up cycle and re-check. Returns true if the check is clean (either
- * on the first pass or after fix-up); false if we couldn't recover, in
- * which case the ticket is already escalated.
+ * one fix-up cycle and re-check. All stages share the original deadline.
+ * Unsuccessful outcomes have already been escalated before returning.
  */
 async function ensurePostFinishCheckPasses(
   deps: CodeHandlerDeps,
   args: CodeHandlerArgs,
   ctx: FixupContext,
-): Promise<boolean> {
+): Promise<"passed" | "blocked" | "check_failed"> {
+  ctx.budget.throwIfExpired();
   const first = await ctx.executor.run(CHECK_COMMAND, {
     timeoutMs: CHECK_TIMEOUT_MS,
   });
-  if (first.exitCode === 0) return true;
+  if (first.exitCode === 0) return "passed";
 
   log.warn("post-finish check failed; running fix-up", {
     issue: args.issue.identifier,
@@ -575,6 +651,8 @@ async function ensurePostFinishCheckPasses(
     task: fixupTask,
     maxIterations: FIXUP_MAX_ITERATIONS,
     timeoutMs: deps.agentLoopTimeoutMs,
+    deadlineMs: ctx.budget.deadlineMs,
+    signal: ctx.budget.signal,
     temperature: 0.3,
     linear: deps.linear,
     currentIssue: {
@@ -596,17 +674,23 @@ async function ensurePostFinishCheckPasses(
     cacheCreationTokens: fixupResult.cacheCreationTokens,
     cacheReadTokens: fixupResult.cacheReadTokens,
   });
+  if (fixupResult.status === "blocked") {
+    await escalateToReporter(deps, args, "blocked", fixupResult.summary);
+    return "blocked";
+  }
+  ctx.budget.throwIfExpired();
+  if (fixupResult.status === "timeout") throw new DeadlineExceededError();
 
   const second = await ctx.executor.run(CHECK_COMMAND, {
     timeoutMs: CHECK_TIMEOUT_MS,
   });
-  if (second.exitCode === 0) return true;
+  if (second.exitCode === 0) return "passed";
 
   log.warn("check still failing after fix-up; escalating", {
     issue: args.issue.identifier,
   });
   await postCheckFailureEscalation(deps, args, second);
-  return false;
+  return "check_failed";
 }
 
 function renderCheckFixupTask(failed: { stdout: string; stderr: string }): string {
@@ -676,8 +760,12 @@ async function escalateToReporter(
   deps: CodeHandlerDeps,
   args: CodeHandlerArgs,
   reason: string,
+  detail?: string | null,
 ): Promise<void> {
   const messages: Record<string, string> = {
+    blocked: "i'm blocked and haven't verified this work. handing it back with the evidence below.",
+    review_failed:
+      "the reviewer couldn't complete after two attempts, so there's no review verdict for this revision. i've preserved the work and haven't opened a PR. handing it back for human review.",
     iteration_cap:
       "i hit the iteration cap on this one before getting to a clean stopping point. bouncing it back so a human can take a look.",
     timeout:
@@ -687,8 +775,8 @@ async function escalateToReporter(
     error:
       "ran into an error i couldn't recover from. bouncing back to you.",
   };
-  const body =
-    messages[reason] ?? `something went wrong (${reason}). bouncing back.`;
+  const body = [messages[reason] ?? `something went wrong (${reason}). bouncing back.`, detail]
+    .filter(Boolean).join("\n\n");
   try {
     await deps.linear.postComment(args.issue.id, body);
   } catch (err) {
@@ -706,11 +794,12 @@ interface ReviewLoopCtx {
   reviewerGlm: GLMClient;
   fingerprint: string;
   worktreePath: string;
+  budget: CodeBudget;
 }
 
 type ReviewLoopOutcome =
   | { kind: "approved"; verificationReport: string }
-  | { kind: "escalated" };
+  | { kind: "escalated"; status?: "blocked" | "check_failed" | "review_failed"; summary?: string };
 
 async function runReviewLoop(
   deps: CodeHandlerDeps,
@@ -722,8 +811,9 @@ async function runReviewLoop(
   let lastRunLog = ctx.primaryRunLog;
 
   while (round < deps.review.maxRounds) {
+    ctx.budget.throwIfExpired();
     round++;
-    const diff = await getDiff(ctx.worktreePath, BASE_BRANCH);
+    const diff = await getDiff(ctx.worktreePath, BASE_BRANCH, ctx.budget);
     const grepFn = async (pattern: string, glob?: string) =>
       ctx.executor.grep(pattern, glob);
     const untested = await findUntestedExports({ diff, grep: grepFn });
@@ -750,9 +840,14 @@ async function runReviewLoop(
       worktreePath: ctx.worktreePath,
       iterationCap: deps.review.iterationCap,
       timeoutMs: deps.review.timeoutMs,
+      deadlineMs: ctx.budget.deadlineMs,
+      signal: ctx.budget.signal,
     });
 
+    ctx.budget.throwIfExpired();
+
     if (outcome.kind === "failed") {
+      const firstReason = outcome.reason;
       log.warn("reviewer pass failed; retrying once", {
         issue: args.issue.identifier,
         round,
@@ -773,20 +868,38 @@ async function runReviewLoop(
         worktreePath: ctx.worktreePath,
         iterationCap: deps.review.iterationCap,
         timeoutMs: deps.review.timeoutMs,
+        deadlineMs: ctx.budget.deadlineMs,
+        signal: ctx.budget.signal,
       });
+      ctx.budget.throwIfExpired();
       if (outcome.kind === "failed") {
         recordEvent(deps.db, {
           eventType: "review_failed",
           ticketLinearId: args.issue.id,
-          payload: { round, reason: outcome.reason },
+          payload: {
+            round,
+            reason: outcome.reason,
+            firstReason,
+            attempts: 2,
+            failureClass: "review_unavailable",
+          },
         });
-        log.warn("reviewer failed twice; default-approving", {
+        log.warn("reviewer unavailable after two attempts; escalating without publication", {
           issue: args.issue.identifier,
           round,
         });
+        // A failed reviewer supplied no verdict. Preserve the work for a human;
+        // do not invent findings or send the primary into another repair loop.
+        markReviewPassEscalated(deps.db, {
+          issueLinearId: args.issue.id,
+          fingerprint: ctx.fingerprint,
+          round,
+        });
+        await escalateToReporter(deps, args, "review_failed");
         return {
-          kind: "approved",
-          verificationReport: "_reviewer pass unavailable for this PR_",
+          kind: "escalated",
+          status: "review_failed",
+          summary: "Review unavailable after two failed attempts for this revision; human review is required before publication.",
         };
       }
     }
@@ -850,6 +963,8 @@ async function runReviewLoop(
       task: fixupTask,
       maxIterations: FIXUP_MAX_ITERATIONS,
       timeoutMs: deps.agentLoopTimeoutMs,
+      deadlineMs: ctx.budget.deadlineMs,
+      signal: ctx.budget.signal,
       temperature: 0.3,
       linear: deps.linear,
       currentIssue: {
@@ -868,6 +983,12 @@ async function runReviewLoop(
       status: fixup.status,
       iterations: fixup.iterations,
     });
+    if (fixup.status === "blocked") {
+      await escalateToReporter(deps, args, "blocked", fixup.summary);
+      return { kind: "escalated", status: "blocked" };
+    }
+    ctx.budget.throwIfExpired();
+    if (fixup.status === "timeout") throw new DeadlineExceededError();
     lastRunLog = fixup.runLog;
     previousFindings = outcome.review.findings.map((f) => ({
       title: f.title,
@@ -877,8 +998,9 @@ async function runReviewLoop(
     const checkOk = await ensurePostFinishCheckPasses(deps, args, {
       executor: ctx.executor,
       system: primarySystem,
+      budget: ctx.budget,
     });
-    if (!checkOk) return { kind: "escalated" };
+    if (checkOk !== "passed") return { kind: "escalated", status: checkOk };
   }
   return { kind: "escalated" };
 }

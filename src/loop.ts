@@ -52,6 +52,7 @@ import {
   recordEvent,
   setClassification,
   setRevisitMark,
+  type ActionOutcome,
   type TicketRow,
   upsertTicket,
 } from "./state/queries.ts";
@@ -310,13 +311,16 @@ async function runOne(
   const slotDeps: LoopDeps = { ...deps, glm };
 
   try {
-    await dispatch(slotDeps, action);
-    recordActionEnd(deps.db, { id: actionId, success: true });
+    const outcome = (await dispatch(slotDeps, action)) ?? "handled";
+    // Keep normal handled outcomes cached, including escalations. The
+    // independent outcome field is the delivery metric, not success=1.
+    recordActionEnd(deps.db, { id: actionId, success: true, outcome });
     log.info("action complete", {
       action: action.type,
       issue: action.issue.identifier,
       slot,
       provider,
+      outcome,
     });
     return action.type;
   } catch (err) {
@@ -337,6 +341,7 @@ async function runOne(
       recordActionEnd(deps.db, {
         id: actionId,
         success: false,
+        outcome: "rate_limited",
         errorMessage: `all providers armed; earliest reset ${err.earliestReset?.toISOString() ?? "unknown"}`,
       });
       return null;
@@ -351,6 +356,7 @@ async function runOne(
     recordActionEnd(deps.db, {
       id: actionId,
       success: false,
+      outcome: "error",
       errorMessage: message,
     });
     return action.type;
@@ -493,14 +499,13 @@ function reopenTicket(
   clearTerminalState(db, issue.id);
 }
 
-async function dispatch(deps: LoopDeps, action: CandidateAction): Promise<void> {
+async function dispatch(deps: LoopDeps, action: CandidateAction): Promise<ActionOutcome | void> {
   switch (action.type) {
     case "classify":
       await runClassify(deps, action);
       return;
     case "start_coding":
-      await runStartCoding(deps, action);
-      return;
+      return runStartCoding(deps, action);
     case "wait_for_blocker":
       await runWaitForBlocker(
         { db: deps.db, linear: deps.linear },
@@ -702,7 +707,7 @@ async function runFixCiFailure(
 async function runStartCoding(
   deps: LoopDeps,
   action: CandidateAction,
-): Promise<void> {
+): Promise<ActionOutcome> {
   const issue = action.issue;
   const repo = deps.repoMap.get(issue.teamKey);
   if (!repo) {
@@ -714,11 +719,11 @@ async function runStartCoding(
       { db: deps.db, linear: deps.linear },
       { issue, reason: "unmapped_team" },
     );
-    return;
+    return "escalated";
   }
   const comments = await deps.linear.fetchComments(issue.id);
   const scope = action.state.classification?.scope ?? "M";
-  await runCodeHandler(
+  const result = await runCodeHandler(
     {
       db: deps.db,
       linear: deps.linear,
@@ -737,6 +742,7 @@ async function runStartCoding(
   // bump the signature and revisit_code fires; without comments it stays
   // stable and revisit_code is dormant.
   setRevisitMark(deps.db, issue.id, action.state.humanInputSignature);
+  return result.status;
 }
 
 async function runRevisitCode(
