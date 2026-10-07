@@ -17,6 +17,9 @@ The image pins Bun 1.3.14 and Node 24.21.0. Node is copied from the official
 The build executes both runtimes to check shared-library compatibility with
 Ubuntu. Bun installs dependencies and launches package scripts; Node-shebang
 tools such as Vitest run under Node. Do not force them onto Bun with `--bun`.
+`NODE_OPTIONS=--max-old-space-size=8192` gives those tools an 8 GiB heap:
+Mulligan's Svelte check exceeds Node's default heap. The executor's existing
+12 GiB container memory limit remains unchanged.
 
 Run the sandbox and runtime integration checks against the newly built image:
 
