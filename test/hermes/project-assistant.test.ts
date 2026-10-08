@@ -89,6 +89,57 @@ describe('host-owned project assistant', () => {
       expect(data(await exec(a, 'recall_learning', { project }, audience)).records).toEqual([]);
     }
   });
+  test('a literal query miss after reopen returns labeled recent records from the same private project scope', async () => {
+    const f = fixture(), a = f.open();
+    data(await exec(a, 'remember_fact', { project: 'mulligan', text: 'The private fixture phrase is amber-harbor-62.' }));
+    data(await exec(a, 'propose_skill', { project: 'mulligan', text: 'Inspect current_work before proposing a next action.' }));
+    a.close(); const b = f.open();
+    const result = data(await exec(b, 'recall_learning', { project: 'mulligan', query: 'What did I ask you to remember earlier?' },
+      { ...privateAudience, threadTs: '9999.000001' }));
+    expect(result).toMatchObject({ scopeRecordCount: 2, matchedRecordCount: 0, retrieval: 'recent_fallback',
+      queryMode: 'case_insensitive_literal_substring', truncated: false });
+    expect(result.records.map((row: any) => row.kind)).toEqual(['skill_proposal', 'fact']);
+    expect(result.records[0].status).toBe('proposal_only');
+    expect(result.records[1].text).toContain('amber-harbor-62');
+    expect(result.records.every((row: any) => row.provenance.threadTs === privateAudience.threadTs)).toBe(true);
+  });
+  test('recall distinguishes total scope, literal matches, and recent unfiltered records', async () => {
+    const a = fixture().open();
+    data(await exec(a, 'remember_fact', { project: 'mulligan', text: 'Copper fixture phrase.' }));
+    data(await exec(a, 'remember_fact', { project: 'mulligan', text: 'Independent testing preference.' }));
+    const hit = data(await exec(a, 'recall_learning', { project: 'mulligan', query: 'COPPER' }));
+    expect(hit).toMatchObject({ scopeRecordCount: 2, matchedRecordCount: 1, retrieval: 'literal_matches',
+      queryMode: 'case_insensitive_literal_substring', truncated: false });
+    expect(hit.records).toHaveLength(1); expect(hit.records[0].text).toBe('Copper fixture phrase.');
+    for (const args of [{ project: 'mulligan' }, { project: 'mulligan', query: '' }]) {
+      const recent = data(await exec(a, 'recall_learning', args));
+      expect(recent).toMatchObject({ scopeRecordCount: 2, matchedRecordCount: 2, retrieval: 'recent', queryMode: 'none' });
+      expect(recent.records).toHaveLength(2);
+    }
+  });
+  test('filtered misses never expand from an empty shared/project scope into private or another channel', async () => {
+    const f = fixture(), a = f.open({ projects: [f.project, { id: 'other', label: 'Other', summary: 'Another project', sharedChannelIds: ['CONE', 'CTWO'] }] });
+    data(await exec(a, 'remember_fact', { project: 'mulligan', text: 'Private canary only.' }));
+    const miss = { project: 'mulligan', query: 'absent literal query' };
+    expect(data(await exec(a, 'recall_learning', miss, sharedAudience))).toMatchObject({ scopeRecordCount: 0, matchedRecordCount: 0, retrieval: 'empty_scope', records: [] });
+    data(await exec(a, 'remember_fact', { project: 'mulligan', text: 'Shared cone canary only.' }, sharedAudience));
+    const ownChannel = data(await exec(a, 'recall_learning', miss, { ...sharedAudience, threadTs: '9999.000001' }));
+    expect(ownChannel).toMatchObject({ scopeRecordCount: 1, matchedRecordCount: 0, retrieval: 'recent_fallback' });
+    expect(ownChannel.records).toHaveLength(1); expect(ownChannel.records[0].text).toBe('Shared cone canary only.');
+    for (const [audience, project] of [[{ ...sharedAudience, channelId: 'CTWO' }, 'mulligan'], [sharedAudience, 'other'], [privateAudience, 'other']] as const) {
+      const empty = data(await exec(a, 'recall_learning', { project, query: 'Private canary' }, audience));
+      expect(empty).toMatchObject({ scopeRecordCount: 0, matchedRecordCount: 0, retrieval: 'empty_scope', records: [] });
+      expect(JSON.stringify(empty)).not.toContain('canary');
+    }
+  });
+  test('recent fallback retains count, ordering, and truncation bounds', async () => {
+    const a = fixture().open();
+    for (let i = 0; i < 25; i++) data(await exec(a, 'remember_fact', { project: 'mulligan', text: `Note ${i}` }));
+    const result = data(await exec(a, 'recall_learning', { project: 'mulligan', query: 'definitely missing' }));
+    expect(result).toMatchObject({ scopeRecordCount: 25, matchedRecordCount: 0, retrieval: 'recent_fallback', truncated: true });
+    expect(result.records).toHaveLength(20); expect(result.records[0].text).toBe('Note 24'); expect(result.records[19].text).toBe('Note 5');
+    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(12000);
+  });
   test('only trusted owner authority permits writes; model args cannot forge it', async () => {
     const a = fixture().open(), member = { ...sharedAudience, requesterId: 'UMEMBER' };
     expect(a.toolsFor(member).map(tool => tool.function.name)).not.toContain('remember_fact');

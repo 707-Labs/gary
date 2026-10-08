@@ -311,7 +311,7 @@ test('aborting a held host tool propagates cancellation and waits for its drain 
   expect(settled).toBeTrue(); expect(cleanup).toBeTrue(); expect(writes).toBe(0); expect(calls).toBe(1);
 });
 
-test('assembled host tools inspect work, save a lesson, recall it after reopen, and isolate shared context', async () => {
+test('assembled host tools preserve recall fallback evidence after reopen and isolate shared context', async () => {
   const f = fixture(), root = realpathSync(mkdtempSync(join(tmpdir(), 'gary-project-conversation-')));
   const instances: ProjectAssistant[] = [];
   cleanups.push(() => { for (const a of instances) a.close(); rmSync(root, { recursive: true, force: true }); });
@@ -338,8 +338,14 @@ test('assembled host tools inspect work, save a lesson, recall it after reopen, 
       expect(JSON.parse(tools.at(-1).content[0].text)).toMatchObject({ ok: true, dataOnly: true });
       return provider([{ type: 'text', text: 'SYNTH-1 is coding. I saved the project lesson.' }]);
     }
-    if (physical === 4 || physical === 6) return provider([call('recall', 'recall_learning')]);
+    if (physical === 4 || physical === 6) return provider([call('recall', 'recall_learning', { project: 'fixture', query: 'a differently worded lesson request' })]);
     const data = JSON.parse(tools.at(-1).content[0].text).data;
+    // Proves the host delivers guidance and exact retrieval evidence, not model comprehension.
+    expect(body.system[0].text).toContain('scopeRecordCount counts stored records in the current authorized scope');
+    expect(body.system[0].text).toContain('matchedRecordCount counts query matches');
+    expect(body.system[0].text).toContain('Zero query matches do not prove that nothing was saved');
+    expect(body.system[0].text).toContain('retrieval=recent_fallback');
+    expect(body.system[0].text).toContain('never infer another audience');
     if (physical === 5) privateRecall = data; else sharedRecall = data;
     return provider([{ type: 'text', text: physical === 5 ? 'The saved project lesson is available.' : 'No shared lesson is recorded.' }]);
   };
@@ -350,7 +356,9 @@ test('assembled host tools inspect work, save a lesson, recall it after reopen, 
   await reply(turn({ requestId: 'reopened', authority: { ...authority, threadTs: '999.001' }, text: 'Recall the saved project lesson.' }));
   await reply(turn({ requestId: 'shared', authority: { ...authority, surface: 'shared_channel', channelId: 'CSHARED' }, text: 'Recall shared project lessons.' }));
   expect(privateRecall.records).toHaveLength(1); expect(privateRecall.records[0].text).toContain('inspect canonical current work');
+  expect(privateRecall).toMatchObject({ scopeRecordCount: 1, matchedRecordCount: 0, retrieval: 'recent_fallback', queryMode: 'case_insensitive_literal_substring' });
   expect(sharedRecall.records).toEqual([]); expect(JSON.stringify(requests.slice(5))).not.toContain('inspect canonical current work before planning');
+  expect(sharedRecall).toMatchObject({ scopeRecordCount: 0, matchedRecordCount: 0, retrieval: 'empty_scope' });
   expect(f.ledger.status(allocation)).toMatchObject({ attemptCount: 7, unknownAttempts: 0, state: 'active' });
 });
 
