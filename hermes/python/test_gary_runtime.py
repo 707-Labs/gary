@@ -4,20 +4,26 @@ The native factory and RPC transport are fakes. These tests neither import
 Hermes nor contact Gary, Slack, or a model provider.
 """
 
+import ast
+import concurrent.futures
 import copy
 import contextvars
+import hashlib
 import io
 import json
 import os
 import sys
+import tarfile
+import threading
 import time
 import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from gary_runtime import (MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGES, MAX_INPUT_BYTES, MAX_RESPONSE_BYTES,
-                          RuntimeFault, _LONG_TEST_POLICY, _StdioChannel, _deadline, _history, _stdio_http_client, main, run_task)
+                          RuntimeFault, _LONG_TEST_POLICY, _StdioChannel, _bind_native_tool_lifetimes,
+                          _deadline, _history, _native_tool_timeout, _stdio_http_client, main, run_task)
 
 
 CAPABILITY = "test-task-capability-" + "x" * 40
@@ -1372,6 +1378,273 @@ class DiagnosticTests(unittest.TestCase):
             self.assertEqual(result["diagnostic"],{"origin":"worker","code":"native_execution_failed","stage":"native_result","category":"none"})
             self.assertFalse(result["publicationApproved"])
             self.assertNotIn(CAPABILITY,json.dumps(result))
+
+class NativeToolLifetimeTests(unittest.TestCase):
+    def test_per_call_bounds_mirror_exact_generic_requested_and_action_limits(self):
+        with patch("gary_runtime.time.time", return_value=1000.0):
+            manifest = payload(transport="stdio", deadlineMs=10000000, longTestPolicy=_LONG_TEST_POLICY)
+            for command, requested, expected in [
+                ("bun run ci:full", None, 1860), ("bun run check", None, 660),
+                ("bun run ci:full", 1200, 1260), ("bun run ci:full", 99999, 1860),
+                ("bun run ci:full ", None, 180), ("cd /workspace && bun run ci:full", None, 180),
+                ("echo ordinary", 600, 660), ("echo ordinary", 99999, 960),
+            ]:
+                args = {"command": command}
+                if requested is not None:
+                    args["timeout_seconds"] = requested
+                with self.subTest(args=args):
+                    self.assertEqual(_native_tool_timeout(manifest, "run_bash", args), expected)
+            self.assertEqual(_native_tool_timeout({**manifest, "deadlineMs": 1100000}, "run_bash",
+                                                  {"command": "bun run ci:full"}), 160)
+            self.assertEqual(_native_tool_timeout({**manifest, "deadlineMs": 10**16}, "read_file", {}), 9060)
+            without_grant = {k: v for k, v in manifest.items() if k != "longTestPolicy"}
+            self.assertEqual(_native_tool_timeout(without_grant, "run_bash", {"command": "bun run ci:full"}), 180)
+            self.assertEqual(manifest["deadlineMs"], 10000000)  # Grace never changes host authority.
+
+    def test_invalid_requested_timeout_cannot_enlarge_native_bound(self):
+        with patch("gary_runtime.time.time", return_value=1000.0):
+            manifest = payload(transport="stdio", deadlineMs=1900000, longTestPolicy=_LONG_TEST_POLICY)
+            for value in [None, True, False, 0, -1, 0.5, float("inf"), float("nan"), 2**53, "900"]:
+                with self.subTest(value=value), self.assertRaisesRegex(RuntimeFault, "invalid_tool_arguments"):
+                    _native_tool_timeout(manifest, "run_bash", {"command": "bun run ci:full", "timeout_seconds": value})
+            with self.assertRaisesRegex(RuntimeFault, "deadline_exceeded"):
+                _native_tool_timeout({**manifest, "deadlineMs": 1000000}, "read_file", {})
+
+    def test_synthetic_terminal_is_sticky_before_late_receipt_or_model_request(self):
+        for marker_name, code, status in [("_ToolTimeoutResult", "native_tool_timeout", "timeout"),
+                                          ("_ToolCancelledResult", "native_tool_interrupted", "error")]:
+            manifest = payload(transport="stdio", tools=[tool("run_bash")])
+            output, blocked = io.StringIO(), []
+            channel = _StdioChannel(manifest, io.StringIO(), output)
+            native = types.SimpleNamespace(_ToolTimeoutResult=type("Timeout", (str,), {}),
+                                           _ToolCancelledResult=type("Cancelled", (str,), {}),
+                                           _resolve_sequential_tool_timeout=lambda: 420)
+            native._run_sequential_tool_execution_middleware = lambda *a, **kw: types.SimpleNamespace(
+                result=getattr(native, marker_name)("synthetic native result"))
+            def action(agent):
+                _bind_native_tool_lifetimes(native, agent, agent.handlers)
+                try:
+                    native._run_sequential_tool_execution_middleware(agent, function_name="run_bash",
+                                                                     function_args={"command": "echo bounded"})
+                except RuntimeFault:
+                    pass  # Match native's recoverable-tool-error catch.
+                agent.handlers.fail("rpc_transport_error")  # A late daemon fault cannot replace the first fault.
+                for invoke in [lambda: agent.handlers["run_bash"]({"command": "echo late"}, tool_call_id="late"),
+                               lambda: agent.handlers.before_request({"model": "test-model"})]:
+                    try:
+                        invoke()
+                    except RuntimeFault as exc:
+                        blocked.append(exc.code)
+            result = run_task(manifest, native_factory=FakeFactory(action=action), transport=channel)
+            self.assertEqual(blocked, [code, code])
+            self.assertEqual(result["status"], status)
+            self.assertEqual(result["diagnostic"], {"origin": "worker", "code": code, "stage": "tool_call", "category": "none"})
+            self.assertFalse(result["publicationApproved"])
+            self.assertEqual(output.getvalue(), "")
+
+    def test_real_bridge_polling_completes_after_440_virtual_seconds(self):
+        now = [1000.0]
+        with patch("gary_runtime.time.time", side_effect=lambda: now[0]):
+            manifest = payload(transport="stdio", deadlineMs=2800000, longTestPolicy=_LONG_TEST_POLICY,
+                               tools=[tool("run_bash")])
+            pending = {"kind": "test_job_pending", "jobId": "a0000000-0000-0000-0000-000000000001",
+                       "callId": "gate", "taskId": manifest["taskId"], "requestId": manifest["requestId"],
+                       "ownerEpoch": manifest["ownerEpoch"], "name": "run_bash", "deadlineMs": 2200000}
+            receipt = OrdinaryToolDeadlineTests.receipt("gate")
+            replies = [(0, response_frame(1, pending, 202))]
+            replies += [(20, response_frame(n, pending, 202)) for n in range(2, 23)]
+            replies += [(20, response_frame(23, {"kind": "test_job_complete", "jobId": pending["jobId"],
+                                                "callId": "gate", "receipt": receipt}))]
+            output = io.StringIO()
+            channel = _StdioChannel(manifest, OrdinaryToolDeadlineTests.delayed_reader(now, replies), output)
+            result = channel(manifest["executorUrl"], {"name": "run_bash", "callId": "gate",
+                             "arguments": {"command": "bun run ci:full", "timeout_seconds": 1200}},
+                             {"Authorization": "Bearer " + CAPABILITY, "Content-Type": "application/json"}, 60)
+            self.assertEqual(result, receipt)
+            self.assertEqual(now[0], 1440)
+            frames = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual(len(frames), 23)
+            self.assertEqual(sum(frame["path"] == "/tools/execute" for frame in frames), 1)
+            self.assertFalse(any(frame["path"] == "/v1/chat/completions" for frame in frames))
+
+    def test_timeout_during_rpc_rejects_late_success_receipt_and_preserves_first_diagnostic(self):
+        manifest = payload(transport="stdio", tools=[tool("run_bash")])
+        output, observed, holder = io.StringIO(), [], {}
+        class LateReader(io.StringIO):
+            def read(self, size=-1):
+                holder["handlers"].fail("native_tool_timeout", diagnostic_stage="tool_call")
+                return response_frame(1, OrdinaryToolDeadlineTests.receipt("in-flight"))
+        channel = _StdioChannel(manifest, LateReader(), output)
+        def action(agent):
+            holder["handlers"] = agent.handlers
+            try:
+                agent.handlers["run_bash"]({"command": "echo bounded"}, tool_call_id="in-flight")
+            except RuntimeFault as exc:
+                observed.append(exc.code)
+            agent.handlers.fail("rpc_transport_error")
+            try:
+                agent.handlers.before_request({"model": "test-model"})
+            except RuntimeFault as exc:
+                observed.append(exc.code)
+        result = run_task(manifest, native_factory=FakeFactory(action=action), transport=channel)
+        self.assertEqual(observed, ["native_tool_timeout", "native_tool_timeout"])
+        self.assertEqual(result["status"], "timeout")
+        self.assertEqual(result["diagnostic"], {"origin": "worker", "code": "native_tool_timeout", "stage": "tool_call", "category": "none"})
+        self.assertNotIn("history", result)  # No late success can become transcript authority.
+        self.assertFalse(result["publicationApproved"])
+        self.assertEqual([json.loads(line)["path"] for line in output.getvalue().splitlines()], ["/tools/execute"])
+
+
+@unittest.skipUnless(os.environ.get("GARY_HERMES_SOURCE_ARCHIVE"), "set GARY_HERMES_SOURCE_ARCHIVE for pinned native watchdog contracts")
+class PinnedNativeWatchdogTests(unittest.TestCase):
+    """Execute exact pinned resolver/watchdog functions with a deterministic clock.
+
+    No Hermes imports, model calls, subprocesses, network or real sleep. The
+    archive is hash-bound before selecting AST definitions; production middleware
+    controls the timeout/interrupt path, while a fake future controls scheduling.
+    This is separate from the actual-duration isolated-worker smoke.
+    """
+    @classmethod
+    def setUpClass(cls):
+        path = os.environ["GARY_HERMES_SOURCE_ARCHIVE"]
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1048576), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != "9551e0c2ea7c6feaea6d03362fb1344af7742bfb4980397bcfecffcdf2f427fb":
+            raise AssertionError("pinned Hermes archive mismatch")
+        with tarfile.open(path) as archive:
+            cls.executor_source = archive.extractfile("agent/tool_executor.py").read().decode()
+            cls.deadline_source = archive.extractfile("agent/deadline.py").read().decode()
+
+    @staticmethod
+    def definitions(source, names, namespace):
+        tree = ast.parse(source)
+        selected = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names]
+        if {node.name for node in selected} != set(names):
+            raise AssertionError("pinned native seam missing")
+        selected.insert(0, ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0))
+        exec(compile(ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])), "<pinned-hermes>", "exec"), namespace)
+
+    def setup_native(self, duration):
+        self.now, self.events, self.shutdowns, self.interrupts = [1000.0], [], [], []
+        owner = self
+        self.agent = types.SimpleNamespace(_tool_worker_threads_lock=threading.Lock(), _tool_worker_threads=set(),
+                                           _interrupt_requested=False, _touch_activity=lambda *a: None)
+        class Future:
+            def __init__(self, callback):
+                self.callback, self.ready, self.was_cancelled = callback, owner.now[0] + duration, False
+            def result(self, timeout):
+                owner.now[0] = min(self.ready, owner.now[0] + timeout)
+                if owner.now[0] < self.ready:
+                    raise concurrent.futures.TimeoutError()
+                return self.callback()
+            def cancel(self): self.was_cancelled = True
+            def done(self): return owner.now[0] >= self.ready
+            def cancelled(self): return self.was_cancelled
+        class Pool:
+            def __init__(self, **kwargs): pass
+            def submit(self, callback):
+                owner.future = Future(callback)
+                return owner.future
+            def shutdown(self, **kwargs): owner.shutdowns.append(kwargs)
+        deadline = types.ModuleType("agent.deadline")
+        deadline.__dict__.update(os=os, logger=Mock(), MAX_SAFE_TIMEOUT_S=31536000, _timeouts_section=lambda: {})
+        self.definitions(self.deadline_source, ["clamp_timeout", "_lookup_dotted", "resolve_timeout"], deadline.__dict__)
+        self.native = types.ModuleType("pinned_tool_executor")
+        self.native.__dict__.update(
+            time=types.SimpleNamespace(monotonic=lambda: owner.now[0]), threading=threading,
+            concurrent=types.SimpleNamespace(futures=types.SimpleNamespace(TimeoutError=concurrent.futures.TimeoutError,
+                                                                           wait=lambda *a, **kw: None)),
+            _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S=420.0, _SEQUENTIAL_INTERRUPT_POLL_SECONDS=0.25,
+            _NEVER_PARALLEL_TOOLS=frozenset({"clarify"}), logger=Mock(),
+            _ManagedToolResult=types.SimpleNamespace,
+            _ConcurrentToolAuthorizationGate=lambda: types.SimpleNamespace(excluded_seconds=lambda: 0),
+            propagate_context_to_thread=lambda callback: callback,
+            _ra=lambda: types.SimpleNamespace(_set_interrupt=lambda *args: owner.interrupts.append(args)),
+            _emit_terminal_post_tool_call=lambda *a, **kwargs: owner.events.append(kwargs),
+            _run_agent_tool_execution_middleware=lambda agent, **kwargs: types.SimpleNamespace(result=kwargs["execute"](kwargs["function_args"])))
+        self.definitions(self.executor_source, ["_resolve_concurrent_tool_timeout", "_resolve_sequential_tool_timeout",
+                         "_ToolTimeoutResult", "_ToolCancelledResult", "_run_sequential_tool_execution_middleware"], self.native.__dict__)
+        self.modules = patch.dict(sys.modules, {"agent.deadline": deadline,
+            "tools.daemon_pool": types.SimpleNamespace(DaemonThreadPoolExecutor=Pool)})
+        self.modules.start(); self.addCleanup(self.modules.stop)
+        self.clock = patch("gary_runtime.time.time", side_effect=lambda: owner.now[0])
+        self.clock.start(); self.addCleanup(self.clock.stop)
+        self.environment = patch.dict(os.environ, {}, clear=True)
+        self.environment.start(); self.addCleanup(self.environment.stop)
+
+    def call(self, name="run_bash", args=None, agent=None):
+        return self.native._run_sequential_tool_execution_middleware(agent or self.agent,
+            function_name=name, function_args=args or {"command": "bun run ci:full"},
+            effective_task_id="offline", tool_call_id="gate", execute=lambda args: "verified fixture receipt")
+
+    def bind(self, remaining=1800):
+        self.fault = None
+        def fail(code, **kwargs): self.fault = self.fault or code
+        def guard():
+            if self.fault: raise RuntimeFault(self.fault)
+            return _deadline(self.handlers.payload)
+        self.handlers = types.SimpleNamespace(payload=payload(transport="stdio", deadlineMs=(self.now[0]+remaining)*1000,
+                                               longTestPolicy=_LONG_TEST_POLICY), guard=guard, fail=fail)
+        _bind_native_tool_lifetimes(self.native, self.agent, self.handlers)
+
+    def test_original_pinned_watchdog_abandons_at_exactly_420_seconds(self):
+        self.setup_native(450)
+        outcome = self.call()
+        self.assertIsInstance(outcome.result, self.native._ToolTimeoutResult)
+        self.assertEqual(self.now[0], 1420)
+        self.assertEqual(self.events[0]["error_type"], "tool_timeout")
+        self.assertEqual(self.shutdowns, [{"wait": False, "cancel_futures": True}])
+
+    def test_bound_pinned_watchdog_allows_long_and_ordinary_450_second_receipts(self):
+        for args in [{"command": "bun run ci:full"}, {"command": "echo ordinary", "timeout_seconds": 600}]:
+            self.setup_native(450)
+            self.bind()
+            self.assertEqual(self.call(args=args).result, "verified fixture receipt")
+            self.assertEqual(self.now[0], 1450)
+            self.assertEqual(self.events, [])
+            self.assertEqual(self.shutdowns, [{"wait": True, "cancel_futures": False}])
+            self.assertEqual(self.native._resolve_sequential_tool_timeout(), 420)  # Context reset.
+
+    def test_wrapped_command_still_uses_generic_bound_and_times_out_terminally(self):
+        self.setup_native(450)
+        self.bind()
+        with self.assertRaisesRegex(RuntimeFault, "native_tool_timeout"):
+            self.call(args={"command": "cd /workspace && bun run ci:full"})
+        self.assertEqual(self.now[0], 1180)
+        self.assertEqual(self.fault, "native_tool_timeout")
+        self.assertEqual(self.native._resolve_sequential_tool_timeout(), 420)
+
+    def test_short_action_and_requested_deadline_are_not_extended_for_execution(self):
+        for remaining, args, expected in [(90, {"command": "bun run ci:full"}, 1150),
+                                           (1800, {"command": "bun run ci:full", "timeout_seconds": 1}, 1061)]:
+            self.setup_native(450)
+            self.bind(remaining)
+            with self.assertRaisesRegex(RuntimeFault, "native_tool_timeout"):
+                self.call(args=args)
+            self.assertEqual(self.now[0], expected)
+            self.assertEqual(self.handlers.payload["deadlineMs"], (1000+remaining)*1000)
+
+    def test_native_interrupt_is_terminal_without_joining_abandoned_handler(self):
+        self.setup_native(450)
+        self.bind()
+        self.agent._interrupt_requested = True
+        with self.assertRaisesRegex(RuntimeFault, "native_tool_interrupted"):
+            self.call()
+        self.assertEqual(self.events[0]["status"], "cancelled")
+        self.assertEqual(self.shutdowns, [{"wait": False, "cancel_futures": True}])
+        self.assertEqual(self.native._resolve_sequential_tool_timeout(), 420)
+
+    def test_unrelated_agent_retains_pinned_legacy_watchdog(self):
+        self.setup_native(450)
+        self.bind()
+        outsider = types.SimpleNamespace(**self.agent.__dict__)
+        outcome = self.call(agent=outsider)
+        self.assertIsInstance(outcome.result, self.native._ToolTimeoutResult)
+        self.assertEqual(self.now[0], 1420)
+        self.assertIsNone(self.fault)
+
 
 if __name__ == "__main__":
     unittest.main()

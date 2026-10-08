@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { DockerExecutor } from "../src/executors/docker.ts";
 import { createExecutorJobJournal, reconcileDockerExecutorJobs, type ExecutorJobJournal, type ExecutorTestJob } from "../src/executors/index.ts";
 import { runProcess } from "../src/executors/process.ts";
+import { ExecutorCleanupGuard, ExecutorCleanupUncertainError } from "../src/executors/cleanup-guard.ts";
+import { SpendLedger } from "../src/spend.ts";
 
 let root: string, workspace: string, binary: string, directory: string, modePath: string, callsPath: string, containerPath: string;
 let journal: ExecutorJobJournal | undefined;
@@ -70,11 +72,12 @@ function open(): ExecutorJobJournal {
 }
 async function ready() { journal = open(); await reconcileDockerExecutorJobs(journal); }
 function context(): ExecutorTestJob { return Object.freeze({ jobId: "logical-job", taskId: "task", requestId: "request", actionId: "action", ownerEpoch: "owner", journal: journal! }); }
-function executor(readOnly = false) { return new DockerExecutor(workspace, { image: "sha256:" + "a".repeat(64), dockerBinary: binary, readOnly }); }
+function executor(readOnly = false, cleanupGuard?: ExecutorCleanupGuard) { return new DockerExecutor(workspace, { image: "sha256:" + "a".repeat(64), dockerBinary: binary, readOnly, ...(cleanupGuard ? { cleanupGuard } : {}) }); }
 function rows(): Array<Record<string, unknown>> { const db = new Database(join(directory, "jobs.sqlite"), { readonly: true }); try { return db.query("SELECT * FROM invocations").all() as Array<Record<string, unknown>>; } finally { db.close(); } }
 function calls(): Array<{ raw: string[]; args: string[]; secret: string | null; context: string | null }> { return readFileSync(callsPath, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)); }
-function run(options: { timeoutMs?: number; signal?: AbortSignal; deadlineMs?: number } = {}) {
-  return executor().run("bun run ci:full", { testJob: context(), timeoutMs: 10_000, deadlineMs: Date.now() + 10_000, ...options });
+function run(options: { timeoutMs?: number; signal?: AbortSignal; deadlineMs?: number; cleanupGuard?: ExecutorCleanupGuard } = {}) {
+  const { cleanupGuard, ...bounded } = options;
+  return executor(false, cleanupGuard).run("bun run ci:full", { testJob: context(), timeoutMs: 10_000, deadlineMs: Date.now() + 10_000, ...bounded });
 }
 
 test("durable labeled create/start/immutable-ID cleanup and absence precede success; clean client environment", async () => {
@@ -101,18 +104,23 @@ test("durable labeled create/start/immutable-ID cleanup and absence precede succ
 
 test("nonzero execution still removes the owned container and retains failed record", async () => {
   await ready(); mode({ exitCode: 19 });
-  expect((await run()).exitCode).toBe(19); expect(rows()[0]!.state).toBe("failed"); expect(existsSync(containerPath)).toBe(false);
+  const cleanupGuard = new ExecutorCleanupGuard();
+  expect((await run({ cleanupGuard })).exitCode).toBe(19); expect(rows()[0]!.state).toBe("failed"); expect(existsSync(containerPath)).toBe(false);
+  expect(cleanupGuard.signal.aborted).toBe(false); expect(() => cleanupGuard.assertSafe()).not.toThrow();
+  mode({}); expect((await run({ cleanupGuard })).exitCode).toBe(0); expect(rows()).toHaveLength(2);
 });
 
 test("cancellation kills CLI, awaits container removal, and returns timeout", async () => {
   await ready(); mode({ hang: true });
-  const controller = new AbortController();
-  const pending = run({ signal: controller.signal });
+  const controller = new AbortController(), cleanupGuard = new ExecutorCleanupGuard();
+  const pending = run({ signal: controller.signal, cleanupGuard });
   // Wait for actual start, not an arbitrary timeout preceding spawn.
   while (!calls().some(c => c.args[0] === "start")) await Bun.sleep(5);
   controller.abort();
   const result = await pending;
   expect(result.timedOut).toBe(true); expect(existsSync(containerPath)).toBe(false); expect(rows()[0]!.state).toBe("failed");
+  expect(cleanupGuard.signal.aborted).toBe(false); expect(() => cleanupGuard.assertSafe()).not.toThrow();
+  mode({}); expect((await run({ cleanupGuard })).exitCode).toBe(0); expect(rows()).toHaveLength(2);
 });
 
 test("absolute command deadline cannot be extended by a larger timeout", async () => {
@@ -130,14 +138,14 @@ test("combined stdout/stderr overflow is terminal after exact cleanup", async ()
 
 test.each(["rmFail", "foreign", "listFail", "replacement"])("%s cleanup uncertainty blocks further admission", async flag => {
   await ready(); mode({ [flag]: true });
-  await expect(run()).rejects.toThrow("executor_job_cleanup_unverified");
+  await expect(run()).rejects.toThrow("executor_cleanup_uncertain");
   expect(rows()[0]!.state).toBe("cleanup_unknown");
   await expect(run()).rejects.toThrow("executor_journal_not_ready");
   if (flag === "foreign") expect(calls().some(c => c.args[1] === "rm")).toBe(false);
 });
 
 test("restart reconciliation removes only recorded owned container and abandons, never runs it", async () => {
-  await ready(); mode({ rmFail: true }); await expect(run()).rejects.toThrow("executor_job_cleanup_unverified");
+  await ready(); mode({ rmFail: true }); await expect(run()).rejects.toThrow("executor_cleanup_uncertain");
   const original = rows()[0]!;
   journal!.close(); journal = open(); mode({});
   const before = calls().length;
@@ -158,7 +166,7 @@ test("daemon changes block recovery without removing from a different daemon", a
 
 test("ambiguous create without observed container remains unresolved despite empty listing", async () => {
   await ready(); mode({ createNoContainer: true });
-  await expect(run()).rejects.toThrow("executor_job_spawn_unresolved");
+  await expect(run()).rejects.toThrow("executor_cleanup_uncertain");
   expect(rows()[0]!.state).toBe("spawn_unknown");
   journal!.close(); journal = open(); mode({});
   await expect(reconcileDockerExecutorJobs(journal)).rejects.toThrow("executor_job_spawn_unresolved");
@@ -204,7 +212,7 @@ function sql(statement: string) { const db = new Database(join(directory, "jobs.
 
 test("renaming a recorded ID cannot masquerade as container absence", async () => {
   await ready(); mode({ rename: true });
-  await expect(run()).rejects.toThrow("executor_job_cleanup_unverified");
+  await expect(run()).rejects.toThrow("executor_cleanup_uncertain");
   expect(rows()[0]!.state).toBe("cleanup_unknown"); expect(existsSync(containerPath)).toBe(true);
   expect(calls().some(c => c.args[1] === "rm")).toBe(false);
 });
@@ -214,7 +222,9 @@ test.each(["insert", "id", "terminal"])("journal %s durability failure cannot yi
   const event = stage === "insert" ? "BEFORE INSERT" : "BEFORE UPDATE";
   const when = stage === "id" ? "WHEN NEW.container_id IS NOT NULL" : stage === "terminal" ? "WHEN NEW.terminal_ms IS NOT NULL" : "";
   sql(`CREATE TRIGGER injected_failure ${event} ON invocations ${when} BEGIN SELECT RAISE(ABORT,'injected durability failure'); END;`);
-  await expect(run()).rejects.toThrow("injected durability failure");
+  const guard = new ExecutorCleanupGuard();
+  await expect(run({ cleanupGuard: guard })).rejects.toThrow(stage === "id" ? "injected durability failure" : "executor_cleanup_uncertain");
+  expect(guard.signal.aborted).toBe(stage !== "id");
   expect(existsSync(containerPath)).toBe(false);
   expect(calls().filter(c => c.args[0] === "start")).toHaveLength(stage === "terminal" ? 1 : 0);
   await expect(run()).rejects.toThrow("executor_journal_not_ready");
@@ -270,3 +280,50 @@ test("recovery never competes with a still-live persisted guardian", async () =>
   expect(calls().slice(before).some(c => c.args[1] === "rm" || c.args[0] === "create" || c.args[0] === "start")).toBe(false);
   expect(rows()[0]!.state).toBe("pending");
 });
+
+for (const failure of ["cleanup", "spawn", "terminal_write"] as const) {
+  test(`journal ${failure} uncertainty latches the shared action guard before any later executor or paid request`, async () => {
+    await ready();
+    const guard = new ExecutorCleanupGuard();
+    if (failure === "terminal_write") sql("CREATE TRIGGER uncertain_terminal BEFORE UPDATE ON invocations WHEN NEW.terminal_ms IS NOT NULL BEGIN SELECT RAISE(ABORT,'synthetic private durability failure'); END;");
+    else mode(failure === "cleanup" ? { rmFail: true } : { createNoContainer: true });
+    let caught: unknown;
+    try { await run({ cleanupGuard: guard }); } catch (error) { caught = error; }
+    expect(caught).toBeInstanceOf(ExecutorCleanupUncertainError);
+    const error = caught as ExecutorCleanupUncertainError;
+    expect(guard.signal.aborted).toBe(true); expect(guard.signal.reason).toBe(error);
+    expect(error.message).toBe("executor_cleanup_uncertain");
+    const retained = rows(); expect(retained).toHaveLength(1);
+    expect(retained[0]!.state).toBe(failure === "cleanup" ? "cleanup_unknown" : failure === "spawn" ? "spawn_unknown" : "pending");
+    expect(retained[0]!.terminal_ms).toBeNull();
+    expect(typeof retained[0]!.name).toBe("string");
+    expect(error.evidence).toEqual({ container: retained[0]!.name as string,
+      reason: failure === "cleanup" ? "journal_cleanup_unverified" : failure === "spawn" ? "journal_spawn_unresolved" : "journal_terminal_unverified",
+      exitCode: null, timedOut: null });
+    expect(JSON.stringify(error)).not.toContain("private");
+    const cliCalls = calls().length;
+    // Catching the initial error cannot re-enable a fresh executor sharing the
+    // same action guard, including operations outside the journaled route.
+    for (const operation of [
+      () => run({ cleanupGuard: guard }),
+      () => executor(false, guard).run("ordinary later command"),
+      () => executor(false, guard).readFile("later.txt"),
+    ]) await expect(operation()).rejects.toBe(error);
+    expect(calls()).toHaveLength(cliCalls); expect(rows()).toEqual(retained);
+    const ledger = new SpendLedger(":memory:");
+    try {
+      ledger.createCampaign("offline-cleanup", 10); ledger.enrollTicket("offline-cleanup", "offline-ticket", 10);
+      let dispatches = 0;
+      const fakeFetch = (async () => { dispatches++; throw new Error("must not dispatch"); }) as unknown as typeof fetch;
+      const fetch = ledger.guardedFetch("deepseek", fakeFetch);
+      const request = new Request("https://api.deepseek.com/anthropic/v1/messages", { method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer offline-not-a-secret" },
+        body: JSON.stringify({ model: "deepseek-v4-pro", max_tokens: 8192, messages: [{ role: "user", content: "offline fixture" }] }) });
+      await expect(ledger.withSpendScope("offline-ticket", () =>
+        ledger.withPaidRequestGuard(() => guard.assertSafe(), () => fetch(request)))).rejects.toBe(error);
+      expect(dispatches).toBe(0); expect(ledger.status("offline-ticket")!.attemptCount).toBe(0);
+      expect(ledger.status("offline-ticket")!.chargedMicros).toBe(0);
+    } finally { ledger.close(); }
+    expect(rows()).toEqual(retained);
+  });
+}

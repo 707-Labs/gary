@@ -87,3 +87,24 @@ for(const reason of ['owner_revoked','unknown_usage'])test('host heartbeat abort
  });
  active=false;await expect(running).rejects.toThrow(reason);expect(cleaned).toBe(true);
 });
+
+test('verification busy lease remains held after cancellation until cleanup resolves, then releases once',async()=>{
+ const {verification:v}=fixture(),abort=new AbortController();
+ let release!:()=>void,entered!:()=>void,settled=false,starts=0;
+ const ready=new Promise<void>(resolve=>{entered=resolve;});
+ const hold=new Promise<void>(resolve=>{release=resolve;});
+ const running=v.run('bun run ci:full',{signal:abort.signal},async opts=>{
+  starts++;entered();await hold;expect(opts.signal!.aborted).toBe(true);return ok;
+ });
+ // Observe the rejection immediately so the intentional late cancellation cannot
+ // appear as an unhandled test rejection when cleanup is released below.
+ const outcome=running.then(value=>({value,error:undefined}),error=>({value:undefined,error})).finally(()=>{settled=true;});
+ try {
+ await ready;abort.abort();
+ await expect(v.run('bun run check',{},async()=>{starts++;return ok;})).rejects.toThrow('concurrent_verification');
+ expect(settled).toBe(false);expect(starts).toBe(1);expect(v.snapshot().counts['bun run check']).toBe(0);
+ release();const result=await outcome;expect(result.value).toBeUndefined();expect(result.error).toBeInstanceOf(Error);
+ await expect(v.run('bun run check',{},async()=>{starts++;return ok;})).resolves.toEqual(ok);
+ expect(starts).toBe(2);expect(v.snapshot().counts).toEqual({'bun run ci:full':1,'bun run check':1});
+ } finally {release();await outcome;}
+});

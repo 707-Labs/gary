@@ -7,6 +7,7 @@ import { throwIfExpired } from "../deadline.ts";
 import type { ExecResult } from "./index.ts";
 import { runProcess } from "./process.ts";
 import { armExecutorJobGuardian, type ExecutorJobGuardian } from "./job-guardian.ts";
+import type { ExecutorCleanupGuard } from "./cleanup-guard.ts";
 
 export const EXECUTOR_JOB_OUTPUT_LIMIT = 16 * 1024 * 1024;
 const CLEANUP_MS = 15_000;
@@ -33,6 +34,8 @@ interface RecordRow {
 interface MetaRow { id: string; daemon_id: string | null; owner_pid: number | null; owner_token: string | null }
 interface Invocation {
   context: ExecutorTestJob;
+  /** The same sticky action fence used by ordinary executors and paid requests. */
+  cleanupGuard: ExecutorCleanupGuard;
   workspaceRoot: string;
   image: string;
   mountedRoots?: readonly string[];
@@ -211,6 +214,7 @@ class Journal implements ExecutorJobJournal {
   }
 
   async invoke(invocation: Invocation): Promise<ExecResult> {
+    invocation.cleanupGuard.assertSafe();
     this.owned();
     if (!this.ready || this.busy) fail("executor_journal_not_ready");
     const context = contextSnapshot(invocation.context);
@@ -224,6 +228,7 @@ class Journal implements ExecutorJobJournal {
     const deadlineMs = Math.min(invocation.options.deadlineMs!, Date.now() + invocation.options.timeoutMs);
     this.busy = true;
     let record: RecordRow | undefined;
+    let cleanupProven = false, terminalPersisted = false, creationAttempted = false;
     try {
       await this.daemon(Math.min(deadlineMs, Date.now() + CLEANUP_MS));
       throwIfExpired({ ...invocation.options, deadlineMs });
@@ -242,7 +247,6 @@ class Journal implements ExecutorJobJournal {
       let result: ExecResult | undefined;
       let error: unknown;
       let guardian: ExecutorJobGuardian | undefined;
-      let creationAttempted = false;
       try {
         guardian = await armExecutorJobGuardian({
           dockerHost: this.dockerHost, dockerBinary: this.binary, dockerConfig: this.config,
@@ -293,6 +297,7 @@ class Journal implements ExecutorJobJournal {
           this.db.query("UPDATE invocations SET state='spawn_unknown' WHERE id=?").run(record.id);
           fail("executor_job_spawn_unresolved");
         }
+        cleanupProven = true;
       } catch (e) {
         this.ready = false;
         if (record.container_id !== null) this.db.query("UPDATE invocations SET state='cleanup_unknown' WHERE id=?").run(record.id);
@@ -301,12 +306,26 @@ class Journal implements ExecutorJobJournal {
       }
       const success = !error && result?.exitCode === 0 && !result.timedOut;
       this.db.query("UPDATE invocations SET state=?,terminal_ms=? WHERE id=?").run(success ? "completed" : "failed", Date.now(), record.id);
+      terminalPersisted = true;
       if (error) throw error;
       return result!;
     } catch (e) {
       // A durable pending row survives any unanticipated journal/IO failure.
       // No further invocation is admitted until recovery proves its absence.
-      if (record) this.ready = false;
+      if (record) {
+        this.ready = false;
+        // Journal refusal only fences a later executor invocation. A reviewer
+        // can catch this tool error and approve without invoking another tool,
+        // so uncertain physical cleanup or durable closure must also revoke the
+        // shared action and every subsequent physical model/publication path.
+        // Keep known-clean failed command results recoverable.
+        if (!cleanupProven || !terminalPersisted) invocation.cleanupGuard.markUncertain({
+          container: record.name,
+          reason: cleanupProven || !creationAttempted ? "journal_terminal_unverified"
+            : record.container_id === null ? "journal_spawn_unresolved" : "journal_cleanup_unverified",
+          exitCode: null, timedOut: null,
+        });
+      }
       throw e;
     } finally { this.busy = false; }
   }

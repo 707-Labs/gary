@@ -88,12 +88,14 @@ async function runtimeFixture(configure?:(config:HermesActivationConfig,workspac
   return{...f,workspace,db,ledger,binding,admit,deps,args,counts:()=>({requests,launches})};
 }
 
-test('coding activation accepts the async worker pin and rejects the previous read-only worker',()=>{
+test('coding activation accepts the bounded-watchdog worker and rejects previous workers',()=>{
   const f=configFixture();
-  expect(HERMES_CODING_WORKER_IMAGE).toBe('sha256:8f728373dd6121e8031e113988c76eb561eb4758b2e3e701932e3a36ff991fcb');
+  expect(HERMES_CODING_WORKER_IMAGE).toBe('sha256:ea2a59841aefabea24027c34ce05601c2e2125ecc1c759c0d46eff1d1970dea8');
   expect(loadHermesActivationConfig(f.path).workerImage).toBe(HERMES_CODING_WORKER_IMAGE);
-  f.save({...f.config,workerImage:HERMES_CANARY_WORKER_IMAGE});
-  expect(()=>loadHermesActivationConfig(f.path)).toThrow('hermes_activation_rejected:config_unavailable_or_invalid');
+  for (const workerImage of [HERMES_CANARY_WORKER_IMAGE, 'sha256:8f728373dd6121e8031e113988c76eb561eb4758b2e3e701932e3a36ff991fcb']) {
+    f.save({...f.config,workerImage});
+    expect(()=>loadHermesActivationConfig(f.path)).toThrow('hermes_activation_rejected:config_unavailable_or_invalid');
+  }
 });
 test('coding worker pin leaves the read-only canary policy unchanged',()=>{
   expect(HERMES_CANARY_WORKER_IMAGE).toBe('sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab');

@@ -1,7 +1,8 @@
 /** Host-only evidence. No command, output, credentials or model-supplied text. */
 export interface ExecutorCleanupEvidence {
   readonly container: string;
-  readonly reason: "removal_failed" | "removal_threw";
+  readonly reason: "removal_failed" | "removal_threw"
+    | "journal_cleanup_unverified" | "journal_spawn_unresolved" | "journal_terminal_unverified";
   readonly exitCode: number | null;
   readonly timedOut: boolean | null;
 }

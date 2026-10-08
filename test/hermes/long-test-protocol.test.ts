@@ -204,3 +204,89 @@ test('drain fences retained handles while preserving already verified finish evi
  expect((await f.host.handle(request('/tools/execute',execute('late')))).status).toBe(409);expect(f.stats().runs).toBe(1);
  await f.host.drain();expect(f.host.finalizeTrace(f.host.result({status:'finished'}))).toBe(true);
 });
+
+test('virtual-clock CI survives 440 seconds of bounded polling without another start or model call',async()=>{
+ // Host-only virtual elapsed-time proof. The Python SDK's independent watchdog
+ // must be tested separately; this fixture does not execute that SDK or Docker.
+ const started=Date.now();let clock=started,pollTimeouts=0;
+ const realTimer=globalThis.setTimeout;
+ const wall=spyOn(Date,'now').mockImplementation(()=>clock);
+ const timer=spyOn(globalThis,'setTimeout').mockImplementation(((fn:Parameters<typeof setTimeout>[0],ms?:number,...args:unknown[])=>{
+  if(ms===CODING_VERIFICATION_POLICY.pollWaitMs)return realTimer(()=>{clock+=ms;pollTimeouts++;fn();},0);
+  return realTimer(fn,ms,...args);
+ }) as typeof setTimeout);
+ let host:ReturnType<typeof createSessionHost>|undefined;
+ try {
+  const f=fixture({admission:{taskId:'task',requestId:'request',ticketId:'ticket',actionId:'action',fingerprint:'fingerprint',ownerEpoch:'owner',deadlineMs:started+1_800_000}});
+  host=f.host;const pending=await f.start();
+  for(let i=0;i<22;i++){
+   const response=await f.poll(pending);expect(response.status).toBe(202);
+   expect(await response.json()).toEqual(pending);
+   expect(f.stats()).toMatchObject({runs:1,observations:0,providers:0,cleaned:false});
+   expect(f.stats().runOptions!.signal!.aborted).toBe(false);
+  }
+  expect(clock-started).toBe(440_000);expect(pollTimeouts).toBe(22);
+  expect(f.stats().runOptions!.deadlineMs).toBe(started+1_800_000);
+  expect(f.stats().runOptions!.timeoutMs).toBe(1_800_000);
+  f.release();const response=await f.poll(pending),complete=await response.json();
+  expect(response.status).toBe(200);expect(complete).toMatchObject({kind:'test_job_complete',jobId:pending.jobId,callId:'gate',receipt:{ok:true,name:'run_bash',tool_call_id:'gate'}});
+  expect(f.stats()).toMatchObject({runs:1,observations:1,providers:0,cleaned:true});
+  expect(f.host.state.finishGateMet).toBe(true);expect(f.host.state.runLog).toHaveLength(1);
+  expect((await f.poll(pending)).status).toBe(409);expect(f.stats().runs).toBe(1);
+  await f.host.drain();
+ } finally {await host?.drain();timer.mockRestore();wall.mockRestore();}
+});
+
+for(const failure of ['cancelled_poll','duplicate_poll'] as const)test(failure+' cannot finalize or drain while executor cleanup is held',async()=>{
+ const dir=realpathSync(mkdtempSync(join(tmpdir(),'long-test-held-cleanup-')));cleanup.push(()=>rmSync(dir,{recursive:true,force:true}));
+ const path=join(dir,'trace.jsonl'),trace=createAuditTrace({path,binding:{taskId:'task',requestId:'request',ticketId:'ticket',actionId:'action',ownerEpoch:'owner'}});
+ let started!:()=>void,release!:()=>void,runs=0,aborts=0,physicallyClean=false;
+ const entered=new Promise<void>(resolve=>{started=resolve;});
+ const held=new Promise<void>(resolve=>{release=resolve;});
+ const executor:Executor={workspaceRoot:'/offline',readFile:async()=>'',writeFile:async()=>{},listFiles:async()=>[],grep:async()=>[],run:async(_command,opts)=>{
+  runs++;opts!.signal!.addEventListener('abort',()=>{aborts++;},{once:true});started();
+  await held;physicallyClean=true;return{stdout:'late zero exit',stderr:'',exitCode:0,timedOut:false};
+ }};
+ const f=fixture({executor,trace});cleanup.push(release);
+ const pending=await f.start();await entered;
+ const abort=new AbortController();
+ const polling=f.host.handle(new Request(request('/tools/jobs/poll',{taskId:'task',requestId:'request',ownerEpoch:'owner',callId:pending.callId,jobId:pending.jobId}),{signal:abort.signal}));
+ // Let the first handler acquire its polling guard without advancing a deadline.
+ await Bun.sleep(1);
+ if(failure==='cancelled_poll')abort.abort();else expect((await f.poll(pending)).status).toBe(409);
+ expect((await polling).status).toBe(409);expect(aborts).toBe(1);expect(physicallyClean).toBe(false);
+ let drained=false;const draining=f.host.drain().then(()=>{drained=true;});
+ await Promise.resolve();expect(drained).toBe(false);
+ expect(f.host.finalizeTrace({status:'error',terminationReason:'session_inactive'})).toBe(false);
+ expect(readFileSync(path,'utf8')).not.toContain('"kind":"terminal"');
+ expect((await f.host.handle(request('/tools/execute',execute('retry')))).status).toBe(409);
+ expect((await f.poll(pending)).status).toBe(409);expect(runs).toBe(1);
+ // A caller must not release its resource lease merely because the poll failed.
+ // This is the host drain boundary, not a test of the external Python flock.
+ release();await draining;expect(drained).toBe(true);expect(physicallyClean).toBe(true);
+ expect(f.host.state.finishGateMet).toBe(false);expect(f.stats().observations).toBe(0);expect(f.stats().providers).toBe(0);
+ const result=f.host.result({status:'finished'});expect(result.status).toBe('error');
+ expect(f.host.finalizeTrace(result)).toBe(true);
+ const events=readFileSync(path,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+ expect(events.filter(event=>event.kind==='terminal')).toHaveLength(1);
+ expect(events.at(-1)).toMatchObject({kind:'terminal',status:'error',pendingOperationIds:[]});
+});
+
+test('a replacement RPC host cannot poll or adopt the previous host job, and a closed admission cannot restart',async()=>{
+ let active=true;
+ const assertAdmission=()=>{if(!active)throw new Error('canonical_trial_closed');};
+ const original=fixture({assertAdmission}),pending=await original.start();await Bun.sleep(1);
+ const replacement=fixture({assertAdmission});
+ const rejected=await replacement.poll(pending);expect(rejected.status).toBe(409);
+ expect(JSON.stringify(await rejected.json())).not.toContain(pending.jobId);
+ expect(replacement.stats()).toMatchObject({runs:0,providers:0,observations:0});
+ expect(original.host.pendingTestJob).toBe(true);expect(original.stats().runs).toBe(1);
+ // Client loss is closed by its owning launcher. A fresh client has no durable
+ // receipt replay/adoption protocol; only journal reconciliation handles orphans.
+ await original.host.drain();expect(original.stats().cleaned).toBe(true);
+ active=false;
+ expect(()=>createSessionHost(original.options)).toThrow('canonical_trial_closed');
+ expect((await original.poll(pending)).status).toBe(409);
+ expect((await replacement.host.handle(request('/tools/execute',execute('restarted')))).status).toBe(409);
+ expect(replacement.stats()).toMatchObject({runs:0,providers:0,observations:0});
+});

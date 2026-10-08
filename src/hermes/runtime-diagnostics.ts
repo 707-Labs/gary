@@ -61,6 +61,8 @@ export const RUNTIME_DIAGNOSTICS = {
       "native_pin_mismatch",
       "native_process_reuse_denied",
       "native_runtime_error",
+      "native_tool_timeout",
+      "native_tool_interrupted",
       "native_toolset_mismatch",
       "registry_binding_mismatch",
       "registry_toolset_mismatch",

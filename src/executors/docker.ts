@@ -261,6 +261,7 @@ export class DockerExecutor implements Executor {
       if (this.readOnly || this.networkMode !== "none") throw new Error("executor_job_requires_isolated_coding_executor");
       return runJournaledDockerInvocation({
         context: opts.testJob, workspaceRoot: this.workspaceRoot, image: this.image, args,
+        cleanupGuard: this.cleanupGuard,
         mountedRoots: [this.workspaceRoot, ...(this.gitCommonDir ? [this.gitCommonDir] : [])],
         options: {
           ...(opts.signal ? { signal: opts.signal } : {}),

@@ -12,6 +12,7 @@ timeout) returns a decoded JSON object; it must not follow redirects.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import copy
 import ipaddress
 import json
@@ -45,6 +46,10 @@ _NATIVE_SPECIAL = frozenset({
 _RUN_LOCK = threading.Lock()
 _NATIVE_STARTED = False
 _STDIO_PATHS = frozenset({"/v1/chat/completions", "/tools/execute", "/tools/state", "/tools/jobs/poll"})
+# Last-resort native supervision, not additional host execution authority.
+# The host still owns the original action/command deadlines and cleanup proof.
+_NATIVE_TOOL_CLEANUP_GRACE_S = 60.0
+_MAX_ACTION_S = 9000.0  # coding-runtime-policy.ts: actionTimeoutMs / 1000
 
 
 class RuntimeFault(Exception):
@@ -55,7 +60,7 @@ class RuntimeFault(Exception):
 
 
 
-_DIAGNOSTIC_CODES = frozenset(['concurrent_task_denied', 'deadline_exceeded', 'diagnostic_rejected', 'duplicate_live_tool_call_id', 'endpoint_origin_mismatch', 'executor_state_invalidated', 'history_contains_capability', 'history_duplicate_tool_id', 'history_pending_tool_calls', 'history_too_large', 'history_tool_receipt_mismatch', 'invalid_capability', 'invalid_deadline', 'invalid_endpoint', 'invalid_history', 'invalid_history_content', 'invalid_history_fields', 'invalid_history_message', 'invalid_history_reasoning', 'invalid_history_tool_arguments', 'invalid_history_tool_call', 'invalid_history_tool_calls', 'invalid_history_tool_id', 'invalid_history_tool_name', 'invalid_identity', 'invalid_input_json', 'invalid_long_test_policy', 'invalid_maxIterations', 'invalid_maxTokens', 'invalid_model', 'invalid_model_history_response', 'invalid_native_result', 'invalid_native_source', 'invalid_payload', 'invalid_prompt', 'invalid_rpc_response', 'invalid_state_receipt', 'invalid_stdio_frame', 'invalid_stdio_request', 'invalid_stdio_response', 'invalid_stdio_transport', 'invalid_system_prompt', 'invalid_temperature', 'invalid_test_job', 'invalid_tool_arguments', 'invalid_tool_name', 'invalid_tool_schema', 'invalid_tools', 'invalid_transport', 'missing_original_tool_call_id', 'model_attempt_limit', 'model_authority_rejected', 'model_output_cap_exceeded', 'native_dotenv_present', 'native_execution_failed', 'native_pin_mismatch', 'native_process_reuse_denied', 'native_runtime_error', 'native_toolset_mismatch', 'registry_binding_mismatch', 'registry_toolset_mismatch', 'rpc_authority_rejected', 'rpc_http_error', 'rpc_redirect_denied', 'rpc_transport_error', 'stdio_closed', 'stdio_endpoint_denied', 'stdio_frame_too_large', 'stdio_method_denied', 'test_job_binding_rejected', 'test_job_poll_limit', 'test_job_receipt_rejected', 'tool_receipt_mismatch', 'unapproved_native_tool', 'unexpected_native_iteration_cap', 'unexpected_test_job', 'unknown_native_failure', 'unknown_runtime_fault', 'unresolved_live_tool_calls', 'unsupported_model_request', 'untraced_live_tool_call'])
+_DIAGNOSTIC_CODES = frozenset(['concurrent_task_denied', 'deadline_exceeded', 'diagnostic_rejected', 'duplicate_live_tool_call_id', 'endpoint_origin_mismatch', 'executor_state_invalidated', 'history_contains_capability', 'history_duplicate_tool_id', 'history_pending_tool_calls', 'history_too_large', 'history_tool_receipt_mismatch', 'invalid_capability', 'invalid_deadline', 'invalid_endpoint', 'invalid_history', 'invalid_history_content', 'invalid_history_fields', 'invalid_history_message', 'invalid_history_reasoning', 'invalid_history_tool_arguments', 'invalid_history_tool_call', 'invalid_history_tool_calls', 'invalid_history_tool_id', 'invalid_history_tool_name', 'invalid_identity', 'invalid_input_json', 'invalid_long_test_policy', 'invalid_maxIterations', 'invalid_maxTokens', 'invalid_model', 'invalid_model_history_response', 'invalid_native_result', 'invalid_native_source', 'invalid_payload', 'invalid_prompt', 'invalid_rpc_response', 'invalid_state_receipt', 'invalid_stdio_frame', 'invalid_stdio_request', 'invalid_stdio_response', 'invalid_stdio_transport', 'invalid_system_prompt', 'invalid_temperature', 'invalid_test_job', 'invalid_tool_arguments', 'invalid_tool_name', 'invalid_tool_schema', 'invalid_tools', 'invalid_transport', 'missing_original_tool_call_id', 'model_attempt_limit', 'model_authority_rejected', 'model_output_cap_exceeded', 'native_dotenv_present', 'native_execution_failed', 'native_pin_mismatch', 'native_process_reuse_denied', 'native_runtime_error', 'native_tool_interrupted', 'native_tool_timeout', 'native_toolset_mismatch', 'registry_binding_mismatch', 'registry_toolset_mismatch', 'rpc_authority_rejected', 'rpc_http_error', 'rpc_redirect_denied', 'rpc_transport_error', 'stdio_closed', 'stdio_endpoint_denied', 'stdio_frame_too_large', 'stdio_method_denied', 'test_job_binding_rejected', 'test_job_poll_limit', 'test_job_receipt_rejected', 'tool_receipt_mismatch', 'unapproved_native_tool', 'unexpected_native_iteration_cap', 'unexpected_test_job', 'unknown_native_failure', 'unknown_runtime_fault', 'unresolved_live_tool_calls', 'unsupported_model_request', 'untraced_live_tool_call'])
 _DIAGNOSTIC_STAGES = frozenset(['unknown', 'input_validation', 'native_init', 'native_run', 'model_request', 'model_response', 'tool_call', 'state_read', 'native_result', 'stdio_write', 'stdio_read', 'stdio_response'])
 
 def _diagnostic(code, stage, exc=None):
@@ -748,7 +753,77 @@ def _native_factory(*, agent_kwargs, tools, tool_handlers):
     for name, handler in tool_handlers.items():
         if registry.get_entry(name).handler is not handler:
             raise RuntimeFault("registry_binding_mismatch")
+    if tool_handlers.stdio_channel is not None:
+        from agent import tool_executor
+        _bind_native_tool_lifetimes(tool_executor, agent, tool_handlers)
     return agent
+
+
+def _native_tool_timeout(payload, name, arguments):
+    """Mirror admitted command bounds; the host never receives the grace."""
+    remaining = min(_MAX_ACTION_S, _deadline(payload, model_stdio=True))
+    ceiling = remaining
+    if name == "run_bash":
+        if not isinstance(arguments, dict) or not isinstance(arguments.get("command"), str):
+            raise RuntimeFault("invalid_tool_arguments")
+        requested = arguments.get("timeout_seconds")
+        if "timeout_seconds" in arguments and (type(requested) is not int or not 0 < requested <= 9007199254740991):
+            raise RuntimeFault("invalid_tool_arguments")
+        long_rule = (_LONG_TEST_POLICY["commands"].get(arguments["command"])
+                     if payload.get("longTestPolicy") == _LONG_TEST_POLICY else None)
+        if long_rule:
+            if set(arguments) - {"command", "timeout_seconds"}:
+                raise RuntimeFault("invalid_tool_arguments")
+            cap = long_rule["timeoutMs"] / 1000
+            ceiling = min(cap, requested if requested is not None else cap)
+        else:
+            # verification-policy.ts: generic default 120s, maximum 900s.
+            ceiling = min(900.0, requested if requested is not None else 120.0)
+    return min(ceiling, remaining) + _NATIVE_TOOL_CLEANUP_GRACE_S
+
+
+def _bind_native_tool_lifetimes(native, target_agent, handlers):
+    """Keep the pinned native watchdog finite and behind host-owned deadlines.
+
+    The native middleware resolves its timeout once, before submitting its
+    daemon handler. A call-local resolver avoids changing unrelated agents or
+    the HTTP path. Native timeout/interrupt markers are terminal even when the
+    native conversation loop catches the error; never join an abandoned thread.
+    The host launcher/session must still cancel and await physical cleanup.
+    """
+    original = native._run_sequential_tool_execution_middleware
+    original_resolver = native._resolve_sequential_tool_timeout
+    selected_timeout = contextvars.ContextVar("gary_native_tool_timeout", default=None)
+
+    def resolve():
+        value = selected_timeout.get()
+        return original_resolver() if value is None else value
+
+    def bounded(agent, **kwargs):
+        if agent is not target_agent:
+            return original(agent, **kwargs)
+        handlers.guard()
+        token = None
+        try:
+            timeout = _native_tool_timeout(handlers.payload, kwargs["function_name"], kwargs["function_args"])
+            token = selected_timeout.set(timeout)
+            outcome = original(agent, **kwargs)
+            if isinstance(outcome.result, native._ToolTimeoutResult):
+                raise RuntimeFault("native_tool_timeout")
+            if isinstance(outcome.result, native._ToolCancelledResult):
+                raise RuntimeFault("native_tool_interrupted")
+            handlers.guard()
+            return outcome
+        except RuntimeFault as exc:
+            handlers.fail(exc.code, diagnostic_stage="tool_call")
+            handlers.guard()  # Rethrow the first fault, including a prior RPC failure.
+            raise
+        finally:
+            if token is not None:
+                selected_timeout.reset(token)
+
+    native._resolve_sequential_tool_timeout = resolve
+    native._run_sequential_tool_execution_middleware = bounded
 
 
 class _Handlers(dict):
@@ -795,6 +870,7 @@ def run_task(payload, native_factory=None, transport=None):
         return dict(result, reason="concurrent_task_denied", diagnostic=_diagnostic("concurrent_task_denied", "input_validation"))
     capability = p["capability"]
     fault = [None]
+    fault_lock = threading.Lock()
     stage = ["native_init"]
     fault_diagnostic = [None]
 
@@ -819,9 +895,13 @@ def run_task(payload, native_factory=None, transport=None):
     headers = {"Authorization": "Bearer " + capability, "Content-Type": "application/json",
                "X-Gary-Task-Id": p["taskId"], "X-Gary-Owner-Epoch": p["ownerEpoch"]}
 
-    def fail(code):
-        fault[0] = code
-        fault_diagnostic[0] = (transport.diagnostic if isinstance(transport, _StdioChannel) else None) or _diagnostic(code, stage[0])
+    def fail(code, *, diagnostic_stage=None):
+        with fault_lock:
+            if fault[0] is not None:
+                return
+            fault_diagnostic[0] = (_diagnostic(code, diagnostic_stage) if diagnostic_stage else
+                                  (transport.diagnostic if isinstance(transport, _StdioChannel) else None) or _diagnostic(code, stage[0]))
+            fault[0] = code
 
     def guard():
         if fault[0]:
@@ -843,8 +923,10 @@ def run_task(payload, native_factory=None, transport=None):
             raise RuntimeFault("rpc_transport_error") from None
 
     handlers = _Handlers()
+    handlers.payload = p
     handlers.deadline_ms = p["deadlineMs"]
     handlers.fail = fail
+    handlers.guard = guard
     handlers.stdio_channel = transport if isinstance(transport, _StdioChannel) else None
     if handlers.stdio_channel is not None:
         handlers.stdio_channel.on_fault = fail
@@ -1045,7 +1127,7 @@ def run_task(payload, native_factory=None, transport=None):
                     result["history"] = _history(_redact_result(history[0], capability))
                 return result
     except RuntimeFault as exc:
-        return dict(result, status="timeout" if exc.code == "deadline_exceeded" else "error", reason=_diagnostic(exc.code, stage[0])["code"],
+        return dict(result, status="timeout" if exc.code in {"deadline_exceeded", "native_tool_timeout"} else "error", reason=_diagnostic(exc.code, stage[0])["code"],
                     diagnostic=fault_diagnostic[0] or _diagnostic(exc.code, stage[0]))
     except Exception as exc:
         return dict(result, status="error", reason="native_runtime_error",
