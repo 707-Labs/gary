@@ -1,7 +1,8 @@
-/** Host-only static Slack status service. No model, tool, or coding dispatch surface. */
+/** Host Slack service; optional tightly scoped Tanner DM conversation, no coding dispatch. */
 import { createHash, randomUUID } from 'node:crypto';
 import type { DB } from '../state/db.ts';
 import type { SlackTransport } from './transport.ts';
+import type { SlackConversation } from './conversation.ts';
 
 export const GARY_SLACK = Object.freeze({ appId:'A0C7QFW3PEG', teamId:'T0AA24R7VUZ', botUserId:'U0C7NPEUG1F',
   tannerId:'U0A9M5W16F8', benId:'U0A97PBGXE3', readyRequest:'Sentinel_ecc85c3dae948191965308b6414c1165' });
@@ -42,6 +43,7 @@ export interface SlackServiceOptions {
   allowedUserIds?:readonly string[];
   /** Explicitly approved Tanner-only status replies; no model or history access. */
   tannerDirectMessages?:true;
+  conversation?:SlackConversation;
 }
 export interface SlackServiceHealth {
   running:boolean; identityVerified:boolean; socketHealthy:boolean; hostReady:boolean;
@@ -59,6 +61,7 @@ interface OutboxRow { status:'sent'|'unknown'|'not_sent'; }
 
 export function createSlackService(options:SlackServiceOptions):SlackService {
   if(options.tannerDirectMessages!==undefined&&options.tannerDirectMessages!==true)throw new Error('invalid_slack_dm_switch');
+  if(options.conversation&&(!options.tannerDirectMessages||options.approvedChannelIds?.length))throw new Error('dm_conversation_boundary_rejected');
   const channels=[...(options.approvedChannelIds??[])], users=[...(options.allowedUserIds??[GARY_SLACK.tannerId])];
   if (channels.length>64 || new Set(channels).size!==channels.length || channels.some(id=>!CHANNEL.test(id))) throw new Error('invalid_slack_channel_allowlist');
   if (new Set(users).size!==users.length || users.some(id=>id!==GARY_SLACK.tannerId && id!==GARY_SLACK.benId)) throw new Error('invalid_slack_user_allowlist');
@@ -180,8 +183,20 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
       if(ready?.slack_channel!==event.channel)return;
       await refreshHealth();
       if(!live()||!identityVerified||!options.transport.socketHealthy())return;
-      await sendOnce({key:`dm:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${payload.event_id}`,kind:'dm',requestId:payload.event_id,
-        recipient:event.user,channel:event.channel,threadTs:(event.thread_ts??event.ts) as string,
+      const eventId=payload.event_id,channel=event.channel,ts=event.ts,user=event.user,threadTs=(event.thread_ts??event.ts) as string;
+      const key=`dm:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${eventId}`;
+      if(options.conversation) {
+        if(!hostReady||readinessKind!=='readonly_runtime'||options.db.query('SELECT 1 FROM gary_slack_dm_outbox WHERE delivery_key=?').get(key))return;
+        // Incoming text is passed only after every existing identity/channel/health gate.
+        await options.conversation.respond({eventId,channel,ts,threadTs,text:event.text},async text=>{
+          if(!live()||!hostReady||!identityVerified||!options.transport.socketHealthy())return 'not_sent';
+          await sendOnce({key,kind:'dm',requestId:eventId,recipient:user,channel,threadTs,text});
+          const row=options.db.query<{status:OutboxRow['status'];content_sha256:string;recipient_id:string;target_channel:string;thread_ts:string},[string]>('SELECT status,content_sha256,recipient_id,target_channel,thread_ts FROM gary_slack_dm_outbox WHERE delivery_key=?').get(key);
+          if(!row)return 'not_sent';
+          if(row.content_sha256!==hash(text)||row.recipient_id!==user||row.target_channel!==channel||row.thread_ts!==threadTs)return 'unknown';
+          return row.status;
+        },cancellation.signal);
+      } else await sendOnce({key,kind:'dm',requestId:eventId,recipient:user,channel,threadTs,
         text:hostReady?PRIVATE_DM_STATUS:NOT_READY_STATUS});
       return;
     }

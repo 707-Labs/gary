@@ -9,6 +9,14 @@ const canary = {
   GARY_BUN_CACHE_VOLUME: 'gary-bun-cache-20261007-node24',
   DOCKER_HOST: 'unix:///Users/tanner/.colima/default/docker.sock',
 };
+test('free-form conversation requires explicit private DM, clean release pin and private absolute config path',()=>{
+  const env={...canary,GARY_RUNTIME_MODE:'hermes-readonly-canary',GARY_SLACK_ENABLED:'1',GARY_SLACK_CREDENTIALS_FILE:'/private/runtime/slack.env',
+    GARY_SLACK_TANNER_DM_ENABLED:'1',GARY_READONLY_SLACK_RELEASE_COMMIT:'a'.repeat(40),GARY_SLACK_CONVERSATION_CONFIG:'/private/runtime/conversation.json'};
+  expect(loadHostStartupConfig(env).slackConversationConfigPath).toBe(env.GARY_SLACK_CONVERSATION_CONFIG);
+  for(const key of ['GARY_SLACK_TANNER_DM_ENABLED','GARY_READONLY_SLACK_RELEASE_COMMIT','GARY_SLACK_ENABLED'])expect(()=>loadHostStartupConfig({...env,[key]:undefined})).toThrow();
+  expect(()=>loadHostStartupConfig({...env,GARY_RUNTIME_MODE:'legacy'})).toThrow();
+  expect(()=>loadHostStartupConfig({...env,GARY_SLACK_CONVERSATION_CONFIG:'./config.json'})).toThrow();
+});
 test('ordinary startup remains legacy and never implicitly enables Slack or Hermes', () => {
   expect(loadHostStartupConfig({})).toEqual({ mode: 'legacy' });
   for (const env of [{ GARY_RUNTIME_MODE: 'other' }, { GARY_HERMES_ACTIVATION_PATH: '/a' }, { GARY_SLACK_ENABLED: '1' }]) {

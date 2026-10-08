@@ -40,6 +40,32 @@ function rows(db:Database):any[]{return db.query('SELECT * FROM gary_slack_outbo
 function dm(overrides:Record<string,unknown>={},payloadOverrides:Record<string,unknown>={}) {
   return envelope({type:'message',channel_type:'im',channel:'D0FIXTURE1',text:'private inbound fixture',...overrides},payloadOverrides);
 }
+test('free-form dispatch keeps Tanner/app/team/DM/readiness boundary and authenticates exact delivered content',async()=>{
+  let calls=0;const f=fixture({tannerDirectMessages:true,conversation:{ready:()=>true,close:()=>({drained:true}),async respond(input,deliver){
+    calls++;expect(input.text).toBe('private inbound fixture');expect(await deliver('A real conversational answer.')).toBe('sent');
+  }}});f.health=readonlyHealthy;await f.service.start();
+  for(const event of [{user:GARY_SLACK.benId},{channel:'D0FOREIGN'},{bot_id:'B1234567'},{subtype:'message_changed'}])await f.fake.emit(dm(event));
+  await f.fake.emit(dm({}, {team_id:'T0FOREIGN'}));await f.fake.emit(dm({}, {api_app_id:'A0FOREIGN'}));expect(calls).toBe(0);
+  await f.fake.emit(dm());expect(calls).toBe(1);expect(f.fake.sends[1]?.text).toBe('A real conversational answer.');
+  await f.fake.emit(dm());expect(calls).toBe(1);
+  f.health={...readonlyHealthy,ready:false};await f.fake.emit(dm({}, {event_id:'EvUnready'}));expect(calls).toBe(1);
+});
+test('upgrading old static sent/unknown DM claims never starts inference or treats old prose as new delivered text',async()=>{
+  for(const unknown of [false,true]){
+    const original=fixture({tannerDirectMessages:true});original.health=readonlyHealthy;await original.service.start();
+    if(unknown)original.fake.send=async()=>({ok:false,outcome:'unknown',code:'fixture'});
+    await original.fake.emit(dm());await original.service.stop();
+    let calls=0;const upgraded=fixture({db:original.db,tannerDirectMessages:true,conversation:{ready:()=>true,close:()=>({drained:true}),async respond(){calls++;}}});
+    upgraded.health=readonlyHealthy;await upgraded.service.start();await upgraded.fake.emit(dm());expect(calls).toBe(0);expect(upgraded.fake.sends).toEqual([]);
+  }
+});
+test('conversation cannot confirm a mismatched delivery row and shutdown waits for its handler',async()=>{
+  let finish!:()=>void,entered!:()=>void;const gate=new Promise<void>(resolve=>finish=resolve),started=new Promise<void>(resolve=>entered=resolve);
+  const f=fixture({tannerDirectMessages:true,conversation:{ready:()=>true,close:()=>({drained:true}),async respond(_input,deliver){
+    expect(await deliver('first authenticated body')).toBe('sent');expect(await deliver('different body')).toBe('unknown');entered();await gate;
+  }}});f.health=readonlyHealthy;await f.service.start();const event=f.fake.emit(dm());await started;
+  let stopped=false;const stop=f.service.stop().then(()=>stopped=true);await Promise.resolve();expect(stopped).toBe(false);finish();await Promise.all([stop,event]);expect(stopped).toBe(true);
+});
 test('explicit private DM opt-in replies once only to Tanner in the previously verified private conversation',async()=>{
   const f=fixture({tannerDirectMessages:true});f.health=readonlyHealthy;await f.service.start();
   const readyBefore=JSON.stringify(rows(f.db));

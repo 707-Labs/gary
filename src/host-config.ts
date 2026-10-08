@@ -7,6 +7,7 @@ export interface HostStartupConfig {
   activationPath?: string;
   /** Exact reviewed Slack-only host release; original canary receipt remains immutable. */
   readonlySlackReleaseCommit?:string;
+  slackConversationConfigPath?:string;
   slack?: { credentialsPath: string; approvedChannelIds: readonly string[]; tannerDirectMessages?:true };
 }
 
@@ -23,6 +24,8 @@ export function loadHostStartupConfig(env: Readonly<Record<string, string | unde
   const enabled = env.GARY_SLACK_ENABLED;
   const direct=env.GARY_SLACK_TANNER_DM_ENABLED;
   const slackRelease=env.GARY_READONLY_SLACK_RELEASE_COMMIT;
+  const conversation=env.GARY_SLACK_CONVERSATION_CONFIG;
+  if(conversation!==undefined&&(mode!=='hermes-readonly-canary'||enabled!=='1'||direct!=='1'||!slackRelease))throw new Error('dm_conversation_requires_pinned_readonly_slack');
   if(direct!==undefined&&direct!=='0'&&direct!=='1')throw new Error('invalid_slack_dm_switch');
   if((direct==='1'||slackRelease!==undefined)&&(mode!=='hermes-readonly-canary'||enabled!=='1'))throw new Error('private_dm_requires_readonly_slack');
   if(slackRelease!==undefined&&(!/^[a-f0-9]{40}$/.test(slackRelease)||direct!=='1'))throw new Error('invalid_slack_release_commit');
@@ -59,6 +62,7 @@ export function loadHostStartupConfig(env: Readonly<Record<string, string | unde
   if (mode === 'hermes-readonly-canary' && approvedChannelIds.length) throw new Error('readonly_canary_shared_channels_disabled');
   return Object.freeze({ mode, activationPath,
     ...(slackRelease?{readonlySlackReleaseCommit:slackRelease}:{}),
+    ...(conversation!==undefined?{slackConversationConfigPath:path(conversation)}:{}),
     slack: Object.freeze({ credentialsPath: path(env.GARY_SLACK_CREDENTIALS_FILE), approvedChannelIds: Object.freeze(approvedChannelIds),
       ...(direct==='1'?{tannerDirectMessages:true as const}:{}) }) });
 }

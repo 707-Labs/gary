@@ -12,6 +12,8 @@ import { createSlackTransport } from './slack/transport.ts';
 import { createSlackService, type SlackService } from './slack/service.ts';
 import { openDb } from './state/db.ts';
 import { openSpendLedger } from './spend.ts';
+import { createSlackConversation, loadSlackConversationConfig, fingerprintSlackConversationConfig, type SlackConversation } from './slack/conversation.ts';
+import { createHermesDMResponder } from './hermes/dm-conversation.ts';
 import { log } from './logger.ts';
 
 export interface ReadonlyStartupDependencies {
@@ -31,11 +33,12 @@ export function verifyReadonlyRelease(expected: string, slackRelease?:string, cw
   }
   if(slackRelease!==undefined) {
     git(['merge-base','--is-ancestor',expected,slackRelease]);
-    // Only this explicitly pinned, independently reviewed Slack patch may reuse
-    // the existing model/tool proof. No runtime, provider, executor, dependency,
+    // Only this explicitly pinned, independently reviewed Slack/conversation patch may reuse
+    // the existing model/tool proof. No underlying runtime, provider transport, executor, dependency,
     // entrypoint, native worker, or receipt source is allowed to differ.
     const allowed=new Set(['src/slack/service.ts','src/host-config.ts','src/readonly-startup.ts',
-      'test/slack/service.test.ts','test/host-config.test.ts','test/readonly-startup.test.ts']);
+      'test/slack/service.test.ts','test/host-config.test.ts','test/readonly-startup.test.ts',
+      'src/slack/conversation.ts','src/hermes/dm-conversation.ts','test/slack/conversation.test.ts','test/hermes/dm-conversation.test.ts']);
     const changed=git(['diff','--name-only',expected,slackRelease]).split('\n').filter(Boolean);
     if(!changed.length||changed.some(file=>!allowed.has(file)))throw new Error('readonly_slack_release_scope_mismatch');
   }
@@ -55,6 +58,8 @@ export async function runReadonlyGaryHost(host: HostStartupConfig, deps: Startup
   if (host.mode !== 'hermes-readonly-canary' || !host.activationPath || !host.slack || host.slack.approvedChannelIds.length) {
     throw new Error('readonly_startup_configuration_rejected');
   }
+  if(host.slackConversationConfigPath&&(!host.slack.tannerDirectMessages||!host.readonlySlackReleaseCommit))throw new Error('dm_conversation_requires_pinned_readonly_slack');
+  const conversationConfig=host.slackConversationConfigPath?loadSlackConversationConfig(host.slackConversationConfigPath):undefined;
   const config = loadReadonlyCanaryConfig(host.activationPath);
   (deps.verifyReadonlyRelease ?? verifyReadonlyRelease)(config.releaseCommit,host.readonlySlackReleaseCommit);
   const setup = deps.readonlySetup ? deps.readonlySetup() : (() => {
@@ -69,6 +74,7 @@ export async function runReadonlyGaryHost(host: HostStartupConfig, deps: Startup
   const db = (deps.db ?? openDb)(resolve(setup.stateDir, 'gary.db'));
   let ledger: ReturnType<typeof openSpendLedger> | undefined;
   let slack: SlackService | undefined;
+  let conversation:SlackConversation|undefined;
   const controller = new AbortController();
   const abort = () => { controller.abort(); void slack?.stop().catch(() => undefined); };
   const onInt = () => { log.info('signal received', { signal: 'SIGINT' }); abort(); };
@@ -87,7 +93,8 @@ export async function runReadonlyGaryHost(host: HostStartupConfig, deps: Startup
       signal: controller.signal, ...(deps.launch ? { launch: deps.launch } : {}) });
     const transport = deps.slackTransport ? deps.slackTransport(credentials) : createSlackTransport({ credentials });
     if(host.readonlySlackReleaseCommit&&!canary.check().ready)throw new Error('readonly_slack_release_requires_existing_receipt');
-    slack = createSlackService({ db, transport, checkHostHealth: canary.check, approvedChannelIds: [],
+    if(conversationConfig)conversation=createSlackConversation({config:conversationConfig,ledger,reply:createHermesDMResponder({ledger,providerApiKey:provider.apiKey,fetch:request=>rawFetch(request),...(deps.launch?{launch:deps.launch}:{})})});
+    slack = createSlackService({ db, transport, ...(conversation?{conversation}:{}), checkHostHealth: canary.check, approvedChannelIds: [],
       ...(host.slack.tannerDirectMessages?{tannerDirectMessages:true as const}:{}) });
     const initial = await slack.start();
     if (controller.signal.aborted) return;
@@ -102,6 +109,9 @@ export async function runReadonlyGaryHost(host: HostStartupConfig, deps: Startup
         || ready.readyDelivery !== 'sent') throw new Error('readonly_ready_delivery_unconfirmed');
     log.info('readonly canary ready', { runId: config.runId, receiptId: ready.readinessReceiptId,
       readyDelivery: ready.readyDelivery, runtime: host.mode, codingDispatch: 'disabled' });
+    if(conversation&&!conversation.ready())throw new Error('dm_conversation_not_ready');
+    if(conversationConfig)log.info('readonly conversation ready',{runId:conversationConfig.runId,allocationId:conversationConfig.allocationId,
+      configFingerprint:fingerprintSlackConversationConfig(conversationConfig),model:'deepseek-v4-pro',tools:'none'});
     await (deps.waitReadonlyIdle ?? idle)(controller.signal, async () => {
       const health = await slack!.refreshHealth();
       log.info('readonly slack health', { connected: health.running && health.identityVerified && health.socketHealthy,
@@ -113,6 +123,7 @@ export async function runReadonlyGaryHost(host: HostStartupConfig, deps: Startup
     deps.signal?.removeEventListener('abort', abort);
     try { await slack?.stop(); } finally {
       try {
+        if(conversation&&conversationConfig){const drained=conversation.close().drained;log.info('readonly conversation stopped',{runId:conversationConfig.runId,drained});}
         if (ledger?.status(config.allocationId)?.state === 'active') ledger.markTerminal(config.allocationId, 'readonly_host_stopped');
       } finally { try { ledger?.close(); } finally { db.close(); } }
     }

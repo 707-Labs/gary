@@ -9,6 +9,8 @@ import type { StartupDependencies } from '../src/startup.ts';
 import { APPROVED_SLACK_IDENTITY, type SlackTransport } from '../src/slack/transport.ts';
 import { READONLY_READY_DM_TEXT } from '../src/slack/service.ts';
 import { openDb } from '../src/state/db.ts';
+import { SpendLedger } from '../src/spend.ts';
+import { Database } from 'bun:sqlite';
 
 const roots:string[]=[];
 afterEach(()=>{for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});});
@@ -48,6 +50,16 @@ test('actual main readonly mode starts verified Slack, runs one canary, sends ex
 test('restart reuses verified readonly evidence but cannot repeat the authorized ready notification',async()=>{
   const f=fixture();await main(f.deps);await main(f.deps);
   expect(f.counts().runs).toBe(1);expect(f.counts().idle).toBe(2);expect(f.posts).toHaveLength(1);
+});
+test('conversation startup uses existing canary only and shutdown preserves its operator-owned $5 allocation',async()=>{
+  const f=fixture();f.setReady();await main(f.deps);const path=join(f.root,'conversation.json');
+  writeFileSync(path,JSON.stringify({version:1,runId:'hermes-dm-20261008',campaignId:'hermes-dm-20261008',allocationId:'local:hermes-dm-20261008-tanner'}),{mode:0o600});
+  let ledger=new SpendLedger(join(f.root,'state','spend.db'));ledger.createCampaign('hermes-dm-20261008',5);ledger.enrollTicket('hermes-dm-20261008','local:hermes-dm-20261008-tanner',5);ledger.close();
+  f.deps.env={...f.deps.env,GARY_SLACK_TANNER_DM_ENABLED:'1',GARY_READONLY_SLACK_RELEASE_COMMIT:'b'.repeat(40),GARY_SLACK_CONVERSATION_CONFIG:path};
+  await main(f.deps);expect(f.posts).toHaveLength(1);expect(f.counts().runs).toBe(0);
+  ledger=new SpendLedger(join(f.root,'state','spend.db'));expect(ledger.status('local:hermes-dm-20261008-tanner')).toMatchObject({state:'active',attemptCount:0});ledger.close();
+  const db=new Database(join(f.root,'context.sqlite'));db.query('UPDATE control SET blocked=1 WHERE id=1').run();db.close();
+  await expect(main(f.deps)).rejects.toThrow('dm_conversation_not_ready');
 });
 test('pinned Slack-only release requires existing readiness and can never run a new canary',async()=>{
   const f=fixture();f.deps.env={...f.deps.env,GARY_SLACK_TANNER_DM_ENABLED:'1',GARY_READONLY_SLACK_RELEASE_COMMIT:'b'.repeat(40)};
