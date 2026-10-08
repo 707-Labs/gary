@@ -10,7 +10,7 @@ import {join} from 'node:path';
 const resources: Array<()=>void> = [];
 afterEach(()=>{for(const cleanup of resources.splice(0).reverse()) cleanup();});
 const token = 'test-capability-000000000000000000000000';
-function fixture(progress?: ProductiveProgressGuard, cap = 5, trace?:AuditTrace) {
+function fixture(progress?: ProductiveProgressGuard, cap = 5, trace?:AuditTrace, overrides:Partial<SessionOptions>={}) {
   const ledger = new SpendLedger(':memory:'); resources.push(()=>ledger.close());
   ledger.createCampaign('fixture', 10); ledger.enrollTicket('fixture','ticket-1',cap,{draftPr:true});
   let epoch = 'epoch-1', admitted = true, providerCalls = 0, executorCalls = 0;
@@ -27,6 +27,7 @@ function fixture(progress?: ProductiveProgressGuard, cap = 5, trace?:AuditTrace)
     currentOwnerEpoch:()=>epoch,assertAdmission:()=>{if(!admitted)throw new Error('revoked');},
     ...(progress ? {progress} : {}),
     ...(trace ? {trace} : {}),
+    ...overrides,
   };
   const host=createSessionHost(options);resources.push(()=>host.dispose());
   const request=(path:string,body:unknown,auth=token)=>new Request('http://127.0.0.1:1234'+path,{method:'POST',headers:{authorization:'Bearer '+auth,'content-type':'application/json'},body:JSON.stringify(body)});
@@ -134,11 +135,11 @@ test('budget refusal remains distinct from a native transport error',async()=>{
  const result=f.host.result({status:'error'});expect(result.status).toBe('error');expect(result.terminationReason).toBe('budget_exhausted');expect(result.errorMessage).toBe('budget_exhausted');
  expect(f.ledger.status('ticket-1')!.state).toBe('exhausted');expect(f.ledger.status('ticket-1')!.attemptCount).toBe(0);
 });
-function tracedFixture(cap=5){
+function tracedFixture(cap=5,overrides:Partial<SessionOptions>={}){
  const dir=realpathSync(mkdtempSync(join(tmpdir(),'gary-session-trace-')));resources.push(()=>rmSync(dir,{recursive:true,force:true}));
  const path=join(dir,'trace.jsonl');
  const trace=createAuditTrace({path,binding:{taskId:'task-1',requestId:'request-1',actionId:'action-1',ownerEpoch:'epoch-1',ticketId:'ticket-1'}});
- const f=fixture(undefined,cap,trace);
+ const f=fixture(undefined,cap,trace,overrides);
  const events=()=>readFileSync(path,'utf8').trim().split('\n').map(line=>JSON.parse(line));
  return {...f,trace,path,events};
 }
@@ -174,4 +175,62 @@ test('durable terminal trace identifies budget exhaustion without a provider req
  const result=f.host.result({status:'error'});expect(f.host.finalizeTrace(result)).toBe(true);
  expect(f.events().at(-1).status).toBe('budget_exhausted');expect(f.events().at(-1).errorCode).toBe('reservation_exhausted');
  expect(f.counts().providerCalls).toBe(0);
+});
+
+const modelRequestBody={model:'deepseek-v4-pro',messages:[{role:'user',content:'private-prompt'}],max_tokens:32};
+function rejectedProviderBody(){return {id:'private-response-id',type:'message',role:'assistant',model:'deepseek-v4-pro',
+ content:[{type:'thinking',thinking:'private-reasoning',signature:'private-signature'},
+  {type:'tool_use',id:'private-call-id',name:'read_file',input:{path:'private-path'}}],stop_reason:'tool_use',
+ usage:{input_tokens:10,output_tokens:8,cache_read_input_tokens:0,cache_creation_input_tokens:0}};}
+test('model trace preserves precise fixed rejection metadata without provider content',async()=>{
+ const f=tracedFixture(5,{thinking:'disabled',fetch:async request=>{
+  expect((await request.json()).thinking).toEqual({type:'disabled'});return Response.json(rejectedProviderBody());}});
+ const request=f.request('/v1/chat/completions',{...modelRequestBody,tools:f.host.manifest('http://127.0.0.1:1234/',{prompt:'task',systemPrompt:'Gary',maxIterations:2,maxTokens:32}).tools});
+ expect((await f.host.handle(request)).status).toBe(502);
+ const result=f.host.result({status:'error'});expect(f.host.finalizeTrace(result)).toBe(true);
+ const events=f.events(),failure=events.find(event=>event.kind==='model'&&event.stage==='error');
+ expect(failure.errorCode).toBe('unsupported_provider_response');
+ expect(failure.responseRejection).toEqual({category:'unsupported_block_type',blockTypes:['thinking','tool_use'],blockCount:2,stopReason:'tool_use',modelMatches:true});
+ expect(events.filter(event=>event.kind==='model'&&event.stage==='error')).toHaveLength(1);
+ expect(events.find(event=>event.kind==='model'&&event.stage==='start').modelState.thinking).toBe('disabled');
+ expect(events.at(-1).modelState.thinking).toBe('disabled');
+ const raw=readFileSync(f.path,'utf8');
+ for(const secret of ['private-prompt','private-response-id','private-reasoning','private-signature','private-call-id','private-path',token,'fixture-provider-key'])expect(raw).not.toContain(secret);
+ expect(f.ledger.status('ticket-1')!.attemptCount).toBe(1);
+});
+test('model trace keeps local invalid-request code and unknown policy without a provider call',async()=>{
+ const f=tracedFixture();
+ expect((await f.host.handle(f.request('/v1/chat/completions',{...modelRequestBody,thinking:{type:'disabled'}}))).status).toBe(400);
+ const failed=f.events().find(event=>event.kind==='model'&&event.stage==='error');
+ expect(failed.errorCode).toBe('unsupported_request');expect(failed.responseRejection).toBeUndefined();
+ expect(failed.modelState.thinking).toBe('unknown');
+ expect(f.ledger.status('ticket-1')!.attemptCount).toBe(0);
+});
+test('concurrent rejected requests cannot exchange diagnostic contexts',async()=>{
+ let release!:()=>void,started!:()=>void;
+ const upstreamStarted=new Promise<void>(resolve=>{started=resolve;}),unblock=new Promise<void>(resolve=>{release=resolve;});
+ const f=tracedFixture(5,{fetch:async()=>{started();await unblock;return Response.json(rejectedProviderBody());}});
+ const first=f.host.handle(f.request('/v1/chat/completions',modelRequestBody));
+ await upstreamStarted;
+ expect((await f.host.handle(f.request('/v1/chat/completions',modelRequestBody))).status).toBe(409);
+ release();expect((await first).status).toBe(502);
+ const errors=f.events().filter(event=>event.kind==='model'&&event.stage==='error');
+ expect(errors.map(event=>[event.operationId,event.errorCode])).toEqual([['model-2','request_in_flight'],['model-1','unsupported_provider_response']]);
+ expect(errors[0].responseRejection).toBeUndefined();expect(errors[1].responseRejection.category).toBe('unsupported_block_type');
+ expect(f.ledger.status('ticket-1')!.attemptCount).toBe(1);
+});
+test('failure diagnostic persistence failure cancels the session after one accounted provider call',async()=>{
+ let path='';
+ const f=tracedFixture(5,{fetch:async()=>{chmodSync(path,0o640);return Response.json(rejectedProviderBody());}});path=f.path;
+ expect((await f.host.handle(f.request('/v1/chat/completions',modelRequestBody))).status).toBe(409);
+ expect(f.trace.failed).toBe(true);expect(f.ledger.status('ticket-1')!.attemptCount).toBe(1);
+ expect((await f.host.handle(f.request('/v1/chat/completions',modelRequestBody))).status).toBe(409);
+ expect(f.ledger.status('ticket-1')!.attemptCount).toBe(1);
+ expect(f.host.result({status:'finished'}).terminationReason).toBe('trace_failed');
+});
+test('session rejects non-DeepSeek or invalid trusted thinking policy before transport',()=>{
+ const f=fixture();
+ expect(()=>createSessionHost({...f.options,provider:'z.ai',model:'glm-5.3',thinking:'disabled'})).toThrow('invalid host thinking policy');
+ for(const thinking of ['enabled',null,{type:'disabled'}])expect(()=>createSessionHost({...f.options,thinking} as unknown as SessionOptions)).toThrow('invalid host thinking policy');
+ expect(f.ledger.status('ticket-1')!.attemptCount).toBe(0);
 });

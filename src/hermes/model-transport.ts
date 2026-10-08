@@ -21,6 +21,26 @@ export type ModelTransportCapability = PricedRoute & {
   readonly signal?: AbortSignal;
 };
 
+export type ModelTransportErrorCode =
+  | "unsupported_request" | "body_too_large" | "unsupported_provider_response"
+  | "unauthorized" | "unsupported_route" | "owner_revoked" | "request_in_flight"
+  | "progress_guard_stopped" | "provider_request_failed" | "deadline_or_request_aborted"
+  | "spend_guard_rejected" | "provider_transport_failed";
+export interface ModelResponseRejection {
+  readonly category: "invalid_json" | "envelope" | "model_mismatch" | "content_shape"
+    | "unsupported_block_type" | "invalid_text_block" | "invalid_tool_block" | "tool_policy"
+    | "parallel_tool_policy" | "required_tool_missing" | "stop_reason" | "stop_tool_mismatch" | "empty_content";
+  readonly blockTypes: readonly ("text" | "tool_use" | "thinking" | "redacted_thinking" | "server_tool_use"
+    | "tool_result" | "image" | "document" | "other" | "not_object")[];
+  readonly blockCount: number | null;
+  readonly stopReason: "end_turn" | "stop_sequence" | "max_tokens" | "tool_use" | "pause_turn" | "refusal" | "other" | "missing";
+  readonly modelMatches: boolean;
+}
+export interface ModelTransportFailure {
+  readonly errorCode: ModelTransportErrorCode;
+  readonly responseRejection?: ModelResponseRejection;
+}
+
 export interface ModelTransportOptions {
   /** Existing, enrolled Gary ledger. This module never enrolls, resets or closes it. */
   readonly ledger: SpendLedger;
@@ -34,6 +54,11 @@ export interface ModelTransportOptions {
   readonly assertOwner: (ticketId: string, ownerId: string) => void | Promise<void>;
   /** Optional trusted progress admission after schema validation, before spend reservation. */
   readonly beforeRequest?: (signal: AbortSignal) => Promise<void>;
+  /** Trusted host policy only; worker JSON cannot configure provider thinking. */
+  readonly thinking?: "disabled";
+  /** Called synchronously once per failed request with fixed local metadata only.
+   * Exceptions propagate so a failed audit sink cannot silently lose evidence. */
+  readonly onFailure?: (failure: Readonly<ModelTransportFailure>) => void;
 }
 
 /**
@@ -62,7 +87,8 @@ const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 const activeTickets = new WeakMap<SpendLedger, Set<string>>();
 
 class TransportError extends Error {
-  constructor(readonly status: number, readonly code: string) { super(code); }
+  constructor(readonly status: number, readonly code: ModelTransportErrorCode,
+    readonly responseRejection?: ModelResponseRejection) { super(code); }
 }
 function invalid(): never { throw new TransportError(400, "unsupported_request"); }
 function object(value: unknown): value is JsonObject {
@@ -258,26 +284,56 @@ async function bytes(stream: ReadableStream<Uint8Array> | null, limit: number, s
   }
 }
 
+function responseRejection(value: unknown, model: string, category: ModelResponseRejection["category"]): ModelResponseRejection {
+  const content = object(value) && Array.isArray(value.content) ? value.content : null;
+  const types = new Set<ModelResponseRejection["blockTypes"][number]>();
+  for (const block of content ?? []) {
+    const type = object(block) ? block.type : undefined;
+    types.add(!object(block) ? "not_object"
+      : type === "text" || type === "tool_use" || type === "thinking" || type === "redacted_thinking"
+        || type === "server_tool_use" || type === "tool_result" || type === "image" || type === "document" ? type : "other");
+  }
+  const reason = object(value) ? value.stop_reason : undefined;
+  const stopReason: ModelResponseRejection["stopReason"] = reason === undefined ? "missing"
+    : reason === "end_turn" || reason === "stop_sequence" || reason === "max_tokens" || reason === "tool_use"
+      || reason === "pause_turn" || reason === "refusal" ? reason : "other";
+  return Object.freeze({ category, blockTypes: Object.freeze([...types]),
+    blockCount: content === null ? null : Math.min(content.length, 1_000_000), stopReason,
+    modelMatches: object(value) && value.model === model });
+}
+
 function convertResponse(value: unknown, model: string, request: ConvertedRequest): JsonObject {
-  const bad = (): never => { throw new TransportError(502, "unsupported_provider_response"); };
-  if (!object(value) || value.type !== "message" || value.role !== "assistant" || value.model !== model || typeof value.id !== "string" || !Array.isArray(value.content)) bad();
+  const bad = (category: ModelResponseRejection["category"]): never => {
+    throw new TransportError(502, "unsupported_provider_response", responseRejection(value, model, category));
+  };
+  if (!object(value) || value.type !== "message" || value.role !== "assistant" || typeof value.id !== "string") bad("envelope");
+  if ((value as JsonObject).model !== model) bad("model_mismatch");
+  if (!Array.isArray((value as JsonObject).content)) bad("content_shape");
   const response = value as JsonObject & { content: unknown[] };
   const texts: string[] = [];
   const calls: JsonObject[] = [];
   const ids = new Set<string>();
   for (const block of response.content) {
-    if (!object(block)) bad();
+    if (!object(block)) bad("content_shape");
     const part = block as JsonObject;
-    if (part.type === "text" && typeof part.text === "string" && Object.keys(part).every((key) => ["type", "text"].includes(key))) texts.push(part.text);
-    else if (part.type === "tool_use" && typeof part.id === "string" && CALL_ID.test(part.id) && !ids.has(part.id) && typeof part.name === "string" && request.offeredTools.has(part.name) && object(part.input) && finiteJson(part.input) && Object.keys(part).every((key) => ["type", "id", "name", "input"].includes(key))) {
-      if (request.toolMode === "none" || (request.toolMode === "tool" && part.name !== request.selectedTool)) bad();
-      ids.add(part.id);
+    if (part.type === "text") {
+      if (typeof part.text !== "string" || !Object.keys(part).every((key) => ["type", "text"].includes(key))) bad("invalid_text_block");
+      texts.push(part.text as string);
+    } else if (part.type === "tool_use") {
+      if (typeof part.id !== "string" || !CALL_ID.test(part.id) || ids.has(part.id) || typeof part.name !== "string"
+        || !object(part.input) || !finiteJson(part.input) || !Object.keys(part).every((key) => ["type", "id", "name", "input"].includes(key))) bad("invalid_tool_block");
+      if (!request.offeredTools.has(part.name as string) || request.toolMode === "none"
+        || (request.toolMode === "tool" && part.name !== request.selectedTool)) bad("tool_policy");
+      ids.add(part.id as string);
       calls.push({ id: part.id, type: "function", function: { name: part.name, arguments: JSON.stringify(part.input) } });
-    } else bad();
+    } else bad("unsupported_block_type");
   }
   const reason = response.stop_reason;
-  if ((!request.allowParallel && calls.length > 1) || (["any", "tool"].includes(request.toolMode) && calls.length === 0)) bad();
-  if (!["end_turn", "stop_sequence", "max_tokens", "tool_use"].includes(String(reason)) || (reason === "tool_use") !== (calls.length > 0) || (texts.length === 0 && calls.length === 0)) bad();
+  if (!request.allowParallel && calls.length > 1) bad("parallel_tool_policy");
+  if (["any", "tool"].includes(request.toolMode) && calls.length === 0) bad("required_tool_missing");
+  if (!["end_turn", "stop_sequence", "max_tokens", "tool_use"].includes(String(reason))) bad("stop_reason");
+  if ((reason === "tool_use") !== (calls.length > 0)) bad("stop_tool_mismatch");
+  if (texts.length === 0 && calls.length === 0) bad("empty_content");
   const result: JsonObject = {
     id: response.id, object: "chat.completion", created: Math.floor(Date.now() / 1000), model,
     choices: [{ index: 0, message: { role: "assistant", content: texts.length ? texts.join("") : null,
@@ -310,6 +366,8 @@ export function createModelTransport(options: ModelTransportOptions): ModelTrans
   const issued = options.capability;
   if (!issued || !Object.hasOwn(ROUTES, issued.provider) || ROUTES[issued.provider].model !== issued.model || !Number.isFinite(issued.deadlineMs) || issued.deadlineMs <= 0 || typeof issued.ticketId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(issued.ticketId) || typeof issued.ownerId !== "string" || issued.ownerId.length === 0 || !Array.isArray(issued.allowedToolNames) || issued.allowedToolNames.some((name) => typeof name !== "string" || !TOOL_NAME.test(name))) throw new Error("invalid host capability");
   if (typeof options.bearerToken !== "string" || !/^[^\s]{1,4096}$/.test(options.bearerToken) || typeof options.providerApiKey !== "string" || !/^[^\s]{1,4096}$/.test(options.providerApiKey)) throw new Error("host credentials required");
+  if (options.thinking !== undefined && (options.thinking !== "disabled" || issued.provider !== "deepseek")) throw new Error("invalid host thinking policy");
+  if (options.onFailure !== undefined && typeof options.onFailure !== "function") throw new Error("invalid host failure callback");
   const capability = Object.freeze({ ...issued, allowedToolNames: Object.freeze([...issued.allowedToolNames]) });
   const allowlist = new Set(capability.allowedToolNames);
   const route = ROUTES[capability.provider];
@@ -317,6 +375,8 @@ export function createModelTransport(options: ModelTransportOptions): ModelTrans
   const providerFetch = options.fetch;
   const assertOwner = options.assertOwner;
   const beforeRequest = options.beforeRequest;
+  const thinking = options.thinking;
+  const onFailure = options.onFailure;
   const bearerToken = options.bearerToken;
   const providerApiKey = options.providerApiKey;
   let active = activeTickets.get(ledger);
@@ -351,6 +411,7 @@ export function createModelTransport(options: ModelTransportOptions): ModelTrans
         invalid();
       }
       const converted = convertRequest(body, capability.model, allowlist);
+      if (thinking !== undefined) converted.body.thinking = { type: thinking };
       await guard();
       if (beforeRequest) {
         try { await beforeRequest(currentDeadline.signal); } catch { throw new TransportError(409, "progress_guard_stopped"); }
@@ -374,7 +435,9 @@ export function createModelTransport(options: ModelTransportOptions): ModelTrans
       await guard();
       if (!upstream.ok) throw new TransportError(upstream.status === 429 ? 429 : 502, "provider_request_failed");
       let result: unknown;
-      try { result = await upstream.json(); } catch { throw new TransportError(502, "unsupported_provider_response"); }
+      try { result = await upstream.json(); } catch {
+        throw new TransportError(502, "unsupported_provider_response", responseRejection(undefined, capability.model, "invalid_json"));
+      }
       const completion = convertResponse(result, capability.model, converted);
       await guard();
       return json(completion);
@@ -383,6 +446,8 @@ export function createModelTransport(options: ModelTransportOptions): ModelTrans
         : error instanceof TransportError ? error
         : error instanceof SpendLimitError ? new TransportError(402, "spend_guard_rejected")
         : new TransportError(502, "provider_transport_failed");
+      onFailure?.(Object.freeze({ errorCode: failure.code,
+        ...(failure.responseRejection ? { responseRejection: failure.responseRejection } : {}) }));
       return json({ error: { message: failure.code, type: "guarded_transport_error", code: failure.code } }, failure.status);
     } finally {
       if (locked) tickets.delete(capability.ticketId);

@@ -15,7 +15,7 @@ import { createAuditTrace, type AuditTrace } from './audit-trace.ts';
 import { canonicalArguments, canonicalizeConversation, finiteJson, sameConversation, type ConversationMessage } from './conversation.ts';
 import { HERMES_CANARY_CHILD_IMAGE, HERMES_CANARY_WORKER_IMAGE } from './activation.ts';
 
-export const READONLY_CANARY_POLICY = Object.freeze({version:1,provider:'deepseek',model:'deepseek-v4-pro',
+export const READONLY_CANARY_POLICY = Object.freeze({version:2,provider:'deepseek',model:'deepseek-v4-pro',thinking:'disabled',
   workerImage:HERMES_CANARY_WORKER_IMAGE,executorImage:HERMES_CANARY_CHILD_IMAGE,
   dockerExecutable:'/usr/local/bin/docker',dockerHost:'unix:///Users/tanner/.colima/default/docker.sock',
   maxRequests:3,maxTokens:1024,timeoutMs:120_000,temperature:0,capMicros:5_000_000,
@@ -195,7 +195,7 @@ export function createReadonlyCanary(input:ReadonlyCanaryConfig,deps:ReadonlyCan
         return native;
       };
       const runLoop=createGaryLoopAdapter({baseUrl:'http://127.0.0.1/',launch,hostOptions:{...route,admission,capabilityToken:randomBytes(32).toString('hex'),ledger:deps.ledger,
-        executor,readOnly:true,allowedTools:['read_file'],finishGateCommand:'',currentOwnerEpoch:()=>{active();return owner;},
+        executor,readOnly:true,thinking:READONLY_CANARY_POLICY.thinking,allowedTools:['read_file'],finishGateCommand:'',currentOwnerEpoch:()=>{active();return owner;},
         assertAdmission:supplied=>{active();if(JSON.stringify(supplied)!==JSON.stringify(admission))failed();},trace,signal:controller.signal}});
       const result=await runLoop({glm:{} as AgentLoopArgs['glm'],executor,task:'Read challenge.json using read_file. Return only a JSON object with exactly nonce (copied from the file) and sum (the integer sum of a and b). Do not invent the file contents.',
         systemPrompt:'You are Gary running a read-only runtime verification. Use only the provided read_file tool. Read the challenge before answering. No coding, publication or delegation is authorized.',
@@ -206,7 +206,7 @@ export function createReadonlyCanary(input:ReadonlyCanaryConfig,deps:ReadonlyCan
     }catch(e){error=true;if(!claimed&&e instanceof Error&&e.message==='readonly_canary_already_attempted')throw e;}
     finally{
       try{await child?.close();}catch{error=true;}
-      if(trace&&!traceClosed&&!trace.failed){try{if(!traceTerminal)trace.append({kind:'terminal',status:'error',iteration:modelRequests,phase:'hermes',modelState:{provider:'deepseek',model:'deepseek-v4-pro',thinking:'unknown',effort:'unknown'}});trace.close();}catch{error=true;}}
+      if(trace&&!traceClosed&&!trace.failed){try{if(!traceTerminal)trace.append({kind:'terminal',status:'error',iteration:modelRequests,phase:'hermes',modelState:{provider:'deepseek',model:'deepseek-v4-pro',thinking:READONLY_CANARY_POLICY.thinking,effort:'unknown'}});trace.close();}catch{error=true;}}
       clearTimeout(timer);deps.signal?.removeEventListener('abort',abort);
     }
     try{

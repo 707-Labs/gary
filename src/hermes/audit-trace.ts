@@ -32,7 +32,7 @@ const errorCodes = ["unknown", "cancelled", "deadline_exceeded", "owner_revoked"
   "unsupported_provider_response", "unsupported_request", "unauthorized", "session_inactive", "request_in_flight", "tool_failed",
   "tool_denied", "path_denied", "invalid_arguments", "duplicate_call", "call_limit", "bridge_busy", "task_terminal",
   "capability_inactive", "capability_revoked", "executor_result_invalid", "native_runtime_error", "protocol_rejected", "cleanup_failed",
-  "trace_persistence_failed", "operator_stopped", "process_exit", "signal", "aborted", "deadline_or_request_aborted"] as const;
+  "trace_persistence_failed", "unsupported_route", "body_too_large", "progress_guard_stopped", "operator_stopped", "process_exit", "signal", "aborted", "deadline_or_request_aborted"] as const;
 export type AuditErrorCode = typeof errorCodes[number];
 export type AuditTerminalStatus = "finished" | "blocked" | "no_finish" | "iteration_cap" | "timeout" | "error" | "cancelled" | "budget_exhausted";
 interface AuditContext { iteration: number | "unknown"; phase: AuditPhase; modelState: AuditModelState }
@@ -41,6 +41,13 @@ interface StartBase extends AuditContext {
   input?: AuditFingerprint; arguments?: AuditFingerprint; command?: AuditFingerprint;
 }
 export type AuditOperationStart = StartBase & ({ kind: "model" } | { kind: "tool"; toolName: AuditToolName });
+export interface AuditResponseRejection {
+  category: "invalid_json" | "envelope" | "model_mismatch" | "content_shape" | "unsupported_block_type" | "invalid_text_block" | "invalid_tool_block" | "tool_policy" | "parallel_tool_policy" | "required_tool_missing" | "stop_reason" | "stop_tool_mismatch" | "empty_content";
+  blockTypes: ("text" | "tool_use" | "thinking" | "redacted_thinking" | "server_tool_use" | "tool_result" | "image" | "document" | "other" | "not_object")[];
+  blockCount: number | null;
+  stopReason: "end_turn" | "stop_sequence" | "max_tokens" | "tool_use" | "pause_turn" | "refusal" | "other" | "missing";
+  modelMatches: boolean;
+}
 export interface AuditOperationEnd {
   kind: "model" | "tool"; stage: "result" | "error" | "cancel"; operationId: string;
   output?: AuditFingerprint; stdout?: AuditFingerprint; stderr?: AuditFingerprint;
@@ -48,6 +55,7 @@ export interface AuditOperationEnd {
   /** Only a host-observed count; never inferred from model text or a tool claim. */
   trustedChangedFileCount?: number;
   httpStatus?: number;
+  responseRejection?: AuditResponseRejection;
 }
 export interface AuditTerminal extends AuditContext {
   kind: "terminal"; status: AuditTerminalStatus; errorCode?: AuditErrorCode;
@@ -97,6 +105,23 @@ function context(value: Record<string, unknown>): void {
       || (model.provider === "deepseek" && !["unknown", "deepseek-v4-pro"].includes(model.model as string))
       || (model.provider === "z.ai" && !["unknown", "glm-5.3"].includes(model.model as string))
       || (Object.hasOwn(model, "thinkingBudgetTokens") && (model.thinking !== "enabled" || !natural(model.thinkingBudgetTokens, 1_048_576)))) throw new AuditTraceError("invalid_trace_event");
+}
+function responseRejection(value: unknown): void {
+  if (!object(value)) throw new AuditTraceError("invalid_trace_event");
+  only(value, ["category", "blockTypes", "blockCount", "stopReason", "modelMatches"]);
+  if (!["invalid_json", "envelope", "model_mismatch", "content_shape", "unsupported_block_type", "invalid_text_block", "invalid_tool_block", "tool_policy", "parallel_tool_policy", "required_tool_missing", "stop_reason", "stop_tool_mismatch", "empty_content"].includes(value.category as string)
+      || (value.blockCount !== null && !natural(value.blockCount, 1_000_000))
+      || !["end_turn", "stop_sequence", "max_tokens", "tool_use", "pause_turn", "refusal", "other", "missing"].includes(value.stopReason as string)
+      || typeof value.modelMatches !== "boolean" || !Array.isArray(value.blockTypes) || value.blockTypes.length > 10) throw new AuditTraceError("invalid_trace_event");
+  const descriptors = Object.getOwnPropertyDescriptors(value.blockTypes), seen = new Set<string>();
+  if (Reflect.ownKeys(value.blockTypes).length !== value.blockTypes.length + 1) throw new AuditTraceError("invalid_trace_event");
+  for (let i = 0; i < value.blockTypes.length; i++) {
+    const item = descriptors[String(i)];
+    if (!item || !Object.hasOwn(item, "value") || typeof item.value !== "string"
+        || !["text", "tool_use", "thinking", "redacted_thinking", "server_tool_use", "tool_result", "image", "document", "other", "not_object"].includes(item.value)
+        || seen.has(item.value)) throw new AuditTraceError("invalid_trace_event");
+    seen.add(item.value);
+  }
 }
 export function auditErrorCode(value: unknown): AuditErrorCode {
   return typeof value === "string" && (errorCodes as readonly string[]).includes(value) ? value as AuditErrorCode : "unknown";
@@ -214,10 +239,14 @@ export function createAuditTrace(options: AuditTraceOptions): AuditTrace {
                   || (Object.hasOwn(event, "parentOperationId") && (!id(event.parentOperationId) || !active.has(event.parentOperationId as string)))) throw new AuditTraceError("invalid_trace_event");
               for (const key of ["input", "arguments", "command"]) if (Object.hasOwn(event, key)) fingerprint(event[key]);
             } else {
-              only(event, ["kind", "stage", "operationId", "output", "stdout", "stderr", "exitCode", "timedOut", "errorCode", "trustedChangedFileCount", "httpStatus"]);
+              only(event, ["kind", "stage", "operationId", "output", "stdout", "stderr", "exitCode", "timedOut", "errorCode", "trustedChangedFileCount", "httpStatus", "responseRejection"]);
               const start = active.get(event.operationId as string);
               if (!["result", "error", "cancel"].includes(event.stage as string) || !start || start.event.kind !== event.kind
                   || (["error", "cancel"].includes(event.stage as string) && !Object.hasOwn(event, "errorCode"))) throw new AuditTraceError("invalid_trace_event");
+              if (Object.hasOwn(event, "responseRejection")) {
+                if (event.kind !== "model" || event.stage !== "error" || event.errorCode !== "unsupported_provider_response") throw new AuditTraceError("invalid_trace_event");
+                responseRejection(event.responseRejection);
+              }
               for (const key of ["output", "stdout", "stderr"]) if (Object.hasOwn(event, key)) fingerprint(event[key]);
               if (Object.hasOwn(event, "exitCode") && event.exitCode !== null && (!Number.isSafeInteger(event.exitCode) || (event.exitCode as number) < -2147483648 || (event.exitCode as number) > 2147483647)) throw new AuditTraceError("invalid_trace_event");
               if (Object.hasOwn(event, "timedOut") && typeof event.timedOut !== "boolean") throw new AuditTraceError("invalid_trace_event");

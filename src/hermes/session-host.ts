@@ -4,7 +4,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createExecutorBridge, type ExecutorBridgeOptions } from './executor-bridge.ts';
 import { EXECUTOR_TOOL_NAMES } from './executor-bridge.ts';
 import { INTEGRATION_TOOL_NAMES, type ScopedIntegrationBindings } from './scoped-integrations.ts';
-import { createModelTransport, type ModelTransportOptions } from './model-transport.ts';
+import { createModelTransport, type ModelTransportOptions, type ModelTransportFailure } from './model-transport.ts';
 import type { SpendLedger } from '../spend.ts';
 import type { AgentLoopResult } from '../agent/loop.ts';
 import type { ProductiveProgressGuard } from './progress-guard.ts';
@@ -21,6 +21,8 @@ export interface SessionOptions {
   provider: 'z.ai' | 'deepseek';
   model: 'glm-5.3' | 'deepseek-v4-pro';
   providerApiKey: string;
+  /** Trusted DeepSeek host policy; never read from native request JSON. */
+  thinking?: 'disabled';
   /** Mandatory injection. Offline tests use a fake; only a reviewed host may supply real fetch. */
   fetch: ModelTransportOptions['fetch'];
   executor: ExecutorBridgeOptions['executor'];
@@ -58,15 +60,18 @@ export function createSessionHost(options: SessionOptions) {
   if (token.length < 32 || !admission.actionId || !admission.fingerprint || !admission.requestId
       || !Number.isFinite(admission.deadlineMs)) throw new Error('invalid admitted session');
   if (options.model !== (options.provider === 'z.ai' ? 'glm-5.3' : 'deepseek-v4-pro')) throw new Error('unpriced provider/model pair');
+  const thinking=options.thinking;
+  if (thinking !== undefined && (thinking !== 'disabled' || options.provider !== 'deepseek')) throw new Error('invalid host thinking policy');
   const cancellation = new AbortController();
   const cancelFromParent = () => cancellation.abort(options.signal?.reason);
   if (options.signal?.aborted) cancelFromParent();
   else options.signal?.addEventListener('abort', cancelFromParent, { once: true });
   let disposed = false;
   let traceFinalized = false, traceSequence = 0, modelRequests = 0;
-  const modelState = {provider:options.provider,model:options.model,thinking:'unknown' as const,effort:'unknown' as const};
+  const modelState = {provider:options.provider,model:options.model,thinking:thinking ?? 'unknown' as const,effort:'unknown' as const};
   const traceContext = () => ({iteration:modelRequests,phase:options.tracePhase?.() ?? 'hermes' as AuditPhase,modelState});
   const currentTool = new AsyncLocalStorage<{operationId:string;toolName:AuditToolName}>();
+  const currentModel = new AsyncLocalStorage<{failure?:ModelTransportFailure}>();
   let bridgeInvalidated = () => false;
   const live = () => {
     if (disposed || traceFinalized || options.trace?.failed || bridgeInvalidated() || cancellation.signal.aborted || options.progress?.state.stopReason || Date.now() >= admission.deadlineMs) throw new Error('session inactive');
@@ -120,6 +125,12 @@ export function createSessionHost(options: SessionOptions) {
       signal: cancellation.signal,
     },
     bearerToken: token, providerApiKey: options.providerApiKey, fetch: options.fetch,
+    ...(thinking === undefined ? {} : {thinking}),
+    onFailure: failure => {
+      const context=currentModel.getStore();
+      if (!context || context.failure) throw new Error('model failure context invalid');
+      context.failure=failure;
+    },
     ...(options.progress ? { beforeRequest: (signal: AbortSignal) => options.progress!.beforeModelRequest(signal) } : {}),
     assertOwner: (ticketId: string, ownerId: string) => {
       if (ticketId !== admission.ticketId || ownerId !== admission.ownerEpoch) throw new Error('scope mismatch');
@@ -140,9 +151,12 @@ export function createSessionHost(options: SessionOptions) {
       const operationId='model-'+(++traceSequence); modelRequests++;
       try {
         options.trace?.append({kind:'model',stage:'start',operationId,...traceContext()});
-        const response=await model(request);
+        const context:{failure?:ModelTransportFailure}={};
+        const response=await currentModel.run(context,()=>model(request));
         options.trace?.append({kind:'model',stage:response.ok?'result':'error',operationId,httpStatus:response.status,
-          ...(response.ok?{}:{errorCode:response.status===402?'spend_guard_rejected' as const:response.status===408?'deadline_exceeded' as const:'provider_transport_failed' as const})});
+          ...(response.ok?{}:{errorCode:auditErrorCode(context.failure?.errorCode ?? 'provider_transport_failed'),
+            ...(context.failure?.errorCode==='unsupported_provider_response' && context.failure.responseRejection
+              ? {responseRejection:{...context.failure.responseRejection,blockTypes:[...context.failure.responseRejection.blockTypes]}} : {})})});
         return response;
       } catch { cancellation.abort(); return fail(409,'trace_or_model_failed'); }
     }

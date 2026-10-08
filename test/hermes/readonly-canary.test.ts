@@ -2,7 +2,7 @@ import { afterEach, expect, spyOn, test } from 'bun:test';
 import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createReadonlyCanary, loadReadonlyCanaryConfig } from '../../src/hermes/readonly-canary.ts';
+import { createReadonlyCanary, loadReadonlyCanaryConfig, READONLY_CANARY_POLICY } from '../../src/hermes/readonly-canary.ts';
 import { HERMES_CANARY_CHILD_IMAGE } from '../../src/hermes/activation.ts';
 import type { GaryRuntimeLauncher, NativeRuntimeOutcome } from '../../src/hermes/gary-loop-adapter.ts';
 import type { createReadonlyChildExecutor } from '../../src/hermes/readonly-child.ts';
@@ -49,6 +49,7 @@ function runtimeFixture(options: { mode?: Mode; campaignCap?: number; allocation
   const challengePath = () => join(f.config.fixtureDirectory, f.config.runId, 'challenge.json');
   const challenge = (): Challenge => JSON.parse(readFileSync(challengePath(), 'utf8'));
   const expected = () => { const value = challenge(); return JSON.stringify({ nonce: value.nonce, sum: value.a + value.b }); };
+  const upstreamThinking: unknown[] = [];
   let requests = 0, launches = 0, executorCreations = 0, reads = 0, closes = 0;
   const hooks: { afterRead?: () => void; beforeLaunch?: () => Promise<void>; afterNative?: (value: NativeRuntimeOutcome) => NativeRuntimeOutcome;
     close?: () => Promise<void>; nativeSystem?: string } = {};
@@ -94,7 +95,8 @@ function runtimeFixture(options: { mode?: Mode; campaignCap?: number; allocation
   const deps: Dependencies = { db, ledger, createExecutor, launch,
     route: { provider: 'deepseek', model: 'deepseek-v4-pro', providerApiKey: KEY, fetch: async request => {
       verify(() => expect(request.url).toBe('https://api.deepseek.com/anthropic/v1/messages')); requests++;
-      const body = await request.json(); verify(() => { expect(body.model).toBe('deepseek-v4-pro'); expect(body.max_tokens).toBeLessThanOrEqual(1024);
+      const body = await request.json(); upstreamThinking.push(body.thinking);
+      verify(() => { expect(body.model).toBe('deepseek-v4-pro'); expect(body.max_tokens).toBeLessThanOrEqual(1024); expect(body.thinking).toEqual({ type: 'disabled' });
         if (hooks.nativeSystem) expect(JSON.stringify(body.system)).not.toContain(hooks.nativeSystem); });
       let content: unknown[], stopReason: string;
       if (requests === 1 && mode !== 'missing-read') {
@@ -113,7 +115,7 @@ function runtimeFixture(options: { mode?: Mode; campaignCap?: number; allocation
       return Response.json({ id: 'offline-reply-' + requests, type: 'message', role: 'assistant', model: 'deepseek-v4-pro', content, stop_reason: stopReason,
         ...(mode === 'unknown-usage' ? {} : { usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }) });
     } } };
-  return { ...f, db, ledger, dbPath, ledgerPath, deps, hooks, challenge, challengePath, expected,
+  return { ...f, db, ledger, dbPath, ledgerPath, deps, hooks, challenge, challengePath, expected, upstreamThinking,
     counts: () => ({ requests, launches, executorCreations, reads, closes }) };
 }
 async function failClosed(f: ReturnType<typeof runtimeFixture>) {
@@ -148,11 +150,13 @@ for (const mode of ['unknown-key', 'duplicate-key', 'public-file', 'public-paren
 }
 
 test('actual host RPC, settled spend, read receipt and final answer yield a separate runtime receipt', async () => {
+  expect(READONLY_CANARY_POLICY).toMatchObject({ version: 2, thinking: 'disabled', maxRequests: 3, maxTokens: 1024, timeoutMs: 120_000 });
   const f = runtimeFixture(), canary = createReadonlyCanary(loadReadonlyCanaryConfig(f.path), f.deps);
   expect(f.counts()).toEqual({ requests: 0, launches: 0, executorCreations: 0, reads: 0, closes: 0 });
   expect(existsSync(f.challengePath())).toBe(false); expect(readdirSync(f.config.traceDirectory)).toEqual([]);
   expect(canary.check().ready).toBe(false); await canary.run();
   expect(f.counts()).toEqual({ requests: 2, launches: 1, executorCreations: 1, reads: 1, closes: 1 });
+  expect(f.upstreamThinking).toEqual([{ type: 'disabled' }, { type: 'disabled' }]);
   expect(canary.check()).toMatchObject({ kind: 'readonly_runtime', ready: true, readonlyCanarySucceeded: true });
   expect(canary.check().receiptId).toMatch(/^sha256:[a-f0-9]{64}$/);
   expect(f.db.query('PRAGMA synchronous').get()).toEqual({ synchronous: 2 });

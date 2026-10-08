@@ -153,3 +153,38 @@ describe("durable sanitized local execution trace", () => {
     expect(invoked).toBe(false);
   });
 });
+
+
+describe("sanitized provider compatibility diagnostics", () => {
+  const diagnostic = () => ({ category: "unsupported_block_type" as const, blockTypes: ["thinking", "tool_use"] as ("thinking" | "tool_use")[], blockCount: 2, stopReason: "tool_use" as const, modelMatches: true });
+  test("retains exact local code and bounded structure without response content", () => {
+    const f = fixture(); f.trace.append(start());
+    f.trace.append({ kind: "model", stage: "error", operationId: "model-1", httpStatus: 502, errorCode: "unsupported_provider_response", responseRejection: diagnostic() });
+    f.trace.append({ ...terminal("error"), errorCode: "native_runtime_error" }); f.trace.close();
+    expect(f.events()[2]).toMatchObject({ errorCode: "unsupported_provider_response", responseRejection: diagnostic() });
+    expect(f.events().at(-1).pendingOperationIds).toEqual([]);
+  });
+  for (const invalid of [
+    { category: "PRIVATE_PROVIDER_DETAIL" }, { blockTypes: ["PRIVATE_CONTENT"] }, { blockTypes: ["text", "text"] },
+    { blockTypes: Array(11).fill("text") }, { blockTypes: Array(2) }, { blockCount: 1_000_001 }, { blockCount: -1 },
+    { stopReason: "PRIVATE_REASON" }, { modelMatches: "yes" }, { rawBody: "PRIVATE_BODY" },
+  ]) test("rejects unsafe or unbounded diagnostic " + Object.keys(invalid)[0], () => {
+    const f = fixture(); f.trace.append(start());
+    expect(() => f.trace.append({ kind: "model", stage: "error", operationId: "model-1", errorCode: "unsupported_provider_response", responseRejection: { ...diagnostic(), ...invalid } } as any)).toThrow(AuditTraceError);
+    expect(f.trace.failed).toBe(true); expect(readFileSync(f.path, "utf8")).not.toContain("PRIVATE_");
+  });
+  test("diagnostic array accessors are rejected without evaluation", () => {
+    const f = fixture(); f.trace.append(start()); let read = false;
+    const values = Object.defineProperty(["text"], "0", { enumerable: true, get() { read = true; return "PRIVATE_CONTENT"; } });
+    expect(() => f.trace.append({ kind: "model", stage: "error", operationId: "model-1", errorCode: "unsupported_provider_response", responseRejection: { ...diagnostic(), blockTypes: values } } as any)).toThrow(AuditTraceError);
+    expect(read).toBe(false);
+  });
+  test("diagnostics cannot be attached to successful operations or unrelated errors", () => {
+    for (const event of [{ stage: "result", errorCode: undefined }, { stage: "error", errorCode: "provider_transport_failed" }]) {
+      const f = fixture(); f.trace.append(start());
+      expect(() => f.trace.append({ kind: "model", operationId: "model-1", ...event, responseRejection: diagnostic() } as any)).toThrow(AuditTraceError);
+    }
+    const f = fixture(); f.trace.append({ ...start(), kind: "tool", toolName: "read_file" });
+    expect(() => f.trace.append({ kind: "tool", stage: "error", operationId: "model-1", errorCode: "unsupported_provider_response", responseRejection: diagnostic() } as any)).toThrow(AuditTraceError);
+  });
+});

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createModelTransport, type ModelTransportCapability, type ModelTransportOptions } from "../../src/hermes/model-transport.ts";
+import { createModelTransport, type ModelTransportCapability, type ModelTransportOptions, type ModelTransportFailure, type ModelResponseRejection } from "../../src/hermes/model-transport.ts";
 import { SpendLedger, spendReservationMicros } from "../../src/spend.ts";
 
 type Body = Record<string, unknown>;
@@ -55,6 +55,134 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
     expect(ledger.status("TICKET-1")!.attemptCount).toBe(1);
     expect(ledger.status("TICKET-1")!.unknownAttempts).toBe(0);
     expect(ledger.status("TICKET-1")!.chargedMicros).toBe(530); // Full requested output, not just two emitted tokens.
+  });
+
+  test("trusted DeepSeek disabled policy is sent on both tool and follow-up turns", async () => {
+    const sent: Body[] = [], failures: ModelTransportFailure[] = [];
+    const { handler } = setup({ thinking: "disabled", onFailure: failure => { failures.push(failure); }, fetch: async req => {
+      sent.push(await req.json());
+      return Response.json(sent.length === 1 ? providerBody({ content: [{ type: "tool_use", id: "call_1", name: "read_file", input: { path: "README.md" } }], stop_reason: "tool_use" }) : providerBody());
+    } });
+    expect((await handler(request({ tools: [TOOL] }))).status).toBe(200);
+    expect((await handler(request({ tools: [TOOL], messages: [{ role: "user", content: "inspect" },
+      { role: "assistant", content: null, tool_calls: [call()] }, { role: "tool", tool_call_id: "call_1", content: "fixture\n" }] }))).status).toBe(200);
+    expect(sent.map(body => body.thinking)).toEqual([{ type: "disabled" }, { type: "disabled" }]);
+    expect(ledger.status("TICKET-1")!.attemptCount).toBe(2);
+    expect(failures).toEqual([]);
+  });
+
+  test("worker thinking overrides are rejected before spend even when host disables thinking", async () => {
+    for (const thinking of [undefined, "disabled"] as const) {
+      const { handler, sent } = setup({ ...(thinking ? { thinking } : {}) });
+      for (const value of [{ type: "disabled" }, { type: "enabled" }, "disabled", null]) {
+        expect((await handler(request({ thinking: value }))).status).toBe(400);
+      }
+      expect(sent).toHaveLength(0);
+    }
+    expect(ledger.status("TICKET-1")!.attemptCount).toBe(0);
+  });
+
+  test("only the DeepSeek host can choose disabled and invalid policy never dispatches", () => {
+    const { options, sent } = setup();
+    for (const thinking of ["enabled", null, { type: "disabled" }]) {
+      expect(() => createModelTransport({ ...options, thinking } as unknown as ModelTransportOptions)).toThrow("invalid host thinking policy");
+    }
+    expect(() => createModelTransport({ ...options, capability: { ...options.capability, provider: "z.ai", model: "glm-5.3" }, thinking: "disabled" })).toThrow("invalid host thinking policy");
+    expect(() => createModelTransport({ ...options, onFailure: "untrusted" } as unknown as ModelTransportOptions)).toThrow("invalid host failure callback");
+    expect(sent).toHaveLength(0);
+    expect(ledger.status("TICKET-1")!.attemptCount).toBe(0);
+  });
+
+  test("thinking plus tool response stays rejected with fixed metadata and no sensitive content", async () => {
+    const failures: ModelTransportFailure[] = [];
+    const { handler } = setup({ onFailure: failure => { failures.push(failure); }, fetch: async () => Response.json(providerBody({
+      id: "private-response-id", content: [{ type: "thinking", thinking: "private-reasoning", signature: "private-signature" },
+        { type: "tool_use", id: "private-call-id", name: "read_file", input: { path: "private-file" } }], stop_reason: "tool_use",
+    })) });
+    const response = await handler(request({ tools: [TOOL] }));
+    expect(response.status).toBe(502);
+    expect(failures).toEqual([{ errorCode: "unsupported_provider_response", responseRejection: {
+      category: "unsupported_block_type", blockTypes: ["thinking", "tool_use"], blockCount: 2, stopReason: "tool_use", modelMatches: true,
+    } }]);
+    expect(Object.isFrozen(failures[0])).toBe(true);
+    expect(Object.isFrozen(failures[0]!.responseRejection)).toBe(true);
+    expect(Object.isFrozen(failures[0]!.responseRejection!.blockTypes)).toBe(true);
+    const output = JSON.stringify(failures) + await response.text();
+    for (const secret of ["private-response-id", "private-reasoning", "private-signature", "private-call-id", "private-file", TOKEN, "fake-upstream-key"]) expect(output).not.toContain(secret);
+    expect(ledger.status("TICKET-1")!.attemptCount).toBe(1);
+    expect(ledger.status("TICKET-1")!.unknownAttempts).toBe(0);
+    expect(ledger.status("TICKET-1")!.chargedMicros).toBe(530);
+  });
+
+  test("response rejection categories preserve all strict checks without reflecting unknown values", async () => {
+    const tool = { type: "tool_use", id: "call_1", name: "read_file", input: {} };
+    const cases: Array<{ category: ModelResponseRejection["category"]; body?: Body; raw?: string; request?: Body }> = [
+      { category: "invalid_json", raw: "private-invalid-json" },
+      { category: "envelope", body: { role: "private-role" } },
+      { category: "model_mismatch", body: { model: "private-model" } },
+      { category: "content_shape", body: { content: "private-content" } },
+      { category: "content_shape", body: { content: [null] } },
+      { category: "unsupported_block_type", body: { content: [{ type: "private-type", "private-field": "private-value" }] } },
+      { category: "invalid_text_block", body: { content: [{ type: "text", text: "private-text", "private-field": "private-value" }] } },
+      { category: "invalid_tool_block", body: { content: [{ ...tool, "private-field": "private-value" }], stop_reason: "tool_use" } },
+      { category: "tool_policy", body: { content: [{ ...tool, name: "private-tool" }], stop_reason: "tool_use" } },
+      { category: "tool_policy", body: { content: [tool], stop_reason: "tool_use" }, request: { tool_choice: "none" } },
+      { category: "parallel_tool_policy", body: { content: [tool, { ...tool, id: "call_2" }], stop_reason: "tool_use" }, request: { parallel_tool_calls: false } },
+      { category: "required_tool_missing", request: { tool_choice: "required" } },
+      { category: "stop_reason", body: { stop_reason: "private-stop" } },
+      { category: "stop_tool_mismatch", body: { content: [tool], stop_reason: "end_turn" } },
+      { category: "empty_content", body: { content: [] } },
+    ];
+    for (const fixture of cases) {
+      const failures: ModelTransportFailure[] = [];
+      const { handler } = setup({ onFailure: failure => { failures.push(failure); }, fetch: async () => fixture.raw === undefined
+        ? Response.json(providerBody(fixture.body)) : new Response(fixture.raw) });
+      expect((await handler(request({ tools: [TOOL], ...fixture.request }))).status).toBe(502);
+      expect(failures).toHaveLength(1);
+      expect(failures[0]!.errorCode).toBe("unsupported_provider_response");
+      expect(failures[0]!.responseRejection!.category).toBe(fixture.category);
+      expect(JSON.stringify(failures)).not.toContain("private-");
+    }
+  });
+
+  test("untrusted repeated block types and stop reasons become bounded fixed metadata", async () => {
+    const failures: ModelTransportFailure[] = [];
+    const content = [{ type: "private-first" }, ...Array.from({ length: 300 }, () => ({ type: "thinking", thinking: "private-text" })),
+      ...["text", "tool_use", "redacted_thinking", "server_tool_use", "tool_result", "image", "document"].map(type => ({ type })), null];
+    const { handler } = setup({ onFailure: failure => { failures.push(failure); }, fetch: async () => Response.json(providerBody({ content, stop_reason: { private: "value" } })) });
+    expect((await handler(request())).status).toBe(502);
+    const shape = failures[0]!.responseRejection!;
+    expect(shape.blockTypes).toHaveLength(10);
+    expect(shape.blockCount).toBe(content.length);
+    expect(shape.stopReason).toBe("other");
+    expect(JSON.stringify(shape)).not.toContain("private");
+  });
+
+  test("local failure callback runs once with the precise code and no conversion metadata", async () => {
+    const failures: ModelTransportFailure[] = [];
+    const { handler } = setup({ onFailure: failure => { failures.push(failure); } });
+    expect((await handler(request({}, "wrong"))).status).toBe(401);
+    expect((await handler(request({}, "Bearer " + TOKEN, "/v1/models"))).status).toBe(404);
+    expect((await handler(request({ stream: true }))).status).toBe(400);
+    const stopped = setup({ onFailure: failure => { failures.push(failure); }, beforeRequest: async () => { throw new Error("private-progress"); } });
+    expect((await stopped.handler(request())).status).toBe(409);
+    const broken = setup({ onFailure: failure => { failures.push(failure); }, fetch: async () => { throw new Error("private-provider-error"); } });
+    expect((await broken.handler(request())).status).toBe(502);
+    expect(failures).toEqual((["unauthorized", "unsupported_route", "unsupported_request", "progress_guard_stopped", "provider_transport_failed"] as const).map(errorCode => ({ errorCode })));
+  });
+
+  test("a synchronous diagnostic sink failure propagates once after accounting and releases its lock", async () => {
+    let callbacks = 0, calls = 0;
+    const sinkFailure = new Error("private-audit-sink-error");
+    const { handler } = setup({ onFailure: () => { callbacks++; throw sinkFailure; }, fetch: async () => {
+      calls++; return Response.json(calls === 1 ? providerBody({ content: [{ type: "thinking", thinking: "private" }] }) : providerBody());
+    } });
+    await expect(handler(request())).rejects.toBe(sinkFailure);
+    expect(callbacks).toBe(1); expect(calls).toBe(1);
+    expect(ledger.status("TICKET-1")!.attemptCount).toBe(1);
+    expect(ledger.status("TICKET-1")!.chargedMicros).toBe(530);
+    expect((await handler(request())).status).toBe(200);
+    expect(callbacks).toBe(1); expect(calls).toBe(2);
   });
 
   test("supports only the already-priced Z.ai model/route pairing", async () => {
