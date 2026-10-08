@@ -1,3 +1,4 @@
+import { logSlackIngressDiagnostic } from './slack/ingress-diagnostics.ts';
 import { mkdirSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { createExecutorJobJournal, reconcileDockerExecutorJobs, type ExecutorJobJournal } from './executors/index.ts';
@@ -103,17 +104,17 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
       issueId: activationConfig.issueId, repo: activationConfig.repo }) : undefined;
     if (controller.signal.aborted) return;
     if (host.slack && slackCredentials && readiness) {
-      const transport = deps.slackTransport ? deps.slackTransport(slackCredentials) : createSlackTransport({ credentials: slackCredentials });
+      const transport = deps.slackTransport ? deps.slackTransport(slackCredentials) : createSlackTransport({ credentials: slackCredentials, onIngressDiagnostic:logSlackIngressDiagnostic });
       const responderDeps={ledger:spend,providerApiKey:providerConfigs[0]!.apiKey,fetch:(request:Request)=>rawFetch(request),...(deps.launch?{launch:deps.launch}:{})};
       if(conversationConfig)conversation=createSlackConversation({config:conversationConfig,ledger:spend,reply:createHermesDMResponder(responderDeps)});
       if(sharedConfig){
         try {
           if(!transport.memberInfo||!transport.channelInfo)throw new Error('shared_metadata_unavailable');
-          sharedConversation=createSlackSharedConversation({config:sharedConfig,ledger:spend,reply:createHermesSharedResponder(responderDeps),
+          sharedConversation=createSlackSharedConversation({config:sharedConfig,ledger:spend,onIngressDiagnostic:logSlackIngressDiagnostic,reply:createHermesSharedResponder(responderDeps),
             metadata:{memberInfo:(id,signal)=>transport.memberInfo!(id,signal),channelInfo:(id,signal)=>transport.channelInfo!(id,signal)}});
         }catch{log.warn('shared conversation unavailable',{reason:'shared_runtime_initialization_rejected'});}
       }
-      slack = createSlackService({ db, transport, checkHostHealth: readiness.check, approvedChannelIds: host.slack.approvedChannelIds,
+      slack = createSlackService({ db, transport, onIngressDiagnostic:logSlackIngressDiagnostic, checkHostHealth: readiness.check, approvedChannelIds: host.slack.approvedChannelIds,
         ...(conversation?{conversation,tannerDirectMessages:true as const}:{}),...(sharedConversation?{sharedConversation}:{}),
         ...(host.conversationRuntimeRelease?{checkConversationHealth:()=>!controller.signal.aborted}: {}) });
       const health = await slack.start();

@@ -1,3 +1,4 @@
+import { createSlackIngressEmitter, slackEnvelopeShape, type SlackIngressObserver } from './ingress-diagnostics.ts';
 import { validSlackCredentials, type SlackCredentials } from "./credentials.ts";
 
 export interface SlackIdentity { readonly appId: string; readonly teamId: string; readonly botUserId: string }
@@ -33,6 +34,7 @@ export interface SlackSocket {
 }
 export interface SlackTransportOptions {
   credentials: SlackCredentials;
+  onIngressDiagnostic?:SlackIngressObserver;
   /** Dependency seams for offline tests; production uses global fetch/WebSocket. */
   fetch?: SlackFetch;
   createSocket?: (url: string) => SlackSocket;
@@ -104,6 +106,7 @@ async function readJson(response: Response, signal: AbortSignal): Promise<Record
 
 export function createSlackTransport(options: SlackTransportOptions): SlackTransport {
   if (!options || !validSlackCredentials(options.credentials)) return fail("slack_configuration_rejected");
+  const observe=createSlackIngressEmitter('transport',options.onIngressDiagnostic);
   const credentials = Object.freeze({ ...options.credentials });
   const fetcher = options.fetch ?? ((url, init) => fetch(url, init));
   const socketFactory = options.createSocket ?? ((url) => new WebSocket(url) as unknown as SlackSocket);
@@ -198,6 +201,7 @@ export function createSlackTransport(options: SlackTransportOptions): SlackTrans
       const timer = setTimeout(() => finish("slack_socket_unhealthy"), helloTimeout);
       const finish = (code?: FaultCode) => {
         if (done) return;
+        if(code)observe('transport_protocol_rejected');
         done = true;
         clearTimeout(timer);
         if (socket === ws) { healthy = false; helloAppId = undefined; socket = undefined; }
@@ -215,6 +219,7 @@ export function createSlackTransport(options: SlackTransportOptions): SlackTrans
           const data = record(event) ? event.data : undefined;
           if (typeof data !== "string" || Buffer.byteLength(data, "utf8") > MAX_SOCKET_BYTES) return finish("slack_socket_protocol_rejected");
           const envelope: unknown = JSON.parse(data);
+          observe('transport_envelope',slackEnvelopeShape(envelope,APPROVED_SLACK_IDENTITY));
           if (!record(envelope)) return finish("slack_socket_protocol_rejected");
           if (envelope.type === "hello") {
             // Official Socket Mode hello binds the app-level token to its app.
@@ -224,6 +229,7 @@ export function createSlackTransport(options: SlackTransportOptions): SlackTrans
             sawHello = true;
             helloAppId = envelope.connection_info.app_id;
             healthy = true;
+            observe('transport_hello');
             clearTimeout(timer);
             onReady();
             return;
@@ -241,7 +247,7 @@ export function createSlackTransport(options: SlackTransportOptions): SlackTrans
           Promise.resolve().then(() => {
             if (!stopped) return onEnvelope(envelope);
           }).catch(() => undefined).finally(() => { pendingHandlers--; });
-        } catch { finish("slack_socket_protocol_rejected"); }
+        } catch { observe('transport_frame_rejected');finish("slack_socket_protocol_rejected"); }
       };
       const listeners: Array<[string, (event: unknown) => void]> = [
         ["message", onMessage], ["error", () => finish("slack_socket_unhealthy")], ["close", () => finish()],

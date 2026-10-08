@@ -346,3 +346,25 @@ test('a stopped service cannot report its cached successful start as current rea
   await expect(f.service.start()).rejects.toThrow('slack_service_stopped');expect(f.service.health.running).toBe(false);
   expect(f.fake.starts).toBe(1);expect(f.fake.sends).toHaveLength(1);
 });
+
+test('ingress diagnostics distinguish gates without exposing fields; labeled mentions preserve exact authorization',async()=>{
+  const records:any[]=[],calls:string[]=[];
+  const f=fixture({onIngressDiagnostic:value=>{records.push(value);throw new Error('observer failure');},checkConversationHealth:()=>true,
+    sharedConversation:{ready:()=>true,close:()=>({drained:true}),async respond(input){calls.push(input.text);}}});
+  f.health={...healthy,ready:false};await f.service.start();
+  await f.fake.emit(envelope({text:`<@${GARY_SLACK.botUserId}|Gary> synthetic-secret-body`}));
+  await f.fake.emit(envelope({text:`<@${GARY_SLACK.botUserId}> synthetic-secret-body`}));
+  expect(calls).toHaveLength(2);expect(records.some(x=>x.stage==='shared_dispatch')).toBe(true);
+  const cases:Array<[any,any,string]>=[
+    [{bot_id:null},{},'shared_bot_rejected'],[{subtype:null},{},'shared_bot_rejected'],[{user:GARY_SLACK.botUserId},{},'shared_bot_rejected'],
+    [{user:'invalid'},{},'shared_shape_rejected'],[{text:`<@${GARY_SLACK.botUserId}X|Gary>`},{},'shared_mention_rejected'],
+    [{text:`<@U0OTHER11|${GARY_SLACK.botUserId}>`},{},'shared_mention_rejected'],
+    [{},{is_ext_shared_channel:true},'shared_scope_rejected'],[{team:'TFOREIGN'},{},'shared_scope_rejected'],
+    [{},{api_app_id:'AFOREIGN'},'service_payload_rejected'],
+  ];
+  for(const [event,payload,stage] of cases){records.length=0;await f.fake.emit(envelope(event,payload));expect(records.at(-1).stage).toBe(stage);}
+  expect(calls).toHaveLength(2);
+  f.fake.identity.teamId='TFOREIGN';records.length=0;await f.fake.emit(envelope());expect(records.at(-1).stage).toBe('shared_health_rejected');
+  expect(calls).toHaveLength(2);expect(f.fake.sends).toEqual([]);
+  expect(JSON.stringify(records)).not.toContain('synthetic-secret-body');expect(JSON.stringify(records)).not.toContain(GARY_SLACK.tannerId);
+});

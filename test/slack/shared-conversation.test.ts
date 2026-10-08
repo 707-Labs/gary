@@ -106,3 +106,30 @@ test('exhausted shared allocation sends bounded typed notices with no inference 
   const original=f.metadata.memberInfo;f.metadata.memberInfo=async id=>({...await original(id),deleted:true});await shared.respond(mention(2),deliver,signal);
   expect(notices).toHaveLength(1);expect(calls).toBe(0);shared.close();
 });
+
+test('labeled mentions reach the same durable shared admission; diagnostics cannot change authorization',async()=>{
+  const f=fixture(),records:any[]=[];let calls=0;
+  const shared=createSlackSharedConversation({...f,onIngressDiagnostic:record=>{records.push(record);throw new Error('untrusted observer failure');},reply:async()=>{calls++;return 'safe fixture reply';}});
+  const first=mention(1,{text:`<@${POLICY.botUserId}|Gary> synthetic-only-secret`});
+  await shared.respond(first,sent,signal);await shared.respond({...first,eventId:'EvAlias'},sent,signal);
+  expect(calls).toBe(1);expect(records.filter(r=>r.stage==='shared_claimed')).toHaveLength(1);expect(records.at(-1).stage).toBe('shared_duplicate');
+  for(const text of [`<@${POLICY.botUserId}X>`,`<@U0OTHER11|${POLICY.botUserId}>`,`<<@${POLICY.botUserId}>>`])await shared.respond(mention(2,{text}),sent,signal);
+  expect(calls).toBe(1);expect(records.at(-1).stage).toBe('shared_input_rejected');
+  expect(JSON.stringify(records)).not.toContain('synthetic-only-secret');expect(shared.close()).toEqual({drained:true});
+});
+test('metadata lookup failures and policy denials have fixed diagnostics and no claim or provider call',async()=>{
+  for(const reason of ['member_lookup','channel_lookup','member_policy','channel_policy']){
+    const f=fixture(),records:any[]=[];let calls=0;
+    const member=f.metadata.memberInfo,channel=f.metadata.channelInfo;
+    if(reason==='member_lookup')f.metadata.memberInfo=async()=>{throw new Error('xoxb-private-raw-error');};
+    if(reason==='channel_lookup')f.metadata.channelInfo=async()=>{throw new Error('xoxb-private-raw-error');};
+    if(reason==='member_policy')f.metadata.memberInfo=async id=>({...await member(id),isRestricted:true});
+    if(reason==='channel_policy')f.metadata.channelInfo=async id=>({...await channel(id),isExtShared:true});
+    const shared=createSlackSharedConversation({...f,onIngressDiagnostic:record=>{records.push(record);},reply:async()=>{calls++;return 'never';}});
+    await shared.respond(mention(1),async()=>{throw new Error('must not send');},signal);
+    expect(calls).toBe(0);
+    expect(records.some(r=>r.stage===({member_lookup:'shared_member_lookup_failed',channel_lookup:'shared_channel_lookup_failed',member_policy:'shared_member_rejected',channel_policy:'shared_channel_rejected'}[reason]))).toBe(true);
+    expect(JSON.stringify(records)).not.toContain('xoxb-private-raw-error');shared.close();
+    const db=new Database(join(f.dir,'shared-context.sqlite'));expect(db.query('SELECT count(*) AS n FROM events').get()).toEqual({n:0});db.close();
+  }
+});

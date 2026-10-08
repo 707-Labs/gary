@@ -326,3 +326,16 @@ describe("Slack transport, fake fetch and WebSocket only", () => {
     expect(validateSlackSocketUrl(`wss://${host}.slack.com/link/?ticket=fake`)).toBe(`wss://${host}.slack.com/link/?ticket=fake`);
   });
 });
+
+test('transport arrival diagnostics contain only fixed shape and cannot prevent ACK/handler delivery',async()=>{
+  const records:any[]=[],received:unknown[]=[];
+  const h=harness({onIngressDiagnostic:record=>{records.push(record);throw new Error('observer raw failure');}});
+  const socket=await h.start(value=>{received.push(value);});
+  const secret='xoxb-private-frame-body';
+  socket.frame({...envelope,payload:{...envelope.payload,type:'event_callback',event:{type:'app_mention',text:secret,user:secret,bot_id:null,subtype:null}}});
+  await until(()=>received.length===1);
+  expect(socket.sent).toEqual([JSON.stringify({envelope_id:envelope.envelope_id})]);
+  expect(records.some(r=>r.stage==='transport_hello')).toBe(true);
+  expect(records.at(-1)).toMatchObject({component:'transport',stage:'transport_envelope',envelopeKind:'events_api',eventKind:'app_mention',hasBotId:true,hasSubtype:true});
+  expect(JSON.stringify(records)).not.toContain(secret);expect(JSON.stringify(records)).not.toContain(credentials.botToken);
+});

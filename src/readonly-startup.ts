@@ -1,3 +1,4 @@
+import { logSlackIngressDiagnostic } from './slack/ingress-diagnostics.ts';
 /** One read-only activation in the existing Gary host. No ticket polling or publication clients. */
 import { execFileSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
@@ -91,10 +92,10 @@ export async function runReadonlyGaryHost(host: HostStartupConfig, deps: Startup
     const canary = (deps.readonlyCanary ?? createReadonlyCanary)(config, { db, ledger,
       route: { provider: 'deepseek', model: 'deepseek-v4-pro', providerApiKey: provider.apiKey, fetch: request => rawFetch(request) },
       signal: controller.signal, ...(deps.launch ? { launch: deps.launch } : {}) });
-    const transport = deps.slackTransport ? deps.slackTransport(credentials) : createSlackTransport({ credentials });
+    const transport = deps.slackTransport ? deps.slackTransport(credentials) : createSlackTransport({ credentials, onIngressDiagnostic:logSlackIngressDiagnostic });
     if(host.readonlySlackReleaseCommit&&!canary.check().ready)throw new Error('readonly_slack_release_requires_existing_receipt');
     if(conversationConfig)conversation=createSlackConversation({config:conversationConfig,ledger,reply:createHermesDMResponder({ledger,providerApiKey:provider.apiKey,fetch:request=>rawFetch(request),...(deps.launch?{launch:deps.launch}:{})})});
-    slack = createSlackService({ db, transport, ...(conversation?{conversation}:{}), checkHostHealth: canary.check, approvedChannelIds: [],
+    slack = createSlackService({ db, transport, onIngressDiagnostic:logSlackIngressDiagnostic, ...(conversation?{conversation}:{}), checkHostHealth: canary.check, approvedChannelIds: [],
       ...(host.slack.tannerDirectMessages?{tannerDirectMessages:true as const}:{}) });
     const initial = await slack.start();
     if (controller.signal.aborted) return;

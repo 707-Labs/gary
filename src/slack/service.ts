@@ -1,5 +1,7 @@
 /** Host Slack service; optional tightly scoped Tanner DM conversation, no coding dispatch. */
 import { createHash, randomUUID } from 'node:crypto';
+import { hasSlackUserMention } from './mentions.ts';
+import { createSlackIngressEmitter, slackEnvelopeShape, type SlackIngressObserver } from './ingress-diagnostics.ts';
 import type { DB } from '../state/db.ts';
 import type { SlackTransport } from './transport.ts';
 import type { SlackConversation } from './conversation.ts';
@@ -36,6 +38,7 @@ export type SlackHostHealth = {
 };
 export interface SlackServiceOptions {
   db:DB;
+  onIngressDiagnostic?:SlackIngressObserver;
   transport:SlackTransport;
   checkHostHealth():SlackHostHealth|Promise<SlackHostHealth>;
   /** Empty by default: no shared-channel replies until explicitly approved. */
@@ -67,6 +70,7 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
   if(options.tannerDirectMessages!==undefined&&options.tannerDirectMessages!==true)throw new Error('invalid_slack_dm_switch');
   if(options.conversation&&(!options.tannerDirectMessages||options.approvedChannelIds?.length))throw new Error('dm_conversation_boundary_rejected');
   if(options.sharedConversation&&options.approvedChannelIds?.length)throw new Error('shared_conversation_boundary_rejected');
+  const observe=createSlackIngressEmitter('service',options.onIngressDiagnostic);
   const channels=[...(options.approvedChannelIds??[])], users=[...(options.allowedUserIds??[GARY_SLACK.tannerId])];
   if (channels.length>64 || new Set(channels).size!==channels.length || channels.some(id=>!CHANNEL.test(id))) throw new Error('invalid_slack_channel_allowlist');
   if (new Set(users).size!==users.length || users.some(id=>id!==GARY_SLACK.tannerId && id!==GARY_SLACK.benId)) throw new Error('invalid_slack_user_allowlist');
@@ -175,11 +179,13 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
     refreshPromise=track(refresh()).finally(()=>{refreshPromise=undefined;});return refreshPromise;
   }
   async function mention(envelope:unknown):Promise<void> {
-    if(!live()||!object(envelope)||envelope.type!=='events_api'||!object(envelope.payload))return;
+    observe('service_envelope',slackEnvelopeShape(envelope,GARY_SLACK));
+    if(!live()||!object(envelope)||envelope.type!=='events_api'||!object(envelope.payload)){observe('service_envelope_rejected');return;}
     const payload=envelope.payload;
     if(payload.type!=='event_callback'||payload.team_id!==GARY_SLACK.teamId||payload.api_app_id!==GARY_SLACK.appId
-      ||typeof payload.event_id!=='string'||!/^Ev[A-Za-z0-9]{1,80}$/.test(payload.event_id)||!object(payload.event))return;
+      ||typeof payload.event_id!=='string'||!/^Ev[A-Za-z0-9]{1,80}$/.test(payload.event_id)||!object(payload.event)){observe('service_payload_rejected');return;}
     const event=payload.event;
+    if(event.type!=='app_mention')observe('service_event_not_mention');
     if(event.type==='message') {
       if(!options.tannerDirectMessages||event.channel_type!=='im'||event.user!==GARY_SLACK.tannerId
         ||event.bot_id!==undefined||event.subtype!==undefined||typeof event.channel!=='string'||!/^D[A-Z0-9]{5,32}$/.test(event.channel)
@@ -210,19 +216,21 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
       return;
     }
     if(options.sharedConversation&&event.type==='app_mention') {
-      if(event.bot_id!==undefined||event.subtype!==undefined||event.user===GARY_SLACK.botUserId
-        ||typeof event.user!=='string'||!/^[UW][A-Z0-9]{5,32}$/.test(event.user)
+      if(event.bot_id!==undefined||event.subtype!==undefined||event.user===GARY_SLACK.botUserId){observe('shared_bot_rejected');return;}
+      if(typeof event.user!=='string'||!/^[UW][A-Z0-9]{5,32}$/.test(event.user)
         ||typeof event.channel!=='string'||!CHANNEL.test(event.channel)||typeof event.text!=='string'||!event.text.trim()
-        ||event.text.length>40_000||!event.text.includes(`<@${GARY_SLACK.botUserId}>`)
-        ||typeof event.ts!=='string'||!TIMESTAMP.test(event.ts)||(event.thread_ts!==undefined&&(typeof event.thread_ts!=='string'||!TIMESTAMP.test(event.thread_ts)))
-        ||(event.team!==undefined&&event.team!==GARY_SLACK.teamId)||(payload.context_team_id!==undefined&&payload.context_team_id!==GARY_SLACK.teamId)
-        ||(payload.is_ext_shared_channel!==undefined&&payload.is_ext_shared_channel!==false))return;
+        ||event.text.length>40_000
+        ||typeof event.ts!=='string'||!TIMESTAMP.test(event.ts)||(event.thread_ts!==undefined&&(typeof event.thread_ts!=='string'||!TIMESTAMP.test(event.thread_ts)))){observe('shared_shape_rejected');return;}
+      if(!hasSlackUserMention(event.text,GARY_SLACK.botUserId)){observe('shared_mention_rejected');return;}
+      if((event.team!==undefined&&event.team!==GARY_SLACK.teamId)||(payload.context_team_id!==undefined&&payload.context_team_id!==GARY_SLACK.teamId)
+        ||(payload.is_ext_shared_channel!==undefined&&payload.is_ext_shared_channel!==false)){observe('shared_scope_rejected');return;}
       const eventId=payload.event_id,channel=event.channel,user=event.user,ts=event.ts,threadTs=(event.thread_ts??event.ts) as string;
       const key=`shared:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${eventId}`,oldKey=`mention:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${eventId}`;
       if(options.db.query('SELECT 1 FROM gary_slack_shared_outbox WHERE delivery_key=?').get(key)
-        ||options.db.query('SELECT 1 FROM gary_slack_outbox WHERE delivery_key=?').get(oldKey))return;
+        ||options.db.query('SELECT 1 FROM gary_slack_outbox WHERE delivery_key=?').get(oldKey)){observe('shared_duplicate');return;}
       await refreshHealth();
-      if(!conversationAvailable())return;
+      if(!conversationAvailable()){observe('shared_health_rejected');return;}
+      observe('shared_dispatch');
       await options.sharedConversation.respond({type:'app_mention',appId:GARY_SLACK.appId,teamId:GARY_SLACK.teamId,botUserId:GARY_SLACK.botUserId,
         requesterId:user,eventId,channel,ts,threadTs,text:event.text},async (text,kind='answer')=>{
         if(!conversationAvailable()||(kind!=='answer'&&kind!=='notice')||(kind==='answer'&&!options.sharedConversation!.ready()))return 'not_sent';
@@ -237,7 +245,7 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
     }
     if(event.type!=='app_mention'||event.bot_id!==undefined||event.subtype!==undefined||typeof event.user!=='string'
       ||!userSet.has(event.user)||typeof event.channel!=='string'||!channelSet.has(event.channel)
-      ||typeof event.text!=='string'||event.text.length>40_000||!event.text.includes(`<@${GARY_SLACK.botUserId}>`)
+      ||typeof event.text!=='string'||event.text.length>40_000||!hasSlackUserMention(event.text,GARY_SLACK.botUserId)
       ||typeof event.ts!=='string'||!TIMESTAMP.test(event.ts)
       ||(event.thread_ts!==undefined&&(typeof event.thread_ts!=='string'||!TIMESTAMP.test(event.thread_ts))))return;
     // Refresh trusted health only; incoming text never enters a model or becomes instructions.

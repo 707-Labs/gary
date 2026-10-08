@@ -1,5 +1,7 @@
 /** Isolated context for explicitly mentioned shared-channel turns; no DM or coding authority. */
 import { Database } from 'bun:sqlite';
+import { hasSlackUserMention } from './mentions.ts';
+import { createSlackIngressEmitter, type SlackIngressObserver } from './ingress-diagnostics.ts';
 import { constants, openSync, closeSync, fstatSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, normalize } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -40,13 +42,18 @@ export interface SlackSharedMetadata {
   memberInfo(userId:string,signal?:AbortSignal):Promise<SlackMemberMetadata>;
   channelInfo(channelId:string,signal?:AbortSignal):Promise<SlackChannelMetadata>;
 }
-export function sharedMetadataAllowed(input:SlackSharedConversationInput,member:SlackMemberMetadata,channel:SlackChannelMetadata,now=Date.now()):boolean {
-  const fresh=(at:number)=>Number.isFinite(at)&&at<=now&&now-at<=POLICY.metadataMaxAgeMs;
+function memberAllowed(input:SlackSharedConversationInput,member:SlackMemberMetadata,now:number):boolean {
   return member.id===input.requesterId&&member.teamId===POLICY.teamId&&member.deleted===false&&member.isBot===false&&member.isAppUser===false
-    &&member.isRestricted===false&&member.isUltraRestricted===false&&member.isStranger===false&&fresh(member.observedAt)
-    &&channel.id===input.channel&&channel.teamId===POLICY.teamId&&channel.isMember===true&&channel.isArchived===false
+    &&member.isRestricted===false&&member.isUltraRestricted===false&&member.isStranger===false&&fresh(member.observedAt,now);
+}
+const fresh=(at:number,now:number)=>Number.isFinite(at)&&at<=now&&now-at<=POLICY.metadataMaxAgeMs;
+function channelAllowed(input:SlackSharedConversationInput,channel:SlackChannelMetadata,now:number):boolean {
+  return channel.id===input.channel&&channel.teamId===POLICY.teamId&&channel.isMember===true&&channel.isArchived===false
     &&typeof channel.isPrivate==='boolean'&&channel.isShared===false&&channel.isExtShared===false&&channel.isOrgShared===false
-    &&channel.isPendingExtShared===false&&fresh(channel.observedAt);
+    &&channel.isPendingExtShared===false&&fresh(channel.observedAt,now);
+}
+export function sharedMetadataAllowed(input:SlackSharedConversationInput,member:SlackMemberMetadata,channel:SlackChannelMetadata,now=Date.now()):boolean {
+  return memberAllowed(input,member,now)&&channelAllowed(input,channel,now);
 }
 export type DMDelivery=(text:string,kind?:'answer'|'notice')=>Promise<'sent'|'unknown'|'not_sent'>;
 export interface SlackSharedConversation {
@@ -55,7 +62,8 @@ export interface SlackSharedConversation {
   ready():boolean;
 }
 interface Session { history:string; turns:number; blocked:number }
-export function createSlackSharedConversation(options:{config:SlackSharedConversationConfig;ledger:SpendLedger;metadata:SlackSharedMetadata;reply:(turn:DMTurn)=>Promise<string>}):SlackSharedConversation {
+export function createSlackSharedConversation(options:{config:SlackSharedConversationConfig;ledger:SpendLedger;metadata:SlackSharedMetadata;onIngressDiagnostic?:SlackIngressObserver;reply:(turn:DMTurn)=>Promise<string>}):SlackSharedConversation {
+  const observe=createSlackIngressEmitter('shared',options.onIngressDiagnostic);
   const {config,ledger}=options,owner=randomUUID(),fingerprint=fingerprintSlackSharedConversationConfig(config),file=join(config.contextDirectory,'shared-context.sqlite');
   privatePath(config.contextDirectory,true);
   try {const fd=openSync(file,constants.O_CREAT|constants.O_EXCL|constants.O_WRONLY|constants.O_NOFOLLOW,0o600);closeSync(fd);}
@@ -83,9 +91,15 @@ export function createSlackSharedConversation(options:{config:SlackSharedConvers
   const allocationReady=()=>{const s=ledger.status(config.allocationId);return exactDMAllocation(s,config.allocationId,config.campaignId)&&s.unknownAttempts===0;};
   if(!allocationReady()){db.close();throw new Error('dm_budget_unavailable');}
   async function authorize(input:SlackSharedConversationInput,signal:AbortSignal):Promise<boolean> {
-    try {const [member,channel]=await Promise.all([options.metadata.memberInfo(input.requesterId,signal),options.metadata.channelInfo(input.channel,signal)]);
-      return !signal.aborted&&sharedMetadataAllowed(input,member,channel);
-    }catch{return false;}
+    try {const [member,channel]=await Promise.all([
+      options.metadata.memberInfo(input.requesterId,signal).catch(error=>{observe('shared_member_lookup_failed');throw error;}),
+      options.metadata.channelInfo(input.channel,signal).catch(error=>{observe('shared_channel_lookup_failed');throw error;})]);
+      const now=Date.now();
+      if(signal.aborted){observe('shared_health_rejected');return false;}
+      if(!memberAllowed(input,member,now)){observe('shared_member_rejected');return false;}
+      if(!channelAllowed(input,channel,now)){observe('shared_channel_rejected');return false;}
+      observe('shared_metadata_allowed');return true;
+    }catch{observe('shared_metadata_unavailable');return false;}
   }
   const encodedText=(input:SlackSharedConversationInput)=>JSON.stringify({senderId:input.requesterId,text:input.text});
   async function execute(input:SlackSharedConversationInput,key:string,sessionKey:string,deliver:DMDelivery,signal:AbortSignal,isAvailable:()=>boolean):Promise<void> {
@@ -131,18 +145,20 @@ export function createSlackSharedConversation(options:{config:SlackSharedConvers
   async function admit(input:SlackSharedConversationInput,deliver:DMDelivery,signal:AbortSignal,isAvailable:()=>boolean=()=>true):Promise<void> {
     if(closed||!isAvailable()||signal.aborted||input.type!=='app_mention'||input.appId!==POLICY.appId||input.teamId!==POLICY.teamId||input.botUserId!==POLICY.botUserId
       ||typeof input.requesterId!=='string'||! /^[UW][A-Z0-9]{5,32}$/.test(input.requesterId)||input.requesterId===POLICY.botUserId||input.requesterId==='USLACKBOT'
-      ||typeof input.text!=='string'||!input.text.trim()||!input.text.includes(`<@${POLICY.botUserId}>`)||!/^Ev[A-Za-z0-9]{1,80}$/.test(input.eventId)
-      ||!/^[CG][A-Z0-9]{5,32}$/.test(input.channel)||!/^\d{10,16}\.\d{6}$/.test(input.ts)||!/^\d{10,16}\.\d{6}$/.test(input.threadTs))return Promise.resolve();
+      ||typeof input.text!=='string'||!input.text.trim()||!hasSlackUserMention(input.text,POLICY.botUserId)||!/^Ev[A-Za-z0-9]{1,80}$/.test(input.eventId)
+      ||!/^[CG][A-Z0-9]{5,32}$/.test(input.channel)||!/^\d{10,16}\.\d{6}$/.test(input.ts)||!/^\d{10,16}\.\d{6}$/.test(input.threadTs)){observe('shared_input_rejected');return Promise.resolve();}
     const scope=POLICY.appId+':'+POLICY.teamId;
     const key=config.runId+':'+scope+':'+input.eventId,messageKey=scope+':'+input.channel+':'+input.ts,sessionKey=scope+':'+input.channel+':'+input.threadTs;
     const duplicate=()=>db.query('SELECT 1 FROM events WHERE event_key=? OR message_key=?').get(key,messageKey)
       ||db.query('SELECT 1 FROM notices WHERE event_key=? OR message_key=?').get(key,messageKey);
     const notice=(reason:string):Promise<void>=>{
+      observe('shared_admission_rejected');
       const claimed=db.transaction(()=>{if(duplicate()||Number((db.query('SELECT count(*) AS n FROM notices').get() as any).n)>=POLICY.maxNotices)return false;
         db.query('INSERT INTO notices VALUES (?,?,?)').run(key,messageKey,reason);return true;}).immediate();
       return claimed?deliver("I can't answer this message within the current conversation limits. No model call was made.",'notice').then(()=>{},()=>{}):Promise.resolve();
     };
-    if(duplicate()||!await authorize(input,signal)||!isAvailable()||closed)return Promise.resolve();
+    if(duplicate()){observe('shared_duplicate');return Promise.resolve();}
+    if(!await authorize(input,signal)||!isAvailable()||closed)return Promise.resolve();
     if(queued>=POLICY.maxQueued||blocked()||!allocationReady()||Buffer.byteLength(encodedText(input))>POLICY.maxInputBytes)return notice('shared_admission_limit');
     const accepted=db.transaction(()=>{
       if(duplicate()||db.query("SELECT 1 FROM events WHERE cleanup=0 AND owner<>?").get(owner)
@@ -158,6 +174,7 @@ export function createSlackSharedConversation(options:{config:SlackSharedConvers
       return true;
     }).immediate();
     if(!accepted)return notice('shared_session_limit');
+    observe('shared_claimed');
     queued++;
     const run=tail.then(()=>execute(input,key,sessionKey,deliver,signal,isAvailable));
     tail=run.catch(()=>{db.query('UPDATE control SET blocked=1 WHERE id=1').run();}).finally(()=>{queued--;});
