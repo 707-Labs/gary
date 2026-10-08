@@ -6,11 +6,14 @@ import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { Executor, ExecResult, GrepMatch, RunOpts } from "./index.ts";
 import { WorkspaceBoundaryError } from "./local.ts";
+import { ExecutorCleanupGuard } from "./cleanup-guard.ts";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const SAFE_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export interface DockerExecutorOptions {
+  /** Trusted action-owned fence; omission still fences this executor instance. */
+  cleanupGuard?: ExecutorCleanupGuard;
   image: string;
   readOnly?: boolean;
   networkMode?: "none" | "bridge";
@@ -53,6 +56,7 @@ export class DockerExecutor implements Executor {
   private readonly bunCacheVolume: string | null;
   private readonly fixedEnvironment: Readonly<Record<string, string>>;
   private readonly storybookScratch: boolean;
+  private readonly cleanupGuard: ExecutorCleanupGuard;
 
   constructor(workspaceRoot: string, opts: DockerExecutorOptions) {
     if (!isAbsolute(workspaceRoot)) {
@@ -60,6 +64,7 @@ export class DockerExecutor implements Executor {
     }
     if (!opts.image.trim()) throw new Error("DockerExecutor image must not be empty");
     this.workspaceRoot = resolve(workspaceRoot);
+    this.cleanupGuard = opts.cleanupGuard ?? new ExecutorCleanupGuard();
     this.image = opts.image;
     this.readOnly = opts.readOnly ?? false;
     this.networkMode = opts.networkMode ?? "none";
@@ -180,6 +185,7 @@ export class DockerExecutor implements Executor {
   }
 
   private async invoke(command: string[], opts: InvocationOptions = {}): Promise<ExecResult> {
+    this.cleanupGuard.assertSafe();
     const name = `gary-exec-${process.pid}-${crypto.randomUUID().slice(0, 12)}`;
     const mountMode = this.readOnly ? ",readonly" : "";
     const args = [
@@ -275,22 +281,21 @@ export class DockerExecutor implements Executor {
     if (result.timedOut) {
       // Killing the Docker client does not stop the container. Await removal
       // before returning; cleanup has a separate, strictly bounded grace period.
-      const cleanup = await runProcess(this.dockerBinary, ["rm", "-f", name], {
-        timeoutMs: 5_000,
-      });
-      if (cleanup.exitCode !== 0) {
-        const detail = cleanup.stderr || cleanup.stdout || String(cleanup.exitCode);
-        result.stderr += `\ncontainer cleanup failed for ${name}: ${detail}`;
-        // A caller may replace this result with the shared deadline error.
-        // Preserve cleanup evidence in operational logs as well.
-        log.error("container cleanup failed", {
-          container: name,
-          exitCode: cleanup.exitCode,
-          timedOut: cleanup.timedOut,
-          detail,
-        });
+      let cleanup: ExecResult;
+      try {
+        cleanup = await runProcess(this.dockerBinary, ["rm", "-f", name], { timeoutMs: 5_000 });
+      } catch {
+        log.error("container cleanup uncertain", { container: name, reason: "removal_threw" });
+        this.cleanupGuard.markUncertain({ container: name, reason: "removal_threw", exitCode: null, timedOut: null });
+      }
+      if (cleanup.exitCode !== 0 || cleanup.timedOut) {
+        const evidence = { container: name, reason: "removal_failed" as const,
+          exitCode: cleanup.exitCode, timedOut: cleanup.timedOut };
+        log.error("container cleanup uncertain", evidence);
+        this.cleanupGuard.markUncertain(evidence);
       }
     }
+    this.cleanupGuard.assertSafe();
     return result;
   }
 }

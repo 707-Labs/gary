@@ -26,6 +26,7 @@ import {
 } from "../git.ts";
 import { createWorkspaceExecutor, type WorkspaceExecutorProfile } from "../executors/factory.ts";
 import { bindExecutorDeadline, type Executor, type ExecResult } from "../executors/index.ts";
+import { ExecutorCleanupGuard, ExecutorCleanupUncertainError } from "../executors/cleanup-guard.ts";
 import { createDeadline, DeadlineExceededError, throwIfExpired, type DeadlineOptions } from "../deadline.ts";
 import { log } from "../logger.ts";
 import {
@@ -322,11 +323,26 @@ export async function runCodeHandler(
   deps: CodeHandlerDeps,
   args: CodeHandlerArgs,
 ): Promise<CodeHandlerResult> {
-  const budget = createDeadline({ timeoutMs: deps.agentLoopTimeoutMs, ...(deps.signal ? { signal: deps.signal } : {}) });
+  const cleanupGuard = new ExecutorCleanupGuard();
+  const budget = createDeadline({ timeoutMs: deps.agentLoopTimeoutMs,
+    signal: deps.signal ? AbortSignal.any([deps.signal, cleanupGuard.signal]) : cleanupGuard.signal });
   try {
     deps.verification?.bindDeadline(budget.deadlineMs, budget.signal);
-    return await runCodeHandlerWithinDeadline(deps, args, budget);
+    const run = () => runCodeHandlerWithinDeadline(deps, args, budget, cleanupGuard);
+    // Includes native, reviewer and auxiliary transports, even if a caller catches
+    // the tool error or ignores the action signal. Existing outer guards compose.
+    return await (deps.spend ? deps.spend.withPaidRequestGuard(() => cleanupGuard.assertSafe(), run) : run());
   } catch (err) {
+    // A child timeout with uncertain removal is not an ordinary timeout or a
+    // recoverable tool error. Retain the exact fence even after a swallowed error.
+    try { cleanupGuard.assertSafe(); } catch (failure) {
+      try {
+        if (failure instanceof ExecutorCleanupUncertainError) {
+          recordEvent(deps.db, { eventType: "executor_cleanup_uncertain", ticketLinearId: args.issue.id,
+            payload: failure.evidence });
+        }
+      } finally { throw failure; }
+    }
     // Host shutdown drains in-flight work but starts no timeout escalation writes.
     if (deps.signal?.aborted) throw deps.signal.reason ?? err;
     if (!(err instanceof DeadlineExceededError) && !budget.signal.aborted) throw err;
@@ -348,6 +364,7 @@ async function runCodeHandlerWithinDeadline(
   deps: CodeHandlerDeps,
   args: CodeHandlerArgs,
   budget: CodeBudget,
+  cleanupGuard: ExecutorCleanupGuard,
 ): Promise<CodeHandlerResult> {
   budget.throwIfExpired();
   const [owner, name] = args.repo.split("/") as [string, string];
@@ -453,7 +470,7 @@ async function runCodeHandlerWithinDeadline(
   });
 
   const executor = bindExecutorDeadline(createWorkspaceExecutor(worktreePath,
-    deps.workspaceExecutorProfile ? { profile: deps.workspaceExecutorProfile } : {}), budget);
+    { cleanupGuard, ...(deps.workspaceExecutorProfile ? { profile: deps.workspaceExecutorProfile } : {}) }), budget);
   const system = composeSystemPrompt({ taskInstructions: codeTaskInstructions(checkCommand) });
   const projectSection = formatProjectContext(
     loadProjectContext(worktreePath),

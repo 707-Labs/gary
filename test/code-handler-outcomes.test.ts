@@ -5,6 +5,9 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runProcess } from "../src/executors/process.ts";
+import * as processSeam from "../src/executors/process.ts";
+import { DockerExecutor } from "../src/executors/docker.ts";
+import { ExecutorCleanupGuard, ExecutorCleanupUncertainError } from "../src/executors/cleanup-guard.ts";
 import type { GitHubClient, PullRequestRef } from "../src/adapters/github.ts";
 import { GLMClient } from "../src/adapters/glm.ts";
 import type { AssignedIssue, LinearAdapter } from "../src/adapters/linear.ts";
@@ -15,6 +18,7 @@ import * as git from "../src/git.ts";
 import { runCodeHandler, type CodeHandlerArgs, type CodeHandlerDeps, type CodePublicationReceipt } from "../src/handlers/code.ts";
 import { createProvider, createProviderChain } from "../src/providers.ts";
 import * as reviewer from "../src/review/runner.ts";
+const realRunReviewer = reviewer.runReviewer;
 import * as skills from "../src/skills.ts";
 import { openDb } from "../src/state/db.ts";
 import { getTicket, upsertTicket } from "../src/state/queries.ts";
@@ -753,14 +757,14 @@ describe('trusted parent executor profile at the CODE handler boundary',()=>{
     f.review.mockResolvedValueOnce({kind:'failed',reason:'offline retry'}).mockResolvedValueOnce(reviewResult());
     expect((await f.invoke()).status).toBe('pr_opened');
     expect(f.factory).toHaveBeenCalledTimes(1);
-    expect(f.factory.mock.calls[0]).toEqual(['/offline/workspaces/FIX-1',{profile}]);
+    expect(f.factory.mock.calls[0]).toEqual(['/offline/workspaces/FIX-1',{profile,cleanupGuard:expect.any(ExecutorCleanupGuard)}]);
     expect(f.review).toHaveBeenCalledTimes(2);
     for(const [args] of f.review.mock.calls)expect(args.executor).toBe(primaryExecutor!);
     expect(f.run.mock.calls.map(([command])=>command)).toEqual(['fixture primary check','bun run check']);
   });
   it('legacy omission passes no profile',async()=>{
     expect((await f.invoke()).status).toBe('pr_opened');
-    expect(f.factory.mock.calls[0]).toEqual(['/offline/workspaces/FIX-1',{}]);
+    expect(f.factory.mock.calls[0]).toEqual(['/offline/workspaces/FIX-1',{cleanupGuard:expect.any(ExecutorCleanupGuard)}]);
   });
 });
 
@@ -1116,4 +1120,95 @@ describe('canonical coding reserve role binding',()=>{
    expect(limits).toEqual([4096,1024,128]);expect(ledger.status(issue.id)?.remainingMicros).toBe(0);expect(f.openPr).toHaveBeenCalledTimes(1);
   }finally{ledger.close();rmSync(dir,{recursive:true,force:true});}
  });
+});
+
+describe('CODE ordinary executor cleanup fence through the real reviewer', () => {
+  for (const confirmed of [false, true]) for (const sameTurn of [false, true]) {
+    it(`${confirmed ? 'confirmed' : 'uncertain'} cleanup with ${sameTurn ? 'same-turn' : 'later-turn'} approval`, async () => {
+      const ledger = new SpendLedger(':memory:');
+      const calls: string[][] = [];
+      let physicalRequests = 0;
+      try {
+        ledger.createCampaign('cleanup-fixture', 5); ledger.enrollTicket('cleanup-fixture', issue.id, 5);
+        f.deps.spend = ledger;
+        f.deps.agentLoopTimeoutMs = 60_000; f.deps.review.timeoutMs = 30_000;
+        f.deps.verification = createActionVerification({policy:CODING_VERIFICATION_POLICY,assertActive:()=>{}});
+        restoreAfter(spyOn(processSeam, 'runProcess')).mockImplementation(async (_binary, args) => {
+          calls.push(args);
+          if (args[0] === 'rm') return checkResult(confirmed ? 0 : 1);
+          if (args.at(-1) === 'reviewer-child-timeout') {
+            // Expire the real verification child's one-second deadline while the
+            // sixty-second CODE budget remains live. The process seam is inert.
+            f.expire(); return {...checkResult(124), timedOut: true};
+          }
+          return checkResult();
+        });
+        f.factory.mockImplementation((path, opts) => new DockerExecutor(path, {
+          image: 'offline-fixture-image', cleanupGuard: opts!.cleanupGuard!,
+        }));
+        const approve = {type:'tool_use',id:'approve',name:'submit_review',input:{
+          verdict:'approve',findings:[],advisory_notes:[],verification_report:'offline fixture only',
+        }};
+        const physical = ledger.guardedFetch('deepseek', (async () => {
+          physicalRequests++;
+          const command = {type:'tool_use',id:'command',name:'run_bash',input:{command:'reviewer-child-timeout',timeout_seconds:1}};
+          return Response.json({id:'offline',type:'message',role:'assistant',model:'deepseek-v4-pro',
+            content:physicalRequests === 1 ? [command,...(sameTurn ? [approve] : [])] : [approve],
+            stop_reason:'tool_use',stop_sequence:null,usage:{input_tokens:10,output_tokens:5,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+        }) as unknown as typeof fetch);
+        const provider = createProvider({name:'deepseek',apiKey:'offline-fixture-only',
+          baseUrl:'https://api.deepseek.com/anthropic',model:'deepseek-v4-pro',defaultBackoffMs:1000}, {fetch:physical});
+        const glm = new GLMClient(createProviderChain([provider]));
+        f.review.mockImplementation(args => realRunReviewer({...args, glm}));
+        const run = () => ledger.withSpendScope(issue.id, () => f.invoke());
+        if (confirmed) {
+          expect((await run()).status).toBe('pr_opened');
+          expect(physicalRequests).toBe(sameTurn ? 1 : 2);
+          expect(f.db.query('SELECT verdict FROM review_passes').all()).toEqual([{verdict:'approve'}]);
+          expect(f.push).toHaveBeenCalledTimes(1); expect(f.openPr).toHaveBeenCalledTimes(1);
+        } else {
+          await expect(run()).rejects.toBeInstanceOf(ExecutorCleanupUncertainError);
+          expect(physicalRequests).toBe(1);
+          expect(f.review).toHaveBeenCalledTimes(1);
+          expect(f.db.query('SELECT verdict FROM review_passes').all()).toEqual([{verdict:'failed'}]);
+          expect(f.complete).not.toHaveBeenCalled(); expect(f.rebase).not.toHaveBeenCalled();
+          expect(f.push).not.toHaveBeenCalled(); expect(f.openPr).not.toHaveBeenCalled();
+          expect(f.postComment).not.toHaveBeenCalled();
+          const row = f.db.query<{payload_json:string},[]>('SELECT payload_json FROM events WHERE event_type = \'executor_cleanup_uncertain\'').get();
+          expect(JSON.parse(row!.payload_json)).toEqual({container:calls.find(args => args[0]==='rm')![2],
+            reason:'removal_failed',exitCode:1,timedOut:false});
+          expect(calls.at(-1)![0]).toBe('rm');
+        }
+        expect(ledger.status(issue.id)?.attemptCount).toBe(physicalRequests);
+        expect(ledger.status(issue.id)?.unknownAttempts).toBe(0);
+        expect(calls.filter(args => args[0]==='rm')).toHaveLength(1);
+      } finally { ledger.close(); }
+    });
+  }
+
+  it('blocks a signal-ignoring paid retry and a swallowed failure followed by an approval claim', async () => {
+    const ledger = new SpendLedger(':memory:');
+    let physicalRequests = 0;
+    try {
+      ledger.createCampaign('cleanup-swallowed',5); ledger.enrollTicket('cleanup-swallowed',issue.id,5);
+      f.deps.spend = ledger;
+      restoreAfter(spyOn(processSeam,'runProcess')).mockImplementation(async (_binary,args) =>
+        args[0]==='rm' ? checkResult(1) : args.at(-1)==='reviewer-child-timeout' ? {...checkResult(124),timedOut:true} : checkResult());
+      f.factory.mockImplementation((path,opts)=>new DockerExecutor(path,{image:'offline-fixture-image',cleanupGuard:opts!.cleanupGuard!}));
+      const physical=ledger.guardedFetch('deepseek',(async()=>{physicalRequests++;return Response.json({usage:{input_tokens:1,output_tokens:1}});}) as unknown as typeof fetch);
+      f.review.mockImplementation(async args=>{
+        try { await args.executor.run('reviewer-child-timeout',{timeoutMs:1}); } catch { /* Simulate existing tool conversion. */ }
+        expect(args.signal?.aborted).toBe(true);
+        // Deliberately omit signal: the existing physical request guard must stop it before reservation/send.
+        await expect(physical('https://api.deepseek.com/anthropic/v1/messages',{method:'POST',headers:{'content-type':'application/json'},
+          body:JSON.stringify({model:'deepseek-v4-pro',max_tokens:32,messages:[{role:'user',content:'offline'}]})})).rejects.toThrow('executor_cleanup_uncertain');
+        return reviewResult('approve');
+      });
+      await expect(ledger.withSpendScope(issue.id,()=>f.invoke())).rejects.toThrow('executor_cleanup_uncertain');
+      expect(physicalRequests).toBe(0); expect(ledger.status(issue.id)?.attemptCount).toBe(0);
+      expect(f.review).toHaveBeenCalledTimes(1); expect(f.rebase).not.toHaveBeenCalled();
+      expect(f.complete).not.toHaveBeenCalled(); expect(f.push).not.toHaveBeenCalled(); expect(f.openPr).not.toHaveBeenCalled();
+      expect(f.db.query("SELECT COUNT(*) AS n FROM events WHERE event_type='review_decision'").get()).toEqual({n:0});
+    } finally { ledger.close(); }
+  });
 });

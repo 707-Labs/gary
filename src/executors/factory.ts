@@ -1,6 +1,7 @@
 import { DockerExecutor } from "./docker.ts";
 import type { Executor } from "./index.ts";
 import { LocalExecutor } from "./local.ts";
+import type { ExecutorCleanupGuard } from "./cleanup-guard.ts";
 
 /** Trusted caller-selected parent profile; never populated from task/model JSON. */
 export interface WorkspaceExecutorProfile {
@@ -14,6 +15,8 @@ export interface WorkspaceExecutorProfile {
 }
 
 export interface WorkspaceExecutorOptions {
+  /** Shared host action fence; never supplied by task/model arguments. */
+  cleanupGuard?: ExecutorCleanupGuard;
   readOnly?: boolean;
   profile?: WorkspaceExecutorProfile;
 }
@@ -44,6 +47,7 @@ export function createWorkspaceExecutor(
     throw new Error("invalid_fixed_executor_profile");
   }
   return new DockerExecutor(workspaceRoot, {
+    ...(opts.cleanupGuard ? { cleanupGuard: opts.cleanupGuard } : {}),
     image: opts.profile?.image ?? (process.env.GARY_EXECUTOR_IMAGE?.trim() || "gary-executor:ubuntu24.04"),
     readOnly: opts.readOnly ?? false,
     networkMode: network,

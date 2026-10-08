@@ -1,4 +1,5 @@
 import { RuntimeDiagnosticError } from '../../src/hermes/runtime-diagnostics.ts';
+import { ExecutorCleanupUncertainError } from '../../src/executors/cleanup-guard.ts';
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -82,6 +83,28 @@ function makeFixture(){
 let f:ReturnType<typeof makeFixture>;
 beforeEach(()=>{f=makeFixture();});
 afterEach(()=>f.cleanup());
+
+for (const knownUsage of [true, false]) test(`cleanup fence closes canonical action/claim without releasing ${knownUsage ? 'settled' : 'unknown'} liability or reopening after restart`, async () => {
+  expect((await tick(f.deps)).actionsTaken).toEqual(['classify']);
+  let charge = 0;
+  f.coding.mockImplementation(async () => {
+    if (knownUsage) await f.fakeModel(true);
+    else await expect(f.fakeModel(false)).rejects.toThrow();
+    charge = f.ledger().status(f.issue.id)!.chargedMicros;
+    throw new ExecutorCleanupUncertainError(Object.freeze({container:'gary-exec-offline-fixture',
+      reason:'removal_failed',exitCode:1,timedOut:false}));
+  });
+  expect((await tick(f.deps)).actionsTaken).toEqual(['start_coding']);
+  expect(f.actions()[1]).toMatchObject({action_type:'start_coding',success:0,outcome:'error'});
+  expect(f.actions()[1]!.completed_at).not.toBeNull();
+  expect(f.claim()?.phase).toBe('closed');
+  expect(f.ledger().status(f.issue.id)).toMatchObject({state:'closed',attemptCount:1,chargedMicros:charge,unknownAttempts:knownUsage ? 0 : 1});
+  expect(f.publications()).toBe(0);
+  const actions=f.actions(); f.restart(); f.issue.description+=' changed human context';
+  expect((await tick(f.deps)).actionsTaken).toEqual([]);
+  expect(f.actions()).toEqual(actions); expect(f.coding).toHaveBeenCalledTimes(1); expect(f.fakeRequests()).toBe(1);
+  expect(f.ledger().status(f.issue.id)).toMatchObject({state:'closed',chargedMicros:charge,unknownAttempts:knownUsage ? 0 : 1});
+});
 
 describe('durable coding trial through the actual dispatcher, offline only',()=>{
   test('good classification permits exactly one coding action and closes the same real ledger',async()=>{
