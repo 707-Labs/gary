@@ -9,6 +9,7 @@ import type { AgentLoopArgs } from '../../src/agent/loop.ts';
 import * as classifier from '../../src/handlers/classifier.ts';
 import * as codeHandler from '../../src/handlers/code.ts';
 import { createCodingTrial, type CodingTrial } from '../../src/hermes/coding-trial.ts';
+import { HERMES_CODING_RUNTIME_POLICY } from '../../src/hermes/coding-runtime-policy.ts';
 import type { CodeActionAdmission } from '../../src/hermes/canonical-admission.ts';
 import { tick, type LoopDeps } from '../../src/loop.ts';
 import { AllProvidersExhaustedError, createProvider, createProviderChain } from '../../src/providers.ts';
@@ -36,7 +37,7 @@ function makeFixture(){
   const provider=createProvider({name:'deepseek',model:'deepseek-v4-pro',apiKey:'fake-only',baseUrl:'https://provider.invalid',defaultBackoffMs:1000},
     {fetch:(async()=>{forbiddenNetwork++;throw new Error('network forbidden in offline dispatcher test');}) as unknown as typeof fetch});
   const controller=(fingerprint=policyFingerprint)=>createCodingTrial({db,ledger,issueId:issue.id,repo,policyFingerprint:fingerprint});
-  const deps:LoopDeps={db,spend:ledger,codingTrial:controller(),allowedIssueIds:new Set([issue.id]),allowedActionTypes:new Set(['classify','start_coding']),
+  const deps:LoopDeps={db,spend:ledger,codingTrial:controller(),codingExecutorProfile:HERMES_CODING_RUNTIME_POLICY.executor,allowedIssueIds:new Set([issue.id]),allowedActionTypes:new Set(['classify','start_coding']),
     linear:{linearUserId:'gary',fetchAssignedIssues:async()=>[issue],fetchCommentMeta:async()=>[],fetchComments:async()=>[],
       postComment:async()=>{},moveToInProgress:async()=>{},unassign:async()=>{}} as unknown as LinearAdapter,
     github:{} as GitHubClient,glm:new GLMClient(createProviderChain([provider])),cloudflare:null,repoMap:new Map([['FIX',repo]]),
@@ -51,6 +52,7 @@ function makeFixture(){
   const comment=spyOn(classifier,'generateClassificationComment').mockResolvedValue('offline classification');
   const coding=spyOn(codeHandler,'runCodeHandler').mockImplementation(async(handler,args)=>{
     expect(handler.strictPublicationArtifact).toBe(true);expect(args.draftPr).toBe(true);
+    expect(handler.workspaceExecutorProfile).toBe(HERMES_CODING_RUNTIME_POLICY.executor);
     expect(await handler.runAdmittedAgentLoop!({} as AgentLoopArgs)).toEqual(result);
     handler.assertCanPublish!();publications++;
     return {status:'pr_opened',branch:'offline-trial',summary:'offline only'};
@@ -146,4 +148,16 @@ describe('durable coding trial through the actual dispatcher, offline only',()=>
     expect(f.ledger().status(f.issue.id)).toMatchObject({state:'closed',unknownAttempts:1,attemptCount:1});
     const before=f.actions();f.restart();expect((await tick(f.deps)).actionsTaken).toEqual([]);expect(f.actions()).toEqual(before);
   });
+});
+
+
+for(const kind of ['missing','foreign','without-trial'] as const)test('executor profile '+kind+' fails before polling or action creation',async()=>{
+  const poll=spyOn(f.deps.linear,'fetchAssignedIssues');
+  try{
+    if(kind==='missing')delete f.deps.codingExecutorProfile;
+    else if(kind==='foreign')f.deps.codingExecutorProfile={...HERMES_CODING_RUNTIME_POLICY.executor};
+    else delete f.deps.codingTrial;
+    await expect(tick(f.deps)).rejects.toThrow('invalid_coding_executor_profile');
+    expect(poll).not.toHaveBeenCalled();expect(f.actions()).toEqual([]);expect(f.classify).not.toHaveBeenCalled();expect(f.coding).not.toHaveBeenCalled();
+  }finally{poll.mockRestore();}
 });

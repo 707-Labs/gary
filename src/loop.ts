@@ -41,6 +41,7 @@ import {
 import type { DB } from "./state/db.ts";
 import type { SpendLedger } from "./spend.ts";
 import type { CodingTrial, CodingTrialAction } from "./hermes/coding-trial.ts";
+import { HERMES_CODING_RUNTIME_POLICY } from "./hermes/coding-runtime-policy.ts";
 import {
   clearClassification,
   clearTerminalState,
@@ -67,6 +68,8 @@ export interface LoopDeps {
   spend?: SpendLedger;
   /** Durable one-issue classify/code admission, enabled only by the explicit Hermes activation. */
   codingTrial?: CodingTrial;
+  /** Fixed in-process profile for the admitted trial, never caller/model environment. */
+  codingExecutorProfile?: typeof HERMES_CODING_RUNTIME_POLICY.executor;
   /** Exact Linear issue IDs eligible for any intake/dispatch. Omitted is unrestricted; empty or malformed denies all. */
   allowedIssueIds?: ReadonlySet<string>;
   /** Optional action scope; omitted preserves all legacy handlers. Empty or malformed denies all. */
@@ -135,6 +138,9 @@ export interface TickResult {
  * doesn't collide on `.git` locks.
  */
 export async function tick(deps: LoopDeps): Promise<TickResult> {
+  if (deps.codingTrial ? deps.codingExecutorProfile !== HERMES_CODING_RUNTIME_POLICY.executor : deps.codingExecutorProfile !== undefined) {
+    throw new Error("invalid_coding_executor_profile");
+  }
   // Every configured provider has its long-window cap armed. Skip the
   // tick entirely so we don't burn fetch + dispatch on calls that will
   // immediately throw AllProvidersExhausted. Cheap optimization;
@@ -838,7 +844,8 @@ async function runStartCoding(
       agentLoopTimeoutMs: deps.agentLoopTimeoutMs,
       review: deps.review,
       ...(codeLoop ? { runAdmittedAgentLoop: codeLoop } : {}),
-      ...(deps.codingTrial ? { strictPublicationArtifact: true as const } : {}),
+      ...(deps.codingTrial ? { strictPublicationArtifact: true as const,
+        workspaceExecutorProfile: deps.codingExecutorProfile! } : {}),
       ...(onPublicationReceipt ? { onPublicationReceipt } : {}),
       ...publicationGuard(deps, issue.id),
       ...(assertCodeAction ? {assertCanPublish:()=>{assertCodeAction();publicationGuard(deps,issue.id).assertCanPublish?.();}} : {}),

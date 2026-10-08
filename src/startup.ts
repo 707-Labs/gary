@@ -97,7 +97,7 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
       circuitBreakerWindowHours: cfg.runtime.circuitBreakerWindowHours, stalePrAfterMs: cfg.runtime.stalePrAfterMs,
       review: activation ? {...HERMES_CODING_RUNTIME_POLICY.review,providerOrder:[...HERMES_CODING_RUNTIME_POLICY.review.providerOrder]} : cfg.review, intervalMs: cfg.runtime.pollIntervalMs, signal: controller.signal,
       ...(activation ? { allowedIssueIds: activation.allowedIssueIds, allowedActionTypes: activation.allowedActionTypes,
-        codingTrial: activation.codingTrial, createAdmittedCodeLoop: activation.createAdmittedCodeLoop, onCodePublication: readiness!.recordPublication } : {}),
+        codingTrial: activation.codingTrial, codingExecutorProfile: HERMES_CODING_RUNTIME_POLICY.executor, createAdmittedCodeLoop: activation.createAdmittedCodeLoop, onCodePublication: readiness!.recordPublication } : {}),
       ...(slack ? { onTickComplete: async () => {
         if (controller.signal.aborted) return;
         const health = await slack!.refreshHealth();

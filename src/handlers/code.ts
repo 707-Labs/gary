@@ -17,7 +17,7 @@ import {
   rebaseOntoFreshBase,
   slugify,
 } from "../git.ts";
-import { createWorkspaceExecutor } from "../executors/factory.ts";
+import { createWorkspaceExecutor, type WorkspaceExecutorProfile } from "../executors/factory.ts";
 import { bindExecutorDeadline, type Executor, type ExecResult } from "../executors/index.ts";
 import { createDeadline, DeadlineExceededError, throwIfExpired, type DeadlineOptions } from "../deadline.ts";
 import { log } from "../logger.ts";
@@ -224,6 +224,8 @@ export interface CodeHandlerDeps {
   assertCanPublish?: () => void;
   /** Trusted canary opt-in. Legacy publication behavior is unchanged on omission. */
   strictPublicationArtifact?: true;
+  /** Trusted coding-only profile shared by primary, fixups, checks and reviewer. */
+  workspaceExecutorProfile?: WorkspaceExecutorProfile;
   /** Trusted host-only readiness persistence; never a publication authorization.
    * Failure is recorded without relabeling an already-created PR as a failure.
    */
@@ -381,7 +383,8 @@ async function runCodeHandlerWithinDeadline(
     signal: budget.signal,
   });
 
-  const executor = bindExecutorDeadline(createWorkspaceExecutor(worktreePath), budget);
+  const executor = bindExecutorDeadline(createWorkspaceExecutor(worktreePath,
+    deps.workspaceExecutorProfile ? { profile: deps.workspaceExecutorProfile } : {}), budget);
   const system = composeSystemPrompt({ taskInstructions: CODE_TASK_INSTRUCTIONS });
   const projectSection = formatProjectContext(
     loadProjectContext(worktreePath),

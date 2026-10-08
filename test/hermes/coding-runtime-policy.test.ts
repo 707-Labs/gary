@@ -41,3 +41,24 @@ test('fixed trial policy bounds every stage and freezes nested review settings',
   expect(Object.isFrozen(HERMES_CODING_RUNTIME_POLICY.review)).toBe(true);
   expect(Object.isFrozen(HERMES_CODING_RUNTIME_POLICY.review.providerOrder)).toBe(true);
 });
+
+
+test('fixed coding executor and environment are deeply frozen and included in admission identity', () => {
+  const executor=HERMES_CODING_RUNTIME_POLICY.executor;
+  expect(HERMES_CODING_RUNTIME_POLICY.version).toBe(3);
+  expect(executor.image).toBe('sha256:0efb49a8f21794948395f7bec2c15557a78473acd760207613fe7714e7c47f8c');
+  expect(executor.bunCacheVolume).toBe('gary-bun-cache-20261007-node24');
+  expect({cpus:executor.cpus,memory:executor.memory,pidsLimit:executor.pidsLimit}).toEqual({cpus:'4',memory:'12g',pidsLimit:512});
+  expect(executor.storybookScratch).toBe(true);
+  expect(executor.fixedEnvironment).toEqual({PUBLIC_PARTYKIT_HOST:'party.mulligan-labs.com',VITEST_MAX_WORKERS:'2',
+    TMPDIR:'/workspace/node_modules/.cache/gary-preflight-tmp',WRANGLER_SEND_METRICS:'false',DO_NOT_TRACK:'1',STORYBOOK_DISABLE_TELEMETRY:'1'});
+  expect(Object.isFrozen(executor)).toBe(true);expect(Object.isFrozen(executor.fixedEnvironment)).toBe(true);
+  const config={issueId:'ticket'};
+  for(const changed of [{...executor,image:'other'},{...executor,bunCacheVolume:'other'},
+      {...executor,storybookScratch:false},
+      {...executor,cpus:'8'},{...executor,memory:'24g'},{...executor,pidsLimit:1024},
+      {...executor,fixedEnvironment:{...executor.fixedEnvironment,VITEST_MAX_WORKERS:'3'}}]) {
+    expect(fingerprintHermesCodingActivation(config)).not.toBe('sha256:'+fingerprintJson({config,
+      policy:{...HERMES_CODING_RUNTIME_POLICY,executor:changed}}).sha256);
+  }
+});

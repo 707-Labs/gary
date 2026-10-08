@@ -189,3 +189,12 @@ test('same admitted runner retains original baseline across a verified repair',a
   expect(repaired[0]!.actionId).toBe(first.actionId);expect(repaired[0]!.requestId).not.toBe(first.requestId);
   expect(f.counts()).toEqual({requests:8,launches:2});expect(f.ledger.status(ID)!.attemptCount).toBe(8);
 });
+
+
+test('preparation command limit matches runtime before any action admission',()=>{
+  const f=configFixture();
+  f.config.policy.preparationCommands=Array.from({length:8},(_,i)=>'true # trusted preparation '+i);f.save();
+  expect(loadHermesActivationConfig(f.path).policy.preparationCommands).toHaveLength(8);
+  f.config.policy.preparationCommands.push('true # ninth command');f.save();
+  expect(()=>loadHermesActivationConfig(f.path)).toThrow('hermes_activation_rejected');
+});

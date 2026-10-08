@@ -1,5 +1,6 @@
 /** Public startup switches only. Secrets are loaded by the isolated host Slack loader. */
 import { isAbsolute, normalize } from 'node:path';
+import { HERMES_CODING_RUNTIME_POLICY } from './hermes/coding-runtime-policy.ts';
 
 export interface HostStartupConfig {
   mode: 'legacy' | 'hermes-canary' | 'hermes-readonly-canary';
@@ -27,10 +28,13 @@ export function loadHostStartupConfig(env: Readonly<Record<string, string | unde
   }
   // The host's existing executor remains the only workspace mutation authority.
   // Require the reviewed Docker path; never silently use LocalExecutor here.
-  if (env.GARY_EXECUTOR !== 'docker' || env.GARY_EXECUTOR_NETWORK !== 'none'
-      || env.GARY_EXECUTOR_IMAGE !== 'sha256:e77edfc6e20402c7ed9f447dca81dc61e277c2a39199963f455a37a03dfcedf4'
-      || env.DOCKER_HOST !== 'unix:///Users/tanner/.colima/default/docker.sock' || Boolean(env.DOCKER_CONTEXT)
-      || (env.GARY_BUN_CACHE_VOLUME !== undefined && env.GARY_BUN_CACHE_VOLUME !== 'gary-bun-cache')) {
+  const executor = HERMES_CODING_RUNTIME_POLICY.executor;
+  const reviewedPair = mode === 'hermes-canary'
+    ? env.GARY_EXECUTOR_IMAGE === executor.image && env.GARY_BUN_CACHE_VOLUME === executor.bunCacheVolume
+    : env.GARY_EXECUTOR_IMAGE === 'sha256:e77edfc6e20402c7ed9f447dca81dc61e277c2a39199963f455a37a03dfcedf4'
+      && (env.GARY_BUN_CACHE_VOLUME === undefined || env.GARY_BUN_CACHE_VOLUME === 'gary-bun-cache');
+  if (!reviewedPair || env.GARY_EXECUTOR !== 'docker' || env.GARY_EXECUTOR_NETWORK !== 'none'
+      || env.DOCKER_HOST !== 'unix:///Users/tanner/.colima/default/docker.sock' || Boolean(env.DOCKER_CONTEXT)) {
     throw new Error('hermes_requires_reviewed_docker_executor');
   }
   const activationPath = path(env.GARY_HERMES_ACTIVATION_PATH);

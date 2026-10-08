@@ -40,7 +40,7 @@ const policySchema = z.object({
   voicePrinciples: text(65_536), readTicketIdentifiers: unique(z.string().regex(/^[A-Z]+-\d+$/), 256, 1),
   publicFetch: z.object({ policy: fetchPolicy }).strict(),
   cloudflare: z.object({ allowedServices: unique(text(512).refine(s => !/[\x00-\x1f]/.test(s)), 256), allowedDatabases: unique(text(512).refine(s => !/[\x00-\x1f]/.test(s)), 256) }).strict(),
-  preparationCommands: unique(checkCommand, 16),
+  preparationCommands: unique(checkCommand, 8),
 }).strict();
 const activationSchema = z.object({
   version: z.literal(1), issueId: z.string().uuid(), repo: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),

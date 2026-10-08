@@ -306,7 +306,7 @@ function makeFixture() {
     workspaceRoot: "/offline/workspaces/FIX-1",
     run, readFile: async () => "fixture", writeFile: async () => {}, listFiles: async () => [], grep: async () => [],
   };
-  restoreAfter(spyOn(executorFactory, "createWorkspaceExecutor")).mockReturnValue(executor);
+  const factory = restoreAfter(spyOn(executorFactory, "createWorkspaceExecutor")).mockReturnValue(executor);
   restoreAfter(spyOn(skills, "loadProjectContext")).mockReturnValue({ claudeMd: null, agentsMd: null, hasBeads: false });
   restoreAfter(spyOn(skills, "loadSkillIndex")).mockReturnValue([]);
   restoreAfter(spyOn(git, "ensureBareClone")).mockResolvedValue("/offline/repos/fixture.git");
@@ -334,7 +334,7 @@ function makeFixture() {
     review: { providerOrder: ["z.ai"], maxRounds: 2, iterationCap: 15, timeoutMs: 1000 },
   };
   return {
-    db, deps, run, hasCommits, primary, review, complete, push, openPr, rebase, postComment, pr, gitCommand,
+    db, deps, run, hasCommits, primary, review, complete, push, openPr, rebase, postComment, pr, gitCommand, factory,
     expire() { now += 1001; },
     invoke: (options: Pick<CodeHandlerArgs, "draftPr"> = {}) => runCodeHandler(deps, { issue, comments: [], repo: "fixture/repo", scope: "S", ...options }),
   };
@@ -731,5 +731,26 @@ describe("CODE handler admitted loop dependency", () => {
       expect(f.push).not.toHaveBeenCalled(); expect(f.openPr).not.toHaveBeenCalled();
       expect(spend.status(issue.id)?.state).toBe("closed"); expect(spend.status(issue.id)?.attemptCount).toBe(0);
     } finally { spend.close(); }
+  });
+});
+
+
+describe('trusted parent executor profile at the CODE handler boundary',()=>{
+  it('primary, host check and both reviewer attempts reuse the same configured executor',async()=>{
+    const profile={image:'sha256:'+'a'.repeat(64),bunCacheVolume:'fixture-cache',cpus:'4',memory:'12g',pidsLimit:512,fixedEnvironment:Object.freeze({VITEST_MAX_WORKERS:'2'})};
+    f.deps.workspaceExecutorProfile=profile;
+    let primaryExecutor:Executor|undefined;
+    f.primary.mockImplementation(async args=>{primaryExecutor=args.executor;await args.executor.run('fixture primary check');return loopResult('finished');});
+    f.review.mockResolvedValueOnce({kind:'failed',reason:'offline retry'}).mockResolvedValueOnce(reviewResult());
+    expect((await f.invoke()).status).toBe('pr_opened');
+    expect(f.factory).toHaveBeenCalledTimes(1);
+    expect(f.factory.mock.calls[0]).toEqual(['/offline/workspaces/FIX-1',{profile}]);
+    expect(f.review).toHaveBeenCalledTimes(2);
+    for(const [args] of f.review.mock.calls)expect(args.executor).toBe(primaryExecutor!);
+    expect(f.run.mock.calls.map(([command])=>command)).toEqual(['fixture primary check','bun run check']);
+  });
+  it('legacy omission passes no profile',async()=>{
+    expect((await f.invoke()).status).toBe('pr_opened');
+    expect(f.factory.mock.calls[0]).toEqual(['/offline/workspaces/FIX-1',{}]);
   });
 });

@@ -18,6 +18,10 @@ export interface DockerExecutorOptions {
   pidsLimit?: number;
   dockerBinary?: string;
   bunCacheVolume?: string;
+  /** Host-selected defaults applied to every invocation, including file operations. */
+  fixedEnvironment?: Readonly<Record<string, string>>;
+  /** Coding-only, disposable 512 MiB tmpfs at the fixed Storybook output path. */
+  storybookScratch?: true;
 }
 
 interface InvocationOptions extends DeadlineOptions {
@@ -45,6 +49,8 @@ export class DockerExecutor implements Executor {
   private readonly gid: number;
   private readonly gitCommonDir: string | null;
   private readonly bunCacheVolume: string | null;
+  private readonly fixedEnvironment: Readonly<Record<string, string>>;
+  private readonly storybookScratch: boolean;
 
   constructor(workspaceRoot: string, opts: DockerExecutorOptions) {
     if (!isAbsolute(workspaceRoot)) {
@@ -55,6 +61,11 @@ export class DockerExecutor implements Executor {
     this.image = opts.image;
     this.readOnly = opts.readOnly ?? false;
     this.networkMode = opts.networkMode ?? "none";
+    if (opts.storybookScratch !== undefined && (opts.storybookScratch !== true
+        || this.readOnly || this.networkMode !== "none")) {
+      throw new Error("invalid_storybook_scratch");
+    }
+    this.storybookScratch = opts.storybookScratch === true;
     this.cpus = opts.cpus ?? "4";
     this.memory = opts.memory ?? "12g";
     this.pidsLimit = opts.pidsLimit ?? 512;
@@ -63,6 +74,15 @@ export class DockerExecutor implements Executor {
     this.gid = process.getgid?.() ?? 1000;
     this.gitCommonDir = discoverGitCommonDir(this.workspaceRoot);
     this.bunCacheVolume = opts.bunCacheVolume?.trim() || null;
+    const fixed = opts.fixedEnvironment ?? {};
+    const entries = Object.getOwnPropertyDescriptors(fixed);
+    const reserved = new Set(["CI", "LANG", "HOME", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "BUN_INSTALL_CACHE_DIR"]);
+    if (Object.keys(entries).length > 32 || Object.entries(entries).some(([key, descriptor]) =>
+      !SAFE_ENV_NAME.test(key) || reserved.has(key) || !Object.hasOwn(descriptor, "value")
+      || typeof descriptor.value !== "string" || descriptor.value.includes("\0") || descriptor.value.length > 4096)) {
+      throw new Error("invalid_fixed_executor_environment");
+    }
+    this.fixedEnvironment = Object.freeze(Object.fromEntries(Object.entries(entries).map(([key, descriptor]) => [key, descriptor.value as string])));
     assertMountSafe(this.workspaceRoot);
     if (this.gitCommonDir) assertMountSafe(this.gitCommonDir);
     if (this.bunCacheVolume && !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(this.bunCacheVolume)) {
@@ -200,6 +220,9 @@ export class DockerExecutor implements Executor {
       "--mount",
       `type=bind,src=${this.workspaceRoot},dst=/workspace${mountMode}`,
     ];
+    if (this.storybookScratch) {
+      args.push("--tmpfs", `/workspace/storybook-static:rw,noexec,nosuid,nodev,size=512m,uid=${this.uid},gid=${this.gid}`);
+    }
     if (this.gitCommonDir) {
       args.push(
         "--mount",
@@ -214,10 +237,15 @@ export class DockerExecutor implements Executor {
         "BUN_INSTALL_CACHE_DIR=/tmp/bun-cache",
       );
     }
-    for (const [key, value] of Object.entries(opts.env ?? {}).sort()) {
+    const environment = { ...this.fixedEnvironment };
+    for (const [key, value] of Object.entries(opts.env ?? {})) {
       if (!SAFE_ENV_NAME.test(key)) throw new Error(`invalid environment variable name: ${key}`);
-      args.push("--env", `${key}=${value}`);
+      if (Object.hasOwn(this.fixedEnvironment, key) && value !== this.fixedEnvironment[key]) {
+        throw new Error("fixed_executor_environment_conflict");
+      }
+      environment[key] = value;
     }
+    for (const [key, value] of Object.entries(environment).sort()) args.push("--env", `${key}=${value}`);
     args.push("--workdir", opts.cwd ?? "/workspace", this.image, ...command);
 
     throwIfExpired(opts);

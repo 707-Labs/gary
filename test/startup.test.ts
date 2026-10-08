@@ -8,6 +8,7 @@ import type { Config } from '../src/config.ts';
 import type { StartupDependencies } from '../src/startup.ts';
 import { HERMES_CANARY_WORKER_IMAGE, HERMES_CANARY_CHILD_IMAGE, type HermesActivationConfig } from '../src/hermes/activation.ts';
 import { bindCanonicalCodeAction } from '../src/hermes/canonical-admission.ts';
+import { HERMES_CODING_RUNTIME_POLICY } from '../src/hermes/coding-runtime-policy.ts';
 import { openDb } from '../src/state/db.ts';
 import { SpendLedger } from '../src/spend.ts';
 import { setClassification, upsertTicket } from '../src/state/queries.ts';
@@ -48,7 +49,8 @@ function fixture() {
     cloudflare:null,runtime:{pollIntervalMs:1,maxAttemptsPerTicket:1,circuitBreakerWindowHours:6,maxCiAttempts:1,agentLoopMaxIterations:50,agentLoopTimeoutMs:30_000,stalePrAfterMs:1000},
     review:{providerOrder:['deepseek'],maxRounds:1,iterationCap:5,timeoutMs:1000},
   };
-  const env={GARY_RUNTIME_MODE:'hermes-canary',GARY_HERMES_ACTIVATION_PATH:activationPath,GARY_EXECUTOR:'docker',GARY_EXECUTOR_NETWORK:'none',GARY_EXECUTOR_IMAGE:HERMES_CANARY_CHILD_IMAGE,
+  const env={GARY_RUNTIME_MODE:'hermes-canary',GARY_HERMES_ACTIVATION_PATH:activationPath,GARY_EXECUTOR:'docker',GARY_EXECUTOR_NETWORK:'none',GARY_EXECUTOR_IMAGE:HERMES_CODING_RUNTIME_POLICY.executor.image,
+      GARY_BUN_CACHE_VOLUME:HERMES_CODING_RUNTIME_POLICY.executor.bunCacheVolume,
     DOCKER_HOST:'unix:///Users/tanner/.colima/default/docker.sock'};
   let networkCalls=0;
   const deps:StartupDependencies={env,config:()=>config,linear:()=>({} as LinearAdapter),github:()=>({} as GitHubClient),
@@ -62,6 +64,7 @@ test('actual main selects the real Hermes factory and an injected failure never 
     runLoop:async args=>{
       polls++;expect([...args.allowedIssueIds!]).toEqual([issueId]);expect([...args.allowedActionTypes!]).toEqual(['classify','start_coding']);
       expect(typeof args.onCodePublication).toBe('function');
+      expect(args.codingExecutorProfile).toBe(HERMES_CODING_RUNTIME_POLICY.executor);
       expect(args.review).toEqual({providerOrder:['deepseek'],maxRounds:1,iterationCap:6,timeoutMs:180_000});
       expect(f.config.review.iterationCap).toBe(5); // Legacy config cannot widen or shrink the fixed trial review contract.
       args.spend!.createCampaign('fixture',10);args.spend!.enrollTicket('fixture',issueId,10,{draftPr:true});
@@ -87,7 +90,7 @@ test('actual main selects the real Hermes factory and an injected failure never 
 test('actual legacy main preserves the existing DeepSeek-only campaign and omits all canary hooks',async()=>{
   const f=fixture(); let polls=0;
   f.config.providers=[...f.config.providers,{name:'z.ai',apiKey:'fake-zai',baseUrl:'https://api.z.ai/api/anthropic',model:'glm-5.3',defaultBackoffMs:1000}];
-  await main({...f.deps,env:{},runLoop:async args=>{polls++;expect(args.createAdmittedCodeLoop).toBeUndefined();expect(args.allowedIssueIds).toBeUndefined();expect(args.codingTrial).toBeUndefined();
+  await main({...f.deps,env:{},runLoop:async args=>{polls++;expect(args.createAdmittedCodeLoop).toBeUndefined();expect(args.allowedIssueIds).toBeUndefined();expect(args.codingTrial).toBeUndefined();expect(args.codingExecutorProfile).toBeUndefined();
     expect(args.glm.chain.providers.map(p=>p.name)).toEqual(['deepseek']);expect(args.review).toEqual(f.config.review);}});
   expect(polls).toBe(1);expect(f.networkCalls()).toBe(0);
 });

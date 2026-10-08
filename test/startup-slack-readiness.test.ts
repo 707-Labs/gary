@@ -12,6 +12,7 @@ import { runProcess } from '../src/executors/process.ts';
 import type { GaryRuntimeLauncher } from '../src/hermes/gary-loop-adapter.ts';
 import { HERMES_CANARY_CHILD_IMAGE, HERMES_CANARY_WORKER_IMAGE, type HermesActivationConfig } from '../src/hermes/activation.ts';
 import { bindCanonicalCodeAction } from '../src/hermes/canonical-admission.ts';
+import { HERMES_CODING_RUNTIME_POLICY } from '../src/hermes/coding-runtime-policy.ts';
 import type { CodePublicationReceipt } from '../src/handlers/code.ts';
 import { openDb } from '../src/state/db.ts';
 import { recordActionEnd, recordPr, setClassification, upsertTicket } from '../src/state/queries.ts';
@@ -75,7 +76,8 @@ async function fixture(){
     run:async(command,options)=>runProcess('/bin/bash',['-c',command],{...options,cwd:workspace,env,timeoutMs:options?.timeoutMs??10_000})};
   const sockets:FakeSocket[]=[],posts:Record<string,unknown>[]=[],methods:string[]=[];let modelCalls=0,launches=0,credentialLoads=0;
   const deps:StartupDependencies={config:()=>config,linear:()=>({} as LinearAdapter),github:()=>({} as GitHubClient),db:path=>openDb(path),ledger:path=>new SpendLedger(path),
-    env:{GARY_RUNTIME_MODE:'hermes-canary',GARY_HERMES_ACTIVATION_PATH:activationPath,GARY_EXECUTOR:'docker',GARY_EXECUTOR_NETWORK:'none',GARY_EXECUTOR_IMAGE:HERMES_CANARY_CHILD_IMAGE,
+    env:{GARY_RUNTIME_MODE:'hermes-canary',GARY_HERMES_ACTIVATION_PATH:activationPath,GARY_EXECUTOR:'docker',GARY_EXECUTOR_NETWORK:'none',GARY_EXECUTOR_IMAGE:HERMES_CODING_RUNTIME_POLICY.executor.image,
+      GARY_BUN_CACHE_VOLUME:HERMES_CODING_RUNTIME_POLICY.executor.bunCacheVolume,
       DOCKER_HOST:'unix:///Users/tanner/.colima/default/docker.sock',GARY_SLACK_ENABLED:'1',GARY_SLACK_CREDENTIALS_FILE:credentialsPath},
     fetch:(async(input:RequestInfo|URL,init?:RequestInit)=>{
       const request=new Request(input,init);expect(request.url).toBe('https://api.deepseek.com/anthropic/v1/messages');
@@ -108,6 +110,7 @@ for(const mode of modes)test('actual startup Slack readiness: '+mode,async()=>{
   const f=await fixture();const launch=f.deps.launch!;
   if(mode==='native-error')f.deps.launch=async(...args)=>({...await launch(...args),status:'error',reason:'offline_negative_outcome'});
   await main({...f.deps,runLoop:async args=>{
+    expect(args.codingExecutorProfile).toBe(HERMES_CODING_RUNTIME_POLICY.executor);
     const refresh=async()=>{expect(typeof args.onTickComplete).toBe('function');await args.onTickComplete!({candidatesConsidered:0,actionsTaken:[]});};
     const noSend=()=>{expect(f.posts).toEqual([]);expect(args.db.query('SELECT count(*) AS n FROM gary_slack_outbox').get()).toEqual({n:0});};
     noSend();expect(f.counts()).toEqual({modelCalls:0,launches:0,credentialLoads:1});
