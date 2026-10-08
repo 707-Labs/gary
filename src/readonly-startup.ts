@@ -17,17 +17,27 @@ import { log } from './logger.ts';
 export interface ReadonlyStartupDependencies {
   /** All injection points are trusted offline-test code, never configuration data. */
   readonlySetup?: () => { stateDir: string; provider: ProviderConfig };
-  verifyReadonlyRelease?: (expected: string) => void;
+  verifyReadonlyRelease?: (expected: string, slackRelease?:string) => void;
   readonlyCanary?: typeof createReadonlyCanary;
   waitReadonlyIdle?: (signal: AbortSignal, refresh: () => Promise<void>) => Promise<void>;
 }
-function verifyRelease(expected: string): void {
-  const cwd = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+export function verifyReadonlyRelease(expected: string, slackRelease?:string, cwd=resolve(dirname(fileURLToPath(import.meta.url)), '..')): void {
   const env = { PATH: '/usr/bin:/bin', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
   const git = (args: string[]) => execFileSync('/usr/bin/git', ['--no-optional-locks', '-c', 'core.fsmonitor=false', ...args],
     { cwd, env, encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-  if (git(['rev-parse', 'HEAD']) !== expected || git(['status', '--porcelain=v1', '--untracked-files=no'])) {
+  if(!/^[a-f0-9]{40}$/.test(expected)||(slackRelease!==undefined&&!/^[a-f0-9]{40}$/.test(slackRelease)))throw new Error('readonly_release_mismatch');
+  if (git(['rev-parse', 'HEAD']) !== (slackRelease??expected) || git(['status', '--porcelain=v1', '--untracked-files=no'])) {
     throw new Error('readonly_release_mismatch');
+  }
+  if(slackRelease!==undefined) {
+    git(['merge-base','--is-ancestor',expected,slackRelease]);
+    // Only this explicitly pinned, independently reviewed Slack patch may reuse
+    // the existing model/tool proof. No runtime, provider, executor, dependency,
+    // entrypoint, native worker, or receipt source is allowed to differ.
+    const allowed=new Set(['src/slack/service.ts','src/host-config.ts','src/readonly-startup.ts',
+      'test/slack/service.test.ts','test/host-config.test.ts','test/readonly-startup.test.ts']);
+    const changed=git(['diff','--name-only',expected,slackRelease]).split('\n').filter(Boolean);
+    if(!changed.length||changed.some(file=>!allowed.has(file)))throw new Error('readonly_slack_release_scope_mismatch');
   }
 }
 async function idle(signal: AbortSignal, refresh: () => Promise<void>): Promise<void> {
@@ -46,7 +56,7 @@ export async function runReadonlyGaryHost(host: HostStartupConfig, deps: Startup
     throw new Error('readonly_startup_configuration_rejected');
   }
   const config = loadReadonlyCanaryConfig(host.activationPath);
-  (deps.verifyReadonlyRelease ?? verifyRelease)(config.releaseCommit);
+  (deps.verifyReadonlyRelease ?? verifyReadonlyRelease)(config.releaseCommit,host.readonlySlackReleaseCommit);
   const setup = deps.readonlySetup ? deps.readonlySetup() : (() => {
     const providers = loadProviderConfigs().filter(provider => provider.name === 'deepseek');
     if (providers.length !== 1) throw new Error('readonly_provider_unavailable');
@@ -76,11 +86,16 @@ export async function runReadonlyGaryHost(host: HostStartupConfig, deps: Startup
       route: { provider: 'deepseek', model: 'deepseek-v4-pro', providerApiKey: provider.apiKey, fetch: request => rawFetch(request) },
       signal: controller.signal, ...(deps.launch ? { launch: deps.launch } : {}) });
     const transport = deps.slackTransport ? deps.slackTransport(credentials) : createSlackTransport({ credentials });
-    slack = createSlackService({ db, transport, checkHostHealth: canary.check, approvedChannelIds: [] });
+    if(host.readonlySlackReleaseCommit&&!canary.check().ready)throw new Error('readonly_slack_release_requires_existing_receipt');
+    slack = createSlackService({ db, transport, checkHostHealth: canary.check, approvedChannelIds: [],
+      ...(host.slack.tannerDirectMessages?{tannerDirectMessages:true as const}:{}) });
     const initial = await slack.start();
     if (controller.signal.aborted) return;
     if (!initial.running || !initial.identityVerified || !initial.socketHealthy) throw new Error('readonly_slack_identity_unavailable');
-    if (!canary.check().ready) await canary.run();
+    if (!canary.check().ready) {
+      if(host.readonlySlackReleaseCommit)throw new Error('readonly_slack_release_requires_existing_receipt');
+      await canary.run();
+    }
     if (controller.signal.aborted) return;
     const ready = await slack.refreshHealth();
     if (!ready.hostReady || ready.readinessKind !== 'readonly_runtime' || !ready.identityVerified || !ready.socketHealthy

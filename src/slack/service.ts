@@ -9,6 +9,7 @@ export const READY_DM_TEXT = "i'm gary. the Hermes runtime is up and running, an
 export const READONLY_READY_DM_TEXT = "i'm gary. the Hermes runtime is up, my read-only model/tool check passed, and this Slack connection is verified. coding still follows the approved Linear flow.";
 const READY_STATUS = "i'm gary. the Hermes runtime has passed its current readiness checks. this Slack connection only reports status; please use the normal approved Linear flow for coding work.";
 const NOT_READY_STATUS = "i'm gary. the Hermes runtime has not passed its current readiness checks. this Slack connection only reports status; please use the normal approved Linear flow for coding work. i haven't started a task from this message.";
+export const PRIVATE_DM_STATUS = "i got your message. this private DM connection is working. i can report runtime status here; coding work still goes through the approved Linear flow. i haven't started a task from this message.";
 const CHANNEL = /^[CG][A-Z0-9]{5,32}$/;
 const TIMESTAMP = /^\d{10,16}\.\d{6}$/;
 const RECEIPT = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
@@ -39,6 +40,8 @@ export interface SlackServiceOptions {
   approvedChannelIds?:readonly string[];
   /** Only Tanner and optionally explicitly approved Ben. Default Tanner. */
   allowedUserIds?:readonly string[];
+  /** Explicitly approved Tanner-only status replies; no model or history access. */
+  tannerDirectMessages?:true;
 }
 export interface SlackServiceHealth {
   running:boolean; identityVerified:boolean; socketHealthy:boolean; hostReady:boolean;
@@ -55,6 +58,7 @@ export interface SlackService {
 interface OutboxRow { status:'sent'|'unknown'|'not_sent'; }
 
 export function createSlackService(options:SlackServiceOptions):SlackService {
+  if(options.tannerDirectMessages!==undefined&&options.tannerDirectMessages!==true)throw new Error('invalid_slack_dm_switch');
   const channels=[...(options.approvedChannelIds??[])], users=[...(options.allowedUserIds??[GARY_SLACK.tannerId])];
   if (channels.length>64 || new Set(channels).size!==channels.length || channels.some(id=>!CHANNEL.test(id))) throw new Error('invalid_slack_channel_allowlist');
   if (new Set(users).size!==users.length || users.some(id=>id!==GARY_SLACK.tannerId && id!==GARY_SLACK.benId)) throw new Error('invalid_slack_user_allowlist');
@@ -78,8 +82,9 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
         throw new Error('slack_durability_unverified');
       }
     } catch {throw new Error('slack_durability_unverified');}
-    options.db.exec(`CREATE TABLE IF NOT EXISTS gary_slack_outbox (
-      delivery_key TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('ready','mention')),
+    // A separate DM outbox leaves every historical ready/mention claim intact.
+    for(const table of options.tannerDirectMessages?['gary_slack_outbox','gary_slack_dm_outbox']:['gary_slack_outbox'])options.db.exec(`CREATE TABLE IF NOT EXISTS ${table} (
+      delivery_key TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN (${table==='gary_slack_dm_outbox'?"'dm'":"'ready','mention'"})),
       request_id TEXT NOT NULL, app_id TEXT NOT NULL, team_id TEXT NOT NULL, bot_user_id TEXT NOT NULL,
       recipient_id TEXT NOT NULL, target_channel TEXT NOT NULL, thread_ts TEXT,
       content_sha256 TEXT NOT NULL, readiness_receipt_id TEXT, claim_id TEXT NOT NULL,
@@ -103,12 +108,13 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
     } catch {identityVerified=false;}
     return identityVerified;
   }
-  async function sendOnce(input:{key:string;kind:'ready'|'mention';requestId:string;recipient:string;channel:string;threadTs?:string;text:string}):Promise<void> {
+  async function sendOnce(input:{key:string;kind:'ready'|'mention'|'dm';requestId:string;recipient:string;channel:string;threadTs?:string;text:string}):Promise<void> {
     if(!live()||!identityVerified||!options.transport.socketHealthy())return;
+    const table=input.kind==='dm'?'gary_slack_dm_outbox':'gary_slack_outbox';
     const claim=randomUUID();
     // An exclusive durable UNKNOWN claim precedes the network request. A process
     // crash, ambiguous response, or duplicate process can never trigger an automatic retry.
-    const claimed=options.db.query(`INSERT OR IGNORE INTO gary_slack_outbox
+    const claimed=options.db.query(`INSERT OR IGNORE INTO ${table}
       (delivery_key,kind,request_id,app_id,team_id,bot_user_id,recipient_id,target_channel,thread_ts,
        content_sha256,readiness_receipt_id,claim_id,status,claimed_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'unknown',?)`).run(input.key,input.kind,input.requestId,GARY_SLACK.appId,GARY_SLACK.teamId,
@@ -126,7 +132,7 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
         } else if(!result.ok && result.outcome==='definitely_not_sent') {status='not_sent';error='transport_declined';}
       }
     } catch { /* Retain unknown. Never infer non-delivery from timeout or cancellation. */ }
-    options.db.query(`UPDATE gary_slack_outbox SET status=?, completed_at=?, slack_channel=?, slack_ts=?, error_code=?
+    options.db.query(`UPDATE ${table} SET status=?, completed_at=?, slack_channel=?, slack_ts=?, error_code=?
       WHERE delivery_key=? AND claim_id=? AND status='unknown'`).run(status,new Date().toISOString(),channel,ts,error,input.key,claim);
   }
   async function refresh():Promise<SlackServiceHealth> {
@@ -162,6 +168,23 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
     if(payload.type!=='event_callback'||payload.team_id!==GARY_SLACK.teamId||payload.api_app_id!==GARY_SLACK.appId
       ||typeof payload.event_id!=='string'||!/^Ev[A-Za-z0-9]{1,80}$/.test(payload.event_id)||!object(payload.event))return;
     const event=payload.event;
+    if(event.type==='message') {
+      if(!options.tannerDirectMessages||event.channel_type!=='im'||event.user!==GARY_SLACK.tannerId
+        ||event.bot_id!==undefined||event.subtype!==undefined||typeof event.channel!=='string'||!/^D[A-Z0-9]{5,32}$/.test(event.channel)
+        ||typeof event.text!=='string'||!event.text.trim()||event.text.length>40_000
+        ||typeof event.ts!=='string'||!TIMESTAMP.test(event.ts)
+        ||(event.thread_ts!==undefined&&(typeof event.thread_ts!=='string'||!TIMESTAMP.test(event.thread_ts))))return;
+      // The existing verified ready delivery binds this exact private conversation.
+      // No conversations.history/info lookup, shared channels, or other users.
+      const ready=options.db.query<{slack_channel:string},[string]>("SELECT slack_channel FROM gary_slack_outbox WHERE delivery_key=? AND status='sent'").get(readyKey);
+      if(ready?.slack_channel!==event.channel)return;
+      await refreshHealth();
+      if(!live()||!identityVerified||!options.transport.socketHealthy())return;
+      await sendOnce({key:`dm:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${payload.event_id}`,kind:'dm',requestId:payload.event_id,
+        recipient:event.user,channel:event.channel,threadTs:(event.thread_ts??event.ts) as string,
+        text:hostReady?PRIVATE_DM_STATUS:NOT_READY_STATUS});
+      return;
+    }
     if(event.type!=='app_mention'||event.bot_id!==undefined||event.subtype!==undefined||typeof event.user!=='string'
       ||!userSet.has(event.user)||typeof event.channel!=='string'||!channelSet.has(event.channel)
       ||typeof event.text!=='string'||event.text.length>40_000||!event.text.includes(`<@${GARY_SLACK.botUserId}>`)

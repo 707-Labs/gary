@@ -1,5 +1,7 @@
 import { afterEach, expect, test } from 'bun:test';
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { verifyReadonlyRelease } from '../src/readonly-startup.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { main } from '../src/index.ts';
@@ -46,6 +48,30 @@ test('actual main readonly mode starts verified Slack, runs one canary, sends ex
 test('restart reuses verified readonly evidence but cannot repeat the authorized ready notification',async()=>{
   const f=fixture();await main(f.deps);await main(f.deps);
   expect(f.counts().runs).toBe(1);expect(f.counts().idle).toBe(2);expect(f.posts).toHaveLength(1);
+});
+test('pinned Slack-only release requires existing readiness and can never run a new canary',async()=>{
+  const f=fixture();f.deps.env={...f.deps.env,GARY_SLACK_TANNER_DM_ENABLED:'1',GARY_READONLY_SLACK_RELEASE_COMMIT:'b'.repeat(40)};
+  f.deps.verifyReadonlyRelease=(expected,actual)=>{expect(expected).toBe(f.config.releaseCommit);expect(actual).toBe('b'.repeat(40));};
+  await expect(main(f.deps)).rejects.toThrow('readonly_slack_release_requires_existing_receipt');
+  expect(f.counts().runs).toBe(0);expect(f.counts().starts).toBe(0);expect(f.posts).toEqual([]);
+  f.setReady();await main(f.deps);expect(f.counts().runs).toBe(0);expect(f.counts().idle).toBe(1);
+});
+test('compatibility verifies exact clean descendant and rejects any non-Slack production change',()=>{
+  const root=realpathSync(mkdtempSync(join(tmpdir(),'gary-slack-release-')));roots.push(root);
+  const git=(...args:string[])=>execFileSync('/usr/bin/git',args,{cwd:root,encoding:'utf8',env:{PATH:'/usr/bin:/bin',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null'}}).trim();
+  git('init','-q');git('config','user.name','Offline Test');git('config','user.email','offline@example.invalid');
+  mkdirSync(join(root,'src/slack'),{recursive:true});mkdirSync(join(root,'src/hermes'),{recursive:true});
+  writeFileSync(join(root,'src/slack/service.ts'),'old');writeFileSync(join(root,'src/hermes/readonly-canary.ts'),'unchanged');
+  git('add','.');git('commit','-qm','fixture base');const base=git('rev-parse','HEAD');
+  verifyReadonlyRelease(base,undefined,root);
+  writeFileSync(join(root,'src/slack/service.ts'),'reviewed patch');git('add','.');git('commit','-qm','fixture DM');const slack=git('rev-parse','HEAD');
+  verifyReadonlyRelease(base,slack,root);
+  expect(()=>verifyReadonlyRelease(base,undefined,root)).toThrow('readonly_release_mismatch');
+  expect(()=>verifyReadonlyRelease(base,'a'.repeat(40),root)).toThrow('readonly_release_mismatch');
+  writeFileSync(join(root,'src/slack/service.ts'),'dirty');expect(()=>verifyReadonlyRelease(base,slack,root)).toThrow('readonly_release_mismatch');
+  writeFileSync(join(root,'src/slack/service.ts'),'reviewed patch');writeFileSync(join(root,'src/hermes/readonly-canary.ts'),'changed proof');
+  git('add','.');git('commit','-qm','fixture forbidden change');const forbidden=git('rev-parse','HEAD');
+  expect(()=>verifyReadonlyRelease(base,forbidden,root)).toThrow('readonly_slack_release_scope_mismatch');
 });
 test('wrong release, wrong Slack identity and failed canary cannot send a ready DM',async()=>{
   for(const failure of ['revision','identity','canary'] as const){

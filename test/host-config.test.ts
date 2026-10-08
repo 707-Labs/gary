@@ -64,3 +64,11 @@ test('readonly retains the original image and default cache and cannot inherit t
     {GARY_EXECUTOR_IMAGE:canary.GARY_EXECUTOR_IMAGE,GARY_BUN_CACHE_VOLUME:'gary-bun-cache'},
   ])expect(()=>loadHostStartupConfig({...env,...override})).toThrow('hermes_requires_reviewed_docker_executor');
 });
+test('Tanner DM opt-in and exact Slack release pin are restricted to readonly mode',()=>{
+  const env={...canary,GARY_RUNTIME_MODE:'hermes-readonly-canary',GARY_EXECUTOR_IMAGE:READONLY_IMAGE,GARY_BUN_CACHE_VOLUME:'gary-bun-cache',GARY_SLACK_ENABLED:'1',GARY_SLACK_CREDENTIALS_FILE:'/private/runtime/slack.env',
+    GARY_SLACK_TANNER_DM_ENABLED:'1',GARY_READONLY_SLACK_RELEASE_COMMIT:'b'.repeat(40)};
+  expect(loadHostStartupConfig(env)).toMatchObject({readonlySlackReleaseCommit:'b'.repeat(40),slack:{tannerDirectMessages:true,approvedChannelIds:[]}});
+  for(const update of [{GARY_RUNTIME_MODE:'legacy'},{GARY_RUNTIME_MODE:'hermes-canary'},{GARY_SLACK_ENABLED:'0'},
+    {GARY_SLACK_TANNER_DM_ENABLED:'yes'},{GARY_SLACK_TANNER_DM_ENABLED:'0'},{GARY_READONLY_SLACK_RELEASE_COMMIT:'main'}])
+    expect(()=>loadHostStartupConfig({...env,...update})).toThrow();
+});

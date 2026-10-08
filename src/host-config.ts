@@ -5,7 +5,9 @@ import { HERMES_CODING_RUNTIME_POLICY } from './hermes/coding-runtime-policy.ts'
 export interface HostStartupConfig {
   mode: 'legacy' | 'hermes-canary' | 'hermes-readonly-canary';
   activationPath?: string;
-  slack?: { credentialsPath: string; approvedChannelIds: readonly string[] };
+  /** Exact reviewed Slack-only host release; original canary receipt remains immutable. */
+  readonlySlackReleaseCommit?:string;
+  slack?: { credentialsPath: string; approvedChannelIds: readonly string[]; tannerDirectMessages?:true };
 }
 
 function path(value: string | undefined): string {
@@ -19,6 +21,11 @@ export function loadHostStartupConfig(env: Readonly<Record<string, string | unde
   const mode = env.GARY_RUNTIME_MODE ?? 'legacy';
   if (mode !== 'legacy' && mode !== 'hermes-canary' && mode !== 'hermes-readonly-canary') throw new Error('invalid_runtime_mode');
   const enabled = env.GARY_SLACK_ENABLED;
+  const direct=env.GARY_SLACK_TANNER_DM_ENABLED;
+  const slackRelease=env.GARY_READONLY_SLACK_RELEASE_COMMIT;
+  if(direct!==undefined&&direct!=='0'&&direct!=='1')throw new Error('invalid_slack_dm_switch');
+  if((direct==='1'||slackRelease!==undefined)&&(mode!=='hermes-readonly-canary'||enabled!=='1'))throw new Error('private_dm_requires_readonly_slack');
+  if(slackRelease!==undefined&&(!/^[a-f0-9]{40}$/.test(slackRelease)||direct!=='1'))throw new Error('invalid_slack_release_commit');
   if (enabled !== undefined && enabled !== '0' && enabled !== '1') throw new Error('invalid_slack_enable_switch');
   if (mode === 'legacy') {
     if (env.GARY_HERMES_ACTIVATION_PATH || enabled === '1' || env.GARY_SLACK_CREDENTIALS_FILE || env.GARY_SLACK_ALLOWED_CHANNEL_IDS) {
@@ -51,5 +58,7 @@ export function loadHostStartupConfig(env: Readonly<Record<string, string | unde
   }
   if (mode === 'hermes-readonly-canary' && approvedChannelIds.length) throw new Error('readonly_canary_shared_channels_disabled');
   return Object.freeze({ mode, activationPath,
-    slack: Object.freeze({ credentialsPath: path(env.GARY_SLACK_CREDENTIALS_FILE), approvedChannelIds: Object.freeze(approvedChannelIds) }) });
+    ...(slackRelease?{readonlySlackReleaseCommit:slackRelease}:{}),
+    slack: Object.freeze({ credentialsPath: path(env.GARY_SLACK_CREDENTIALS_FILE), approvedChannelIds: Object.freeze(approvedChannelIds),
+      ...(direct==='1'?{tannerDirectMessages:true as const}:{}) }) });
 }

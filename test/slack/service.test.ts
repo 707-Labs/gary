@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createSlackService, GARY_SLACK, READY_DM_TEXT, READONLY_READY_DM_TEXT, type SlackHostHealth, type SlackService, type SlackServiceOptions } from '../../src/slack/service.ts';
+import { createSlackService, GARY_SLACK, READY_DM_TEXT, READONLY_READY_DM_TEXT, PRIVATE_DM_STATUS, type SlackHostHealth, type SlackService, type SlackServiceOptions } from '../../src/slack/service.ts';
 import type { SlackTransport } from '../../src/slack/transport.ts';
 
 const cleanups:Array<()=>void|Promise<void>>=[];
@@ -37,6 +37,46 @@ function envelope(overrides:Record<string,unknown>={},payloadOverrides:Record<st
     event_id:'EvFixture1',event:{type:'app_mention',user:GARY_SLACK.tannerId,channel:'C0APPROVED',ts:'1791417600.000002',text:`<@${GARY_SLACK.botUserId}> status`,...overrides},...payloadOverrides}};
 }
 function rows(db:Database):any[]{return db.query('SELECT * FROM gary_slack_outbox ORDER BY rowid').all();}
+function dm(overrides:Record<string,unknown>={},payloadOverrides:Record<string,unknown>={}) {
+  return envelope({type:'message',channel_type:'im',channel:'D0FIXTURE1',text:'private inbound fixture',...overrides},payloadOverrides);
+}
+test('explicit private DM opt-in replies once only to Tanner in the previously verified private conversation',async()=>{
+  const f=fixture({tannerDirectMessages:true});f.health=readonlyHealthy;await f.service.start();
+  const readyBefore=JSON.stringify(rows(f.db));
+  await Promise.all([f.fake.emit(dm()),f.fake.emit(dm())]);
+  expect(f.fake.sends).toHaveLength(2);
+  expect(f.fake.sends[1]).toEqual({channel:'D0FIXTURE1',threadTs:'1791417600.000002',text:PRIVATE_DM_STATUS});
+  expect(JSON.stringify(rows(f.db))).toBe(readyBefore);
+  const records=f.db.query('SELECT * FROM gary_slack_dm_outbox').all() as any[];
+  expect(records).toHaveLength(1);expect(records[0]).toMatchObject({kind:'dm',request_id:'EvFixture1',recipient_id:GARY_SLACK.tannerId,status:'sent'});
+  expect(JSON.stringify(records)).not.toContain('private inbound fixture');
+  expect(JSON.stringify(records)).not.toContain(PRIVATE_DM_STATUS);
+});
+test('DM admission rejects other users, conversations, event types, bot/subtype and malformed or foreign envelopes',async()=>{
+  const f=fixture({tannerDirectMessages:true});await f.service.start();
+  for(const event of [{user:GARY_SLACK.benId},{user:'U0STRANGER'},{channel:'D0OTHER11'},{channel:'C0FIXTURE1'},
+    {channel_type:'mpim'},{channel_type:undefined},{bot_id:'B0FIXTURE1'},{subtype:'message_changed'},
+    {ts:'invalid'},{thread_ts:'invalid'},{text:''},{text:'x'.repeat(40_001)},{type:'app_mention'}])await f.fake.emit(dm(event));
+  for(const payload of [{team_id:'T0WRONG11'},{api_app_id:'A0WRONG11'},{event_id:'bad'}])await f.fake.emit(dm({},payload));
+  expect(f.fake.sends).toHaveLength(1);expect(f.db.query('SELECT * FROM gary_slack_dm_outbox').all()).toEqual([]);
+  const disabled=fixture();await disabled.service.start();await disabled.fake.emit(dm());
+  expect(disabled.fake.sends).toHaveLength(1);expect(disabled.db.query("SELECT name FROM sqlite_master WHERE name='gary_slack_dm_outbox'").all()).toEqual([]);
+});
+test('DM unknown delivery survives service restart without automatic retry or ready replay',async()=>{
+  const f=fixture({tannerDirectMessages:true});await f.service.start();
+  f.fake.send=async()=>({ok:false,outcome:'unknown',code:'fixture_timeout'});
+  await f.fake.emit(dm());await f.service.stop();
+  const restarted=fixture({db:f.db,tannerDirectMessages:true});await restarted.service.start();await restarted.fake.emit(dm());
+  expect(restarted.fake.sends).toEqual([]);
+  expect(f.db.query('SELECT status FROM gary_slack_dm_outbox').get()).toEqual({status:'unknown'});
+});
+test('DM preserves thread reply target and reports unavailable host without inference',async()=>{
+  const f=fixture({tannerDirectMessages:true});await f.service.start();f.health={...healthy,ready:false};
+  await f.fake.emit(dm({thread_ts:'1791417600.000001'}));
+  expect(f.fake.sends[1]?.threadTs).toBe('1791417600.000001');expect(f.fake.sends[1]?.text).toContain('not passed');
+  expect(f.fake.sends[1]?.text).toContain("haven't started a task");
+  await f.service.stop();await f.fake.emit(dm({}, {event_id:'EvAfterStop'}));expect(f.fake.sends).toHaveLength(2);
+});
 
 test('construction validates policy without schema mutation, socket startup or sends',()=>{
   const f=fixture();expect(f.db.query("SELECT name FROM sqlite_master WHERE name='gary_slack_outbox'").all()).toEqual([]);
