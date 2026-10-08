@@ -44,7 +44,7 @@ _NATIVE_SPECIAL = frozenset({
 })
 _RUN_LOCK = threading.Lock()
 _NATIVE_STARTED = False
-_STDIO_PATHS = frozenset({"/v1/chat/completions", "/tools/execute", "/tools/state"})
+_STDIO_PATHS = frozenset({"/v1/chat/completions", "/tools/execute", "/tools/state", "/tools/jobs/poll"})
 
 
 class RuntimeFault(Exception):
@@ -53,6 +53,11 @@ class RuntimeFault(Exception):
         self.code = code
         super().__init__(code)
 
+
+_LONG_TEST_POLICY = {"version": 1, "commands": {
+    "bun run ci:full": {"timeoutMs": 1800000, "maxStarts": 4},
+    "bun run check": {"timeoutMs": 600000, "maxStarts": 8}},
+    "pollWaitMs": 20000, "heartbeatMs": 1000, "maxPolls": 96}
 
 def _deadline(payload: dict) -> float:
     remaining = (payload["deadlineMs"] - time.time() * 1000) / 1000
@@ -123,6 +128,11 @@ def _validate(payload):
     _deadline(p)
     if p.get("transport", "http") not in ("http", "stdio"):
         raise RuntimeFault("invalid_transport")
+    if "longTestPolicy" in p:
+        if (p.get("transport") != "stdio" or
+                json.dumps(p["longTestPolicy"], sort_keys=True, allow_nan=False) !=
+                json.dumps(_LONG_TEST_POLICY, sort_keys=True)):
+            raise RuntimeFault("invalid_long_test_policy")
     p["modelBaseUrl"] = _url(p.get("modelBaseUrl"))
     if p.get("transport") == "stdio":
         _url(p["modelBaseUrl"], suffix="/v1")
@@ -426,9 +436,62 @@ class _StdioChannel:
     def __call__(self, url, body, headers, timeout):
         status, response = self.exchange(url, body, headers, timeout,
                                          allowed_paths={"/tools/execute", "/tools/state"})
-        if not 200 <= status < 300 and status != 400:
-            self.fail("rpc_http_error")
-        return response
+        if status != 202:
+            if status not in (200, 400):
+                self.fail("rpc_http_error")
+            return response
+        policy = self.payload.get("longTestPolicy")
+        arguments = body.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = _strict_json(arguments)
+            except Exception:
+                self.fail("invalid_test_job")
+        if (policy != _LONG_TEST_POLICY or url != self.payload["executorUrl"]
+                or body.get("name") != "run_bash" or not isinstance(arguments, dict)
+                or arguments.get("command") not in _LONG_TEST_POLICY["commands"]):
+            self.fail("unexpected_test_job")
+        expected_keys = {"kind", "jobId", "callId", "taskId", "requestId", "ownerEpoch", "name", "deadlineMs"}
+        if (set(response) != expected_keys or response.get("kind") != "test_job_pending"
+                or not isinstance(response.get("jobId"), str)
+                or not re.fullmatch(r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}", response["jobId"])
+                or response.get("callId") != body.get("callId") or response.get("name") != "run_bash"
+                or any(response.get(key) != self.payload[key] for key in ("taskId", "requestId", "ownerEpoch"))
+                or type(response.get("deadlineMs")) not in (int, float)
+                or not math.isfinite(response["deadlineMs"]) or response["deadlineMs"] > self.payload["deadlineMs"]
+                or response["deadlineMs"] > time.time()*1000 + _LONG_TEST_POLICY["commands"][arguments["command"]]["timeoutMs"]):
+            self.fail("test_job_binding_rejected")
+        pending = dict(response)
+        deadline_ms = pending["deadlineMs"]
+        poll_url = self.payload["executorUrl"].rsplit("/", 1)[0] + "/jobs/poll"
+        poll_body = {key: pending[key] for key in ("taskId", "requestId", "ownerEpoch", "callId", "jobId")}
+        def job_time():
+            try:
+                return _deadline({"deadlineMs": deadline_ms})
+            except RuntimeFault as exc:
+                self.fail(exc.code)
+        for _ in range(_LONG_TEST_POLICY["maxPolls"]):
+            remaining = job_time()
+            status, response = self.exchange(poll_url, poll_body, headers, remaining,
+                                             allowed_paths={"/tools/jobs/poll"})
+            job_time()
+            if status == 202:
+                if response != pending:
+                    self.fail("test_job_binding_rejected")
+                continue
+            if status not in (200, 400):
+                self.fail("rpc_http_error")
+            if (set(response) != {"kind", "jobId", "callId", "receipt"}
+                    or response.get("kind") != "test_job_complete" or response.get("jobId") != pending["jobId"]
+                    or response.get("callId") != pending["callId"] or not isinstance(response.get("receipt"), dict)):
+                self.fail("test_job_receipt_rejected")
+            receipt = response["receipt"]
+            if (receipt.get("tool_call_id") != pending["callId"] or receipt.get("name") != "run_bash"
+                    or type(receipt.get("ok")) is not bool or not isinstance(receipt.get("content"), str)
+                    or (status == 200) != receipt["ok"]):
+                self.fail("test_job_receipt_rejected")
+            return receipt
+        self.fail("test_job_poll_limit")
 
 
 def _stdio_http_client(channel, timeout):

@@ -157,7 +157,8 @@ export function createGaryLoopAdapter(options: GaryLoopAdapterOptions): (args: A
     const failure = (code: string, status = 400): Response => Response.json({ error: { code } }, { status });
     const guard = () => { budget.throwIfExpired(); if (fatal) throw new Error("runtime_protocol_rejected"); };
     const protocolFault = (code: string) => { fatal ??= code; cancellation.abort(); return failure(code); };
-    const result = (native: NativeRuntimeOutcome["status"], errorMessage?: string, nativeText?: string): GaryLoopAdapterResult => {
+    const result = async (native: NativeRuntimeOutcome["status"], errorMessage?: string, nativeText?: string): Promise<GaryLoopAdapterResult> => {
+      await host?.drain();
       const base = host ? host.result({ status: native, iterations: modelRequests }) : empty(errorMessage ?? "session_unavailable");
       let status = base.status;
       if (Date.now() >= budget.deadlineMs) status = "timeout";
@@ -244,15 +245,15 @@ export function createGaryLoopAdapter(options: GaryLoopAdapterOptions): (args: A
       guard();
       if (!native || native.taskId !== manifest.taskId || native.requestId !== manifest.requestId
           || native.publicationApproved !== false || !nativeStatuses.has(native.status)) {
-        return result("error", "native_outcome_binding_rejected");
+        return await result("error", "native_outcome_binding_rejected");
       }
-      return result(native.status, undefined, native.text);
+      return await result(native.status, undefined, native.text);
     } catch {
-      return result("error", fatal ?? (Date.now() >= budget.deadlineMs ? "shared_deadline_exceeded"
+      return await result("error", fatal ?? (Date.now() >= budget.deadlineMs ? "shared_deadline_exceeded"
         : budget.signal.aborted ? "aborted" : "runtime_launch_or_admission_failed"));
     } finally {
       cancellation.abort();
-      try { host?.dispose(); } finally { budget.dispose(); }
+      try { await host?.drain(); host?.dispose(); } finally { budget.dispose(); }
     }
   };
 }

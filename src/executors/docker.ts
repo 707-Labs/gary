@@ -1,5 +1,6 @@
 import { throwIfExpired, type DeadlineOptions } from "../deadline.ts";
 import { runProcess } from "./process.ts";
+import { runJournaledDockerInvocation, type ExecutorTestJob } from "./job-journal.ts";
 import { log } from "../logger.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
@@ -29,6 +30,7 @@ interface InvocationOptions extends DeadlineOptions {
   cwd?: string;
   env?: Record<string, string>;
   stdin?: string;
+  testJob?: ExecutorTestJob;
 }
 
 /**
@@ -249,6 +251,19 @@ export class DockerExecutor implements Executor {
     args.push("--workdir", opts.cwd ?? "/workspace", this.image, ...command);
 
     throwIfExpired(opts);
+    if (opts.testJob !== undefined) {
+      if (this.readOnly || this.networkMode !== "none") throw new Error("executor_job_requires_isolated_coding_executor");
+      return runJournaledDockerInvocation({
+        context: opts.testJob, workspaceRoot: this.workspaceRoot, image: this.image, args,
+        mountedRoots: [this.workspaceRoot, ...(this.gitCommonDir ? [this.gitCommonDir] : [])],
+        options: {
+          ...(opts.signal ? { signal: opts.signal } : {}),
+          ...(opts.deadlineMs !== undefined ? { deadlineMs: opts.deadlineMs } : {}),
+          ...(opts.stdin !== undefined ? { stdin: opts.stdin } : {}),
+          timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        },
+      });
+    }
     const result = await runProcess(this.dockerBinary, args, {
       ...(opts.signal ? { signal: opts.signal } : {}),
       ...(opts.deadlineMs !== undefined ? { deadlineMs: opts.deadlineMs } : {}),

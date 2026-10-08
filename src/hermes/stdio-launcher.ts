@@ -1,3 +1,4 @@
+import { snapshotLongTestPolicy } from '../verification-policy.ts';
 import { canonicalizeConversation } from './conversation.ts';
 /** A task-scoped pipe transport. The caller owns the reviewed OS/container boundary. */
 import { spawn } from 'node:child_process';
@@ -31,6 +32,8 @@ export function createStdioLauncher(options: StdioLaunchOptions): GaryRuntimeLau
       || !cwd.startsWith('/') || typeof options.cleanup !== 'function') throw new Error('invalid worker launch specification');
   return async (manifest, handle, signal) => {
     if (signal.aborted || Date.now() >= manifest.deadlineMs) throw reject();
+    const longTests=manifest.longTestPolicy===undefined ? undefined : snapshotLongTestPolicy(manifest.longTestPolicy);
+    const maxPolls=longTests ? longTests.maxPolls*Object.values(longTests.commands).reduce((sum,rule)=>sum+rule.maxStarts,0) : 0;
     const cancellation = new AbortController();
     const active = AbortSignal.any([signal, cancellation.signal]);
     const timer = setTimeout(() => cancellation.abort(), Math.max(0, Math.min(2147483647, manifest.deadlineMs - Date.now())));
@@ -78,7 +81,7 @@ export function createStdioLauncher(options: StdioLaunchOptions): GaryRuntimeLau
     let result: NativeRuntimeOutcome | undefined;
     try {
       await write({ type: 'start', payload: { ...manifest, transport: 'stdio' } });
-      let pending = Buffer.alloc(0), nextId = 1;
+      let pending = Buffer.alloc(0), nextId = 1, ordinaryRequests=0,pollRequests=0;
       for await (const chunk of child.stdout) {
         guard();
         pending = Buffer.concat([pending, Buffer.from(chunk)]);
@@ -113,11 +116,13 @@ export function createStdioLauncher(options: StdioLaunchOptions): GaryRuntimeLau
             continue;
           }
           if (!exact(frame, ['type','id','method','path','headers','body']) || frame.type !== 'request'
-              || frame.id !== nextId || nextId > MAX_REQUESTS || frame.method !== 'POST'
-              || typeof frame.path !== 'string' || !paths.has(frame.path) || !object(frame.body)
+              || frame.id !== nextId || frame.method !== 'POST'
+              || typeof frame.path !== 'string' || (!paths.has(frame.path) && !(longTests && frame.path==='/tools/jobs/poll')) || !object(frame.body)
               || !object(frame.headers) || !exact(frame.headers, ['authorization','content-type'])
               || frame.headers.authorization !== 'Bearer ' + manifest.capability
               || frame.headers['content-type'] !== 'application/json') throw reject();
+          if(frame.path==='/tools/jobs/poll') {if(++pollRequests>maxPolls)throw reject();}
+          else if(++ordinaryRequests>MAX_REQUESTS)throw reject();
           nextId++;
           const response = await handle(new Request(new URL(frame.path, manifest.modelBaseUrl), {
             method: 'POST', headers: frame.headers as Record<string, string>, body: JSON.stringify(frame.body), signal: active,

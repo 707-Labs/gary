@@ -1,3 +1,4 @@
+import type { ActionVerification } from "./verification-policy.ts";
 import type { CloudflareClient } from "./adapters/cloudflare.ts";
 import type { GitHubClient, PullRequestRef } from "./adapters/github.ts";
 import type { LinearAdapter } from "./adapters/linear.ts";
@@ -76,6 +77,7 @@ export interface LoopDeps {
   allowedActionTypes?: ReadonlySet<ActionType>;
   /** Optional migration runner. Omitted keeps existing production behavior. */
   createAdmittedCodeLoop?: (admission: CodeActionAdmission) => AdmittedCodeLoopRunner;
+  createCodeVerification?: (admission: CodeActionAdmission) => ActionVerification;
   /** Trusted host observation, bound to this canonical action before handler dispatch. */
   onCodePublication?: (admission: CodeActionAdmission, receipt: CodePublicationReceipt) => void | Promise<void>;
   linear: LinearAdapter;
@@ -367,16 +369,18 @@ async function runOne(
 
   try {
     let codeLoop: AdmittedCodeLoopRunner | undefined;
+    let verification: ActionVerification | undefined;
     if (action.type === "start_coding" && deps.createAdmittedCodeLoop) {
       if (!deps.spend) throw new Error("Hermes requires the canonical spending ledger");
       codeBinding = bindCanonicalCodeAction({ db:deps.db, ledger:deps.spend, actionId,
         fingerprint:fp, issue:action.issue, provider, model, repo:deps.repoMap.get(action.issue.teamKey) ?? "" });
       codeLoop = deps.createAdmittedCodeLoop(codeBinding.admission);
+      verification = deps.createCodeVerification?.(codeBinding.admission);
     }
     const observePublication = codeBinding && deps.onCodePublication
       ? (receipt: CodePublicationReceipt) => deps.onCodePublication!(codeBinding!.admission, receipt) : undefined;
     const assertCurrent = () => {trialAction?.assertActive();codeBinding?.admission.assertActive();};
-    const execute = () => dispatch(slotDeps, action, codeLoop, codeBinding ? assertCurrent : undefined, observePublication);
+    const execute = () => dispatch(slotDeps, action, codeLoop, codeBinding ? assertCurrent : undefined, observePublication, verification);
     const scoped = () => deps.spend ? deps.spend.withSpendScope(action.issue.id, execute) : execute();
     const result = trialAction && deps.spend
       ? await deps.spend.withPaidRequestGuard(phase => {trialAction!.assertActive(phase === 'before_send');codeBinding?.admission.assertActive();}, scoped)
@@ -593,13 +597,13 @@ function reopenTicket(
   clearTerminalState(db, issue.id);
 }
 
-async function dispatch(deps: LoopDeps, action: CandidateAction, codeLoop?: AdmittedCodeLoopRunner, assertCodeAction?: () => void, onPublicationReceipt?: (receipt: CodePublicationReceipt) => void | Promise<void>): Promise<ActionOutcome | void> {
+async function dispatch(deps: LoopDeps, action: CandidateAction, codeLoop?: AdmittedCodeLoopRunner, assertCodeAction?: () => void, onPublicationReceipt?: (receipt: CodePublicationReceipt) => void | Promise<void>, verification?: ActionVerification): Promise<ActionOutcome | void> {
   switch (action.type) {
     case "classify":
       await runClassify(deps, action);
       return;
     case "start_coding":
-      return runStartCoding(deps, action, codeLoop, assertCodeAction, onPublicationReceipt);
+      return runStartCoding(deps, action, codeLoop, assertCodeAction, onPublicationReceipt, verification);
     case "wait_for_blocker":
       await runWaitForBlocker(
         { db: deps.db, linear: deps.linear },
@@ -815,6 +819,7 @@ async function runStartCoding(
   codeLoop?: AdmittedCodeLoopRunner,
   assertCodeAction?: () => void,
   onPublicationReceipt?: (receipt: CodePublicationReceipt) => void | Promise<void>,
+  verification?: ActionVerification,
 ): Promise<ActionOutcome> {
   const issue = action.issue;
   const repo = deps.repoMap.get(issue.teamKey);
@@ -844,6 +849,7 @@ async function runStartCoding(
       agentLoopTimeoutMs: deps.agentLoopTimeoutMs,
       review: deps.review,
       ...(codeLoop ? { runAdmittedAgentLoop: codeLoop } : {}),
+      ...(verification ? {verification} : {}),
       ...(deps.codingTrial ? { strictPublicationArtifact: true as const,
         workspaceExecutorProfile: deps.codingExecutorProfile! } : {}),
       ...(onPublicationReceipt ? { onPublicationReceipt } : {}),

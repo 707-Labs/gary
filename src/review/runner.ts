@@ -17,6 +17,7 @@ import {
   renderReviewTask,
   type ReviewTaskTicket,
   type PreviousFinding,
+  type TrustedHostCheckReceipt,
 } from "./prompts.ts";
 import {
   makeReviewerToolset,
@@ -38,6 +39,7 @@ export interface RunReviewerArgs {
   round: number;
   diff: string;
   runLog: readonly RunLogEntry[];
+  hostCheck?: TrustedHostCheckReceipt;
   precheckFindings: readonly PrecheckFinding[];
   previousFindings: readonly PreviousFinding[];
   worktreePath: string;
@@ -62,11 +64,12 @@ export async function runReviewer(args: RunReviewerArgs): Promise<ReviewerResult
 async function runWithinDeadline(args: RunReviewerArgs, budget: Deadline): Promise<ReviewerResult> {
   const start = Date.now();
   const tools = makeReviewerToolset(bindExecutorDeadline(args.executor, budget), budget);
-  const system = composeReviewerSystemPrompt();
+  const system = composeReviewerSystemPrompt(args.hostCheck);
   const task = renderReviewTask({
     ticket: args.ticket,
     diff: args.diff,
     runLog: args.runLog,
+    ...(args.hostCheck ? { hostCheck: args.hostCheck } : {}),
     precheckFindings: args.precheckFindings,
     previousFindings: args.previousFindings,
     worktreePath: args.worktreePath,

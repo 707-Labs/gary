@@ -1,8 +1,9 @@
 /** Fixed host policy for newly admitted Hermes coding work. No I/O at import. */
 import { fingerprintJson } from './audit-trace.ts';
+import { CODING_VERIFICATION_POLICY } from '../verification-policy.ts';
 
 export const HERMES_CODING_RUNTIME_POLICY = Object.freeze({
-  version: 3,
+  version: 4,
   /** Parent coding workspace only; native worker and read-only children keep their own pins. */
   executor: Object.freeze({
     image: 'sha256:0efb49a8f21794948395f7bec2c15557a78473acd760207613fe7714e7c47f8c',
@@ -24,7 +25,8 @@ export const HERMES_CODING_RUNTIME_POLICY = Object.freeze({
   model: 'deepseek-v4-pro',
   thinking: 'disabled',
   maxAllocationMicros: 10_000_000,
-  actionTimeoutMs: 900_000,
+  actionTimeoutMs: 9_000_000,
+  verification: CODING_VERIFICATION_POLICY,
   review: Object.freeze({providerOrder:Object.freeze(['deepseek'] as const),maxRounds:1,iterationCap:6,timeoutMs:180_000}),
 } as const);
 

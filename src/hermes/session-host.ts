@@ -1,10 +1,12 @@
 /** No listener, polling, provider client, or publication side effect starts on import. */
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual, randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createExecutorBridge, type ExecutorBridgeOptions } from './executor-bridge.ts';
 import { EXECUTOR_TOOL_NAMES } from './executor-bridge.ts';
 import { INTEGRATION_TOOL_NAMES, type ScopedIntegrationBindings } from './scoped-integrations.ts';
 import { createModelTransport, type ModelTransportOptions, type ModelTransportFailure } from './model-transport.ts';
+import { snapshotLongTestPolicy, type LongTestPolicy, type LongTestCommand } from '../verification-policy.ts';
+import type { ExecutorJobJournal, RunOpts } from '../executors/index.ts';
 import type { SpendLedger } from '../spend.ts';
 import type { AgentLoopResult } from '../agent/loop.ts';
 import type { ProductiveProgressGuard } from './progress-guard.ts';
@@ -40,6 +42,9 @@ export interface SessionOptions {
   trace?: AuditTrace;
   tracePhase?: () => AuditPhase;
   signal?: AbortSignal;
+  /** Trusted coding-only policy and durable executor journal; never native input. */
+  longTestPolicy?: LongTestPolicy;
+  executorJobJournal?: ExecutorJobJournal;
 }
 export interface RuntimeManifest {
   taskId: string; requestId: string; ownerEpoch: string; capability: string;
@@ -47,6 +52,7 @@ export interface RuntimeManifest {
   prompt: string; systemPrompt: string; tools: ReturnType<typeof createExecutorBridge>['definitions'];
   maxIterations: number; maxTokens: number; temperature: number; deadlineMs: number;
   history?: readonly Record<string, unknown>[];
+  longTestPolicy?: LongTestPolicy;
 }
 export type TerminationReason = 'budget_exhausted' | 'progress_stopped' | 'trace_failed' | 'timeout' | 'cancelled' | 'native_error' | 'session_inactive' | null;
 const digest = (s: string) => createHash('sha256').update(s).digest();
@@ -62,6 +68,8 @@ export function createSessionHost(options: SessionOptions) {
   if (options.model !== (options.provider === 'z.ai' ? 'glm-5.3' : 'deepseek-v4-pro')) throw new Error('unpriced provider/model pair');
   const thinking=options.thinking;
   if (thinking !== undefined && (thinking !== 'disabled' || options.provider !== 'deepseek')) throw new Error('invalid host thinking policy');
+  const longTestPolicy = options.longTestPolicy === undefined ? undefined : snapshotLongTestPolicy(options.longTestPolicy);
+  if ((longTestPolicy !== undefined) !== (options.executorJobJournal !== undefined) || (longTestPolicy && options.readOnly)) throw new Error('invalid_long_test_binding');
   const cancellation = new AbortController();
   const cancelFromParent = () => cancellation.abort(options.signal?.reason);
   if (options.signal?.aborted) cancelFromParent();
@@ -72,26 +80,53 @@ export function createSessionHost(options: SessionOptions) {
   const traceContext = () => ({iteration:modelRequests,phase:options.tracePhase?.() ?? 'hermes' as AuditPhase,modelState});
   const currentTool = new AsyncLocalStorage<{operationId:string;toolName:AuditToolName}>();
   const currentModel = new AsyncLocalStorage<{failure?:ModelTransportFailure}>();
+  type Job = { id:string; callId:string; command:LongTestCommand; deadlineMs:number; timeoutMs:number;
+    polls:number; pollBusy:boolean; settled:boolean; response?:Response; promise:Promise<void> };
+  let job: Job | undefined, jobFault = false, modelBusy = false;
+  const currentJob = new AsyncLocalStorage<Job>();
+  const operations = new Set<Promise<unknown>>();
+  let drainPromise:Promise<void>|undefined, closing=false;
+  const track = <T>(operation:Promise<T>):Promise<T> => {
+    operations.add(operation); void operation.then(()=>operations.delete(operation),()=>operations.delete(operation)); return operation;
+  };
   let bridgeInvalidated = () => false;
   const live = () => {
-    if (disposed || traceFinalized || options.trace?.failed || bridgeInvalidated() || cancellation.signal.aborted || options.progress?.state.stopReason || Date.now() >= admission.deadlineMs) throw new Error('session inactive');
+    if (jobFault || disposed || traceFinalized || options.trace?.failed || bridgeInvalidated() || cancellation.signal.aborted || options.progress?.state.stopReason || Date.now() >= admission.deadlineMs) throw new Error('session inactive');
     if (options.currentOwnerEpoch() !== admission.ownerEpoch) throw new Error('owner changed');
     options.assertAdmission(admission);
     if (options.ledger.status(admission.ticketId)?.state !== 'active') throw new Error('allocation inactive');
   };
   try {live();} catch(error) {options.signal?.removeEventListener('abort',cancelFromParent);cancellation.abort();throw error;}
-  const executor: ExecutorBridgeOptions['executor'] = !options.trace ? options.executor : {
+  const jobLive = (current:Job) => {
+    live();
+    if (current!==job || Date.now() >= current.deadlineMs || options.ledger.status(admission.ticketId)?.unknownAttempts !== 0) throw new Error('long_test_inactive');
+  };
+  const stopJob = () => { jobFault = true; cancellation.abort(); };
+  const pendingEnvelope = (current:Job) => ({kind:'test_job_pending',jobId:current.id,callId:current.callId,
+    taskId:admission.taskId,requestId:admission.requestId,ownerEpoch:admission.ownerEpoch,name:'run_bash',deadlineMs:current.deadlineMs});
+  const executor: ExecutorBridgeOptions['executor'] = {
     workspaceRoot:options.executor.workspaceRoot,
     readFile:(...args)=>options.executor.readFile(...args),writeFile:(...args)=>options.executor.writeFile(...args),
     listFiles:(...args)=>options.executor.listFiles(...args),grep:(...args)=>options.executor.grep(...args),
     run:async(command,opts)=>{
+      const running=currentJob.getStore();
+      let bounded:RunOpts=opts ?? {};
+      if(running) {
+        jobLive(running);
+        bounded={...bounded,timeoutMs:Math.min(bounded.timeoutMs ?? running.timeoutMs,running.timeoutMs),
+          deadlineMs:Math.min(bounded.deadlineMs ?? Infinity,running.deadlineMs),
+          signal:bounded.signal ? AbortSignal.any([bounded.signal,cancellation.signal]) : cancellation.signal,
+          testJob:Object.freeze({jobId:running.id,taskId:admission.taskId,requestId:admission.requestId,
+            actionId:admission.actionId,ownerEpoch:admission.ownerEpoch,journal:options.executorJobJournal!})};
+      }
+      if(!options.trace) return options.executor.run(command,bounded);
       const parent=currentTool.getStore();
       if(!parent) throw new Error('executor trace context missing');
       const operationId='executor-'+(++traceSequence);
       options.trace!.append({kind:'tool',stage:'start',operationId,parentOperationId:parent.operationId,toolName:parent.toolName,
         command:fingerprintBytes(command),...traceContext()});
       try {
-        const result=await options.executor.run(command,opts);
+        const result=await options.executor.run(command,bounded);
         options.trace!.append({kind:'tool',stage:'result',operationId,exitCode:result.exitCode,timedOut:result.timedOut,
           stdout:fingerprintBytes(result.stdout),stderr:fingerprintBytes(result.stderr)});
         return result;
@@ -142,12 +177,15 @@ export function createSessionHost(options: SessionOptions) {
     const header = request.headers.get('authorization') ?? '';
     return timingSafeEqual(digest(header), digest('Bearer ' + token));
   };
-  async function handle(request: Request): Promise<Response> {
+  async function handleInner(request: Request): Promise<Response> {
     if (!authenticated(request)) return fail(401, 'unauthorized');
     try { live(); } catch { return fail(409, 'session_inactive'); }
     const url = new URL(request.url);
     if (url.search || request.method !== 'POST') return fail(405, 'unsupported_route');
+    if (job && url.pathname !== '/tools/jobs/poll') { stopJob(); return fail(409,'test_job_pending'); }
     if (url.pathname === '/v1/chat/completions') {
+      if(longTestPolicy && modelBusy)return fail(409,'concurrent_model_request');
+      modelBusy=true;
       const operationId='model-'+(++traceSequence); modelRequests++;
       try {
         options.trace?.append({kind:'model',stage:'start',operationId,...traceContext()});
@@ -159,8 +197,9 @@ export function createSessionHost(options: SessionOptions) {
               ? {responseRejection:{...context.failure.responseRejection,blockTypes:[...context.failure.responseRejection.blockTypes]}} : {})})});
         return response;
       } catch { cancellation.abort(); return fail(409,'trace_or_model_failed'); }
+      finally {modelBusy=false;}
     }
-    if (!['/tools/execute', '/tools/state'].includes(url.pathname)) return fail(404, 'unknown_route');
+    if (!['/tools/execute', '/tools/state', ...(longTestPolicy ? ['/tools/jobs/poll'] : [])].includes(url.pathname)) return fail(404, 'unknown_route');
     if (!/^application\/json(?:;|$)/i.test(request.headers.get('content-type') ?? '')) return fail(415, 'json_required');
     let body: Record<string, unknown>;
     try {
@@ -188,13 +227,75 @@ export function createSessionHost(options: SessionOptions) {
       body = parsed as Record<string, unknown>;
     } catch { return fail(cancellation.signal.aborted ? 409 : 400, cancellation.signal.aborted ? 'session_inactive' : 'invalid_body'); }
     try { live(); } catch { return fail(409, 'session_inactive'); }
+    if (job && url.pathname!=='/tools/jobs/poll') {stopJob();return fail(409,'test_job_pending');}
+    if (longTestPolicy && modelBusy) return fail(409,'model_request_pending');
     if (body.taskId !== admission.taskId || body.ownerEpoch !== admission.ownerEpoch) return fail(403, 'scope_mismatch');
+    if (url.pathname === '/tools/jobs/poll') {
+      const current=job;
+      if (!current || body.requestId!==admission.requestId || body.callId!==current.callId || body.jobId!==current.id
+          || Object.keys(body).length!==5 || Object.keys(body).some(k=>!['taskId','requestId','ownerEpoch','callId','jobId'].includes(k))) return fail(409,'test_job_unavailable');
+      if(current.pollBusy || ++current.polls>longTestPolicy!.maxPolls) {stopJob();return fail(409,'test_job_unavailable');}
+      current.pollBusy=true;
+      try {
+        jobLive(current);
+        let timer:ReturnType<typeof setTimeout>|undefined;
+        let abortWait:()=>void=()=>{};
+        const waitSignal=AbortSignal.any([request.signal,cancellation.signal]);
+        try {
+          await Promise.race([current.promise,new Promise<void>(resolve=>{
+            abortWait=()=>resolve(); waitSignal.addEventListener('abort',abortWait,{once:true});
+            timer=setTimeout(resolve,Math.min(longTestPolicy!.pollWaitMs,Math.max(0,current.deadlineMs-Date.now())));
+            if(waitSignal.aborted)resolve();
+          })]);
+        } finally {if(timer)clearTimeout(timer);waitSignal.removeEventListener('abort',abortWait);}
+        if(request.signal.aborted) {stopJob();return fail(409,'test_job_inactive');}
+        jobLive(current);
+        if(!current.settled) return Response.json(pendingEnvelope(current),{status:202});
+        const response=current.response!;
+        if(response.status!==200 && response.status!==400) {stopJob();return response;}
+        const receipt=await response.json();
+        if(receipt.tool_call_id!==current.callId || receipt.name!=='run_bash' || typeof receipt.ok!=='boolean' || typeof receipt.content!=='string') {
+          stopJob();return fail(409,'test_job_receipt_invalid');
+        }
+        job=undefined;
+        return Response.json({kind:'test_job_complete',jobId:current.id,callId:current.callId,receipt},{status:response.status});
+      } catch {stopJob();return fail(409,'test_job_inactive');}
+      finally {current.pollBusy=false;}
+    }
     if (url.pathname === '/tools/state') {
       if (Object.keys(body).some(k => !['taskId','ownerEpoch'].includes(k))) return fail(400, 'unknown_field');
       const state = bridge.state;
       return Response.json({ ok: true, state: { finishSummary: clipped(state.finishSummary), blockedReason: clipped(state.blockedReason),
         finishGateMet: state.finishGateMet, invalidated: state.invalidated, todos: state.todos }, runLog: [], runLogCount: state.runLog.length });
     }
+    let input:unknown=body.arguments;
+    if(typeof input==='string') {try {input=JSON.parse(input);} catch {input=null;}}
+    if(longTestPolicy && body.name==='run_bash' && input && typeof input==='object' && !Array.isArray(input)
+        && typeof (input as Record<string,unknown>).command==='string'
+        && Object.hasOwn(longTestPolicy.commands,(input as Record<string,unknown>).command as string)) {
+      const args=input as Record<string,unknown>,command=args.command as LongTestCommand;
+      if(body.token!==token || typeof body.callId!=='string' || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(body.callId)
+          || Object.keys(args).some(k=>!['command','timeout_seconds'].includes(k))
+          || (args.timeout_seconds!==undefined && (!Number.isSafeInteger(args.timeout_seconds) || (args.timeout_seconds as number)<=0))) return fail(400,'invalid_test_job');
+      if(options.ledger.status(admission.ticketId)?.unknownAttempts!==0) {stopJob();return fail(409,'test_job_inactive');}
+      const timeoutMs=Math.min(longTestPolicy.commands[command].timeoutMs,
+        args.timeout_seconds===undefined ? Infinity : (args.timeout_seconds as number)*1000);
+      const current:Job={id:randomUUID(),callId:body.callId,command,timeoutMs,deadlineMs:Math.min(admission.deadlineMs,Date.now()+timeoutMs),
+        polls:0,pollBusy:false,settled:false,promise:Promise.resolve()};
+      job=current;
+      const heartbeat=setInterval(()=>{try{jobLive(current);}catch{stopJob();}},longTestPolicy.heartbeatMs);
+      const timer=setTimeout(stopJob,Math.max(0,current.deadlineMs-Date.now()));
+      current.promise=track(Promise.resolve().then(()=>currentJob.run(current,()=>executeTool(body))).then(response=>{
+        current.response=response;
+        if(response.status!==200 && response.status!==400)stopJob();
+      },()=>{stopJob();current.response=fail(409,'test_job_failed');}).finally(()=>{
+        current.settled=true;clearInterval(heartbeat);clearTimeout(timer);
+      }));
+      return Response.json(pendingEnvelope(current),{status:202});
+    }
+    return executeTool(body);
+  }
+  async function executeTool(body:Record<string,unknown>):Promise<Response> {
     let response: Awaited<ReturnType<typeof bridge.invoke>>;
     const toolName=typeof body.name==='string' && ([...EXECUTOR_TOOL_NAMES, ...INTEGRATION_TOOL_NAMES] as readonly string[]).includes(body.name) ? body.name as AuditToolName : undefined;
     const operationId='tool-'+(++traceSequence);
@@ -206,6 +307,7 @@ export function createSessionHost(options: SessionOptions) {
           ...(response.ok?{}:{errorCode:auditErrorCode(response.error)})});
       } else response=await bridge.invoke(body);
     } catch { cancellation.abort(); return fail(409,'trace_or_tool_failed'); }
+    if(currentJob.getStore() && !response.ok) {stopJob();return fail(409,'test_job_failed');}
     if (response.ok && options.progress) {
       try { options.progress.observeSuccessfulTool(response.name, typeof body.arguments === 'string' ? JSON.parse(body.arguments) : body.arguments); }
       catch { cancellation.abort(); return fail(409, 'progress_guard_stopped'); }
@@ -213,10 +315,22 @@ export function createSessionHost(options: SessionOptions) {
     try { live(); } catch { return fail(409, 'session_inactive'); }
     return Response.json(response, { status: response.ok ? 200 : 400 });
   }
+  function handle(request:Request):Promise<Response> {return closing ? Promise.resolve(fail(409,'session_inactive')) : track(handleInner(request));}
+  async function drain():Promise<void> {
+    if(drainPromise)return drainPromise;
+    closing=true;
+    if(job || operations.size)stopJob();
+    drainPromise=(async()=>{while(operations.size)await Promise.allSettled([...operations]);job=undefined;})();
+    return drainPromise;
+  }
+
   return {
     handle,
+    drain,
+    get pendingTestJob(){return job!==undefined;},
     /** Parent launches the runtime only after the sandbox/egress path is approved and proven. */
     manifest(baseUrl: string, task: { prompt: string; systemPrompt: string; maxIterations: number; maxTokens: number; temperature?: number }): RuntimeManifest {
+      if(closing)throw new Error('session inactive');
       live();
       const base = new URL(baseUrl);
       if (base.protocol !== 'http:' || !['127.0.0.1', '[::1]', 'localhost'].includes(base.hostname)
@@ -227,10 +341,12 @@ export function createSessionHost(options: SessionOptions) {
       if (!Number.isFinite(temperature) || temperature < 0 || temperature > 1) throw new Error('invalid temperature');
       return { ...task, temperature, taskId: admission.taskId, requestId: admission.requestId, ownerEpoch: admission.ownerEpoch,
         capability: token, modelBaseUrl: new URL('/v1', base).href, executorUrl: new URL('/tools/execute', base).href,
-        stateUrl: new URL('/tools/state', base).href, model: options.model, tools: bridge.definitions, deadlineMs: admission.deadlineMs };
+        stateUrl: new URL('/tools/state', base).href, model: options.model, tools: bridge.definitions, deadlineMs: admission.deadlineMs,
+        ...(longTestPolicy ? {longTestPolicy} : {}) };
     },
     /** Native model prose never grants finish or publication. Only trusted Gary tool state does. */
     result(native: { status?: string; iterations?: number }): AgentLoopResult & { publicationApproved: false; requestId: string; usageSource: 'unavailable-use-spend-ledger'; terminationReason: TerminationReason } {
+      if(job)stopJob();
       const state = bridge.state;
       let status: AgentLoopResult['status'];
       try { live(); status = native.status === 'error' ? 'error' : native.status === 'timeout' ? 'timeout' : state.blockedReason ? 'blocked' : native.status === 'finished' && state.finishSummary && state.finishGateMet && !state.invalidated ? 'finished'
@@ -251,6 +367,7 @@ export function createSessionHost(options: SessionOptions) {
     },
     get state() { return bridge.state; },
     finalizeTrace(outcome: {status:AgentLoopResult['status'];terminationReason:TerminationReason}): boolean {
+      if(operations.size || job)return false;
       if(!options.trace) return true;
       if(options.trace.failed) return false;
       if(traceFinalized) return true;
@@ -261,11 +378,15 @@ export function createSessionHost(options: SessionOptions) {
         options.trace.close();return true;
       } catch {return false;}
     },
-    dispose() { disposed = true; clearTimeout(deadlineTimer); cancellation.abort(); options.signal?.removeEventListener('abort', cancelFromParent); bridge.dispose();
+    dispose() {
+      if(operations.size || job) {disposed=true;cancellation.abort();void drain().then(()=>finishDispose());return;}
+      finishDispose();
+    },
+  };
+  function finishDispose() { disposed = true; clearTimeout(deadlineTimer); cancellation.abort(); options.signal?.removeEventListener('abort', cancelFromParent); bridge.dispose();
       if(options.trace && !traceFinalized && !options.trace.failed) {
         traceFinalized=true;
         try {options.trace.append({kind:'terminal',status:'cancelled',errorCode:'cancelled',...traceContext()});options.trace.close();} catch { /* Failed flag remains authoritative; cleanup has completed. */ }
       }
-    },
-  };
+    }
 }

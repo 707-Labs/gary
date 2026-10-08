@@ -1,3 +1,5 @@
+import type { ExecutorTestJob } from "./job-journal.ts";
+export { createExecutorJobJournal, reconcileDockerExecutorJobs, type ExecutorJobJournal, type ExecutorTestJob } from "./job-journal.ts";
 import { throwIfExpired, type DeadlineOptions } from "../deadline.ts";
 
 // Executor abstraction. Tools are written against this interface so the
@@ -20,6 +22,8 @@ export interface RunOpts extends DeadlineOptions {
   timeoutMs?: number;
   cwd?: string; // relative to workspace root; defaults to root
   env?: Record<string, string>;
+  /** Trusted host context only; never exposed in model tool schemas. */
+  testJob?: ExecutorTestJob;
 }
 
 export interface GrepMatch {

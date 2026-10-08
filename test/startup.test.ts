@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { main } from '../src/index.ts';
 import type { Config } from '../src/config.ts';
 import type { StartupDependencies } from '../src/startup.ts';
-import { HERMES_CANARY_WORKER_IMAGE, HERMES_CANARY_CHILD_IMAGE, type HermesActivationConfig } from '../src/hermes/activation.ts';
+import { HERMES_CODING_WORKER_IMAGE, HERMES_CANARY_CHILD_IMAGE, type HermesActivationConfig } from '../src/hermes/activation.ts';
 import { bindCanonicalCodeAction } from '../src/hermes/canonical-admission.ts';
 import { HERMES_CODING_RUNTIME_POLICY } from '../src/hermes/coding-runtime-policy.ts';
 import { openDb } from '../src/state/db.ts';
@@ -33,9 +33,9 @@ function fixture() {
   command('config','core.hooksPath','/dev/null'); writeFileSync(join(workspace,'task.ts'),'baseline\n');
   command('add','task.ts'); command('commit','-qm','baseline');
   const activation: HermesActivationConfig = { version:1, issueId, repo:'fixture/repo', provider:'deepseek', model:'deepseek-v4-pro',
-    workerImage:HERMES_CANARY_WORKER_IMAGE, childImage:HERMES_CANARY_CHILD_IMAGE,
+    workerImage:HERMES_CODING_WORKER_IMAGE, childImage:HERMES_CANARY_CHILD_IMAGE,
     dockerExecutable:'/usr/local/bin/docker', dockerHost:'unix:///Users/tanner/.colima/default/docker.sock', traceDirectory:traces,
-    policy:{baseCommit:command('rev-parse','HEAD'),task:{allowedFiles:['task.ts'],criteria:[{id:'check',description:'Check allowed change',requiredCommands:['bun run check']}]},
+    policy:{baseCommit:command('rev-parse','HEAD'),task:{allowedFiles:['task.ts'],criteria:[{id:'check',description:'Check allowed change',requiredCommands:['bun run check','bun run ci:full']}]},
       progress:{maxModelRequests:50,maxModelRequestsWithoutProgress:20,maxSuccessfulToolCalls:100,toolRepeatWindow:10,maxRepeatedToolCalls:5},
       instructions:[],voicePrinciples:'Use Gary voice.',readTicketIdentifiers:['ERT-1'],publicFetch:{policy:{kind:'urls',urls:[]}},
       cloudflare:{allowedServices:[],allowedDatabases:[]},preparationCommands:[]}};
@@ -53,7 +53,7 @@ function fixture() {
       GARY_BUN_CACHE_VOLUME:HERMES_CODING_RUNTIME_POLICY.executor.bunCacheVolume,
     DOCKER_HOST:'unix:///Users/tanner/.colima/default/docker.sock'};
   let networkCalls=0;
-  const deps:StartupDependencies={env,config:()=>config,linear:()=>({} as LinearAdapter),github:()=>({} as GitHubClient),
+  const deps:StartupDependencies={executorJobs:{create:options=>({directory:options.directory,close(){}}),reconcile:async()=>{}},env,config:()=>config,linear:()=>({} as LinearAdapter),github:()=>({} as GitHubClient),
     db:()=>openDb(':memory:'),ledger:()=>new SpendLedger(':memory:'),fetch:(async()=>{networkCalls++;throw new Error('fixture_network_forbidden');}) as unknown as typeof fetch};
   return{root,workspace,activation,activationPath,config,env,deps,networkCalls:()=>networkCalls};
 }
@@ -63,7 +63,7 @@ test('actual main selects the real Hermes factory and an injected failure never 
   await main({...f.deps,launch:async manifest=>{launched++;return{taskId:manifest.taskId,requestId:manifest.requestId,status:'error',publicationApproved:false,reason:'offline_fixture_stop'};},
     runLoop:async args=>{
       polls++;expect([...args.allowedIssueIds!]).toEqual([issueId]);expect([...args.allowedActionTypes!]).toEqual(['classify','start_coding']);
-      expect(typeof args.onCodePublication).toBe('function');
+      expect(typeof args.onCodePublication).toBe('function');expect(typeof args.createCodeVerification).toBe('function');expect(args.agentLoopTimeoutMs).toBe(9_000_000);
       expect(args.codingExecutorProfile).toBe(HERMES_CODING_RUNTIME_POLICY.executor);
       expect(args.review).toEqual({providerOrder:['deepseek'],maxRounds:1,iterationCap:6,timeoutMs:180_000});
       expect(f.config.review.iterationCap).toBe(5); // Legacy config cannot widen or shrink the fixed trial review contract.
@@ -79,7 +79,7 @@ test('actual main selects the real Hermes factory and an injected failure never 
       try {
         const runner=args.createAdmittedCodeLoop!(binding.admission);
         const result=await runner({glm:args.glm,executor:new LocalExecutor(f.workspace),systemPrompt:'Offline Gary fixture',task:'Investigate fixture',
-          maxIterations:50,maxTokensPerTurn:128,timeoutMs:30_000,deadlineMs:Date.now()+30_000,finishGateCommand:'bun run check',disableSubagent:true});
+          maxIterations:50,maxTokensPerTurn:128,timeoutMs:30_000,deadlineMs:Date.now()+30_000,finishGateCommand:'bun run ci:full',disableSubagent:true});
         expect(result.status).toBe('error');
         expect(args.spend!.status(issueId)?.attemptCount).toBe(0);
       } finally {trial.complete(false,'error');binding.close();}
@@ -170,4 +170,15 @@ test('cancellation closes Slack ingress immediately and completed-tick hook cann
   const second=slackFixture();let factories=0,polls=0;
   await main({...second.deps,env:second.env,signal:controller.signal,slackTransport:()=>{factories++;return second.transport;},runLoop:async()=>{polls++;}});
   expect({factories,polls}).toEqual({factories:0,polls:0});
+});
+
+test('coding journal reconciliation completes before adapters or admissions; failure closes all handles',async()=>{
+ for(const rejected of [false,true]) {
+  const f=fixture(),events:string[]=[];let directory='';
+  const run=main({...f.deps,executorJobs:{create:options=>{events.push('create');directory=options.directory;return{directory,close(){events.push('close');}};},
+    reconcile:async journal=>{expect(journal.directory).toBe(join(f.activation.traceDirectory,'executor-jobs'));events.push('reconcile');if(rejected)throw new Error('unreconciled');}},
+    linear:()=>{events.push('linear');return {} as LinearAdapter;},runLoop:async()=>{events.push('loop');}});
+  if(rejected)await expect(run).rejects.toThrow('unreconciled');else await run;
+  expect(events).toEqual(rejected?['create','reconcile','close']:['create','reconcile','linear','loop','close']);expect(f.networkCalls()).toBe(0);
+ }
 });

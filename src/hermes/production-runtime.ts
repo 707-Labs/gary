@@ -1,4 +1,6 @@
 /** Optional production composition. Construction never starts a process or changes a ledger. */
+import type { ActionVerification } from '../verification-policy.ts';
+import type { ExecutorJobJournal } from '../executors/index.ts';
 import { randomBytes, randomUUID } from 'node:crypto';
 import type { AgentLoopArgs, AgentLoopResult } from '../agent/loop.ts';
 import type { AdmittedCodeLoopRunner } from '../handlers/code.ts';
@@ -32,6 +34,10 @@ export interface ProductionRuntimeOptions {
   route: Pick<SessionOptions, 'provider' | 'model' | 'providerApiKey' | 'fetch'>;
   /** Host-selected DeepSeek policy; never inferred from agent arguments or native messages. */
   thinking?: 'disabled';
+  /** Same action-owned instance supplied to the outer CODE handler, including repairs. */
+  verificationForAction?: (action: CodeActionAdmission) => ActionVerification;
+  /** Initialized and reconciled by startup before the first admission. */
+  executorJobJournal?: ExecutorJobJournal;
   taskPolicy(admission: CodeActionAdmission, args: AgentLoopArgs): ProductionTaskPolicy | Promise<ProductionTaskPolicy>;
   /** Must create a fresh isolated worker for every invocation, including phases and children. */
   launch: GaryRuntimeLauncher;
@@ -72,6 +78,7 @@ export function createHermesCodeLoopFactory(options: ProductionRuntimeOptions): 
     if (action.provider !== options.route.provider || action.model !== options.route.model) throw new Error('admitted_model_route_mismatch');
     if (boundActions.has(action)) throw new Error("production_action_already_bound");
     boundActions.add(action);
+    const verification = options.verificationForAction?.(action);
     const taskId = `gary-action-${action.actionId}`;
     let busy = false, stopped = false;
     let policy: ProductionTaskPolicy | undefined;
@@ -92,6 +99,9 @@ export function createHermesCodeLoopFactory(options: ProductionRuntimeOptions): 
         }
         workspaceRoot ??= args.executor.workspaceRoot;
         deadlineMs = Math.min(deadlineMs ?? Infinity, incomingDeadline);
+        // The handler owns the lifetime signal. Phase/session cancellation must not poison repairs.
+        verification?.bindDeadline(deadlineMs);
+        if (verification && args.finishGateCommand !== verification.policy.publicationCommand) throw new Error('canonical_finish_policy_mismatch');
         if (args.currentIssue && (args.currentIssue.id !== action.issue.id || args.currentIssue.identifier !== action.issue.identifier
           || args.currentIssue.teamId !== action.issue.teamId)) throw new Error('canonical_ticket_scope_mismatch');
         if (args.defaultRepo !== undefined && args.defaultRepo !== action.repo) throw new Error('canonical_repository_scope_mismatch');
@@ -125,6 +135,7 @@ export function createHermesCodeLoopFactory(options: ProductionRuntimeOptions): 
         if (evidence) await evidence.invalidateVerification();
         if (!evidence) {
           evidence = await createProductionEvidence({ executor:args.executor,
+            ...(verification ? {verification} : {}),
             scope:{taskId,workspaceId:taskId,ownerEpoch:action.ownerEpoch,allocationId:action.ticketId},
             task:{...policy.task,taskId}, baseCommit:policy.baseCommit, voicePrinciples:policy.voicePrinciples,
             instructions:policy.instructions, policy:policy.progress, deadlineMs, assertAdmission:active,
@@ -212,6 +223,8 @@ export function createHermesCodeLoopFactory(options: ProductionRuntimeOptions): 
               throw new Error('canonical_acceptance_incomplete');
             }
           },
+          ...(verification ? {longTestPolicy:verification.policy} : {}),
+          ...(options.executorJobJournal ? {executorJobJournal:options.executorJobJournal} : {}),
           executor:evidence.executor,integrations,allowedTools:grantedTools(integrations),finishGateCommand:args.finishGateCommand!,
           currentOwnerEpoch:()=>{active();return action.ownerEpoch;},assertAdmission,trace,progress:evidence.progress,
           ...(args.signal ? {signal:args.signal} : {}),

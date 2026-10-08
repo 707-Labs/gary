@@ -11,10 +11,12 @@ import { createDockerRuntimeLauncher } from '../../src/hermes/docker-launcher.ts
 import { createAuditTrace } from '../../src/hermes/audit-trace.ts';
 import type { AgentLoopArgs } from '../../src/agent/loop.ts';
 import type { AssignedIssue } from '../../src/adapters/linear.ts';
-import type { Executor } from '../../src/executors/index.ts';
+import type { Executor, ExecutorJobJournal, RunOpts } from '../../src/executors/index.ts';
 import { runProcess } from '../../src/executors/process.ts';
-import type { GaryRuntimeLauncher } from '../../src/hermes/gary-loop-adapter.ts';
+import type { GaryRuntimeLauncher, GaryRuntimeManifest } from '../../src/hermes/gary-loop-adapter.ts';
 import * as readonlyChild from '../../src/hermes/readonly-child.ts';
+
+import { createActionVerification, CODING_VERIFICATION_POLICY } from '../../src/verification-policy.ts';
 
 const dispose:Array<()=>void> = [];
 afterEach(()=>{for(const close of dispose.splice(0).reverse()) close();});
@@ -33,8 +35,21 @@ const fakeNative:GaryRuntimeLauncher=async(m,handle)=>{
     const assistant=(await response.json()).choices[0].message;history.push(assistant);
     if(!assistant.tool_calls?.length)return{taskId:m.taskId,requestId:m.requestId,status:'no_finish',publicationApproved:false,text:assistant.content??'',history};
     for(const call of assistant.tool_calls){
-      const result=await request('/tools/execute',{taskId:m.taskId,ownerEpoch:m.ownerEpoch,token:m.capability,callId:call.id,name:call.function.name,arguments:call.function.arguments});
-      const body=await result.json();history.push({role:'tool',tool_call_id:call.id,content:body.content??JSON.stringify(body)});
+      let result=await request('/tools/execute',{taskId:m.taskId,ownerEpoch:m.ownerEpoch,token:m.capability,callId:call.id,name:call.function.name,arguments:call.function.arguments});
+      let body=await result.json();
+      let jobId:string|undefined;
+      for(let polls=0;result.status===202;polls++){
+        expect(polls).toBeLessThan(m.longTestPolicy?.maxPolls??0);
+        expect(body).toMatchObject({kind:'test_job_pending',taskId:m.taskId,requestId:m.requestId,ownerEpoch:m.ownerEpoch,callId:call.id,name:'run_bash'});
+        jobId??=body.jobId;expect(body.jobId).toBe(jobId);
+        result=await request('/tools/jobs/poll',{taskId:m.taskId,requestId:m.requestId,ownerEpoch:m.ownerEpoch,callId:call.id,jobId});
+        body=await result.json();
+      }
+      if(jobId && result.ok){
+        expect(body).toMatchObject({kind:'test_job_complete',jobId,callId:call.id});
+        body=body.receipt;
+      }
+      history.push({role:'tool',tool_call_id:call.id,content:body.content??JSON.stringify(body)});
       if(!result.ok)return{taskId:m.taskId,requestId:m.requestId,status:'error',publicationApproved:false,history};
       if(call.function.name==='finish'||call.function.name==='report_blocked')return{taskId:m.taskId,requestId:m.requestId,status:call.function.name==='finish'?'finished':'blocked',publicationApproved:false,history};
     }
@@ -275,3 +290,125 @@ test.skipIf(!process.env.GARY_HERMES_NATIVE_TEST_IMAGE)('actual native stdio ret
   f.ledger.markTerminal(issue.id,'offline_unknown_usage_stop');f.binding.close();
   expect(f.ledger.status(issue.id)).toMatchObject({state:'closed',unknownAttempts:1,chargedMicros:1_384_628});
 },60_000);
+
+
+function fullVerificationFixture(f: Awaited<ReturnType<typeof fixture>>) {
+  const verification = createActionVerification({ policy: CODING_VERIFICATION_POLICY, assertActive: () => f.binding.admission.assertActive() });
+  let bindings = 0, pending = 0, polls = 0;
+  const manifests: Readonly<GaryRuntimeManifest>[] = [];
+  const executions: Array<{ command: string; opts: RunOpts }> = [];
+  const journal: ExecutorJobJournal = { directory: '/offline-job-journal', close() {} };
+  f.options.verificationForAction = action => {
+    expect(action).toBe(f.binding.admission); bindings++; return verification;
+  };
+  f.options.executorJobJournal = journal;
+  const taskPolicy = f.options.taskPolicy;
+  f.options.taskPolicy = async (...args) => {
+    const policy = await taskPolicy(...args);
+    return { ...policy, task: { ...policy.task, criteria: [{ id: 'fix', description: 'Verify the changed fixture.', requiredCommands: ['bun run ci:full'] }] } };
+  };
+  const fetch = f.options.route.fetch!;
+  f.options.route.fetch = async request => {
+    const response = await fetch(request);
+    const body = await response.json();
+    for (const block of body.content ?? []) {
+      if (block.type === 'tool_use' && block.name === 'run_bash' && block.input.command === CHECK) block.input.command = 'bun run ci:full';
+    }
+    return Response.json(body, { status: response.status });
+  };
+  const executor = f.args.executor;
+  f.args.executor = { ...executor, run: async (command, opts = {}) => {
+    executions.push({ command, opts });
+    return executor.run(command === 'set -euo pipefail\n' + 'bun run ci:full' ? 'set -euo pipefail\n' + CHECK : command, opts);
+  } };
+  f.args.finishGateCommand = 'bun run ci:full';
+  f.options.launch = async (manifest, handle, signal) => {
+    manifests.push(manifest);
+    return fakeNative(manifest, async request => {
+      if (new URL(request.url).pathname === '/tools/jobs/poll') polls++;
+      const response = await handle(request);
+      if (response.status === 202) pending++;
+      return response;
+    }, signal);
+  };
+  return { verification, journal, manifests, executions, counts: () => ({ bindings, pending, polls }) };
+}
+
+test('opt-in production verification polls real host jobs, preserves one action state across repair, and propagates job capture context', async () => {
+  const f = await fixture();
+  const v = fullVerificationFixture(f);
+  const runner = f.runner();
+  for (let invocation = 1; invocation <= 2; invocation++) {
+    const result = await runner(f.args);
+    expect({ status: result.status, error: result.errorMessage }).toEqual({ status: 'finished', error: undefined });
+    expect(v.verification.snapshot()).toEqual({ deadlineMs: f.args.deadlineMs!,
+      counts: { 'bun run ci:full': invocation, 'bun run check': 0 } });
+  }
+  expect(v.counts()).toEqual({ bindings: 1, pending: 2, polls: 2 });
+  expect(f.counts()).toEqual({ calls: 8, policies: 1 });
+  expect(f.ledger.status(issue.id)?.attemptCount).toBe(8);
+  expect(v.manifests).toHaveLength(2);
+  expect(v.manifests.every(manifest => manifest.longTestPolicy?.commands['bun run ci:full'].timeoutMs === 1_800_000)).toBe(true);
+  expect(v.manifests.every(manifest => manifest.longTestPolicy?.commands['bun run ci:full'].maxStarts === 4)).toBe(true);
+  const jobs = v.executions.filter(call => call.opts.testJob);
+  expect(jobs).toHaveLength(6);
+  for (let invocation = 0; invocation < 2; invocation++) {
+    const group = jobs.slice(invocation * 3, invocation * 3 + 3);
+    const job = group[0]!.opts.testJob!;
+    expect(group[0]!.command).toBe(group[2]!.command);
+    expect(group[1]!.command).toBe('set -euo pipefail\nbun run ci:full');
+    expect(job.journal).toBe(v.journal);
+    expect(job.actionId).toBe(String(f.actionId));
+    expect(job.ownerEpoch).toBe(f.binding.admission.ownerEpoch);
+    expect(job.requestId).toBe(v.manifests[invocation]!.requestId);
+    for (const call of group) {
+      expect(call.opts.testJob).toBe(job);
+      expect(call.opts.deadlineMs).toBe(f.args.deadlineMs);
+    }
+  }
+  expect(jobs[0]!.opts.testJob!.jobId).not.toBe(jobs[3]!.opts.testJob!.jobId);
+  expect(JSON.stringify(f.seen)).not.toContain('test_job_pending');
+  expect(JSON.stringify(f.seen)).not.toContain('test_job_complete');
+  expect(f.traces).toHaveLength(2);
+  expect(f.traces.every(path => readFileSync(path, 'utf8').includes('"status":"finished"'))).toBe(true);
+}, 10_000);
+
+test('changed repair finish gate is rejected before another launch, test, trace or model spend', async () => {
+  const f = await fixture();
+  const v = fullVerificationFixture(f);
+  const runner = f.runner();
+  expect((await runner(f.args)).status).toBe('finished');
+  const before = { modelCalls: f.counts().calls, attempts: f.ledger.status(issue.id)!.attemptCount,
+    executions: v.executions.length, manifests: v.manifests.length, traces: f.traces.length, counters: v.verification.snapshot() };
+  const result = await runner({ ...f.args, finishGateCommand: 'bun run check' });
+  expect(result.status).toBe('error');
+  expect(result.errorMessage).toBe('production_runtime_failed:admission');
+  expect({ modelCalls: f.counts().calls, attempts: f.ledger.status(issue.id)!.attemptCount,
+    executions: v.executions.length, manifests: v.manifests.length, traces: f.traces.length, counters: v.verification.snapshot() }).toEqual(before);
+  expect(v.counts().bindings).toBe(1);
+}, 10_000);
+
+test('read-only children receive neither long-test policy nor executor job authority from an opted-in parent', async () => {
+  const f = await fixture();
+  const v = fullVerificationFixture(f);
+  f.options.readonlyChildren = { imageDigest: 'sha256:' + 'a'.repeat(64) };
+  let closed = 0, reads = 0;
+  const childExecutor: Executor = { ...f.args.executor,
+    readFile: async path => { reads++; return readFileSync(join(f.root, path), 'utf8'); },
+    run: async () => { throw new Error('Read-only fixture must not run a long test'); } };
+  const child = spyOn(readonlyChild, 'createReadonlyChildExecutor').mockImplementation(async options => {
+    options.assertActive(options.admission);
+    return { executor: childExecutor, depth: 1, admission: options.admission, close: async () => { closed++; } };
+  });
+  try {
+    const result = await f.runner()({ ...f.args, disableSubagent: false });
+    expect({ status: result.status, error: result.errorMessage }).toEqual({ status: 'finished', error: undefined });
+    expect(child).toHaveBeenCalledTimes(1); expect(closed).toBe(1); expect(reads).toBe(1);
+    const childManifest = v.manifests.find(manifest => !manifest.tools.some(tool => tool.function.name === 'write_file'))!;
+    expect(childManifest).toBeDefined();
+    expect(childManifest.longTestPolicy).toBeUndefined();
+    expect(v.manifests.find(manifest => manifest.tools.some(tool => tool.function.name === 'write_file'))?.longTestPolicy).toBeDefined();
+    expect(v.verification.snapshot().counts['bun run ci:full']).toBe(1);
+    expect(v.executions.filter(call => call.opts.testJob).every(call => call.opts.testJob!.requestId !== childManifest.requestId)).toBe(true);
+  } finally { child.mockRestore(); }
+}, 10_000);

@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach } from "bun:test";
+import { describe, expect, it, beforeEach, mock } from "bun:test";
 import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -100,6 +100,29 @@ describe("runReviewer", () => {
     ).get();
     expect(row!.verdict).toBe("approve");
     expect(row!.round).toBe(1);
+  });
+
+  it("forwards a trusted exact-artifact host receipt without running the gate again", async () => {
+    const hostCheck = { command: "bun run ci:full", exitCode: 0 as const, timedOut: false as const,
+      exactArtifact: { headSha: "a".repeat(40), baseSha: "b".repeat(40), treeSha: "c".repeat(40), worktreeClean: true as const } };
+    const glm = fakeGlm([approveTurn]);
+    const createMessage = mock<GLMClient["createMessage"]>(async args => {
+      expect(JSON.stringify(args.messages)).toContain("trusted host verification");
+      expect(JSON.stringify(args.messages)).toContain(hostCheck.exactArtifact.headSha);
+      expect(JSON.stringify(args.messages)).toContain("bun run ci:full");
+      expect(args.system).toContain("never claim you ran the host command yourself");
+      return approveTurn();
+    });
+    glm.createMessage = createMessage;
+    const executor = fakeExecutor();
+    const run = mock<Executor["run"]>(async () => { throw new Error("Unexpected duplicate full gate"); });
+    executor.run = run;
+    const result = await runReviewer({ db, glm, executor, hostCheck,
+      ticket: { identifier: "ERT-1", title: "t", description: null }, issueLinearId: "issue-1", fingerprint: "fp-1", round: 1,
+      diff: "diff", runLog: [], precheckFindings: [], previousFindings: [], worktreePath: "/tmp/wt", iterationCap: 6, timeoutMs: 180_000 });
+    expect(result.kind).toBe("verdict");
+    expect(createMessage).toHaveBeenCalledTimes(1);
+    expect(run).not.toHaveBeenCalled();
   });
 
   it("returns changes_needed and persists with finding count", async () => {

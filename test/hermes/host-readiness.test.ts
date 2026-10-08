@@ -1,3 +1,4 @@
+import { CODING_VERIFICATION_POLICY } from '../../src/verification-policy.ts';
 import { expect, test } from 'bun:test';
 import { openDb } from '../../src/state/db.ts';
 import { recordActionEnd, recordActionStart, recordPr, upsertTicket } from '../../src/state/queries.ts';
@@ -36,7 +37,7 @@ function fixture(legacyActions=0) {
     recordPr(db, { githubId: 42, ticketLinearId: issueId, repo, prNumber: 42, branch: 'gary/canary' });
     recordActionEnd(db, { id, success: true, outcome: 'pr_opened' });
   }
-  return { db, monitor, receipt, admission, evidence, allocation, complete, id, issueId };
+  return { db, monitor, receipt, admission, evidence, allocation, complete, id, issueId, activation };
 }
 test('native finish alone and handled success do not claim whole-host readiness', () => {
   const f = fixture();
@@ -196,4 +197,13 @@ test('dangling or malformed canonical owner claims fail closed instead of disapp
    expect(f.monitor.check().ready).toBe(false);
   }finally{f.db.close();}
  }
+});
+
+test('opt-in readiness requires the exact full gate while legacy omission keeps its check contract',()=>{
+ const f=fixture();try {
+  (f.activation as {verificationPolicy?:typeof CODING_VERIFICATION_POLICY}).verificationPolicy=CODING_VERIFICATION_POLICY;
+  f.complete();f.monitor.recordPublication(f.admission,f.receipt);expect(f.monitor.check().ready).toBe(false);
+  for(const command of ['bun run ci:full ','bun run ci:full && true']) {f.receipt.requiredCheck.command=command;f.monitor.recordPublication(f.admission,f.receipt);expect(f.monitor.check().ready).toBe(false);}
+  f.receipt.requiredCheck.command='bun run ci:full';f.monitor.recordPublication(f.admission,f.receipt);expect(f.monitor.check().ready).toBe(true);
+ } finally {f.db.close();}
 });

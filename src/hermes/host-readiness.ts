@@ -50,7 +50,7 @@ export function createCanaryReadiness(options: CanaryReadinessOptions) {
       const { requiredCheck, review, publication: published } = receipt;
       const head = published.remoteHeadSha;
       if (!receipt.admittedRuntime || !receipt.draft || !requiredCheck.passed || requiredCheck.exitCode !== 0 || requiredCheck.timedOut
-          || requiredCheck.command !== 'bun run check' || review.verdict !== 'approve'
+          || requiredCheck.command !== (options.activation.verificationPolicy?.publicationCommand ?? 'bun run check') || review.verdict !== 'approve'
           || receipt.postRebaseCheck === 'incomplete' || !head || !/^[a-f0-9]{40}$/.test(head)) return NOT_READY;
       // Observations are not an isolation claim: any missing/changed/dirty snapshot
       // blocks notification instead of equating an old review with the new head.
@@ -60,7 +60,7 @@ export function createCanaryReadiness(options: CanaryReadinessOptions) {
         'SELECT repo,pr_number,branch,closed_at,merged FROM prs WHERE ticket_linear_id=? AND repo=? AND pr_number=?')
         .get(options.issueId, options.repo, receipt.prNumber);
       if (!pr || pr.branch !== receipt.branch || pr.closed_at !== null || pr.merged !== 0) return NOT_READY;
-      const evidence = { actionId, fingerprint, ownerEpoch, nativeRequestId: native.requestId, head, repo: pr.repo, prNumber: pr.pr_number };
+      const evidence = { actionId, fingerprint, ownerEpoch, verificationPolicy:options.activation.verificationPolicy ?? null, nativeRequestId: native.requestId, head, repo: pr.repo, prNumber: pr.pr_number };
       return { ready: true, hermesCanarySucceeded: true,
         receiptId: 'sha256:' + createHash('sha256').update(JSON.stringify(evidence)).digest('hex') };
     } catch { return NOT_READY; }

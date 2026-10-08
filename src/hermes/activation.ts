@@ -2,6 +2,9 @@
 import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve, relative } from 'node:path';
 import { z } from 'zod';
+import { createActionVerification, type ActionVerification } from '../verification-policy.ts';
+import type { CodeActionAdmission } from './canonical-admission.ts';
+import type { ExecutorJobJournal } from '../executors/index.ts';
 import type { DB } from '../state/db.ts';
 import type { SpendLedger } from '../spend.ts';
 import type { LoopDeps } from '../loop.ts';
@@ -14,6 +17,7 @@ import { createCodingTrial, type CodingTrial } from './coding-trial.ts';
 import { HERMES_CODING_RUNTIME_POLICY, fingerprintHermesCodingActivation } from './coding-runtime-policy.ts';
 
 export const HERMES_CANARY_WORKER_IMAGE = 'sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab';
+export const HERMES_CODING_WORKER_IMAGE = 'sha256:f572a3fa49dbf933adb7e6a2671d929ec04186a4b9bef829ddd5082304bc0325';
 export const HERMES_CANARY_CHILD_IMAGE = 'sha256:e77edfc6e20402c7ed9f447dca81dc61e277c2a39199963f455a37a03dfcedf4';
 const MAX_CONFIG_BYTES = 262_144;
 const text = (max: number) => z.string().min(1).max(max).refine(s => s.trim().length > 0 && !s.includes('\0'));
@@ -45,7 +49,7 @@ const policySchema = z.object({
 const activationSchema = z.object({
   version: z.literal(1), issueId: z.string().uuid(), repo: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),
   provider: z.literal('deepseek'), model: z.literal('deepseek-v4-pro'),
-  workerImage: z.literal(HERMES_CANARY_WORKER_IMAGE), childImage: z.literal(HERMES_CANARY_CHILD_IMAGE),
+  workerImage: z.literal(HERMES_CODING_WORKER_IMAGE), childImage: z.literal(HERMES_CANARY_CHILD_IMAGE),
   dockerExecutable: z.literal('/usr/local/bin/docker'), dockerHost: z.literal('unix:///Users/tanner/.colima/default/docker.sock'),
   traceDirectory: text(4096), policy: policySchema,
 }).strict();
@@ -95,7 +99,7 @@ function validate(value: unknown): HermesActivationConfig {
   // Validate the actual runtime representation before classification can consume the only attempt.
   // Gary's largest admitted CODE phases are investigate=15, implement=35 (handlers/code.ts).
   const commands = new Set(config.policy.task.criteria.flatMap(criterion => criterion.requiredCommands));
-  if (!commands.has('bun run check') || commands.size > 32) reject('invalid_production_checks');
+  if (!commands.has('bun run check') || !commands.has(HERMES_CODING_RUNTIME_POLICY.verification.publicationCommand) || commands.size > 32) reject('invalid_production_checks');
   if (config.policy.progress.maxModelRequests < 50 || config.policy.progress.maxModelRequestsWithoutProgress <= 15) reject('invalid_production_phase_budget');
   try {
     buildTaskContext({ task: { ...config.policy.task, taskId: 'gary-action-9223372036854775807' },
@@ -140,12 +144,15 @@ export interface HermesActivationDependencies {
   route: ProductionRuntimeOptions['route'];
   /** Trusted test seam only; production omits this and uses the pinned Docker launcher. */
   launch?: GaryRuntimeLauncher;
+  executorJobJournal: ExecutorJobJournal;
 }
 export interface HermesActivationBinding {
   readonly allowedIssueIds: ReadonlySet<string>;
   readonly allowedActionTypes: NonNullable<LoopDeps['allowedActionTypes']>;
   readonly createAdmittedCodeLoop: NonNullable<LoopDeps['createAdmittedCodeLoop']>;
   readonly codingTrial: CodingTrial;
+  readonly createCodeVerification: (action: CodeActionAdmission) => ActionVerification;
+  readonly verificationPolicy: typeof HERMES_CODING_RUNTIME_POLICY.verification;
   getHealthEvidence(): readonly RuntimeHealthEvidence[];
 }
 
@@ -154,10 +161,28 @@ export function createHermesActivation(input: HermesActivationConfig, deps: Herm
   const config = validate(input);
   if (deps.route.provider !== config.provider || deps.route.model !== config.model || typeof deps.route.fetch !== 'function'
       || typeof deps.route.providerApiKey !== 'string' || !deps.route.providerApiKey) reject('host_route_mismatch');
+  if (!deps.executorJobJournal) reject('executor_journal_required');
   const codingTrial = createCodingTrial({db:deps.db,ledger:deps.ledger,issueId:config.issueId,repo:config.repo,policyFingerprint:fingerprintHermesCodingActivation(config)});
+  const verifications = new WeakMap<CodeActionAdmission, ActionVerification>();
+  const createCodeVerification = (action: CodeActionAdmission): ActionVerification => {
+    action.assertActive();
+    codingTrial.assertCodingAction(action);
+    if (action.ticketId !== config.issueId || action.repo !== config.repo || action.ledger !== deps.ledger) reject('verification_binding');
+    let value = verifications.get(action);
+    if (!value) {
+      value = createActionVerification({policy:HERMES_CODING_RUNTIME_POLICY.verification,
+        assertActive:()=>{action.assertActive();codingTrial.assertCodingAction(action);},
+        ...(deps.executorJobJournal ? {testJobContext:{taskId:`gary-action-${action.actionId}`,actionId:action.actionId,
+          ownerEpoch:action.ownerEpoch,journal:deps.executorJobJournal}} : {})});
+      verifications.set(action,value);
+    }
+    return value;
+  };
   const health: RuntimeHealthEvidence[] = [];
   const records: Array<{ binding: AuditTraceBinding; path: string; status?: AuditTerminalStatus; closed: boolean }> = [];
   const create = createHermesCodeLoopFactory({ route: deps.route, thinking: HERMES_CODING_RUNTIME_POLICY.thinking,
+    verificationForAction:createCodeVerification,
+    ...(deps.executorJobJournal ? {executorJobJournal:deps.executorJobJournal} : {}),
     launch: deps.launch ?? createDockerRuntimeLauncher({ imageDigest: config.workerImage, dockerExecutable: config.dockerExecutable, dockerHost: config.dockerHost }),
     readonlyChildren: { imageDigest: config.childImage, dockerExecutable: config.dockerExecutable, dockerHost: config.dockerHost },
     taskPolicy: async (action, args): Promise<ProductionTaskPolicy> => {
@@ -215,5 +240,5 @@ export function createHermesActivation(input: HermesActivationConfig, deps: Herm
     };
   };
   return Object.freeze({ allowedIssueIds: new Set([config.issueId]), allowedActionTypes: new Set(['classify','start_coding'] as const),
-    codingTrial, createAdmittedCodeLoop, getHealthEvidence: () => Object.freeze([...health]) });
+    codingTrial, createAdmittedCodeLoop, createCodeVerification, verificationPolicy:HERMES_CODING_RUNTIME_POLICY.verification, getHealthEvidence: () => Object.freeze([...health]) });
 }

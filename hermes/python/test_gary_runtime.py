@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from gary_runtime import (MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGES, MAX_INPUT_BYTES, MAX_RESPONSE_BYTES,
-                          RuntimeFault, _StdioChannel, _history, _stdio_http_client, main, run_task)
+                          RuntimeFault, _LONG_TEST_POLICY, _StdioChannel, _history, _stdio_http_client, main, run_task)
 
 
 CAPABILITY = "test-task-capability-" + "x" * 40
@@ -1046,6 +1046,83 @@ class PhaseHistoryTests(unittest.TestCase):
         self.assertEqual(_history([{"role": "assistant", "content": "answer", "reasoning_content": "provider replay data"}])[0]["reasoning_content"],
                          "provider replay data")
 
+
+class LongTestProtocolTests(unittest.TestCase):
+    def setup_channel(self, updates=None, enabled=True):
+        self.manifest = payload(transport="stdio", deadlineMs=int(time.time()*1000)+120000,
+                                **({"longTestPolicy": copy.deepcopy(_LONG_TEST_POLICY)} if enabled else {}))
+        self.pending = {"kind":"test_job_pending", "jobId":"a0000000-0000-0000-0000-000000000001", "callId":"gate",
+                        "taskId":self.manifest["taskId"], "requestId":self.manifest["requestId"],
+                        "ownerEpoch":self.manifest["ownerEpoch"], "name":"run_bash", "deadlineMs":self.manifest["deadlineMs"]}
+        self.receipt = {"ok":True,"tool_call_id":"gate","name":"run_bash","content":"exit_code: 0\nchecked\n", "truncated":False}
+        complete = {"kind":"test_job_complete", "jobId":self.pending["jobId"], "callId":"gate", "receipt":self.receipt}
+        replies = updates(self.pending, complete) if updates else [(202,self.pending),(202,self.pending),(200,complete)]
+        self.writer = io.StringIO()
+        frames = "".join(response_frame(i+1, body, status) for i,(status,body) in enumerate(replies))
+        self.channel = _StdioChannel(self.manifest, io.StringIO(frames), self.writer)
+        return self.channel
+
+    def call(self, command="bun run ci:full"):
+        return self.channel(self.manifest["executorUrl"], {"taskId":self.manifest["taskId"],"ownerEpoch":self.manifest["ownerEpoch"],
+                    "token":CAPABILITY,"callId":"gate","name":"run_bash","arguments":{"command":command}},
+                    {"Authorization":"Bearer "+CAPABILITY,"Content-Type":"application/json"}, 60)
+
+    def test_automatic_poll_returns_only_original_tool_receipt(self):
+        self.setup_channel()
+        self.assertEqual(self.call(), self.receipt)
+        frames = [json.loads(line) for line in self.writer.getvalue().splitlines()]
+        self.assertEqual([frame["id"] for frame in frames], [1,2,3])
+        self.assertEqual([frame["path"] for frame in frames], ["/tools/execute","/tools/jobs/poll","/tools/jobs/poll"])
+        self.assertEqual(set(frames[1]["body"]), {"taskId","requestId","ownerEpoch","callId","jobId"})
+        self.assertNotIn("command", frames[1]["body"])
+
+    def test_pending_requires_explicit_policy_and_exact_command(self):
+        for enabled,command in [(False,"bun run ci:full"),(True,"bun run ci:full "),(True,"echo hi")]:
+            with self.subTest(enabled=enabled,command=command):
+                self.setup_channel(enabled=enabled)
+                with self.assertRaisesRegex(RuntimeFault,"unexpected_test_job"):
+                    self.call(command)
+                self.assertEqual(len(self.writer.getvalue().splitlines()),1)
+
+    def test_mismatched_owner_call_or_extended_deadline_is_fatal(self):
+        for key,value in [("ownerEpoch","different"),("requestId","different"),("callId","different"),("deadlineMs",10**16),("extra",True)]:
+            with self.subTest(key=key):
+                self.setup_channel(lambda pending,complete:[(202,{**pending,key:value})])
+                with self.assertRaisesRegex(RuntimeFault,"test_job_binding_rejected"):
+                    self.call()
+                self.assertEqual(len(self.writer.getvalue().splitlines()),1)
+
+    def test_pending_update_cannot_change_binding_or_extend_deadline(self):
+        self.setup_channel(lambda pending,complete:[(202,pending),(202,{**pending,"deadlineMs":pending["deadlineMs"]+1})])
+        with self.assertRaisesRegex(RuntimeFault,"test_job_binding_rejected"):
+            self.call()
+
+    def test_failure_receipt_is_recoverable_but_authority_and_mismatch_are_fatal(self):
+        self.setup_channel(lambda pending,complete:[(202,pending),(400,{**complete,"receipt":{**complete["receipt"],"ok":False}})])
+        self.assertIs(self.call()["ok"],False)
+        for status in (401,403,409,302):
+            self.setup_channel(lambda pending,complete:[(202,pending),(status,{"error":{"code":"denied"}})])
+            with self.assertRaises(RuntimeFault):
+                self.call()
+        self.setup_channel(lambda pending,complete:[(202,pending),(200,{**complete,"callId":"other"})])
+        with self.assertRaisesRegex(RuntimeFault,"test_job_receipt_rejected"):
+            self.call()
+
+    def test_poll_count_is_bounded_without_any_model_request(self):
+        self.setup_channel(lambda pending,complete:[(202,pending)]*97)
+        with self.assertRaisesRegex(RuntimeFault,"test_job_poll_limit"):
+            self.call()
+        frames=[json.loads(line) for line in self.writer.getvalue().splitlines()]
+        self.assertEqual(len(frames),97)
+        self.assertEqual(sum(frame["path"]=="/tools/jobs/poll" for frame in frames),96)
+        self.assertNotIn("/v1/chat/completions",[frame["path"] for frame in frames])
+
+    def test_invalid_policy_rejected_before_native_factory(self):
+        factory=FakeFactory()
+        manifest=payload(transport="stdio",longTestPolicy={**_LONG_TEST_POLICY,"maxPolls":999})
+        result=run_task(manifest,native_factory=factory,transport=FakeTransport())
+        self.assertEqual(result["reason"],"invalid_long_test_policy")
+        self.assertEqual(factory.calls,[])
 
 if __name__ == "__main__":
     unittest.main()

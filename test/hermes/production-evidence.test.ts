@@ -4,9 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createProductionEvidence, SMALL_TASK_PROGRESS_POLICY, type ProductionEvidenceOptions } from '../../src/hermes/production-evidence.ts';
 import { runProcess } from '../../src/executors/process.ts';
-import type { Executor, RunOpts } from '../../src/executors/index.ts';
+import type { Executor, ExecutorTestJob, RunOpts } from '../../src/executors/index.ts';
 import type { AuditTrace, AuditTraceEvent } from '../../src/hermes/audit-trace.ts';
 import type { GaryRuntimeManifest } from '../../src/hermes/gary-loop-adapter.ts';
+
+import { createActionVerification, CODING_VERIFICATION_POLICY } from '../../src/verification-policy.ts';
 
 const roots: string[] = [];
 afterEach(() => { for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true }); });
@@ -215,5 +217,75 @@ describe('production evidence through actual offline Git/bash executor fixtures'
     h.options.executor.readFile = async (_path, opts) => { active.abort(); forwarded = !!opts?.signal?.aborted; return 'late private result'; };
     await expect(bounded.executor.readFile('task.ts')).rejects.toThrow('production_evidence_rejected:cancelled');
     expect(forwarded).toBe(true);
+  });
+});
+
+
+describe('shared action verification around production evidence', () => {
+  for (const command of ['bun run ci:full', 'bun run check'] as const) {
+    test(command + ' counts once and carries one job/deadline through before, run and after', async () => {
+      const h = await fixture();
+      const actionDeadline = Date.now() + 9_000_000;
+      const verification = createActionVerification({ policy: CODING_VERIFICATION_POLICY, assertActive: () => {} });
+      verification.bindDeadline(actionDeadline);
+      const executions: Array<{ command: string; opts: RunOpts; starts: number }> = [];
+      const run = h.executor.run;
+      h.executor.run = async (actual, opts = {}) => {
+        executions.push({ command: actual, opts, starts: verification.snapshot().counts[command] });
+        return run(actual === 'set -euo pipefail\n' + command ? 'set -euo pipefail\n' + CHECK : actual, opts);
+      };
+      const evidence = await createProductionEvidence({ ...h.options, verification, deadlineMs: actionDeadline,
+        task: { ...h.options.task, criteria: [{ id: 'full', description: 'Verify the actual patch.', requiredCommands: [command] }] } });
+      await evidence.executor.writeFile('task.ts', 'implementation\n');
+      executions.length = 0;
+      const job: ExecutorTestJob = { jobId: 'job-1', taskId: 'task-1', requestId: 'request-1', actionId: 'action-1', ownerEpoch: 'owner-1',
+        journal: { directory: h.root, close() {} } };
+      const callerDeadline = Date.now() + 300_000;
+      const result = await evidence.executor.run(command, { testJob: job, deadlineMs: callerDeadline });
+      expect(result).toMatchObject({ exitCode: 0, timedOut: false });
+      expect(executions).toHaveLength(3);
+      expect(executions[0]!.command).toBe(executions[2]!.command);
+      expect(executions[1]!.command).toBe('set -euo pipefail\n' + command);
+      expect(executions.every(call => call.starts === 1)).toBe(true);
+      for (const call of executions) {
+        expect(call.opts.testJob).toBe(job);
+        expect(call.opts.deadlineMs).toBe(callerDeadline);
+        expect(call.opts.timeoutMs).toBe(CODING_VERIFICATION_POLICY.commands[command].timeoutMs);
+      }
+      expect(verification.snapshot().counts[command]).toBe(1);
+      const context = await evidence.contextSnapshot();
+      expect(context.acceptance.criteria[0]!.testEvidence).toBe('satisfied');
+      expect(context.acceptance.verifiedTestReceipts).toHaveLength(1);
+      expect(context.acceptance.verifiedTestReceipts[0]).toMatchObject({ command, completed: true, cancelled: false, exitCode: 0, origin: 'task' });
+      expect(verification.snapshot().counts[command]).toBe(1);
+    });
+  }
+
+  test('a near-match remains a bounded generic command and cannot mint a full-gate receipt', async () => {
+    const h = await fixture();
+    const deadlineMs = Date.now() + 9_000_000;
+    const verification = createActionVerification({ policy: CODING_VERIFICATION_POLICY, assertActive: () => {} });
+    verification.bindDeadline(deadlineMs);
+    const executions: Array<{ command: string; opts: RunOpts }> = [];
+    const run = h.executor.run;
+    const alias = 'bun run ci:full ';
+    h.executor.run = async (command, opts = {}) => {
+      executions.push({ command, opts });
+      return run(command === 'set -euo pipefail\n' + alias ? 'set -euo pipefail\n' + CHECK : command, opts);
+    };
+    const evidence = await createProductionEvidence({ ...h.options, verification, deadlineMs,
+      task: { ...h.options.task, criteria: [{ id: 'full', description: 'Full gate only.', requiredCommands: ['bun run ci:full'] }] } });
+    await evidence.executor.writeFile('task.ts', 'implementation\n');
+    executions.length = 0;
+    const before = Date.now();
+    expect((await evidence.executor.run(alias, { timeoutMs: 1_800_000 })).exitCode).toBe(0);
+    expect(executions).toHaveLength(1);
+    expect(executions[0]!.opts.timeoutMs).toBe(900_000);
+    expect(executions[0]!.opts.deadlineMs).toBeGreaterThanOrEqual(before + 900_000);
+    expect(executions[0]!.opts.deadlineMs).toBeLessThanOrEqual(Date.now() + 900_000);
+    expect(verification.snapshot().counts).toEqual({ 'bun run ci:full': 0, 'bun run check': 0 });
+    const context = await evidence.contextSnapshot();
+    expect(context.acceptance.criteria[0]!.testEvidence).toBe('pending');
+    expect(context.acceptance.verifiedTestReceipts).toEqual([]);
   });
 });

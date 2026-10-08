@@ -1,4 +1,5 @@
 /** Host evidence through the admitted Executor only. No global fetch or host filesystem reads. */
+import type { ActionVerification } from '../verification-policy.ts';
 import type { Executor, ExecResult, RunOpts } from '../executors/index.ts';
 import { createProgressGuard, type ProgressPolicy, type ProgressScope, type TrustedProgressSnapshot } from './progress-guard.ts';
 import { buildTaskContext, contextualizeTaskManifest, type ContextMetadataReader, type ContextTaskDefinition,
@@ -13,6 +14,7 @@ export const SMALL_TASK_PROGRESS_POLICY: Readonly<ProgressPolicy> = Object.freez
 });
 export interface ProductionEvidenceOptions {
   executor: Executor;
+  verification?: ActionVerification;
   scope: ProgressScope;
   /** Canonical host task, never inferred from model text. */
   task: ContextTaskDefinition;
@@ -164,9 +166,9 @@ export async function createProductionEvidence(options: ProductionEvidenceOption
     guard(opts.signal);
     return result;
   }
-  async function captureRaw(signal?: AbortSignal): Promise<GitEvidence> {
-    guard(signal);
-    const result = await execute(gitSnapshotCommand(baseCommit, task.allowedFiles), signal ? { signal } : {});
+  async function captureRaw(opts: RunOpts = {}): Promise<GitEvidence> {
+    guard(opts.signal);
+    const result = await execute(gitSnapshotCommand(baseCommit, task.allowedFiles), opts);
     if (result.exitCode !== 0 || result.timedOut || Buffer.byteLength(result.stdout) > 128 * 1024) fail('git_snapshot_failed');
     let value!: GitEvidence;
     try { value = JSON.parse(result.stdout); } catch { fail('git_snapshot_invalid'); }
@@ -183,7 +185,7 @@ export async function createProductionEvidence(options: ProductionEvidenceOption
     return value;
   }
   async function snapshotRaw(signal?: AbortSignal): Promise<TrustedProgressSnapshot> {
-    const git = await captureRaw(signal);
+    const git = await captureRaw(signal ? {signal} : {});
     guard(signal);
     const state = options.allocationState();
     if (!['active', 'exhausted', 'closed'].includes(state)) fail('allocation_state_invalid');
@@ -214,22 +216,25 @@ export async function createProductionEvidence(options: ProductionEvidenceOption
       guard(opts?.signal); await options.executor.writeFile(path, content, boundedOpts(opts)); guard(opts?.signal);
     }),
     run: (command, opts = {}) => queue(async () => {
-      guard(opts.signal);
-      const recognized = commands.has(command);
-      const before = recognized ? await captureRaw(opts.signal) : null;
-      const result = await execute('set -euo pipefail\n' + command, opts, true);
-      if (recognized) {
-        const after = await captureRaw(opts.signal), origin = before?.taskDiffDigest ? 'task' : 'baseline';
-        const receiptId = 'executor-check-' + (++receiptSequence);
-        const receipt: VerifiedTestReceipt = { receiptId, taskId: task.taskId, sequence: receiptSequence,
-          origin, patchRevision: before?.taskDiffDigest ?? null, command, completed: !result.timedOut && before?.workspaceDigest === after.workspaceDigest,
-          cancelled: result.timedOut || !!opts.signal?.aborted, exitCode: result.exitCode, evidenceRef: 'executor:' + receiptId };
-        receipts.set(receiptId, receipt);
-        const key = origin + ':' + command, old = latestReceipts.get(key);
-        if (old) receipts.delete(old);
-        latestReceipts.set(key, receiptId);
-      }
-      return result;
+      const lifecycle = async (opts: RunOpts): Promise<ExecResult> => {
+        guard(opts.signal);
+        const recognized = commands.has(command);
+        const before = recognized ? await captureRaw(opts) : null;
+        const result = await execute('set -euo pipefail\n' + command, opts, true);
+        if (recognized) {
+          const after = await captureRaw(opts), origin = before?.taskDiffDigest ? 'task' : 'baseline';
+          const receiptId = 'executor-check-' + (++receiptSequence);
+          const receipt: VerifiedTestReceipt = { receiptId, taskId: task.taskId, sequence: receiptSequence,
+            origin, patchRevision: before?.taskDiffDigest ?? null, command, completed: !result.timedOut && before?.workspaceDigest === after.workspaceDigest,
+            cancelled: result.timedOut || !!opts.signal?.aborted, exitCode: result.exitCode, evidenceRef: 'executor:' + receiptId };
+          receipts.set(receiptId, receipt);
+          const key = origin + ':' + command, old = latestReceipts.get(key);
+          if (old) receipts.delete(old);
+          latestReceipts.set(key, receiptId);
+        }
+        return result;
+      };
+      return options.verification ? options.verification.run(command, opts, lifecycle) : lifecycle(opts);
     }),
   };
   const capture = (signal?: AbortSignal) => queue(() => snapshotRaw(signal));

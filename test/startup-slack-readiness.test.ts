@@ -10,7 +10,7 @@ import type { GitHubClient } from '../src/adapters/github.ts';
 import type { Executor } from '../src/executors/index.ts';
 import { runProcess } from '../src/executors/process.ts';
 import type { GaryRuntimeLauncher } from '../src/hermes/gary-loop-adapter.ts';
-import { HERMES_CANARY_CHILD_IMAGE, HERMES_CANARY_WORKER_IMAGE, type HermesActivationConfig } from '../src/hermes/activation.ts';
+import { HERMES_CANARY_CHILD_IMAGE, HERMES_CODING_WORKER_IMAGE, type HermesActivationConfig } from '../src/hermes/activation.ts';
 import { bindCanonicalCodeAction } from '../src/hermes/canonical-admission.ts';
 import { HERMES_CODING_RUNTIME_POLICY } from '../src/hermes/coding-runtime-policy.ts';
 import type { CodePublicationReceipt } from '../src/handlers/code.ts';
@@ -22,7 +22,7 @@ import { GARY_SLACK, READY_DM_TEXT } from '../src/slack/service.ts';
 
 const roots:string[]=[];
 afterEach(()=>{for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true});});
-const ISSUE='11111111-1111-4111-8111-111111111111', REPO='fixture/repo', CHECK='bun run check';
+const ISSUE='11111111-1111-4111-8111-111111111111', REPO='fixture/repo', CHECK='bun run ci:full';
 const credentials={botToken:'xoxb-offline-startup-not-a-real-token',appToken:'xapp-offline-startup-not-a-real-token'};
 const SOCKET_URL='wss://wss-primary.slack.com/link/?ticket=offline-fixture-ticket';
 class FakeSocket implements SlackSocket {
@@ -43,8 +43,11 @@ const native:GaryRuntimeLauncher=async(m,handle)=>{
     if(!response.ok)throw new Error('offline_model_rpc_failed');
     const assistant=(await response.json()).choices[0].message;history.push(assistant);
     for(const tool of assistant.tool_calls??[]){
-      const response=await call('/tools/execute',{taskId:m.taskId,ownerEpoch:m.ownerEpoch,token:m.capability,callId:tool.id,name:tool.function.name,arguments:tool.function.arguments});
-      const receipt=await response.json();history.push({role:'tool',tool_call_id:tool.id,content:receipt.content});
+      let response=await call('/tools/execute',{taskId:m.taskId,ownerEpoch:m.ownerEpoch,token:m.capability,callId:tool.id,name:tool.function.name,arguments:tool.function.arguments});
+      let receipt=await response.json();
+      while(response.status===202){response=await call('/tools/jobs/poll',{taskId:m.taskId,requestId:m.requestId,ownerEpoch:m.ownerEpoch,callId:tool.id,jobId:receipt.jobId});receipt=await response.json();}
+      if(receipt.kind==='test_job_complete')receipt=receipt.receipt;
+      history.push({role:'tool',tool_call_id:tool.id,content:receipt.content});
       if(!response.ok)throw new Error('offline_tool_rpc_failed');
       if(tool.function.name==='finish')return{taskId:m.taskId,requestId:m.requestId,status:'finished',publicationApproved:false,history};
     }
@@ -57,11 +60,11 @@ async function fixture(){
   const env={PATH:'/opt/homebrew/bin:/Users/tanner/.bun/bin:/usr/bin:/bin',HOME:root,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null'};
   const run=(command:string)=>runProcess('/bin/bash',['-c',command],{cwd:workspace,env,timeoutMs:10_000});
   for(const command of ['git init -q','git config user.email fixture@example.invalid','git config user.name Fixture','git config core.hooksPath /dev/null'])expect((await run(command)).exitCode).toBe(0);
-  writeFileSync(join(workspace,'task.ts'),'baseline\n');writeFileSync(join(workspace,'package.json'),JSON.stringify({scripts:{check:'test "$(cat task.ts)" = updated'}}));
+  writeFileSync(join(workspace,'task.ts'),'baseline\n');writeFileSync(join(workspace,'package.json'),JSON.stringify({scripts:{'ci:full':'bun run check',check:'test "$(cat task.ts)" = updated'}}));
   expect((await run('git add task.ts package.json && git commit -qm baseline')).exitCode).toBe(0);
-  const activation:HermesActivationConfig={version:1,issueId:ISSUE,repo:REPO,provider:'deepseek',model:'deepseek-v4-pro',workerImage:HERMES_CANARY_WORKER_IMAGE,
+  const activation:HermesActivationConfig={version:1,issueId:ISSUE,repo:REPO,provider:'deepseek',model:'deepseek-v4-pro',workerImage:HERMES_CODING_WORKER_IMAGE,
     childImage:HERMES_CANARY_CHILD_IMAGE,dockerExecutable:'/usr/local/bin/docker',dockerHost:'unix:///Users/tanner/.colima/default/docker.sock',traceDirectory:traces,
-    policy:{baseCommit:(await run('git rev-parse HEAD')).stdout.trim(),task:{allowedFiles:['task.ts'],criteria:[{id:'fix',description:'Exact scoped change',requiredCommands:[CHECK]}]},
+    policy:{baseCommit:(await run('git rev-parse HEAD')).stdout.trim(),task:{allowedFiles:['task.ts'],criteria:[{id:'fix',description:'Exact scoped change',requiredCommands:['bun run check',CHECK]}]},
       progress:{maxModelRequests:50,maxModelRequestsWithoutProgress:20,maxSuccessfulToolCalls:100,toolRepeatWindow:10,maxRepeatedToolCalls:5},instructions:[],voicePrinciples:'Use Gary voice.',
       readTicketIdentifiers:['ERT-1'],publicFetch:{policy:{kind:'urls',urls:[]}},cloudflare:{allowedServices:[],allowedDatabases:[]},preparationCommands:[]}};
   const activationPath=join(root,'activation.json'),credentialsPath=join(root,'slack.env');
@@ -75,14 +78,14 @@ async function fixture(){
   const executor:Executor={workspaceRoot:workspace,readFile:async path=>readFileSync(join(workspace,path),'utf8'),writeFile:async(path,content)=>{writeFileSync(join(workspace,path),content);},listFiles:async()=>[],grep:async()=>[],
     run:async(command,options)=>runProcess('/bin/bash',['-c',command],{...options,cwd:workspace,env,timeoutMs:options?.timeoutMs??10_000})};
   const sockets:FakeSocket[]=[],posts:Record<string,unknown>[]=[],methods:string[]=[];let modelCalls=0,launches=0,credentialLoads=0;
-  const deps:StartupDependencies={config:()=>config,linear:()=>({} as LinearAdapter),github:()=>({} as GitHubClient),db:path=>openDb(path),ledger:path=>new SpendLedger(path),
+  const deps:StartupDependencies={executorJobs:{create:options=>({directory:options.directory,close(){}}),reconcile:async()=>{}},config:()=>config,linear:()=>({} as LinearAdapter),github:()=>({} as GitHubClient),db:path=>openDb(path),ledger:path=>new SpendLedger(path),
     env:{GARY_RUNTIME_MODE:'hermes-canary',GARY_HERMES_ACTIVATION_PATH:activationPath,GARY_EXECUTOR:'docker',GARY_EXECUTOR_NETWORK:'none',GARY_EXECUTOR_IMAGE:HERMES_CODING_RUNTIME_POLICY.executor.image,
       GARY_BUN_CACHE_VOLUME:HERMES_CODING_RUNTIME_POLICY.executor.bunCacheVolume,
       DOCKER_HOST:'unix:///Users/tanner/.colima/default/docker.sock',GARY_SLACK_ENABLED:'1',GARY_SLACK_CREDENTIALS_FILE:credentialsPath},
     fetch:(async(input:RequestInfo|URL,init?:RequestInit)=>{
       const request=new Request(input,init);expect(request.url).toBe('https://api.deepseek.com/anthropic/v1/messages');
       const body=await request.json();expect(body.model).toBe('deepseek-v4-pro');expect(body.thinking).toEqual({type:'disabled'});modelCalls++;
-      const steps=[['read_file',{path:'task.ts'}],['write_file',{path:'task.ts',content:'updated\n'}],['run_bash',{command:CHECK}],['finish',{summary:'Verified offline fixture'}]] as const;
+      const steps=[['read_file',{path:'task.ts'}],['write_file',{path:'task.ts',content:'updated\n'}],['run_bash',{command:'bun run check'}],['run_bash',{command:CHECK}],['finish',{summary:'Verified offline fixture'}]] as const;
       const step=steps[modelCalls-1]!;
       return Response.json({id:'reply-'+modelCalls,type:'message',role:'assistant',model:'deepseek-v4-pro',content:[{type:'tool_use',id:'tool-'+modelCalls,name:step[0],input:step[1]}],stop_reason:'tool_use',
         usage:{input_tokens:10,output_tokens:8,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
@@ -125,7 +128,7 @@ for(const mode of modes)test('actual startup Slack readiness: '+mode,async()=>{
     try{
       const result=await args.createAdmittedCodeLoop!(binding.admission)({glm:args.glm,executor:f.executor,systemPrompt:'Offline Gary fixture',task:'Update task.ts',maxIterations:5,
         maxTokensPerTurn:128,timeoutMs:30_000,deadlineMs:Date.now()+30_000,finishGateCommand:CHECK,disableSubagent:true});
-      expect(result.status).toBe(mode==='native-error'?'error':'finished');expect(f.counts().modelCalls).toBe(4);
+      expect(result.status).toBe(mode==='native-error'?'error':'finished');expect(f.counts().modelCalls).toBe(5);
       const files=readdirSync(f.traces);expect(files).toHaveLength(1);
       const terminal=readFileSync(join(f.traces,files[0]!),'utf8').trim().split('\n').map(line=>JSON.parse(line)).filter(row=>row.kind==='terminal');
       expect(terminal).toHaveLength(1);expect(terminal[0].status).toBe(mode==='native-error'?'error':'finished');
@@ -163,7 +166,7 @@ for(const mode of modes)test('actual startup Slack readiness: '+mode,async()=>{
         expect(row.readiness_receipt_id).toMatch(/^sha256:[a-f0-9]{64}$/);
       }else noSend();
       mention(f.sockets[0]!,'After');await flush();await refresh();
-      expect(f.posts).toHaveLength(mode==='ready'?1:0);expect(f.counts().modelCalls).toBe(4);
+      expect(f.posts).toHaveLength(mode==='ready'?1:0);expect(f.counts().modelCalls).toBe(5);
       expect(args.db.query("SELECT count(*) AS n FROM gary_slack_outbox WHERE kind='mention'").get()).toEqual({n:0});
     }finally{binding.close();}
   }});

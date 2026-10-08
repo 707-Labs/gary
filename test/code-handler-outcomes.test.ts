@@ -14,6 +14,7 @@ import { openDb } from "../src/state/db.ts";
 import { getTicket, upsertTicket } from "../src/state/queries.ts";
 import { recordReviewPass } from "../src/state/review-queries.ts";
 import { SpendLedger } from "../src/spend.ts";
+import { createActionVerification, CODING_VERIFICATION_POLICY } from "../src/verification-policy.ts";
 
 const issue: AssignedIssue = {
   id: "offline-issue", identifier: "FIX-1", title: "Offline handler fixture", description: "Small fixture change",
@@ -752,5 +753,141 @@ describe('trusted parent executor profile at the CODE handler boundary',()=>{
   it('legacy omission passes no profile',async()=>{
     expect((await f.invoke()).status).toBe('pr_opened');
     expect(f.factory.mock.calls[0]).toEqual(['/offline/workspaces/FIX-1',{}]);
+  });
+});
+
+
+describe("CODE shared verification policy", () => {
+  function configure() {
+    const verification = createActionVerification({ policy: CODING_VERIFICATION_POLICY, assertActive: () => {} });
+    f.deps.verification = verification;
+    f.deps.agentLoopTimeoutMs = 9_000_000;
+    return verification;
+  }
+  function primaryGate(verification: ReturnType<typeof configure>, before?: (args: agent.AgentLoopArgs) => void) {
+    const calls: agent.AgentLoopArgs[] = [];
+    f.deps.runAdmittedAgentLoop = async args => {
+      calls.push(args); before?.(args);
+      expect(args.finishGateCommand).toBe("bun run ci:full");
+      expect(args.systemPrompt).toContain("host-required full verification gate");
+      await verification.run(args.finishGateCommand!, {}, opts => args.executor.run(args.finishGateCommand!, opts));
+      return loopResult("finished");
+    };
+    return calls;
+  }
+
+  it("shares the primary and host gate budget and forwards the exact checked artifact to review", async () => {
+    const c = strictPublication();
+    const verification = configure();
+    const calls = primaryGate(verification);
+    expect((await f.invoke()).status).toBe("pr_opened");
+    expect(calls[0]?.phases?.[1]?.entryMessage).toContain("bun run ci:full");
+    expect(verification.snapshot()).toEqual({ deadlineMs: 10_000_000,
+      counts: { "bun run ci:full": 2, "bun run check": 0 } });
+    expect(f.run.mock.calls.map(([command]) => command)).toEqual(["bun run ci:full", "bun run ci:full"]);
+    for (const [, opts] of f.run.mock.calls) {
+      expect(opts?.timeoutMs).toBe(1_800_000);
+      expect(opts?.deadlineMs).toBe(2_800_000);
+    }
+    expect(c.receipts[0]?.requiredCheck.command).toBe("bun run ci:full");
+    expect(f.review.mock.calls[0]?.[0].hostCheck).toEqual({ command: "bun run ci:full", exitCode: 0, timedOut: false,
+      exactArtifact: { headSha: RECEIPT_HEAD, baseSha: "c".repeat(40), treeSha: "d".repeat(40), worktreeClean: true } });
+    expect(f.review.mock.calls[0]?.[0].deadlineMs).toBe(calls[0]?.deadlineMs);
+  });
+
+  it("uses the same four-start budget through a host-check repair without extending the action", async () => {
+    strictPublication();
+    const verification = configure();
+    const calls = primaryGate(verification, () => f.expire());
+    let runs = 0;
+    f.run.mockImplementation(async () => checkResult(++runs === 2 ? 1 : 0));
+    expect((await f.invoke()).status).toBe("pr_opened");
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.task).toContain("Most recent `bun run ci:full` output");
+    expect(calls[1]?.task).toContain("host requires this gate to pass");
+    expect(calls.map(call => call.deadlineMs)).toEqual([10_000_000, 10_000_000]);
+    expect(verification.snapshot().counts["bun run ci:full"]).toBe(4);
+    expect(f.run).toHaveBeenCalledTimes(4);
+    expect(f.run.mock.calls.every(([command]) => command === "bun run ci:full")).toBe(true);
+    expect(f.review.mock.calls[0]?.[0].hostCheck?.command).toBe("bun run ci:full");
+  });
+
+  it("refuses a fifth gate during repair before executing or publishing", async () => {
+    strictPublication();
+    const verification = configure();
+    let primaryCalls = 0;
+    f.deps.runAdmittedAgentLoop = async args => {
+      const repetitions = ++primaryCalls === 1 ? 3 : 1;
+      for (let i = 0; i < repetitions; i++) {
+        await verification.run(args.finishGateCommand!, {}, opts => args.executor.run(args.finishGateCommand!, opts));
+      }
+      return loopResult("finished");
+    };
+    let runs = 0;
+    f.run.mockImplementation(async () => checkResult(++runs === 4 ? 1 : 0));
+    await expect(f.invoke()).rejects.toThrow("verification_rejected:test_start_limit");
+    expect(primaryCalls).toBe(2);
+    expect(verification.snapshot().counts["bun run ci:full"]).toBe(4);
+    expect(f.run).toHaveBeenCalledTimes(4);
+    expect(f.review).not.toHaveBeenCalled();
+    expect(f.push).not.toHaveBeenCalled();
+    expect(f.openPr).not.toHaveBeenCalled();
+  });
+
+  it("refreshes the gate and exact-artifact receipt through the bounded reviewer-repair path", async () => {
+    const c = strictPublication();
+    const verification = configure();
+    let loops = 0;
+    const calls = primaryGate(verification, () => {
+      if (++loops === 2) {
+        c.artifact.headSha = REBASED_HEAD; c.artifact.branchSha = REBASED_HEAD;
+        c.artifact.treeSha = "e".repeat(40); f.pr.headSha = REBASED_HEAD;
+      }
+    });
+    f.review.mockResolvedValueOnce(reviewResult("changes_needed")).mockResolvedValueOnce(reviewResult("approve"));
+    expect((await f.invoke()).status).toBe("pr_opened");
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.task).toContain("Run `bun run ci:full` before finish");
+    expect(verification.snapshot().counts["bun run ci:full"]).toBe(4);
+    expect(f.review.mock.calls.map(([args]) => args.hostCheck?.exactArtifact.headSha)).toEqual([RECEIPT_HEAD, REBASED_HEAD]);
+    expect(f.review.mock.calls[1]?.[0].hostCheck?.exactArtifact.treeSha).toBe("e".repeat(40));
+    expect(c.receipts[0]?.requiredCheck.command).toBe("bun run ci:full");
+    expect(c.receipts[0]?.exactArtifact?.headSha).toBe(REBASED_HEAD);
+  });
+
+  it("preserves host evidence on a failed-review retry and counts any reviewer gate in the same budget", async () => {
+    strictPublication();
+    const verification = configure();
+    primaryGate(verification);
+    let reviews = 0;
+    f.review.mockImplementation(async args => {
+      await args.executor.run("bun run ci:full", { timeoutMs: 180_000,
+        ...(args.deadlineMs === undefined ? {} : { deadlineMs: args.deadlineMs }),
+        ...(args.signal === undefined ? {} : { signal: args.signal }) });
+      return ++reviews === 1 ? { kind: "failed", reason: "fixture retry" } : reviewResult();
+    });
+    expect((await f.invoke()).status).toBe("pr_opened");
+    expect(verification.snapshot().counts["bun run ci:full"]).toBe(4);
+    expect(f.review.mock.calls[0]?.[0].hostCheck).toEqual(f.review.mock.calls[1]?.[0].hostCheck);
+    expect(f.run.mock.calls.slice(2).every(([, opts]) => opts?.timeoutMs === 180_000)).toBe(true);
+  });
+
+  it("routes a legacy-compatible post-rebase recheck through the selected shared gate", async () => {
+    const verification = configure();
+    primaryGate(verification);
+    f.rebase.mockResolvedValue({ kind: "clean", preRebaseSha: RECEIPT_HEAD, postRebaseSha: REBASED_HEAD });
+    expect((await f.invoke()).status).toBe("pr_opened");
+    expect(verification.snapshot().counts["bun run ci:full"]).toBe(3);
+    expect(f.run.mock.calls.map(([command]) => command)).toEqual(Array(3).fill("bun run ci:full"));
+    expect(f.review.mock.calls[0]?.[0].hostCheck).toBeUndefined();
+  });
+
+  it("keeps the legacy gate, timeout and reviewer prompt input when policy is omitted", async () => {
+    expect((await f.invoke()).status).toBe("pr_opened");
+    expect(f.primary.mock.calls[0]?.[0].finishGateCommand).toBe("bun run check");
+    expect(f.primary.mock.calls[0]?.[0].systemPrompt).toContain("project's typecheck/svelte-check command");
+    expect(f.run.mock.calls[0]?.[0]).toBe("bun run check");
+    expect(f.run.mock.calls[0]?.[1]?.timeoutMs).toBe(600_000);
+    expect(f.review.mock.calls[0]?.[0].hostCheck).toBeUndefined();
   });
 });

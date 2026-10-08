@@ -1,4 +1,6 @@
 import { resolve } from "node:path";
+import type { ActionVerification } from "../verification-policy.ts";
+import type { TrustedHostCheckReceipt } from "../review/prompts.ts";
 import type { CloudflareClient } from "../adapters/cloudflare.ts";
 import type { GitHubClient } from "../adapters/github.ts";
 import { GLMClient } from "../adapters/glm.ts";
@@ -80,7 +82,7 @@ function phaseBudget(scope: "S" | "M" | "L"): { investigate: number; implement: 
   return { investigate: 15, implement: 35 };
 }
 
-function buildCodePhases(scope: "S" | "M" | "L" = "M"): readonly PhaseSpec[] {
+function buildCodePhases(scope: "S" | "M" | "L" = "M", checkCommand = CHECK_COMMAND): readonly PhaseSpec[] {
   const { investigate, implement } = phaseBudget(scope);
   return [
     {
@@ -94,36 +96,40 @@ function buildCodePhases(scope: "S" | "M" | "L" = "M"): readonly PhaseSpec[] {
       name: "implement",
       maxIter: implement,
       entryMessage:
-        "good — you've explored. now: (1) write a 3-5 bullet plan, (2) implement the change and commit, (3) run `bun run check` and fix anything you broke, (4) call finish() after verification passes. If you're stuck or cannot verify, call report_blocked with the concrete error, partial work, and needed human action. After two attempts reproduce the same failure without new evidence, stop and report the blocker.",
+        `good — you've explored. now: (1) write a 3-5 bullet plan, (2) implement the change and commit, (3) run \`${checkCommand}\` and fix anything you broke, (4) call finish() after verification passes. If you're stuck or cannot verify, call report_blocked with the concrete error, partial work, and needed human action. After two attempts reproduce the same failure without new evidence, stop and report the blocker.`,
       nudgeMessage:
         "you're approaching the iteration cap. If verified, commit and call finish(). Otherwise call report_blocked with partial progress and the specific unresolved error; do not claim verification passed.",
     },
   ];
 }
 
-const CHECK_FIXUP_TASK_INSTRUCTIONS = `Your previous turn ended with finish() but \`${CHECK_COMMAND}\` is failing. Fix the errors caused by your changes, commit, then call finish() again.
+function checkFixupTaskInstructions(checkCommand: string): string {
+  return `Your previous turn ended with finish() but \`${checkCommand}\` is failing. Fix the errors caused by your changes, commit, then call finish() again.
 
 Rules:
-- Run \`${CHECK_COMMAND}\` and confirm it exits 0 BEFORE calling finish.
+- Run \`${checkCommand}\` and confirm it exits 0 BEFORE calling finish.
 - Only fix what's broken — don't refactor unrelated code.
-- If the failure is in code you didn't touch, investigate before assuming it's pre-existing. The pre-push hook runs the same command, so anything failing here will block your push.
+- If the failure is in code you didn't touch, investigate before assuming it's pre-existing. ${checkCommand === CHECK_COMMAND ? "The pre-push hook runs the same command, so anything failing here will block your push." : "The host requires this gate to pass before publication."}
 - Commit your fix-up changes before calling finish.
 - First distinguish a changed-code failure from an existing repository failure or unavailable tooling/dependencies. Cite the first actionable error; do not change unrelated code to bypass an environment problem.
 - After two attempts reproduce the same failure without new evidence, call report_blocked with the error and partial progress. A blocked exit does not require a passing check.`;
+}
 
-const CODE_TASK_INSTRUCTIONS = `You are working on a Linear ticket for 707 Labs. Make the smallest change that solves the ticket and stop.
+function codeTaskInstructions(checkCommand: string): string {
+  return `You are working on a Linear ticket for 707 Labs. Make the smallest change that solves the ticket and stop.
 
 You can use tools to read, edit, run bash commands, and commit. When you're done, call finish() with a one-sentence summary.
 
 Rules:
 - Read before you write. Look at the existing code, the project's conventions (CLAUDE.md, AGENTS.md, .claude/skills/), and any related files before changing anything.
 - Make the smallest change that solves the ticket. Don't refactor unrelated code.
-- BEFORE calling finish, run \`bun run check\` (the project's typecheck/svelte-check command). If there are errors caused by your changes, fix them and re-run. The repo has a pre-push hook that runs the same command — your push will be rejected if it fails.
+- BEFORE calling finish, run \`${checkCommand}\`${checkCommand === CHECK_COMMAND ? " (the project's typecheck/svelte-check command)" : " (the host-required full verification gate)"}. If there are errors caused by your changes, fix them and re-run. ${checkCommand === CHECK_COMMAND ? "The repo has a pre-push hook that runs the same command — your push will be rejected if it fails." : "The host independently verifies this gate before publication."}
 - Run other tests if there's an obvious command for the area you touched (look at package.json scripts and tests in the changed file's directory). If tests fail, try to fix them.
 - If the ticket is ambiguous, make a reasonable choice and note it in finish()'s summary.
 - If you cannot complete or verify the task, call report_blocked with the concrete blocker, partial work, and what a human must resolve. Do not use finish() for partial progress.
 - Don't install new dependencies unless the ticket clearly requires it.
 - Commit your changes before calling finish.`;
+}
 
 export const PR_BODY_TASK_INSTRUCTIONS = `Write a PR body for the changes you just made. Use voice.md examples 5 (small, confident) and 6 (medium, with uncertainty) as your structural template — match that exact format. Pick the level of detail based on the size and certainty of this change.
 
@@ -226,6 +232,8 @@ export interface CodeHandlerDeps {
   strictPublicationArtifact?: true;
   /** Trusted coding-only profile shared by primary, fixups, checks and reviewer. */
   workspaceExecutorProfile?: WorkspaceExecutorProfile;
+  /** Shared host-owned command ceilings and attempt counts for this coding action. */
+  verification?: ActionVerification;
   /** Trusted host-only readiness persistence; never a publication authorization.
    * Failure is recorded without relabeling an already-created PR as a failure.
    */
@@ -272,12 +280,25 @@ async function runCodeAgentLoop(deps: CodeHandlerDeps, args: AgentLoopArgs): Pro
   return result;
 }
 
+function selectedCheckCommand(deps: CodeHandlerDeps): string {
+  return deps.verification?.policy.publicationCommand ?? CHECK_COMMAND;
+}
+
+function runRequiredCheck(deps: CodeHandlerDeps, executor: Executor): Promise<ExecResult> {
+  const verification = deps.verification;
+  if (!verification) return executor.run(CHECK_COMMAND, { timeoutMs: CHECK_TIMEOUT_MS });
+  const command = verification.policy.publicationCommand;
+  return verification.run(command, { timeoutMs: verification.policy.commands[command]!.timeoutMs },
+    boundedOpts => executor.run(command, boundedOpts));
+}
+
 export async function runCodeHandler(
   deps: CodeHandlerDeps,
   args: CodeHandlerArgs,
 ): Promise<CodeHandlerResult> {
   const budget = createDeadline({ timeoutMs: deps.agentLoopTimeoutMs });
   try {
+    deps.verification?.bindDeadline(budget.deadlineMs, budget.signal);
     return await runCodeHandlerWithinDeadline(deps, args, budget);
   } catch (err) {
     if (!(err instanceof DeadlineExceededError) && !budget.signal.aborted) throw err;
@@ -304,6 +325,7 @@ async function runCodeHandlerWithinDeadline(
 
   const branch = `${args.issue.identifier}-${slugify(args.issue.title)}`;
   const worktreePath = resolve(deps.workspacesDir, args.issue.identifier);
+  const checkCommand = selectedCheckCommand(deps);
   const strictArtifact = deps.strictPublicationArtifact === true;
   if (deps.strictPublicationArtifact !== undefined && !strictArtifact) throw new Error("invalid_strict_publication_policy");
   const sameArtifact = (left: CodePublicationArtifact, right: CodePublicationArtifact) =>
@@ -346,8 +368,16 @@ async function runCodeHandlerWithinDeadline(
       if (result.exitCode !== 0 || result.timedOut || !checkStartedArtifact || !sameArtifact(checkStartedArtifact, after)) throw new Error("strict_publication_check_unverified");
       checkedArtifact = after;
     }
-    requiredCheck = { command: CHECK_COMMAND, passed: result.exitCode === 0 && !result.timedOut,
+    requiredCheck = { command: checkCommand, passed: result.exitCode === 0 && !result.timedOut,
       exitCode: result.exitCode, timedOut: result.timedOut, afterCheck: await observeGit() };
+  } : undefined;
+
+  const getHostCheck = deps.verification && strictArtifact ? (): TrustedHostCheckReceipt => {
+    if (!checkedArtifact || !requiredCheck?.passed || requiredCheck.timedOut || requiredCheck.exitCode !== 0) {
+      throw new Error("strict_publication_check_unverified");
+    }
+    return Object.freeze({ command: checkCommand, exitCode: 0, timedOut: false,
+      exactArtifact: Object.freeze({ ...checkedArtifact }) });
   } : undefined;
 
   log.info("code handler starting", {
@@ -385,7 +415,7 @@ async function runCodeHandlerWithinDeadline(
 
   const executor = bindExecutorDeadline(createWorkspaceExecutor(worktreePath,
     deps.workspaceExecutorProfile ? { profile: deps.workspaceExecutorProfile } : {}), budget);
-  const system = composeSystemPrompt({ taskInstructions: CODE_TASK_INSTRUCTIONS });
+  const system = composeSystemPrompt({ taskInstructions: codeTaskInstructions(checkCommand) });
   const projectSection = formatProjectContext(
     loadProjectContext(worktreePath),
     loadSkillIndex(worktreePath),
@@ -404,7 +434,7 @@ async function runCodeHandlerWithinDeadline(
     systemPrompt: system,
     task: taskMessage,
     maxIterations: deps.agentLoopMaxIterations,
-    phases: buildCodePhases(args.scope),
+    phases: buildCodePhases(args.scope, checkCommand),
     timeoutMs: deps.agentLoopTimeoutMs,
     deadlineMs: budget.deadlineMs,
     signal: budget.signal,
@@ -417,7 +447,7 @@ async function runCodeHandlerWithinDeadline(
     },
     github: deps.github,
     defaultRepo: args.repo,
-    finishGateCommand: CHECK_COMMAND,
+    finishGateCommand: checkCommand,
     ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
   });
 
@@ -496,6 +526,7 @@ async function runCodeHandlerWithinDeadline(
     budget,
     ...(beforeRequiredCheck ? { beforeRequiredCheck } : {}),
     ...(assertCheckedArtifact ? { assertCheckedArtifact } : {}),
+    ...(getHostCheck ? { getHostCheck } : {}),
     ...(observeRequiredCheck ? { observeRequiredCheck } : {}),
   });
   if (reviewOutcome.kind === "escalated") {
@@ -534,9 +565,7 @@ async function runCodeHandlerWithinDeadline(
       branch,
     });
   } else if (rebase.kind === "clean") {
-    const recheck = await executor.run(CHECK_COMMAND, {
-      timeoutMs: CHECK_TIMEOUT_MS,
-    });
+    const recheck = await runRequiredCheck(deps, executor);
     if (recheck.exitCode !== 0) {
       postRebaseCheck = "failed_reverted";
       log.warn("check failed after rebase; reverting and pushing pre-rebase", {
@@ -798,11 +827,10 @@ async function ensurePostFinishCheckPasses(
   args: CodeHandlerArgs,
   ctx: FixupContext,
 ): Promise<"passed" | "blocked" | "check_failed"> {
+  const checkCommand = selectedCheckCommand(deps);
   ctx.budget.throwIfExpired();
   await ctx.beforeRequiredCheck?.();
-  const first = await ctx.executor.run(CHECK_COMMAND, {
-    timeoutMs: CHECK_TIMEOUT_MS,
-  });
+  const first = await runRequiredCheck(deps, ctx.executor);
   if (first.exitCode === 0) { await ctx.observeRequiredCheck?.(first); return "passed"; }
 
   log.warn("post-finish check failed; running fix-up", {
@@ -811,7 +839,7 @@ async function ensurePostFinishCheckPasses(
     timedOut: first.timedOut,
   });
 
-  const fixupTask = renderCheckFixupTask(first);
+  const fixupTask = renderCheckFixupTask(first, checkCommand);
   const fixupResult = await runCodeAgentLoop(deps, {
     glm: deps.glm,
     executor: ctx.executor,
@@ -830,7 +858,7 @@ async function ensurePostFinishCheckPasses(
     },
     github: deps.github,
     defaultRepo: args.repo,
-    finishGateCommand: CHECK_COMMAND,
+    finishGateCommand: checkCommand,
     ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
   });
   log.info("fixup loop done", {
@@ -850,9 +878,7 @@ async function ensurePostFinishCheckPasses(
   if (fixupResult.status === "timeout") throw new DeadlineExceededError();
 
   await ctx.beforeRequiredCheck?.();
-  const second = await ctx.executor.run(CHECK_COMMAND, {
-    timeoutMs: CHECK_TIMEOUT_MS,
-  });
+  const second = await runRequiredCheck(deps, ctx.executor);
   if (second.exitCode === 0) { await ctx.observeRequiredCheck?.(second); return "passed"; }
 
   log.warn("check still failing after fix-up; escalating", {
@@ -862,13 +888,13 @@ async function ensurePostFinishCheckPasses(
   return "check_failed";
 }
 
-function renderCheckFixupTask(failed: { stdout: string; stderr: string }): string {
+function renderCheckFixupTask(failed: { stdout: string; stderr: string }, checkCommand: string): string {
   const combined = `${failed.stdout}\n${failed.stderr}`.trim();
   const truncated =
     combined.length > FIXUP_OUTPUT_BUDGET
       ? `${combined.slice(0, FIXUP_OUTPUT_BUDGET)}\n... (truncated)`
       : combined;
-  return `${CHECK_FIXUP_TASK_INSTRUCTIONS}\n\nMost recent \`${CHECK_COMMAND}\` output:\n\n\`\`\`\n${truncated}\n\`\`\``;
+  return `${checkFixupTaskInstructions(checkCommand)}\n\nMost recent \`${checkCommand}\` output:\n\n\`\`\`\n${truncated}\n\`\`\``;
 }
 
 async function postCheckFailureEscalation(
@@ -882,7 +908,7 @@ async function postCheckFailureEscalation(
     .slice(-25)
     .join("\n");
   const body = [
-    `i thought i was done but \`${CHECK_COMMAND}\` is still failing after a fix-up pass. bouncing — i'd want a human to look before i try again.`,
+    `i thought i was done but \`${selectedCheckCommand(deps)}\` is still failing after a fix-up pass. bouncing — i'd want a human to look before i try again.`,
     "",
     "tail of the failure output:",
     "```",
@@ -967,6 +993,7 @@ interface ReviewLoopCtx {
   observeRequiredCheck?: (result: ExecResult) => Promise<void>;
   beforeRequiredCheck?: () => Promise<void>;
   assertCheckedArtifact?: () => Promise<void>;
+  getHostCheck?: () => TrustedHostCheckReceipt;
 }
 
 type ReviewLoopOutcome =
@@ -978,6 +1005,13 @@ async function runReviewLoop(
   args: CodeHandlerArgs,
   ctx: ReviewLoopCtx,
 ): Promise<ReviewLoopOutcome> {
+  const checkCommand = selectedCheckCommand(deps);
+  const verification = deps.verification;
+  const reviewExecutor: Executor = verification ? {
+    ...ctx.executor,
+    run: (command, options = {}) => verification.run(command, options,
+      boundedOptions => ctx.executor.run(command, boundedOptions)),
+  } : ctx.executor;
   let round = 0;
   let previousFindings: readonly { title: string; detail: string; bugClass: string }[] = [];
   let lastRunLog = ctx.primaryRunLog;
@@ -1002,13 +1036,14 @@ async function runReviewLoop(
     let outcome: ReviewerResult = await runReviewer({
       db: deps.db,
       glm: ctx.reviewerGlm,
-      executor: ctx.executor,
+      executor: reviewExecutor,
       ticket,
       issueLinearId: args.issue.id,
       fingerprint: ctx.fingerprint,
       round,
       diff,
       runLog: lastRunLog,
+      ...(ctx.getHostCheck ? { hostCheck: ctx.getHostCheck() } : {}),
       precheckFindings: precheck,
       previousFindings,
       worktreePath: ctx.worktreePath,
@@ -1031,13 +1066,14 @@ async function runReviewLoop(
       outcome = await runReviewer({
         db: deps.db,
         glm: ctx.reviewerGlm,
-        executor: ctx.executor,
+        executor: reviewExecutor,
         ticket,
         issueLinearId: args.issue.id,
         fingerprint: ctx.fingerprint,
         round,
         diff,
         runLog: lastRunLog,
+        ...(ctx.getHostCheck ? { hostCheck: ctx.getHostCheck() } : {}),
         precheckFindings: precheck,
         previousFindings,
         worktreePath: ctx.worktreePath,
@@ -1128,9 +1164,9 @@ async function runReviewLoop(
     }
 
     // Re-run the primary with findings as a fixup task.
-    const fixupTask = renderReviewerFixupTask(outcome.review.findings);
+    const fixupTask = renderReviewerFixupTask(outcome.review.findings, checkCommand);
     const primarySystem = composeSystemPrompt({
-      taskInstructions: CODE_TASK_INSTRUCTIONS,
+      taskInstructions: codeTaskInstructions(checkCommand),
     });
     const fixup = await runCodeAgentLoop(deps, {
       glm: deps.glm,
@@ -1150,7 +1186,7 @@ async function runReviewLoop(
       },
       github: deps.github,
       defaultRepo: args.repo,
-      finishGateCommand: CHECK_COMMAND,
+      finishGateCommand: checkCommand,
       ...(deps.cloudflare ? { cloudflare: deps.cloudflare } : {}),
     });
     log.info("reviewer-driven fixup loop done", {
@@ -1185,12 +1221,13 @@ async function runReviewLoop(
 
 function renderReviewerFixupTask(
   findings: readonly { title: string; detail: string; bugClass: string }[],
+  checkCommand: string,
 ): string {
   const lines = [
     "A reviewer agent looked at your work and found blocking issues. Fix each one, commit, then call finish() again.",
     "",
     "Rules:",
-    `- Run \`${CHECK_COMMAND}\` before finish.`,
+    `- Run \`${checkCommand}\` before finish.`,
     "- Address each finding directly. If you disagree with one, fix it anyway and explain in your finish summary.",
     "- Don't refactor unrelated code.",
     "",

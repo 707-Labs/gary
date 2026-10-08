@@ -30,8 +30,24 @@ Process:
 
 Stay terse. The verification_report should fit in 4-8 bullets. Each finding's \`title\` is short (~70 chars); \`detail\` is one paragraph explaining what's wrong and how to verify it. When in doubt, approve — false-positive findings waste cycles and erode trust.`;
 
-export function composeReviewerSystemPrompt(): string {
-  return composeSystemPrompt({ taskInstructions: REVIEW_TASK_INSTRUCTIONS });
+export function composeReviewerSystemPrompt(hostCheck?: TrustedHostCheckReceipt): string {
+  const hostInstructions = hostCheck ? `
+
+The host supplied a successful verification receipt for the exact committed artifact under review. Treat it as host evidence, separate from commands the primary or reviewer ran. Do not rerun the full gate merely to reproduce that receipt; use targeted checks for a specific bug hypothesis. In your verification report attribute this evidence to the host, and never claim you ran the host command yourself.` : "";
+  return composeSystemPrompt({ taskInstructions: REVIEW_TASK_INSTRUCTIONS + hostInstructions });
+}
+
+/** Created by the host only after checking the unchanged, clean committed artifact. */
+export interface TrustedHostCheckReceipt {
+  readonly command: string;
+  readonly exitCode: 0;
+  readonly timedOut: false;
+  readonly exactArtifact: {
+    readonly headSha: string;
+    readonly baseSha: string;
+    readonly treeSha: string;
+    readonly worktreeClean: true;
+  };
 }
 
 export interface ReviewTaskTicket {
@@ -53,6 +69,7 @@ export interface RenderReviewTaskArgs {
   precheckFindings: readonly PrecheckFinding[];
   previousFindings: readonly PreviousFinding[];
   worktreePath: string;
+  hostCheck?: TrustedHostCheckReceipt;
 }
 
 const DIFF_MAX_BYTES = 30_000;
@@ -66,6 +83,12 @@ export function renderReviewTask(args: RenderReviewTaskArgs): string {
   sections.push("Description:");
   sections.push(args.ticket.description ?? "(no description)");
   sections.push("");
+  if (args.hostCheck) {
+    sections.push("--- trusted host verification (completed before this review) ---");
+    sections.push(JSON.stringify(args.hostCheck));
+    sections.push("This receipt applies only to the exact HEAD, base, tree and clean worktree shown above. Attribute it to the host; it is not a command you ran. Review the diff and use targeted tests if needed, without repeating the full gate solely for this receipt.");
+    sections.push("");
+  }
   sections.push("--- diff (under review) ---");
   const diff =
     args.diff.length > DIFF_MAX_BYTES
@@ -76,7 +99,9 @@ export function renderReviewTask(args: RenderReviewTaskArgs): string {
   sections.push("--- run-log (commands the primary executed during its loop) ---");
   if (args.runLog.length === 0) {
     sections.push(
-      "(empty — the primary did not run any shell commands. this is a strong signal for unverified_claim if the diff is non-trivial.)",
+      args.hostCheck
+        ? "(empty — the primary did not record shell commands; the independent host verification receipt above supplies gate evidence.)"
+        : "(empty — the primary did not run any shell commands. this is a strong signal for unverified_claim if the diff is non-trivial.)",
     );
   } else {
     for (const e of args.runLog) {

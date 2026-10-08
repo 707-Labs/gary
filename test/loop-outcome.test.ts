@@ -1,3 +1,4 @@
+import { createActionVerification, CODING_VERIFICATION_POLICY } from "../src/verification-policy.ts";
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import type { AssignedIssue, LinearAdapter } from "../src/adapters/linear.ts";
 import type { GitHubClient } from "../src/adapters/github.ts";
@@ -185,4 +186,13 @@ describe("tick outcome reporting", () => {
     expect((await tick(deps)).actionsTaken).toEqual([]);
     expect(actionRows()).toEqual([{ success: 0, outcome: "rate_limited", error_message: "all providers armed; earliest reset unknown" }]);
   });
+});
+
+it('dispatch forwards one canonical action verification object to the same admitted CODE handler',async()=>{
+ spend=openSpendLedger(':memory:');spend.createCampaign('offline',3);spend.enrollTicket('offline',issue.id,3,{draftPr:true});deps.spend=spend;
+ let admitted:Parameters<NonNullable<LoopDeps['createCodeVerification']>>[0]|undefined;const verification=createActionVerification({policy:CODING_VERIFICATION_POLICY,assertActive(){}});
+ deps.createAdmittedCodeLoop=action=>{admitted=action;return async()=>{throw new Error('stub handler must not run model');};};
+ deps.createCodeVerification=action=>{expect(action).toBe(admitted!);return verification;};
+ coding.mockImplementation(async handler=>{expect(handler.verification).toBe(verification);expect(handler.runAdmittedAgentLoop).toBeDefined();return{status:'blocked',branch:'offline',summary:'fixture'};});
+ expect((await tick(deps)).actionsTaken).toEqual(['start_coding']);expect(coding).toHaveBeenCalledTimes(1);expect(spend.status(issue.id)?.attemptCount).toBe(0);
 });

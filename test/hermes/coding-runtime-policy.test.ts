@@ -36,7 +36,7 @@ test('unsafe non-JSON config cannot produce an admission fingerprint or evaluate
 
 test('fixed trial policy bounds every stage and freezes nested review settings',()=>{
   expect(HERMES_CODING_RUNTIME_POLICY.maxAllocationMicros).toBe(10_000_000);
-  expect(HERMES_CODING_RUNTIME_POLICY.actionTimeoutMs).toBe(900_000);
+  expect(HERMES_CODING_RUNTIME_POLICY.actionTimeoutMs).toBe(9_000_000);
   expect(HERMES_CODING_RUNTIME_POLICY.review).toEqual({providerOrder:['deepseek'],maxRounds:1,iterationCap:6,timeoutMs:180_000});
   expect(Object.isFrozen(HERMES_CODING_RUNTIME_POLICY.review)).toBe(true);
   expect(Object.isFrozen(HERMES_CODING_RUNTIME_POLICY.review.providerOrder)).toBe(true);
@@ -45,7 +45,7 @@ test('fixed trial policy bounds every stage and freezes nested review settings',
 
 test('fixed coding executor and environment are deeply frozen and included in admission identity', () => {
   const executor=HERMES_CODING_RUNTIME_POLICY.executor;
-  expect(HERMES_CODING_RUNTIME_POLICY.version).toBe(3);
+  expect(HERMES_CODING_RUNTIME_POLICY.version).toBe(4);
   expect(executor.image).toBe('sha256:0efb49a8f21794948395f7bec2c15557a78473acd760207613fe7714e7c47f8c');
   expect(executor.bunCacheVolume).toBe('gary-bun-cache-20261007-node24');
   expect({cpus:executor.cpus,memory:executor.memory,pidsLimit:executor.pidsLimit}).toEqual({cpus:'4',memory:'12g',pidsLimit:512});
@@ -62,3 +62,10 @@ test('fixed coding executor and environment are deeply frozen and included in ad
       policy:{...HERMES_CODING_RUNTIME_POLICY,executor:changed}}).sha256);
   }
 });
+
+ test('verification ceilings and publication gate affect the fixed activation identity',()=>{
+ const policy=HERMES_CODING_RUNTIME_POLICY;expect(policy.verification.publicationCommand).toBe('bun run ci:full');
+ expect(policy.verification.commands).toEqual({'bun run ci:full':{timeoutMs:1_800_000,maxStarts:4},'bun run check':{timeoutMs:600_000,maxStarts:8}});
+ for(const verification of [{...policy.verification,publicationCommand:'bun run check'},{...policy.verification,genericCommandTimeoutMs:9_000_000},{...policy.verification,commands:{...policy.verification.commands,'bun run ci:full':{timeoutMs:1_800_001,maxStarts:4}}}])
+ expect(fingerprintHermesCodingActivation({})).not.toBe('sha256:'+fingerprintJson({config:{},policy:{...policy,verification}}).sha256);
+ });

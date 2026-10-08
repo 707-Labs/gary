@@ -1,5 +1,6 @@
 import { mkdirSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { resolve, join } from 'node:path';
+import { createExecutorJobJournal, reconcileDockerExecutorJobs, type ExecutorJobJournal } from './executors/index.ts';
 import { CloudflareClient } from './adapters/cloudflare.ts';
 import { GLMClient } from './adapters/glm.ts';
 import { makeGitHubClient } from './adapters/github.ts';
@@ -32,6 +33,8 @@ export interface StartupDependencies extends ReadonlyStartupDependencies {
   ledger?: typeof openSpendLedger;
   fetch?: typeof fetch;
   launch?: GaryRuntimeLauncher;
+  /** Trusted offline lifecycle seam; production always uses the durable Docker journal. */
+  executorJobs?: { create: typeof createExecutorJobJournal; reconcile: typeof reconcileDockerExecutorJobs };
   runLoop?: (args: RunLoopArgs) => Promise<void>;
   signal?: AbortSignal;
   slackTransport?: (credentials: SlackCredentials) => SlackTransport;
@@ -52,6 +55,7 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
   const db = (deps.db ?? openDb)(cfg.gary.dbPath);
   let spend: ReturnType<typeof openSpendLedger> | undefined;
   let slack: SlackService | undefined;
+  let executorJobJournal: ExecutorJobJournal | undefined;
   const controller = new AbortController();
   const abort = () => {
     controller.abort();
@@ -65,14 +69,23 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
   deps.signal?.addEventListener('abort', abort, { once: true });
   if (deps.signal?.aborted) abort();
   try {
+    if (controller.signal.aborted) return;
     spend = (deps.ledger ?? openSpendLedger)(resolve(cfg.gary.stateDir, 'spend.db'));
+    if (activationConfig) {
+      executorJobJournal = (deps.executorJobs?.create ?? createExecutorJobJournal)({
+        directory:join(activationConfig.traceDirectory,'executor-jobs'), dockerBinary:activationConfig.dockerExecutable,
+        dockerHost:activationConfig.dockerHost });
+      // No adapters, admission, polling or Slack connection until old exact jobs are absent.
+      await (deps.executorJobs?.reconcile ?? reconcileDockerExecutorJobs)(executorJobJournal);
+      if (controller.signal.aborted) return;
+    }
     const linear = deps.linear ? deps.linear(cfg) : new LinearAdapter({ gary: cfg.gary, linear: cfg.linear });
     const github = (deps.github ?? makeGitHubClient)(cfg.github);
     const rawFetch = deps.fetch ?? globalThis.fetch;
     const chain = createProviderChain(providerConfigs.map(provider => createProvider(provider, { fetch: spend!.guardedFetch(provider.name, rawFetch) })));
     const glm = new GLMClient(chain);
     const cloudflare = cfg.cloudflare ? (deps.cloudflare ? deps.cloudflare(cfg.cloudflare) : new CloudflareClient(cfg.cloudflare)) : null;
-    const activation = activationConfig ? createHermesActivation(activationConfig, { db, ledger: spend,
+    const activation = activationConfig ? createHermesActivation(activationConfig, { db, ledger: spend, executorJobJournal:executorJobJournal!,
       route: { provider: activationConfig.provider, model: activationConfig.model, providerApiKey: providerConfigs[0]!.apiKey,
         fetch: request => rawFetch(request) }, ...(deps.launch ? { launch: deps.launch } : {}) }) : undefined;
     const readiness = activation && activationConfig ? createCanaryReadiness({ db, ledger: spend, activation,
@@ -97,7 +110,7 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
       circuitBreakerWindowHours: cfg.runtime.circuitBreakerWindowHours, stalePrAfterMs: cfg.runtime.stalePrAfterMs,
       review: activation ? {...HERMES_CODING_RUNTIME_POLICY.review,providerOrder:[...HERMES_CODING_RUNTIME_POLICY.review.providerOrder]} : cfg.review, intervalMs: cfg.runtime.pollIntervalMs, signal: controller.signal,
       ...(activation ? { allowedIssueIds: activation.allowedIssueIds, allowedActionTypes: activation.allowedActionTypes,
-        codingTrial: activation.codingTrial, codingExecutorProfile: HERMES_CODING_RUNTIME_POLICY.executor, createAdmittedCodeLoop: activation.createAdmittedCodeLoop, onCodePublication: readiness!.recordPublication } : {}),
+        codingTrial: activation.codingTrial, codingExecutorProfile: HERMES_CODING_RUNTIME_POLICY.executor, createAdmittedCodeLoop: activation.createAdmittedCodeLoop, createCodeVerification:activation.createCodeVerification, onCodePublication: readiness!.recordPublication } : {}),
       ...(slack ? { onTickComplete: async () => {
         if (controller.signal.aborted) return;
         const health = await slack!.refreshHealth();
@@ -110,7 +123,7 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
     process.off('SIGINT', onInt); process.off('SIGTERM', onTerm);
     deps.signal?.removeEventListener('abort', abort);
     try { await slack?.stop(); } finally {
-      try { spend?.close(); } finally { db.close(); }
+      try { executorJobJournal?.close(); } finally { try { spend?.close(); } finally { db.close(); } }
     }
   }
 }

@@ -80,3 +80,20 @@ describe("composeReviewerSystemPrompt", () => {
     expect(composeReviewerSystemPrompt()).toContain(REVIEW_TASK_INSTRUCTIONS);
   });
 });
+
+
+describe("trusted host verification receipt", () => {
+  const hostCheck = {
+    command: "bun run ci:full", exitCode: 0 as const, timedOut: false as const,
+    exactArtifact: { headSha: "a".repeat(40), baseSha: "b".repeat(40), treeSha: "c".repeat(40), worktreeClean: true as const },
+  };
+  it("distinguishes exact-artifact host evidence from the reviewer's own tests", () => {
+    const task = renderReviewTask({ ticket: { identifier: "ERT-1", title: "fix", description: null },
+      diff: "fixture diff", runLog: [], precheckFindings: [], previousFindings: [], worktreePath: "/offline", hostCheck });
+    expect(task).toContain(JSON.stringify(hostCheck));
+    expect(task).toContain("not a command you ran");
+    expect(task).not.toContain("strong signal for unverified_claim");
+    expect(composeReviewerSystemPrompt(hostCheck)).toContain("never claim you ran the host command yourself");
+    expect(composeReviewerSystemPrompt()).not.toContain("host supplied a successful verification receipt");
+  });
+});

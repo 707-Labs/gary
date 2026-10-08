@@ -174,17 +174,21 @@ export function createGaryPhaseCoordinator(options: GaryLoopAdapterOptions): (ar
           const phaseManifest = Object.freeze(draftManifest);
           nativeHistory = canonicalizeConversation([...continued, { role: "user", content: phaseManifest.prompt }]);
           providerHistory = structuredClone(nativeHistory);
+          let pendingJob:{jobId:string;callId:string}|undefined;
           const handle: RuntimeRequestHandler = async request => {
             if (!active || signal.aborted) return errorResponse("phase_inactive", 409);
             const url = new URL(request.url);
             if (!timingSafeEqual(auth, digest(request.headers.get("authorization") ?? "")) || request.method !== "POST" || url.search
-                || !["/tools/execute", "/v1/chat/completions"].includes(url.pathname)) return hostHandle(request);
+                || !["/tools/execute", "/tools/jobs/poll", "/v1/chat/completions"].includes(url.pathname)) return hostHandle(request);
             let acquired = false;
             try {
               const model = url.pathname === "/v1/chat/completions";
+              const poll = url.pathname === '/tools/jobs/poll';
+              if(pendingJob && !poll)return fail('phase_test_job_pending');
               if (model) { if (modelBusy) return fail("concurrent_phase_model_requests"); modelBusy = true; acquired = true; }
               const body = await boundedBody(request, signal, model ? 1_048_576 : 131_072);
               if (!active || signal.aborted) return errorResponse("phase_inactive", 409);
+              if(pendingJob && !poll)return fail("phase_test_job_pending");
               if (model) {
                 if (trace.modelRequests >= phase.maxIter) return fail("phase_iteration_limit");
                 trace.modelRequests++;
@@ -208,6 +212,29 @@ export function createGaryPhaseCoordinator(options: GaryLoopAdapterOptions): (ar
                 }
                 return response;
               }
+              if(pendingJob && !poll)return fail('phase_test_job_pending');
+              if(poll) {
+                if(!pendingJob || body.taskId!==manifest.taskId || body.requestId!==manifest.requestId || body.ownerEpoch!==manifest.ownerEpoch
+                    || body.callId!==pendingJob.callId || body.jobId!==pendingJob.jobId) return fail('phase_test_job_mismatch');
+                const expected=pendingCall(nativeHistory,body.callId);
+                if(!expected || expected.name!=='run_bash')return fail('phase_test_job_history_mismatch');
+                const response=await hostHandle(forwarded(request,body)), envelope=await response.clone().json();
+                if(response.status===202) {
+                  if(envelope.kind!=='test_job_pending' || envelope.jobId!==pendingJob.jobId || envelope.callId!==pendingJob.callId) return fail('phase_test_job_mismatch');
+                  return response;
+                }
+                if(envelope.kind==='test_job_complete') {
+                  const receipt=envelope.receipt;
+                  if(envelope.jobId!==pendingJob.jobId || envelope.callId!==pendingJob.callId || !object(receipt)
+                      || receipt.tool_call_id!==pendingJob.callId || receipt.name!=='run_bash' || typeof receipt.content!=='string' || typeof receipt.ok!=='boolean') return fail('phase_test_job_receipt_mismatch');
+                  const row={role:'tool',tool_call_id:pendingJob.callId,content:receipt.content.replaceAll(manifest.capability,'[REDACTED]')};
+                  nativeHistory=canonicalizeConversation([...nativeHistory,row],{requireResolved:false});
+                  providerHistory=canonicalizeConversation([...providerHistory,row],{requireResolved:false});
+                  pendingJob=undefined;
+                  try {canonicalizeConversation(nativeHistory);if(currentTodos){additions.push({position:nativeHistory.length,text:'[current todos]\n'+currentTodos});providerHistory=overlay(nativeHistory);}} catch {}
+                }
+                return response;
+              }
               if (body.taskId !== manifest.taskId || body.ownerEpoch !== manifest.ownerEpoch || body.token !== manifest.capability) return hostHandle(forwarded(request, body));
               if (typeof body.name === "string" && !allowed.has(body.name)) return Response.json({ ok: false, tool_call_id: body.callId, name: body.name,
                 content: `error: tool '${body.name}' is unavailable in phase '${phase.name}'`, error: "phase_tool_denied", truncated: false }, { status: 400 });
@@ -215,6 +242,12 @@ export function createGaryPhaseCoordinator(options: GaryLoopAdapterOptions): (ar
               if (!expected || body.name !== expected.name || canonicalArguments(body.arguments) !== expected.arguments) return fail("tool_call_history_mismatch");
               const response = await hostHandle(forwarded(request, body));
               const receipt = await response.clone().json();
+              if(response.status===202) {
+                if(pendingJob || receipt.kind!=='test_job_pending' || typeof receipt.jobId!=='string' || receipt.callId!==body.callId
+                    || receipt.taskId!==manifest.taskId || receipt.requestId!==manifest.requestId || receipt.ownerEpoch!==manifest.ownerEpoch || receipt.name!=='run_bash' || body.name!=='run_bash')return fail('phase_test_job_mismatch');
+                pendingJob={jobId:receipt.jobId,callId:body.callId as string};
+                return response;
+              }
               if (typeof receipt.content === "string" && receipt.tool_call_id === body.callId && receipt.name === body.name && typeof receipt.ok === "boolean") {
                 const row = { role: "tool", tool_call_id: body.callId, content: receipt.content.replaceAll(manifest.capability, "[REDACTED]") };
                 nativeHistory = canonicalizeConversation([...nativeHistory, row], { requireResolved: false });
@@ -234,6 +267,7 @@ export function createGaryPhaseCoordinator(options: GaryLoopAdapterOptions): (ar
           try { native = await options.launch(phaseManifest, handle, signal); }
           finally { active = false; }
           signal.throwIfAborted();
+          if(pendingJob){fail('phase_returned_with_pending_test');throw new Error(fault);}
           if (!native || native.taskId !== manifest.taskId || native.requestId !== manifest.requestId || native.publicationApproved !== false
               || !["finished", "blocked", "no_finish", "iteration_cap", "timeout", "error"].includes(native.status)) { fail("native_phase_outcome_binding_rejected"); throw new Error(fault); }
           if (native.status === "error" || native.status === "timeout") { trace.termination = native.status; return native; }
