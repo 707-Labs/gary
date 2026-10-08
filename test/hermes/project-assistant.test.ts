@@ -33,6 +33,22 @@ const exec = (a: ProjectAssistant, toolName: string, args: Record<string, unknow
 function data(result: Awaited<ReturnType<typeof exec>>): any { expect(result.ok).toBe(true); if (!result.ok) throw new Error(result.error); return result.data; }
 
 describe('host-owned project assistant', () => {
+  test('tool schemas omit empty required lists while project_list accepts only an empty object', async () => {
+    const a = fixture().open();
+    for (const audience of [privateAudience, sharedAudience, { ...sharedAudience, requesterId: 'UMEMBER' }]) {
+      const tools = a.toolsFor(audience);
+      expect(tools.find(tool => tool.function.name === 'project_list')!.function.parameters).toEqual({
+        type: 'object', properties: {}, additionalProperties: false,
+      });
+      for (const tool of tools) {
+        const params = tool.function.parameters;
+        expect(params.additionalProperties).toBe(false);
+        if ('required' in params) expect((params.required as string[]).length).toBeGreaterThan(0);
+      }
+      expect((await exec(a, 'project_list', {}, audience)).ok).toBe(true);
+      expect(await exec(a, 'project_list', { project: 'mulligan' }, audience)).toEqual({ ok: false, error: 'invalid_arguments', dataOnly: true });
+    }
+  });
   test('reviewed cards and exact pinned source work without shell, model or network authority', async () => {
     const f = fixture(), a = f.open();
     const cards = data(await exec(a, 'project_list', {})).projects;
