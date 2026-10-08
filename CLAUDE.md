@@ -4,7 +4,8 @@ Gary is a single Bun process that polls Linear every 60s, classifies tickets
 assigned to him, opens PRs against the matching `707-Labs` repository
 (team key → repo via `GARY_REPO_MAP`), and self-fixes CI failures. Source
 of truth is Linear + GitHub; SQLite (`~/.gary/state/gary.db`) is operational
-state and is safe to wipe.
+state, canonical action ownership, delivery receipts and closed trial records.
+Preserve it and the separate spend ledger; deleting or rebuilding them loses safety and billing history.
 
 See `GARY_SPEC.md` for the full architecture and `voice.md` for personality.
 
@@ -19,7 +20,8 @@ bun run deploy       # ssh mini → git pull → install → typecheck → reloa
 bun run logs         # tail gary's stdout on the mini
 ```
 
-Read-only probes (safe to run anytime against live services):
+Probe scripts have different effects. Some below perform paid inference or real writes;
+inspect the specific script and its authorized scope before running it:
 
 ```sh
 bun run scripts/probe-linear.ts          # verify Linear auth + list assignments
@@ -96,7 +98,7 @@ Files: `src/review/{precheck.ts, tools.ts, prompts.ts, runner.ts}`,
 - **Action cache filters by `success = 1`**. Failed actions don't block retry, so a deterministically-broken handler will loop until the circuit breaker (5 attempts in 6h) fires.
 - **`Executor` interface uses `run`** rather than the spec's name for the method that runs shell commands. Diverges from the spec to dodge a security-scan false positive on a common substring.
 - **Cloudflare observability is opt-in**: tools only register if `CLOUDFLARE_API_TOKEN` is set. The Workers Logs API only returns data for workers that have `observability.logs.enabled` in their wrangler config. Mulligan-labs workers all have it on with `upload_source_maps: true`, so stack traces come back de-minified.
-- **Project context auto-load**: every coding handler prepends CLAUDE.md / AGENTS.md / `.claude/skills/*/SKILL.md` frontmatter from the worktree to the agent's task message. The agent loads skill bodies on demand via `read_file`. Implemented in `src/skills.ts`. Regex parsing uses `String.match` not `RegExp.exec` to dodge the same security-scan false positive as `Executor.run`.
+- **Project context auto-load**: coding handlers load CLAUDE.md / AGENTS.md and bounded skill indexes from `.agents/skills` and `.claude/skills`. Duplicate names keep their source paths. The agent reads applicable bodies through its admitted tools; see `docs/project-skill-discovery.md`.
 - **Comment-based fingerprints excise non-human writes**: `humanInputSignature` (Linear) hashes non-Gary comment ids; `prCommentSignature` (GitHub) hashes only `User`-typed comments — bots are filtered entirely (Gary, linear[bot] linkbacks, dependabot, etc.). Without this, ANSWER and PR-review tickets would loop because Gary's own response bumps `updatedAt` / adds a comment and shifts the cache. PR review responses are also tracked in `pr_comment_responses` so the signature returns "empty" once Gary has answered every pending human comment. See `src/state-fingerprint.ts`.
 - **Revisit marks gate `revisit_code`**: `ticket_revisit_marks` stores the `humanInputSignature` Gary acted on when `start_coding` ran; `revisit_code` only fires when the current signature differs. Pre-feature tickets without a mark stay dormant by design — back-filling the mark to "current" would silently drop comments Gary missed. See `src/state/queries.ts:getRevisitMark`.
 - **GitHub App viewer login has the `[bot]` suffix**: `getViewer()` for App auth returns `${slug}[bot]` (e.g. `gary-707-labs[bot]`), not the bare slug — that matches the login GitHub attaches to comments authored via the installation token. The bare slug looped pr-review on the first deploy.
@@ -124,22 +126,22 @@ Files: `src/review/{precheck.ts, tools.ts, prompts.ts, runner.ts}`,
 
 Gary runs on the Mac mini as `com.707labs.gary` LaunchAgent. Plist in `scripts/com.707labs.gary.plist`. Logs at `~/Library/Logs/gary/{stdout,stderr}.log` on the mini. State at `~/.gary/` on the mini.
 
-`bun run deploy` is the canonical update path — it pulls latest from `707-Labs/gary` (private), installs, typechecks, syncs the plist if it changed, reloads launchd. The script uses `git pull --ff-only` so it refuses to advance if the mini has local changes.
+`bun run deploy` is the historical legacy deployment script. A pinned Hermes deployment uses its reviewed source/configuration transition and drain procedure; do not replace that procedure with an unreviewed pull/reload or edit consumed receipts.
 
 Auth on the mini is a read-only deploy key (`mini-deploy` on `707-Labs/gary`) used via SSH config alias `Host github.com-gary`.
 
-## Don't do (Weekend 1 non-goals)
+## Runtime boundaries
 
-`GARY_SPEC.md §16` lists explicit non-goals. Most-relevant:
-- No `DockerExecutor` (interface exists, implementation is a stub)
+`GARY_SPEC.md §16` contains historical non-goals. Current boundaries include:
+- DockerExecutor is implemented. The Hermes canary requires the reviewed image/cache profile with no network; native workers have no host credentials or workspace mount.
 - No webhook receivers — polling is fine
 - No automatic merging of Gary's own PRs (architectural, not deferred)
 - ~~No multi-repo support~~ — implemented 2026-04-25 via `GARY_REPO_MAP` (ERT/BIRD/GREEN under the 707-Labs org)
 
-If you're about to build any of these, stop and flag to Tanner.
+New capabilities must preserve the existing authorization, canonical owners and spending controls. Conversation skill proposals are contextual data until their workflow/code changes are tested and reviewed.
 
 ## When something breaks
 
 1. Check `~/Library/Logs/gary/stderr.log` on the mini (`bun run logs` shows stdout).
 2. Check SQLite: `sqlite3 ~/.gary/state/gary.db 'SELECT * FROM events ORDER BY id DESC LIMIT 20;'`
-3. To pull a ticket out of Gary's queue without code changes: reassign in Linear, OR `UPDATE tickets SET terminal_state='escalated' WHERE identifier='ERT-XXXX';`
+3. Use the reviewed task lifecycle to stop or escalate work. Preserve closed trials, action owners, spend holds and receipts; never reset a latched stop by changing SQL state.

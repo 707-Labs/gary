@@ -1,8 +1,8 @@
 # Gary → Hermes production integration
 
-The implementation is in `/Users/tanner/Developer/gary-worktrees/hermes-runtime`, branch `codex/hermes-runtime`, based on deployed Gary commit `2f56d9f98bd3b0f5bb5d68b916dfcba6df382868`. It is opt-in and has not been activated. `src/index.ts` does not enable it. The original checkout and service remain unchanged.
+Hermes is selected explicitly through `src/startup.ts` and the reviewed host configuration. The initial implementation was prepared from Gary commit `2f56d9f98bd3b0f5bb5d68b916dfcba6df382868`; subsequent deployment receipts record activation and later source transitions. Do not use this historical implementation handoff to infer current live source, task success or enabled capabilities.
 
-This handoff supersedes the earlier offline-candidate checkpoint and `runtime-next-steps.md`. The ordinary isolated build and test work was authorized and completed; it did not require new credentials, Docker settings, network permissions or a new account. The remaining live transition is a separate decision.
+This document describes the core integration. See [project-assistant.md](project-assistant.md) for the later project conversation tools and memory. Each live transition remains bound to its exact reviewed source/configuration and canonical state.
 
 ## Implementation
 

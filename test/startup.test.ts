@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { main } from '../src/index.ts';
 import type { Config } from '../src/config.ts';
 import type { StartupDependencies } from '../src/startup.ts';
@@ -233,4 +234,41 @@ test('combined startup separates private and shared contexts from coding publica
     expect({verified,polls,ledgerClosed,network:f.networkCalls()}).toEqual({verified:1,polls:1,ledgerClosed:true,network:0});
     expect(f.stats()).toMatchObject({stopped:true,sends:0});
   }
+});
+
+test('actual startup routes an authenticated Slack question through canonical current-work tools',async()=>{
+ const f=slackFixture(),ledger=new SpendLedger(':memory:'),db=openDb(':memory:');
+ f.activation.repo='707-Labs/mulligan-labs';writeFileSync(f.activationPath,JSON.stringify(f.activation));f.config.gary.repoMap=new Map([['ERT','707-Labs/mulligan-labs']]);
+ const sharedDir=join(f.root,'shared'),projectDir=join(f.root,'projects');mkdirSync(sharedDir,{mode:0o700});mkdirSync(projectDir,{mode:0o700});
+ const sharedPath=join(sharedDir,'config.json');writeFileSync(sharedPath,JSON.stringify({version:1,runId:'hermes-shared-20261008',campaignId:'hermes-shared-20261008',allocationId:'local:hermes-shared-20261008',teamId:'T0AA24R7VUZ',appId:'A0C7QFW3PEG',botUserId:'U0C7NPEUG1F',trigger:'explicit_mention'}),{mode:0o600});
+ const projectPath=join(projectDir,'config.json'),raw=JSON.stringify({version:1,teamId:'T0AA24R7VUZ',ownerUserId:'U0A9M5W16F8',memoryPath:join(projectDir,'project-memory.sqlite'),projects:[{id:'mulligan-labs',repo:'707-Labs/mulligan-labs',teamKey:'ERT',label:'Mulligan Labs',summary:'A multiplayer tabletop; inspect canonical work for current status.',sharedChannelIds:['C0CHANNEL1']}]});
+ writeFileSync(projectPath,raw,{mode:0o600});ledger.createCampaign('hermes-shared-20261008',5);ledger.enrollTicket('hermes-shared-20261008','local:hermes-shared-20261008',5);
+ let receive:(envelope:unknown)=>void|Promise<void>=()=>{},providerCalls=0;const sent:string[]=[];
+ const start=f.transport.start.bind(f.transport);f.transport.start=async(callback,signal)=>{receive=callback;await start(callback,signal);};
+ f.transport.memberInfo=async id=>({id,teamId:'T0AA24R7VUZ',deleted:false,isBot:false,isAppUser:false,isRestricted:false,isUltraRestricted:false,isStranger:false,observedAt:Date.now()});
+ f.transport.channelInfo=async id=>({id,teamId:'T0AA24R7VUZ',isMember:true,isArchived:false,isPrivate:false,isShared:false,isExtShared:false,isOrgShared:false,isPendingExtShared:false,observedAt:Date.now()});
+ f.transport.sendMessage=async request=>{sent.push(request.text);return {ok:true,channel:request.channel,ts:'1791452000.000002'};};
+ await main({...f.deps,env:{...f.env,GARY_CONVERSATION_RUNTIME_RELEASE:'c'.repeat(40),GARY_SLACK_SHARED_CONVERSATION_CONFIG:sharedPath,GARY_PROJECT_ASSISTANT_CONFIG:projectPath,GARY_PROJECT_ASSISTANT_CONFIG_SHA256:createHash('sha256').update(raw).digest('hex')},
+  verifyConversationRelease:()=>{},db:()=>db,ledger:()=>ledger,slackTransport:()=>f.transport,
+  fetch:(async request=>{providerCalls++;const body:any=await (request as Request).json();
+   const content=providerCalls===1?[{type:'tool_use',id:'work_call',name:'current_work',input:{project:'mulligan-labs'}}]:[{type:'text',text:'ERT-2990 is recorded in progress; that record alone does not prove live execution.'}];
+   if(providerCalls===2){expect(JSON.stringify(body.messages)).toContain('ERT-2990');expect(JSON.stringify(body.messages)).toContain('recorded_in_progress');}
+   return Response.json({id:'msg_fixture',type:'message',role:'assistant',model:'deepseek-v4-pro',content,stop_reason:providerCalls===1?'tool_use':'end_turn',usage:{input_tokens:30,output_tokens:10,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+  }) as typeof fetch,
+  launch:async(m,handle)=>{
+   const history:any[]=[...(m.history??[]),{role:'user',content:m.prompt}];
+   const rpc=(path:string,value:unknown)=>handle(new Request('http://127.0.0.1'+path,{method:'POST',headers:{authorization:'Bearer '+m.capability,'content-type':'application/json'},body:JSON.stringify(value)}));
+   for(let i=0;i<2;i++){
+    const response:any=await (await rpc('/v1/chat/completions',{model:m.model,messages:[{role:'system',content:m.systemPrompt},...history],max_tokens:m.maxTokens,temperature:m.temperature,tools:m.tools,stream:false})).json();
+    const message=response.choices[0].message;history.push(message);
+    for(const call of message.tool_calls??[]){const result:any=await (await rpc('/tools/execute',{taskId:m.taskId,ownerEpoch:m.ownerEpoch,token:m.capability,callId:call.id,name:call.function.name,arguments:JSON.parse(call.function.arguments)})).json();history.push({role:'tool',tool_call_id:call.id,content:result.content});}
+   }
+   return {taskId:m.taskId,requestId:m.requestId,status:'no_finish',publicationApproved:false,history};
+  },runLoop:async()=>{
+   db.query("INSERT INTO tickets(linear_id,identifier) VALUES('active-ticket','ERT-2990')").run();
+   db.query("INSERT INTO actions(ticket_linear_id,action_type,state_fingerprint,started_at,outcome) VALUES('active-ticket','start_coding','fixture','2026-10-08T09:20:24Z','unknown')").run();
+   await receive({type:'events_api',payload:{type:'event_callback',team_id:'T0AA24R7VUZ',api_app_id:'A0C7QFW3PEG',event_id:'EvProjectFixture1',event:{type:'app_mention',user:'U0A9M5W16F8',channel:'C0CHANNEL1',ts:'1791452000.000001',text:'<@U0C7NPEUG1F> what are you working on now?'}}});
+   expect(providerCalls).toBe(2);expect(sent).toEqual(['ERT-2990 is recorded in progress; that record alone does not prove live execution.']);
+   expect(ledger.status('local:hermes-shared-20261008')).toMatchObject({attemptCount:2,unknownAttempts:0});
+  }});
 });

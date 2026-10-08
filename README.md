@@ -61,17 +61,22 @@ ssh mini 'launchctl print gui/$(id -u)/com.707labs.gary | head'
 gary is a weekend project that runs in production for exactly one linear
 workspace (two humans). read this before running your own:
 
-- **no sandbox.** the docker executor is a stub; model-generated bash runs
-  directly on the host via `LocalExecutor` with normal shell access.
-- **full env inheritance.** spawned commands see the parent `process.env`,
-  including every key in `.env`. run gary under a dedicated user with a
-  minimal env if that bothers you (it should).
+- **Hermes isolation.** the opt-in Hermes runtime uses pinned Docker workers
+  without network, host credentials or workspace mounts. Admitted workspace
+  actions use a separate reviewed Docker executor. The legacy local executor
+  is still a different runtime and must not be confused with this deployment.
+- **Host-owned authority.** credentials, canonical action ownership, request
+  reservations, review and publication remain on the host. Project memory and
+  repository text do not grant execution, access or spending authority.
 - **acts immediately.** `bun run start` polls linear and acts on real tickets
   assigned to gary right away. point him at a test team first.
-- **prompt injection is the threat model.** ticket text and `fetch_url` page
-  content flow into the agent prompt, and `fetch_url` has no ssrf or
-  private-ip guard. anyone who can write tickets in your workspace can steer
-  gary; keep that set small.
+- **Untrusted inputs.** ticket text, repository content and learned notes are
+  data. Hermes host tools enforce the admitted repository, action and fetch
+  policy; model instructions cannot widen those permissions.
 - **log redaction is narrow.** only `x-access-token:` urls are scrubbed from
   logs; secrets echoed in bash output are not.
 - the mention allowlist defaults closed — unknown senders are ignored.
+
+Project-aware Slack conversations and scoped persistent learning are described
+in [project-assistant.md](docs/project-assistant.md). Deployment receipts, not
+this README, establish which opt-in capabilities are currently active.

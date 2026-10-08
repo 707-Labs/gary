@@ -111,6 +111,7 @@ export function createSlackSharedConversation(options:{config:SlackSharedConvers
       if(session.turns>=POLICY.maxTurns||Buffer.byteLength(JSON.stringify([...history,{role:'user',content:text}]))+POLICY.maxReplyBytes+100>POLICY.maxContextBytes)throw new DMReplyError('dm_context_limit');
       db.query("UPDATE events SET state='running' WHERE event_key=? AND owner=? AND state='queued'").run(key,owner);
       reply=await options.reply({requestId:randomUUID(),ownerId:owner,allocationId:config.allocationId,campaignId:config.campaignId,
+        authority:Object.freeze({surface:'shared_channel',requesterId:input.requesterId,teamId:input.teamId,channelId:input.channel,threadTs:input.threadTs}),
         history,text,signal,
         assertActive:()=>{
           if(closed||!isAvailable()||blocked()||signal.aborted||(db.query('SELECT state,owner FROM events WHERE event_key=?').get(key) as any)?.owner!==owner

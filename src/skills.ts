@@ -1,12 +1,15 @@
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import {
+  closeSync, constants, existsSync, fstatSync, lstatSync, openSync,
+  opendirSync, readFileSync, readSync, realpathSync, type Stats,
+} from "node:fs";
 import { resolve } from "node:path";
 
 /**
  * Surfaces Claude-Code-style project context to Gary's agent loop.
  *
  * Two parts:
- *   - `loadSkillIndex` enumerates `.claude/skills/<name>/SKILL.md` and parses
- *     the frontmatter so the agent gets a per-task menu of conventions.
+ *   - `loadSkillIndex` enumerates `.agents/skills/<name>/SKILL.md` and
+ *     `.claude/skills/<name>/SKILL.md` so the agent gets a per-task menu.
  *   - `loadProjectContext` pulls in CLAUDE.md and AGENTS.md verbatim — the
  *     two files that Claude Code auto-loads in interactive sessions.
  *
@@ -34,44 +37,110 @@ export interface ProjectContext {
 }
 
 const PROJECT_FILE_MAX_BYTES = 12_000;
-const FRONTMATTER_RE = /^---\s*\n([\s\S]+?)\n---/;
-const NAME_RE = /^name:\s*(.+)$/m;
-const DESCRIPTION_RE = /^description:\s*(.+)$/m;
+const SKILL_ROOTS = [".agents/skills", ".claude/skills"] as const;
+const SKILL_DIRECTORY_ENTRY_LIMIT = 256;
+const SKILL_FILE_MAX_BYTES = 256 * 1024;
+const SKILL_FRONTMATTER_MAX_BYTES = 8192;
+const FRONTMATTER_RE = /^---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/;
+const compare = (a: string, b: string): number => a < b ? -1 : a > b ? 1 : 0;
+
+function sameFile(a: Stats, b: Stats): boolean {
+  return a.dev === b.dev && a.ino === b.ino && a.mode === b.mode
+    && a.nlink === b.nlink && a.size === b.size
+    && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
+}
+
+/** Reject redirects at every project-relative component, including skill roots. */
+function directorySnapshot(root: string, parts: readonly string[]): [string, Stats][] {
+  return [root, ...parts.map((_, i) => resolve(root, ...parts.slice(0, i + 1)))].map(path => {
+    const stat = lstatSync(path);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || realpathSync(path) !== path) {
+      throw new Error("skill_directory_rejected");
+    }
+    return [path, stat];
+  });
+}
+
+function unchangedDirectories(directories: readonly [string, Stats][]): boolean {
+  return directories.every(([path, before]) => {
+    const now = lstatSync(path);
+    return now.isDirectory() && !now.isSymbolicLink() && realpathSync(path) === path
+      && now.dev === before.dev && now.ino === before.ino;
+  });
+}
+
+/** Bound discovery before sorting; an oversized root is omitted, never sampled. */
+function skillDirectories(path: string): string[] {
+  const directory = opendirSync(path);
+  const entries: string[] = [];
+  try {
+    let count = 0;
+    for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+      if (++count > SKILL_DIRECTORY_ENTRY_LIMIT) return [];
+      if (entry.isDirectory() && !entry.isSymbolicLink()
+        && Buffer.byteLength(entry.name) <= 128 && !/[\\`\x00-\x1f\x7f]/.test(entry.name)) entries.push(entry.name);
+    }
+  } finally { directory.closeSync(); }
+  return entries.sort(compare);
+}
+
+/** Read only bounded metadata, never a skill body or a non-regular file. */
+function readSkill(root: string, relativeRoot: string, entry: string): ProjectSkill | null {
+  let fd: number | undefined;
+  try {
+    const directories = directorySnapshot(root, [...relativeRoot.split("/"), entry]);
+    const path = `${relativeRoot}/${entry}/SKILL.md`, absolute = resolve(root, path);
+    const before = lstatSync(absolute);
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1
+      || before.size > SKILL_FILE_MAX_BYTES || realpathSync(absolute) !== absolute) return null;
+    fd = openSync(absolute, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || !sameFile(before, opened) || !unchangedDirectories(directories)) return null;
+    const buffer = Buffer.alloc(Math.min(opened.size, SKILL_FRONTMATTER_MAX_BYTES + 1));
+    let bytes = 0;
+    while (bytes < buffer.length) {
+      const n = readSync(fd, buffer, bytes, buffer.length - bytes, bytes);
+      if (n === 0) break;
+      bytes += n;
+    }
+    if (!sameFile(opened, fstatSync(fd)) || !sameFile(opened, lstatSync(absolute))
+      || !unchangedDirectories(directories)) return null;
+    const fm = buffer.subarray(0, bytes).toString("utf8").match(FRONTMATTER_RE);
+    if (!fm?.[1] || Buffer.byteLength(fm[0]) > SKILL_FRONTMATTER_MAX_BYTES) return null;
+    // Reject invalid UTF-8 in metadata, even when the unread body is arbitrary bytes.
+    new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, Buffer.byteLength(fm[0])));
+    const scalar = (key: string, max: number): string | null => {
+      const matches = fm[1]!.split(/\r?\n/).filter(line => line.startsWith(key + ":"));
+      if (matches.length !== 1) return null;
+      const value = matches[0]!.slice(key.length + 1).trim();
+      return value && Buffer.byteLength(value) <= max && !/[\x00-\x1f\x7f]/.test(value) ? value : null;
+    };
+    const name = scalar("name", 64), description = scalar("description", 1024);
+    return name && description ? { name, description, path } : null;
+  } catch { return null; }
+  finally { if (fd !== undefined) closeSync(fd); }
+}
 
 export function loadSkillIndex(workspaceRoot: string): ProjectSkill[] {
-  const skillsRoot = resolve(workspaceRoot, ".claude/skills");
-  if (!existsSync(skillsRoot)) return [];
-
-  let entries: string[];
+  let root: string;
   try {
-    entries = readdirSync(skillsRoot);
-  } catch {
-    return [];
-  }
-
+    const input = resolve(workspaceRoot);
+    if (!lstatSync(input).isDirectory() || lstatSync(input).isSymbolicLink()) return [];
+    // Canonicalize OS aliases such as /tmp before checking project-relative paths.
+    root = realpathSync(input);
+  } catch { return []; }
   const skills: ProjectSkill[] = [];
-  for (const entry of entries) {
-    const skillPath = resolve(skillsRoot, entry, "SKILL.md");
-    if (!existsSync(skillPath)) continue;
-    let content: string;
+  for (const relativeRoot of SKILL_ROOTS) {
     try {
-      content = readFileSync(skillPath, "utf8");
-    } catch {
-      continue;
-    }
-    const fm = content.match(FRONTMATTER_RE);
-    if (!fm || !fm[1]) continue;
-    const block = fm[1];
-    const nameMatch = block.match(NAME_RE);
-    const descMatch = block.match(DESCRIPTION_RE);
-    if (!nameMatch?.[1] || !descMatch?.[1]) continue;
-    skills.push({
-      name: nameMatch[1].trim(),
-      description: descMatch[1].trim(),
-      path: `.claude/skills/${entry}/SKILL.md`,
-    });
+      directorySnapshot(root, relativeRoot.split("/"));
+      for (const entry of skillDirectories(resolve(root, relativeRoot))) {
+        const skill = readSkill(root, relativeRoot, entry);
+        if (skill) skills.push(skill);
+      }
+    } catch { /* Missing, unreadable or redirected roots do not hide the other root. */ }
   }
-  return skills.sort((a, b) => a.name.localeCompare(b.name));
+  // Same-name skills remain distinct: the exact path is their provenance.
+  return skills.sort((a, b) => compare(a.name, b.name) || compare(a.path, b.path));
 }
 
 export function loadProjectContext(workspaceRoot: string): ProjectContext {

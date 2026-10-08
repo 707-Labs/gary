@@ -101,3 +101,9 @@ test('shared-only runtime needs pinned explicit configuration and grants no priv
   expect(()=>loadHostStartupConfig({...env,GARY_SLACK_TANNER_DM_ENABLED:'1'})).toThrow();
   expect(()=>loadHostStartupConfig({...env,GARY_SLACK_SHARED_CONVERSATION_CONFIG:undefined})).toThrow();
 });
+
+test('project tools require a separate exact configuration hash inside the reviewed combined runtime',()=>{
+ const env={...canary,GARY_SLACK_ENABLED:'1',GARY_SLACK_CREDENTIALS_FILE:'/private/runtime/slack.env',GARY_SLACK_SHARED_CONVERSATION_CONFIG:'/private/shared/config.json',GARY_CONVERSATION_RUNTIME_RELEASE:'c'.repeat(40),GARY_PROJECT_ASSISTANT_CONFIG:'/private/project/config.json',GARY_PROJECT_ASSISTANT_CONFIG_SHA256:'d'.repeat(64)};
+ expect(loadHostStartupConfig(env).projectAssistantConfigPath).toBe(env.GARY_PROJECT_ASSISTANT_CONFIG);
+ for(const change of [{GARY_PROJECT_ASSISTANT_CONFIG:undefined},{GARY_PROJECT_ASSISTANT_CONFIG_SHA256:undefined},{GARY_PROJECT_ASSISTANT_CONFIG_SHA256:'main'},{GARY_PROJECT_ASSISTANT_CONFIG:'relative.json'},{GARY_CONVERSATION_RUNTIME_RELEASE:undefined},{GARY_RUNTIME_MODE:'legacy'}])expect(()=>loadHostStartupConfig({...env,...change})).toThrow();
+});

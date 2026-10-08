@@ -19,6 +19,8 @@ export class DMReplyError extends Error {
 }
 export interface DMTurn {
   requestId:string; ownerId:string; allocationId:string; campaignId:string;
+  /** Host-authenticated audience. Never derive authorization from message text. */
+  authority?: {surface:'private_dm'|'shared_channel';requesterId:string;teamId:string;channelId:string;threadTs:string};
   history:readonly DMText[]; text:string; signal:AbortSignal;
   assertActive():void;
   recordWorker(name:string):void;

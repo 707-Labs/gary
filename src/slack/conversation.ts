@@ -72,6 +72,7 @@ export function createSlackConversation(options:{config:SlackConversationConfig;
       if(session.turns>=POLICY.maxTurns||Buffer.byteLength(JSON.stringify([...history,{role:'user',content:input.text}]))+POLICY.maxReplyBytes+100>POLICY.maxContextBytes)throw new DMReplyError('dm_context_limit');
       db.query("UPDATE events SET state='running' WHERE event_key=? AND owner=? AND state='queued'").run(key,owner);
       reply=await options.reply({requestId:randomUUID(),ownerId:owner,allocationId:config.allocationId,campaignId:config.campaignId,
+        authority:Object.freeze({surface:'private_dm',requesterId:'U0A9M5W16F8',teamId:'T0AA24R7VUZ',channelId:input.channel,threadTs:input.threadTs}),
         history,text:input.text,signal,
         assertActive:()=>{
           if(closed||!isAvailable()||blocked()||signal.aborted||(db.query('SELECT state,owner FROM events WHERE event_key=?').get(key) as any)?.owner!==owner
