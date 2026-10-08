@@ -50,7 +50,8 @@ export function createStdioLauncher(options: StdioLaunchOptions): GaryRuntimeLau
       try { await cleanup(); } catch { throw cleanupError(); }
       throw reject('launch');
     }
-    let stopped = false, exited = false, code: number | null = null, spawnFailed = false;
+    let stopped = false, exited = false, workerExited = false, hostOperationPending = false;
+    let code: number | null = null, spawnFailed = false;
     const stop = () => {
       if (stopped) return;
       stopped = true;
@@ -66,7 +67,14 @@ export function createStdioLauncher(options: StdioLaunchOptions): GaryRuntimeLau
       void cleanup().catch(() => {});
     };
     const completion = new Promise<void>(resolve => {
-      child.once('error', () => { spawnFailed = true; exited = true; resolve(); });
+      child.once('error', () => { spawnFailed = true; workerExited = true; exited = true; cancellation.abort(); resolve(); });
+      child.once('exit', () => {
+        workerExited = true;
+        // An executor can outlive the worker waiting for its response. Cancel its
+        // request now, while still awaiting handle() and physical host cleanup.
+        // Normal exit may precede consumption of a buffered terminal frame.
+        if (hostOperationPending) cancellation.abort();
+      });
       child.once('close', exitCode => { code = exitCode; exited = true; resolve(); });
     });
     // Never print raw child output or errors: a failed worker can echo capabilities.
@@ -132,25 +140,30 @@ export function createStdioLauncher(options: StdioLaunchOptions): GaryRuntimeLau
           else if(++ordinaryRequests>MAX_REQUESTS)throw reject(stage);
           nextId++;
           stage = 'response';
-          const response = await handle(new Request(new URL(frame.path, manifest.modelBaseUrl), {
-            method: 'POST', headers: frame.headers as Record<string, string>, body: JSON.stringify(frame.body), signal: active,
-          }));
-          guard();
-          // Bound responses before returning them to the untrusted worker.
-          const reader = response.body?.getReader();
-          if (!reader) throw reject(stage);
+          if (workerExited) throw reject('exit');
+          let response: Response;
           const chunks: Uint8Array[] = []; let length = 0;
-          const abortRead = () => { void reader.cancel().catch(() => {}); };
-          active.addEventListener('abort', abortRead, { once: true });
+          hostOperationPending = true;
           try {
-            for (;;) {
-              guard(); const part = await reader.read(); guard();
-              if (part.done) break;
-              length += part.value.byteLength;
-              if (length > MAX_LINE - 128) { void reader.cancel().catch(() => {}); throw reject(stage); }
-              chunks.push(part.value);
-            }
-          } finally { active.removeEventListener('abort', abortRead); reader.releaseLock(); }
+            response = await handle(new Request(new URL(frame.path, manifest.modelBaseUrl), {
+              method: 'POST', headers: frame.headers as Record<string, string>, body: JSON.stringify(frame.body), signal: active,
+            }));
+            guard();
+            // Bound responses before returning them to the untrusted worker.
+            const reader = response.body?.getReader();
+            if (!reader) throw reject(stage);
+            const abortRead = () => { void reader.cancel().catch(() => {}); };
+            active.addEventListener('abort', abortRead, { once: true });
+            try {
+              for (;;) {
+                guard(); const part = await reader.read(); guard();
+                if (part.done) break;
+                length += part.value.byteLength;
+                if (length > MAX_LINE - 128) { void reader.cancel().catch(() => {}); throw reject(stage); }
+                chunks.push(part.value);
+              }
+            } finally { active.removeEventListener('abort', abortRead); reader.releaseLock(); }
+          } finally { hostOperationPending = false; }
           const body: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
           if (!object(body) || !finiteJson(body)) throw reject(stage);
           stage = 'response_write';

@@ -385,10 +385,11 @@ class _StdioChannel:
             if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
                 raise RuntimeFault("deadline_exceeded")
             parsed = urllib.parse.urlsplit(_url(url))
-            # The host owns the model request's lifetime, including provider
-            # cancellation and accounting. A shorter SDK/local pipe timeout
-            # must not abandon a request that is still pending at the host.
-            deadline_ms = self.payload["deadlineMs"] if parsed.path == "/v1/chat/completions" else min(
+            # The host owns model and tool execution lifetimes, including their
+            # admitted caps and cancellation/cleanup. A shorter local pipe wait
+            # must not abandon a request still pending at the host. State reads
+            # and exact long-test polls retain their narrower bounded waits.
+            deadline_ms = self.payload["deadlineMs"] if parsed.path in ("/v1/chat/completions", "/tools/execute") else min(
                 self.payload["deadlineMs"], time.time() * 1000 + timeout * 1000)
             remaining = (deadline_ms - time.time() * 1000) / 1000
             if remaining <= 0 or not self.lock.acquire(timeout=remaining):

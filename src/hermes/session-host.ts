@@ -293,7 +293,15 @@ export function createSessionHost(options: SessionOptions) {
       }));
       return Response.json(pendingEnvelope(current),{status:202});
     }
-    return executeTool(body);
+    // Loss of an authenticated synchronous caller is terminal for this session.
+    // The bridge already composes this signal with its action deadline and passes
+    // it to every executor operation. Await the tool's physical cleanup instead
+    // of racing cancellation and abandoning a still-running host command.
+    const cancelRequest = () => cancellation.abort(request.signal.reason);
+    request.signal.addEventListener('abort', cancelRequest, { once: true });
+    if (request.signal.aborted) cancelRequest();
+    try { return await executeTool(body); }
+    finally { request.signal.removeEventListener('abort', cancelRequest); }
   }
   async function executeTool(body:Record<string,unknown>):Promise<Response> {
     let response: Awaited<ReturnType<typeof bridge.invoke>>;
@@ -339,7 +347,10 @@ export function createSessionHost(options: SessionOptions) {
           || !Number.isInteger(task.maxTokens) || task.maxTokens < 1 || task.maxTokens > 8192) throw new Error('invalid runtime limit');
       const temperature = task.temperature ?? 0.3;
       if (!Number.isFinite(temperature) || temperature < 0 || temperature > 1) throw new Error('invalid temperature');
-      return { ...task, temperature, taskId: admission.taskId, requestId: admission.requestId, ownerEpoch: admission.ownerEpoch,
+      const verificationGuidance = longTestPolicy
+        ? '\nHost verification: call run_bash with command exactly "bun run check" or "bun run ci:full" for the admitted long-test jobs. Do not add cd, timeout, pipes, redirects, or other shell wrappers. Wrapped commands remain generic commands and do not produce trusted full-CI verification evidence; only the host-bound verification receipt can satisfy the finish gate.'
+        : '';
+      return { ...task, systemPrompt: task.systemPrompt + verificationGuidance, temperature, taskId: admission.taskId, requestId: admission.requestId, ownerEpoch: admission.ownerEpoch,
         capability: token, modelBaseUrl: new URL('/v1', base).href, executorUrl: new URL('/tools/execute', base).href,
         stateUrl: new URL('/tools/state', base).href, model: options.model, tools: bridge.definitions, deadlineMs: admission.deadlineMs,
         ...(longTestPolicy ? {longTestPolicy} : {}) };

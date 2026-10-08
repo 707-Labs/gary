@@ -55,6 +55,22 @@ test('fixed command recognition is exact and legacy omission keeps synchronous t
  }
  const f=fixture({longTestPolicy:undefined,executorJobJournal:undefined} as any);const result=f.host.handle(request('/tools/execute',execute()));await Bun.sleep(1);f.release();expect((await result).status).toBe(200);
 });
+test('shell wrappers remain generic and cannot supply trusted full-CI finish evidence',async()=>{
+ for(const command of ['cd /workspace && bun run ci:full','bun run ci:full | tail -40','timeout 900 bun run ci:full','bun run ci:full > /tmp/check.log']) {
+  const f=fixture();const response=f.host.handle(request('/tools/execute',execute('wrapped',command)));
+  await Bun.sleep(1);f.release();expect((await response).status).toBe(200);
+  expect(f.stats().runOptions!.testJob).toBeUndefined();expect(f.host.pendingTestJob).toBe(false);
+  expect(f.host.state.finishGateMet).toBe(false);expect(f.host.result({status:'finished'}).status).toBe('no_finish');
+  expect((await f.host.handle(request('/tools/execute',{...execute('finish'),name:'finish',arguments:{summary:'done'}}))).status).toBe(400);
+  expect(f.stats().runs).toBe(1);
+ }
+ const task={prompt:'offline',systemPrompt:'original instructions',maxIterations:1,maxTokens:32};
+ const coding=fixture().host.manifest('http://127.0.0.1/',task);
+ expect(coding.systemPrompt).toContain('command exactly "bun run check" or "bun run ci:full"');
+ expect(coding.systemPrompt).toContain('Wrapped commands remain generic commands');
+ const legacy=fixture({longTestPolicy:undefined,executorJobJournal:undefined} as any).host.manifest('http://127.0.0.1/',task);
+ expect(legacy.systemPrompt).toBe(task.systemPrompt);
+});
 test('smaller requested timeouts remain smaller and policy+journal pairing fails closed',async()=>{
  const f=fixture();const body=execute();Object.assign(body.arguments,{timeout_seconds:5});const response=await f.host.handle(request('/tools/execute',body));const pending=await response.json();await Bun.sleep(1);
  expect(f.stats().runOptions!.timeoutMs).toBe(5000);expect(pending.deadlineMs).toBeLessThanOrEqual(Date.now()+5000);f.release();await f.poll(pending);

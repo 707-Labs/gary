@@ -90,7 +90,7 @@ async function runtimeFixture(configure?:(config:HermesActivationConfig,workspac
 
 test('coding activation accepts the async worker pin and rejects the previous read-only worker',()=>{
   const f=configFixture();
-  expect(HERMES_CODING_WORKER_IMAGE).toBe('sha256:f95c4beac523b93e8a74ea840a9916818465965bf3b99833deb50bab2f239c32');
+  expect(HERMES_CODING_WORKER_IMAGE).toBe('sha256:8f728373dd6121e8031e113988c76eb561eb4758b2e3e701932e3a36ff991fcb');
   expect(loadHermesActivationConfig(f.path).workerImage).toBe(HERMES_CODING_WORKER_IMAGE);
   f.save({...f.config,workerImage:HERMES_CANARY_WORKER_IMAGE});
   expect(()=>loadHermesActivationConfig(f.path)).toThrow('hermes_activation_rejected:config_unavailable_or_invalid');

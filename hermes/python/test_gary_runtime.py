@@ -1106,6 +1106,101 @@ class PhaseHistoryTests(unittest.TestCase):
                          "provider replay data")
 
 
+class OrdinaryToolDeadlineTests(unittest.TestCase):
+    @staticmethod
+    def delayed_reader(now, replies):
+        responses = iter(replies)
+        class DelayedReader(io.StringIO):
+            def read(self, size=-1):
+                elapsed, frame = next(responses)
+                now[0] += elapsed
+                return frame
+        return DelayedReader()
+
+    @staticmethod
+    def receipt(call_id):
+        return {"ok": True, "tool_call_id": call_id, "name": "run_bash",
+                "content": "exit_code: 0\nordinary command completed\n"}
+
+    def test_ordinary_stdio_tool_outlives_legacy_sixty_seconds_with_live_host_deadline(self):
+        for elapsed in (61.5, 600.5):
+            with self.subTest(elapsed=elapsed), patch("gary_runtime.time.time") as clock:
+                now = [1000.0]
+                clock.side_effect = lambda: now[0]
+                manifest = payload(transport="stdio", deadlineMs=1900000, tools=[tool("run_bash")])
+                output, observed = io.StringIO(), []
+                reader = self.delayed_reader(now, [(elapsed, response_frame(1, self.receipt("ordinary"))),
+                                                   (0, response_frame(2, state_reply()))])
+                channel = _StdioChannel(manifest, reader, output)
+                def action(agent):
+                    observed.append(agent.handlers["run_bash"]({"command": "bun run test:run fixture.test.ts"}, tool_call_id="ordinary"))
+                result = run_task(manifest, native_factory=FakeFactory(action=action), transport=channel)
+                self.assertEqual(result["status"], "no_finish", result)
+                self.assertEqual(observed, [self.receipt("ordinary")["content"]])
+                self.assertEqual(channel.payload["deadlineMs"], 1900000)
+                self.assertIsNone(channel.fault)
+                self.assertEqual([json.loads(line)["path"] for line in output.getvalue().splitlines()],
+                                 ["/tools/execute", "/tools/state"])
+                self.assertEqual(result["modelAttempts"], 0)
+                self.assertFalse(result["publicationApproved"])
+
+    def test_ordinary_stdio_uses_original_cumulative_deadline_and_latches_expiry(self):
+        now = [1000.0]
+        with patch("gary_runtime.time.time", side_effect=lambda: now[0]):
+            manifest = payload(transport="stdio", deadlineMs=1120000, tools=[tool("run_bash")])
+            output, observed = io.StringIO(), []
+            reader = self.delayed_reader(now, [(61.5, response_frame(1, self.receipt("first"))),
+                                               (58.501, response_frame(2, self.receipt("second")))])
+            channel = _StdioChannel(manifest, reader, output)
+            def action(agent):
+                for call_id in ("first", "second"):
+                    try:
+                        observed.append(agent.handlers["run_bash"]({"command": "echo bounded"}, tool_call_id=call_id))
+                    except RuntimeFault:
+                        pass  # Native catches cannot revive a timed-out host exchange.
+                now[0] = 1000.0
+                try:
+                    agent.handlers["run_bash"]({"command": "echo forbidden"}, tool_call_id="after-expiry")
+                except RuntimeFault as exc:
+                    observed.append(exc.code)
+            result = run_task(manifest, native_factory=FakeFactory(action=action), transport=channel)
+            self.assertEqual(observed, [self.receipt("first")["content"], "deadline_exceeded"])
+            self.assertEqual(result["status"], "timeout", result)
+            self.assertEqual(result["diagnostic"], {"origin":"worker", "code":"deadline_exceeded", "stage":"stdio_read", "category":"none"})
+            self.assertEqual(channel.payload["deadlineMs"], 1120000)
+            self.assertEqual([json.loads(line)["body"]["callId"] for line in output.getvalue().splitlines()], ["first", "second"])
+            self.assertFalse(result["publicationApproved"])
+
+    def test_ordinary_stdio_missing_reply_is_bounded_by_original_host_deadline(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            with os.fdopen(read_fd, "rb") as pipe:
+                output = io.StringIO()
+                manifest = payload(transport="stdio", deadlineMs=time.time()*1000+20)
+                channel = _StdioChannel(manifest, pipe, output)
+                started = time.monotonic()
+                for _ in range(2):
+                    with self.assertRaisesRegex(RuntimeFault, "deadline_exceeded"):
+                        channel(manifest["executorUrl"], {"name":"read_file"},
+                                {"Authorization":"Bearer "+CAPABILITY,"Content-Type":"application/json"}, 60)
+                self.assertLess(time.monotonic()-started, 1)
+                self.assertEqual(len(output.getvalue().splitlines()), 1)
+                self.assertEqual(channel.fault, "deadline_exceeded")
+        finally:
+            os.close(write_fd)
+
+    def test_legacy_http_tool_rpc_retains_sixty_second_transport_cap(self):
+        with patch("gary_runtime.time.time", return_value=1000.0):
+            transport = FakeTransport()
+            factory = FakeFactory(action=lambda agent: agent.handlers["run_bash"](
+                {"command": "echo legacy"}, tool_call_id="legacy"))
+            result = run_task(payload(deadlineMs=1900000, tools=[tool("run_bash")]),
+                              native_factory=factory, transport=transport)
+            self.assertEqual(result["status"], "no_finish", result)
+            self.assertEqual([call["timeout"] for call in transport.calls], [60.0, 60.0])
+            self.assertEqual([call["url"].rsplit("/", 1)[-1] for call in transport.calls], ["execute", "state"])
+
+
 class LongTestProtocolTests(unittest.TestCase):
     def setup_channel(self, updates=None, enabled=True):
         self.manifest = payload(transport="stdio", deadlineMs=int(time.time()*1000)+120000,
@@ -1175,6 +1270,22 @@ class LongTestProtocolTests(unittest.TestCase):
         self.assertEqual(len(frames),97)
         self.assertEqual(sum(frame["path"]=="/tools/jobs/poll" for frame in frames),96)
         self.assertNotIn("/v1/chat/completions",[frame["path"] for frame in frames])
+
+    def test_exact_job_poll_keeps_its_local_wait_cap_below_task_deadline(self):
+        now = [1000.0]
+        with patch("gary_runtime.time.time", side_effect=lambda: now[0]):
+            self.setup_channel()
+            self.channel.reader = type(self.channel.reader)(OrdinaryToolDeadlineTests.delayed_reader(now, [
+                (0, response_frame(1, self.pending, 202)),
+                (60.001, response_frame(2, self.pending, 202)),
+            ]))
+            with self.assertRaisesRegex(RuntimeFault, "deadline_exceeded"):
+                self.call()
+            self.assertLess(now[0]*1000, self.manifest["deadlineMs"])
+            with self.assertRaisesRegex(RuntimeFault, "deadline_exceeded"):
+                self.call()
+            frames = [json.loads(line) for line in self.writer.getvalue().splitlines()]
+            self.assertEqual([frame["path"] for frame in frames], ["/tools/execute", "/tools/jobs/poll"])
 
     def test_invalid_policy_rejected_before_native_factory(self):
         factory=FakeFactory()
