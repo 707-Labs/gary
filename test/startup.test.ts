@@ -14,6 +14,7 @@ import { recordActionStart, upsertTicket } from '../src/state/queries.ts';
 import { LocalExecutor } from '../src/executors/local.ts';
 import type { AssignedIssue, LinearAdapter } from '../src/adapters/linear.ts';
 import type { GitHubClient } from '../src/adapters/github.ts';
+import { APPROVED_SLACK_IDENTITY, type SlackTransport } from '../src/slack/transport.ts';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -100,4 +101,64 @@ test('startup closes canonical handles and signal listeners on polling failure',
   db.close=()=>{dbClosed=true;closeDb();};ledger.close=()=>{ledgerClosed=true;closeLedger();};
   await expect(main({...f.deps,db:()=>db,ledger:()=>ledger,runLoop:async()=>{throw new Error('fixture');}})).rejects.toThrow('fixture');
   expect({dbClosed,ledgerClosed}).toEqual({dbClosed:true,ledgerClosed:true});expect(process.listenerCount('SIGTERM')).toBe(signalCount);
+});
+
+function slackFixture() {
+  const f=fixture();
+  const credentialsPath=join(f.root,'slack.env');
+  writeFileSync(credentialsPath,'SLACK_BOT_TOKEN=xoxb-offline-fixture-only\nSLACK_APP_TOKEN=xapp-offline-fixture-only\n',{mode:0o600});
+  const env={...f.env,GARY_SLACK_ENABLED:'1',GARY_SLACK_CREDENTIALS_FILE:credentialsPath};
+  let started=false,stopped=false,identityCalls=0,sends=0;
+  const transport:SlackTransport={
+    async start(){started=true;},async stop(){stopped=true;},socketHealthy:()=>started&&!stopped,
+    async identity(){identityCalls++;return APPROVED_SLACK_IDENTITY;},
+    async sendMessage(){sends++;return {ok:false,outcome:'definitely_not_sent',code:'fixture'};},
+  };
+  return {...f,env,credentialsPath,transport,stats:()=>({started,stopped,identityCalls,sends})};
+}
+test('actual main loads the private Slack file, connects before polling, refreshes after a tick, and never announces an unproven canary',async()=>{
+  const f=slackFixture();let polls=0;
+  await main({...f.deps,env:f.env,slackTransport:credentials=>{
+    expect(credentials).toEqual({botToken:'xoxb-offline-fixture-only',appToken:'xapp-offline-fixture-only'});return f.transport;
+  },runLoop:async args=>{
+    polls++;expect(f.stats()).toMatchObject({started:true,stopped:false,identityCalls:1,sends:0});
+    expect(typeof args.onTickComplete).toBe('function');
+    await args.onTickComplete!({} as never);
+    expect(f.stats()).toMatchObject({identityCalls:2,sends:0});
+    expect(args.db.query('SELECT count(*) AS n FROM gary_slack_outbox').get()).toEqual({n:0});
+  }});
+  expect(polls).toBe(1);expect(f.stats()).toMatchObject({stopped:true,sends:0});expect(f.networkCalls()).toBe(0);
+});
+test('invalid Slack file and wrong authenticated identity fail before polling',async()=>{
+  for(const kind of ['file','identity','start'] as const){
+    const f=slackFixture();let polls=0,factories=0;
+    if(kind==='file')chmodSync(f.credentialsPath,0o644);
+    if(kind==='identity')f.transport.identity=async()=>({...APPROVED_SLACK_IDENTITY,botUserId:'UWRONG'});
+    if(kind==='start')f.transport.start=async()=>{throw new Error('private transport failure');};
+    await expect(main({...f.deps,env:f.env,slackTransport:()=>{factories++;return f.transport;},runLoop:async()=>{polls++;}})).rejects.toThrow();
+    expect(polls).toBe(0);expect(f.networkCalls()).toBe(0);
+    expect(factories).toBe(kind==='file'?0:1);if(kind!=='file')expect(f.stats().stopped).toBe(true);
+  }
+});
+test('shutdown stops Slack before canonical handles close, including stop failure',async()=>{
+  for(const failStop of [false,true]){
+    const f=slackFixture(),order:string[]=[];
+    const db=openDb(':memory:'),ledger=new SpendLedger(':memory:');
+    const closeDb=db.close.bind(db),closeLedger=ledger.close.bind(ledger);
+    db.close=()=>{order.push('db');closeDb();};ledger.close=()=>{order.push('ledger');closeLedger();};
+    f.transport.stop=async()=>{expect(db.query('SELECT 1 AS n').get()).toEqual({n:1});order.push('slack');if(failStop)throw new Error('fixture_stop_failed');};
+    const result=main({...f.deps,env:f.env,db:()=>db,ledger:()=>ledger,slackTransport:()=>f.transport,runLoop:async()=>{}});
+    if(failStop)await expect(result).rejects.toThrow('slack_service_stop_failed');else await result;
+    expect(order).toEqual(['slack','ledger','db']);expect(f.networkCalls()).toBe(0);
+  }
+});
+test('cancellation closes Slack ingress immediately and completed-tick hook cannot send afterwards',async()=>{
+  const f=slackFixture(),controller=new AbortController();
+  await main({...f.deps,env:f.env,signal:controller.signal,slackTransport:()=>f.transport,runLoop:async args=>{
+    controller.abort();expect(f.stats().stopped).toBe(true);expect(args.signal?.aborted).toBe(true);
+    await args.onTickComplete!({} as never);expect(f.stats()).toMatchObject({identityCalls:1,sends:0});
+  }});
+  const second=slackFixture();let factories=0,polls=0;
+  await main({...second.deps,env:second.env,signal:controller.signal,slackTransport:()=>{factories++;return second.transport;},runLoop:async()=>{polls++;}});
+  expect({factories,polls}).toEqual({factories:0,polls:0});
 });

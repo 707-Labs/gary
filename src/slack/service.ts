@@ -1,0 +1,175 @@
+/** Host-only static Slack status service. No model, tool, or coding dispatch surface. */
+import { createHash, randomUUID } from 'node:crypto';
+import type { DB } from '../state/db.ts';
+import type { SlackTransport } from './transport.ts';
+
+export const GARY_SLACK = Object.freeze({ appId:'A0C7QFW3PEG', teamId:'T0AA24R7VUZ', botUserId:'U0C7NPEUG1F',
+  tannerId:'U0A9M5W16F8', benId:'U0A97PBGXE3', readyRequest:'Sentinel_ecc85c3dae948191965308b6414c1165' });
+export const READY_DM_TEXT = "i'm gary. the Hermes runtime is up and running, and its readiness canary passed. coding work still goes through the approved Linear flow.";
+const READY_STATUS = "i'm gary. the Hermes runtime has passed its current readiness checks. this Slack connection only reports status; please use the normal approved Linear flow for coding work.";
+const NOT_READY_STATUS = "i'm gary. the Hermes runtime has not passed its current readiness checks. this Slack connection only reports status; please use the normal approved Linear flow for coding work. i haven't started a task from this message.";
+const CHANNEL = /^[CG][A-Z0-9]{5,32}$/;
+const TIMESTAMP = /^\d{10,16}\.\d{6}$/;
+const RECEIPT = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+const hash = (value:string) => createHash('sha256').update(value).digest('hex');
+const object = (value:unknown):value is Record<string,unknown> => value !== null && typeof value==='object' && !Array.isArray(value);
+
+export interface SlackHostHealth {
+  /** Trusted host evidence, never inferred from model text or actions.success alone. */
+  ready:boolean;
+  hermesCanarySucceeded:boolean;
+  /** Opaque deployment/canary receipt identifier. No prompts or credentials. */
+  receiptId:string;
+}
+export interface SlackServiceOptions {
+  db:DB;
+  transport:SlackTransport;
+  checkHostHealth():SlackHostHealth|Promise<SlackHostHealth>;
+  /** Empty by default: no shared-channel replies until explicitly approved. */
+  approvedChannelIds?:readonly string[];
+  /** Only Tanner and optionally explicitly approved Ben. Default Tanner. */
+  allowedUserIds?:readonly string[];
+}
+export interface SlackServiceHealth {
+  running:boolean; identityVerified:boolean; socketHealthy:boolean; hostReady:boolean;
+  readinessReceiptId:string|null; readyDelivery:'none'|'sent'|'unknown'|'not_sent';
+}
+export interface SlackService {
+  start():Promise<SlackServiceHealth>;
+  stop():Promise<void>;
+  refreshHealth():Promise<SlackServiceHealth>;
+  readonly health:SlackServiceHealth;
+}
+interface OutboxRow { status:'sent'|'unknown'|'not_sent'; }
+
+export function createSlackService(options:SlackServiceOptions):SlackService {
+  const channels=[...(options.approvedChannelIds??[])], users=[...(options.allowedUserIds??[GARY_SLACK.tannerId])];
+  if (channels.length>64 || new Set(channels).size!==channels.length || channels.some(id=>!CHANNEL.test(id))) throw new Error('invalid_slack_channel_allowlist');
+  if (new Set(users).size!==users.length || users.some(id=>id!==GARY_SLACK.tannerId && id!==GARY_SLACK.benId)) throw new Error('invalid_slack_user_allowlist');
+  const channelSet=new Set(channels), userSet=new Set(users);
+  const cancellation=new AbortController(), pending=new Set<Promise<unknown>>();
+  const readyKey=`ready:${GARY_SLACK.readyRequest}:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${GARY_SLACK.tannerId}`;
+  let running=false, stopped=false, initialized=false, identityVerified=false, hostReady=false, receiptId:string|null=null;
+  let startPromise:Promise<SlackServiceHealth>|undefined, stopPromise:Promise<void>|undefined, refreshPromise:Promise<SlackServiceHealth>|undefined;
+  const live=()=>running&&!stopped&&!cancellation.signal.aborted;
+  function track<T>(promise:Promise<T>):Promise<T> {
+    pending.add(promise);void promise.then(()=>pending.delete(promise),()=>pending.delete(promise));return promise;
+  }
+  function initialize():void {
+    // Root calls start only after configuration validation. No schema mutation at import/construction.
+    options.db.exec(`CREATE TABLE IF NOT EXISTS gary_slack_outbox (
+      delivery_key TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('ready','mention')),
+      request_id TEXT NOT NULL, app_id TEXT NOT NULL, team_id TEXT NOT NULL, bot_user_id TEXT NOT NULL,
+      recipient_id TEXT NOT NULL, target_channel TEXT NOT NULL, thread_ts TEXT,
+      content_sha256 TEXT NOT NULL, readiness_receipt_id TEXT, claim_id TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('unknown','sent','not_sent')),
+      claimed_at TEXT NOT NULL, completed_at TEXT, slack_channel TEXT, slack_ts TEXT, error_code TEXT
+    )`);
+    initialized=true;
+  }
+  function snapshot():SlackServiceHealth {
+    const row=initialized ? options.db.query<OutboxRow,[string]>('SELECT status FROM gary_slack_outbox WHERE delivery_key = ?').get(readyKey) : null;
+    return {running:live(),identityVerified:live()&&identityVerified,socketHealthy:live()&&options.transport.socketHealthy(),
+      hostReady:live()&&hostReady,readinessReceiptId:receiptId,readyDelivery:row?.status??'none'};
+  }
+  async function identity():Promise<boolean> {
+    if(!live() || !options.transport.socketHealthy()) {identityVerified=false;return false;}
+    try {
+      const actual=await options.transport.identity(cancellation.signal);
+      identityVerified=live()&&options.transport.socketHealthy()&&actual.appId===GARY_SLACK.appId
+        && actual.teamId===GARY_SLACK.teamId&&actual.botUserId===GARY_SLACK.botUserId;
+    } catch {identityVerified=false;}
+    return identityVerified;
+  }
+  async function sendOnce(input:{key:string;kind:'ready'|'mention';requestId:string;recipient:string;channel:string;threadTs?:string;text:string}):Promise<void> {
+    if(!live()||!identityVerified||!options.transport.socketHealthy())return;
+    const claim=randomUUID();
+    // An exclusive durable UNKNOWN claim precedes the network request. A process
+    // crash, ambiguous response, or duplicate process can never trigger an automatic retry.
+    const claimed=options.db.query(`INSERT OR IGNORE INTO gary_slack_outbox
+      (delivery_key,kind,request_id,app_id,team_id,bot_user_id,recipient_id,target_channel,thread_ts,
+       content_sha256,readiness_receipt_id,claim_id,status,claimed_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'unknown',?)`).run(input.key,input.kind,input.requestId,GARY_SLACK.appId,GARY_SLACK.teamId,
+        GARY_SLACK.botUserId,input.recipient,input.channel,input.threadTs??null,hash(input.text),receiptId,claim,new Date().toISOString());
+    if(claimed.changes!==1)return;
+    let status:OutboxRow['status']='unknown',channel:string|null=null,ts:string|null=null,error:string|null='transport_unknown';
+    try {
+      if(!live()||!options.transport.socketHealthy()) {status='not_sent';error='service_stopped_before_send';}
+      else {
+        const result=await options.transport.sendMessage({channel:input.channel,text:input.text,
+          ...(input.threadTs?{threadTs:input.threadTs}:{})},cancellation.signal);
+        if(result.ok && typeof result.channel==='string' && TIMESTAMP.test(result.ts)
+          && (input.kind==='ready'?/^D[A-Z0-9]{5,32}$/.test(result.channel):result.channel===input.channel)) {
+          status='sent';channel=result.channel;ts=result.ts;error=null;
+        } else if(!result.ok && result.outcome==='definitely_not_sent') {status='not_sent';error='transport_declined';}
+      }
+    } catch { /* Retain unknown. Never infer non-delivery from timeout or cancellation. */ }
+    options.db.query(`UPDATE gary_slack_outbox SET status=?, completed_at=?, slack_channel=?, slack_ts=?, error_code=?
+      WHERE delivery_key=? AND claim_id=? AND status='unknown'`).run(status,new Date().toISOString(),channel,ts,error,input.key,claim);
+  }
+  async function refresh():Promise<SlackServiceHealth> {
+    if(!live())return snapshot();
+    hostReady=false;receiptId=null;
+    if(!await identity())return snapshot();
+    try {
+      const health=await options.checkHostHealth();
+      if(live() && options.transport.socketHealthy() && health?.ready===true && health.hermesCanarySucceeded===true
+        && typeof health.receiptId==='string' && RECEIPT.test(health.receiptId)) {hostReady=true;receiptId=health.receiptId;}
+    } catch {hostReady=false;}
+    if(hostReady) await sendOnce({key:readyKey,kind:'ready',requestId:GARY_SLACK.readyRequest,recipient:GARY_SLACK.tannerId,
+      channel:GARY_SLACK.tannerId,text:READY_DM_TEXT});
+    return snapshot();
+  }
+  function refreshHealth():Promise<SlackServiceHealth> {
+    if(refreshPromise)return refreshPromise;
+    refreshPromise=track(refresh()).finally(()=>{refreshPromise=undefined;});return refreshPromise;
+  }
+  async function mention(envelope:unknown):Promise<void> {
+    if(!live()||!object(envelope)||envelope.type!=='events_api'||!object(envelope.payload))return;
+    const payload=envelope.payload;
+    if(payload.type!=='event_callback'||payload.team_id!==GARY_SLACK.teamId||payload.api_app_id!==GARY_SLACK.appId
+      ||typeof payload.event_id!=='string'||!/^Ev[A-Za-z0-9]{1,80}$/.test(payload.event_id)||!object(payload.event))return;
+    const event=payload.event;
+    if(event.type!=='app_mention'||event.bot_id!==undefined||event.subtype!==undefined||typeof event.user!=='string'
+      ||!userSet.has(event.user)||typeof event.channel!=='string'||!channelSet.has(event.channel)
+      ||typeof event.text!=='string'||event.text.length>40_000||!event.text.includes(`<@${GARY_SLACK.botUserId}>`)
+      ||typeof event.ts!=='string'||!TIMESTAMP.test(event.ts)
+      ||(event.thread_ts!==undefined&&(typeof event.thread_ts!=='string'||!TIMESTAMP.test(event.thread_ts))))return;
+    // Refresh trusted health only; incoming text never enters a model or becomes instructions.
+    await refreshHealth();
+    if(!live()||!identityVerified||!options.transport.socketHealthy())return;
+    await sendOnce({key:`mention:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${payload.event_id}`,kind:'mention',
+      requestId:payload.event_id,recipient:event.user,channel:event.channel,threadTs:(event.thread_ts??event.ts) as string,
+      text:hostReady?READY_STATUS:NOT_READY_STATUS});
+  }
+  function start():Promise<SlackServiceHealth> {
+    if(stopped)return Promise.reject(new Error('slack_service_stopped'));
+    if(startPromise)return startPromise;
+    startPromise=(async()=>{
+      initialize();
+      try {
+        await options.transport.start(envelope=>track(mention(envelope)),cancellation.signal);
+        if(stopped)return snapshot();
+        running=true;return await refreshHealth();
+      } catch {
+        stopped=true;running=false;identityVerified=false;hostReady=false;cancellation.abort();
+        try { await options.transport.stop(); }
+        finally { await Promise.allSettled([...pending]); throw new Error('slack_service_start_failed'); }
+      }
+    })();return startPromise;
+  }
+  function stop():Promise<void> {
+    if(stopPromise)return stopPromise;
+    stopped=true;running=false;identityVerified=false;hostReady=false;cancellation.abort();
+    stopPromise=(async()=>{
+      let transportFailed=false;
+      try { await options.transport.stop(); } catch { transportFailed=true; }
+      finally {
+        if(startPromise)await startPromise.catch(()=>{});
+        await Promise.allSettled([...pending]);
+      }
+      if(transportFailed)throw new Error('slack_service_stop_failed');
+    })();return stopPromise;
+  }
+  return {start,stop,refreshHealth,get health(){return snapshot();}};
+}
