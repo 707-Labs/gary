@@ -64,15 +64,23 @@ function harness(options: Partial<SlackTransportOptions> = {}, authReply: unknow
 
 describe("Slack transport, fake fetch and WebSocket only", () => {
   test('shared metadata uses only exact bot-authenticated info routes, rejects foreign/pending facts, and discards profile text',async()=>{
-    const calls:Array<{url:string;body:any;headers:Headers}>=[];let user:any={...memberMetadata},channel:any={...channelMetadata};
-    const h=harness({fetch:async(url,init)=>{calls.push({url,body:JSON.parse(String(init.body)),headers:new Headers(init.headers)});
+    const calls:Array<{url:string;init:RequestInit;headers:Headers}>=[];let user:any={...memberMetadata},channel:any={...channelMetadata};
+    const h=harness({fetch:async(url,init)=>{calls.push({url,init,headers:new Headers(init.headers)});
       if(url.endsWith('auth.test'))return Response.json(auth);if(url.endsWith('apps.connections.open'))return Response.json({ok:true,url:socketUrl});
-      if(url.endsWith('users.info'))return Response.json({ok:true,user});if(url.endsWith('conversations.info'))return Response.json({ok:true,channel});throw new Error('forbidden route');}});
+      if(new URL(url).pathname==='/api/users.info')return Response.json({ok:true,user});if(new URL(url).pathname==='/api/conversations.info')return Response.json({ok:true,channel});throw new Error('forbidden route');}});
     await h.start();const member=await h.transport.memberInfo!('U0MEMBER11'),facts=await h.transport.channelInfo!('C0CHANNEL1');
     expect(member).toMatchObject({id:'U0MEMBER11',teamId:APPROVED_SLACK_IDENTITY.teamId,isRestricted:false,isStranger:false});expect(facts).toMatchObject({isMember:true,isShared:false});
     expect(JSON.stringify(member)).not.toContain('private@example');expect(JSON.stringify(member)).not.toContain('Do not retain');
-    for(const call of calls.filter(call=>call.url.endsWith('.info')))expect(call.headers.get('authorization')).toBe('Bearer '+credentials.botToken);
-    expect(calls.filter(call=>call.url.endsWith('.info')).map(call=>call.body)).toEqual([{user:'U0MEMBER11'},{channel:'C0CHANNEL1'}]);
+    const reads=calls.filter(call=>new URL(call.url).pathname.endsWith('.info'));
+    for(const call of reads){
+      expect(call.init.method).toBe('GET');expect(call.init).not.toHaveProperty('body');
+      expect(call.headers.get('content-type')).toBeNull();expect(call.headers.get('cache-control')).toBe('no-store');
+      expect(call.headers.get('authorization')).toBe('Bearer '+credentials.botToken);
+      expect(call.init.redirect).toBe('error');expect(call.init.credentials).toBe('omit');expect(call.init.signal).toBeInstanceOf(AbortSignal);
+      expect(call.url).not.toContain(credentials.botToken);expect(call.url).not.toContain(credentials.appToken);
+    }
+    expect(reads.map(call=>[new URL(call.url).pathname,[...new URL(call.url).searchParams]])).toEqual([
+      ['/api/users.info',[['user','U0MEMBER11']]],['/api/conversations.info',[['channel','C0CHANNEL1']]]]);
     for(const bad of [{id:'C0FOREIGN'},{context_team_id:undefined},{is_member:undefined},{is_im:true},{connected_team_ids:['TFOREIGN']},{shared_team_ids:['TFOREIGN']},{pending_connected_team_ids:[APPROVED_SLACK_IDENTITY.teamId]},{pending_shared:['TFOREIGN']},{is_ext_ws_shared:true},{is_ext_ws_shared:'false'},{conversation_host_id:'TFOREIGN'}]){
       channel={...channelMetadata,...bad};await expect(h.transport.channelInfo!('C0CHANNEL1')).rejects.toThrow('slack_response_rejected');
     }
@@ -137,6 +145,9 @@ describe("Slack transport, fake fetch and WebSocket only", () => {
     const h = harness(); await h.start();
     expect(await h.transport.sendMessage({ ...message, token: "ignored", response_url: "https://elsewhere.invalid" } as typeof message)).toEqual({ ok: true, channel: message.channel, ts: "124.456" });
     const posted = h.calls.filter(call => call.url.endsWith("chat.postMessage")); expect(posted).toHaveLength(1);
+    expect(posted[0]!.init.method).toBe("POST");
+    expect(new Headers(posted[0]!.init.headers).get("content-type")).toBe("application/json; charset=utf-8");
+    expect(new Headers(posted[0]!.init.headers).get("authorization")).toBe(`Bearer ${credentials.botToken}`);
     expect(JSON.parse(posted[0]!.init.body as string)).toEqual({ channel: message.channel, text: message.text,
       thread_ts: message.threadTs, unfurl_links: false, unfurl_media: false });
   });
@@ -338,4 +349,49 @@ test('transport arrival diagnostics contain only fixed shape and cannot prevent 
   expect(records.some(r=>r.stage==='transport_hello')).toBe(true);
   expect(records.at(-1)).toMatchObject({component:'transport',stage:'transport_envelope',envelopeKind:'events_api',eventKind:'app_mention',hasBotId:true,hasSubtype:true});
   expect(JSON.stringify(records)).not.toContain(secret);expect(JSON.stringify(records)).not.toContain(credentials.botToken);
+});
+
+test('metadata GET uses the exact constructed response URL and never retries mismatched queries or redirects',async()=>{
+  let responseUrl:(url:string)=>string=url=>url,redirected=false;
+  const metadataCalls:string[]=[];
+  const h=harness({fetch:async(url,init)=>{
+    const parsed=new URL(url);
+    if(parsed.pathname==='/api/auth.test')return Response.json(auth);
+    if(parsed.pathname==='/api/apps.connections.open')return Response.json({ok:true,url:socketUrl});
+    const isUser=parsed.pathname==='/api/users.info';expect(isUser||parsed.pathname==='/api/conversations.info').toBe(true);
+    metadataCalls.push(url);expect(init.method).toBe('GET');expect(init).not.toHaveProperty('body');
+    const response=Response.json(isUser?{ok:true,user:memberMetadata}:{ok:true,channel:channelMetadata});
+    Object.defineProperty(response,'url',{value:responseUrl(url)});Object.defineProperty(response,'redirected',{value:redirected});return response;
+  }});
+  await h.start();
+  const reads=[()=>h.transport.memberInfo!('U0MEMBER11'),()=>h.transport.channelInfo!('C0CHANNEL1')];
+  for(const read of reads){
+    responseUrl=url=>url;redirected=false;await expect(read()).resolves.toBeDefined();
+    for(const wrong of [(url:string)=>url.split('?')[0]!, (url:string)=>url+'EXTRA', (url:string)=>url+'&unexpected=1',
+      (url:string)=>url+'&'+new URL(url).searchParams.toString(),(url:string)=>url.replace('slack.com','elsewhere.invalid'),
+      (url:string)=>url.replace('/api/','/different/'),(url:string)=>url+'#fragment']){
+      responseUrl=wrong;const before=metadataCalls.length;await expect(read()).rejects.toThrow('slack_response_rejected');expect(metadataCalls).toHaveLength(before+1);
+    }
+    responseUrl=url=>url;redirected=true;await expect(read()).rejects.toThrow('slack_response_rejected');
+  }
+  const before=metadataCalls.length;
+  for(const id of ['U0MEMBER11&token=secret','U0MEMBER11?x=1','USLACKBOT','U0MEMBER11\n'])await expect(h.transport.memberInfo!(id)).rejects.toThrow('slack_response_rejected');
+  for(const id of ['C0CHANNEL1&user=other','C0CHANNEL1?x=1','D0PRIVATE1','C0CHANNEL1\n'])await expect(h.transport.channelInfo!(id)).rejects.toThrow('slack_response_rejected');
+  expect(metadataCalls).toHaveLength(before);
+});
+
+test('metadata GET retains bounded response parsing, deadline and cancellation',async()=>{
+  for(const kind of ['oversized','timeout','cancel'] as const){
+    const abort=new AbortController();let attempts=0,requestSignal:AbortSignal|undefined;
+    const h=harness({httpTimeoutMs:10,fetch:async(url,init)=>{
+      if(url.endsWith('auth.test'))return Response.json(auth);if(url.endsWith('apps.connections.open'))return Response.json({ok:true,url:socketUrl});
+      attempts++;expect(init.method).toBe('GET');requestSignal=init.signal!;
+      if(kind==='oversized')return new Response('{}',{headers:{'content-length':'65537'}});
+      if(kind==='cancel')queueMicrotask(()=>abort.abort());
+      return new Promise<Response>(()=>{});
+    }});
+    await h.start();
+    await expect(h.transport.channelInfo!('C0CHANNEL1',abort.signal)).rejects.toThrow(kind==='oversized'?'slack_response_rejected':kind==='timeout'?'slack_request_timeout':'slack_request_cancelled');
+    expect(attempts).toBe(1);expect(requestSignal?.aborted).toBe(true);
+  }
 });

@@ -147,13 +147,21 @@ export function createSlackTransport(options: SlackTransportOptions): SlackTrans
     });
     try {
       return await Promise.race([aborted, (async () => {
-        const response = await fetcher(`https://slack.com/api/${method}`, {
-          method: "POST", redirect: "error", credentials: "omit", signal: controller.signal,
-          headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store",
+        const metadataRead = method === "users.info" || method === "conversations.info";
+        let requestUrl = `https://slack.com/api/${method}`;
+        if (metadataRead) {
+          const key = method === "users.info" ? "user" : "channel";
+          const value = body[key];
+          if (typeof value !== "string" || Object.keys(body).length !== 1) return fail("slack_configuration_rejected");
+          requestUrl += `?${new URLSearchParams({ [key]: value })}`;
+        }
+        const response = await fetcher(requestUrl, {
+          method: metadataRead ? "GET" : "POST", redirect: "error", credentials: "omit", signal: controller.signal,
+          headers: { ...(metadataRead ? {} : { "Content-Type": "application/json; charset=utf-8" }), "Cache-Control": "no-store",
             Authorization: `Bearer ${method === "apps.connections.open" ? credentials.appToken : credentials.botToken}` },
-          body: JSON.stringify(body),
+          ...(metadataRead ? {} : { body: JSON.stringify(body) }),
         });
-        if (response.redirected || (response.url && response.url !== `https://slack.com/api/${method}`)) {
+        if (response.redirected || (response.url && response.url !== requestUrl)) {
           void response.body?.cancel().catch(() => undefined);
           return fail("slack_response_rejected");
         }
