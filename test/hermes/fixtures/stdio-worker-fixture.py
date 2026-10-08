@@ -14,7 +14,23 @@ frame = {'type': 'request', 'id': 1, 'method': 'POST',
          'body': {'taskId': p['taskId'], 'ownerEpoch': p['ownerEpoch']}}
 result = {'type': 'result', 'result': {'taskId': p['taskId'], 'requestId': p['requestId'],
           'status': 'no_finish', 'publicationApproved': False}}
-if mode == 'sleep':
+if mode.startswith('diagnostic_'):
+    result['result']['status']='error'
+    result['result']['reason']=p['capability']
+    diagnostic={'origin':'worker','code':'invalid_model_history_response','stage':'model_response','category':'none'}
+    if mode=='diagnostic_secret': diagnostic['code']=p['capability']
+    if mode=='diagnostic_extra': diagnostic['raw']=p['capability']
+    if mode=='diagnostic_host': diagnostic={'origin':'host','code':'aborted','stage':'launch','category':'none'}
+    result['result']['diagnostic']=diagnostic
+    emit(result)
+    if mode=='diagnostic_exit1': sys.exit(1)
+    if mode=='diagnostic_exit2': sys.exit(2)
+    if mode=='diagnostic_trailing': sys.stdout.write('{');sys.stdout.flush();sys.exit(1)
+elif mode=='response_write_closed':
+    os.close(0)
+    emit(frame)
+    time.sleep(.2)
+elif mode == 'sleep':
     time.sleep(30)
 elif mode == 'huge':
     print('x' * 1048577, flush=True)

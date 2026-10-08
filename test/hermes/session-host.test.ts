@@ -234,3 +234,14 @@ test('session rejects non-DeepSeek or invalid trusted thinking policy before tra
  for(const thinking of ['enabled',null,{type:'disabled'}])expect(()=>createSessionHost({...f.options,thinking} as unknown as SessionOptions)).toThrow('invalid host thinking policy');
  expect(f.ledger.status('ticket-1')!.attemptCount).toBe(0);
 });
+
+test('diagnostic does not override exhausted ledger or terminal persistence failure',async()=>{
+ const f=tracedFixture(.01);
+ await f.host.handle(f.request('/v1/chat/completions',{model:'deepseek-v4-pro',messages:[{role:'user',content:'task'}],max_tokens:32}));
+ const diagnostic={origin:'worker',code:'native_runtime_error',stage:'native_run',category:'type_error'} as const;
+ const outcome=f.host.result({status:'error'});expect(outcome.terminationReason).toBe('budget_exhausted');
+ expect(f.host.finalizeTrace({...outcome,diagnostic})).toBe(true);
+ expect(f.events().at(-1)).toMatchObject({status:'budget_exhausted',errorCode:'reservation_exhausted',diagnostic});
+ const g=tracedFixture();expect(g.host.finalizeTrace({...g.host.result({status:'error'}),diagnostic:{...diagnostic,raw:'SECRET'} as any})).toBe(false);
+ expect(g.trace.failed).toBe(true);expect(readFileSync(g.path,'utf8')).not.toContain('SECRET');
+});

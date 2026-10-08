@@ -1,3 +1,4 @@
+import { runtimeDiagnostic, RuntimeDiagnosticError, workerDiagnostic, diagnosticFromError } from './runtime-diagnostics.ts';
 import { snapshotLongTestPolicy } from '../verification-policy.ts';
 import { canonicalizeConversation } from './conversation.ts';
 /** A task-scoped pipe transport. The caller owns the reviewed OS/container boundary. */
@@ -20,7 +21,8 @@ const paths = new Set(['/v1/chat/completions', '/tools/execute', '/tools/state']
 const statuses = new Set(['finished','blocked','no_finish','iteration_cap','timeout','error']);
 const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const exact = (v: Record<string, unknown>, keys: string[]) => Object.keys(v).length === keys.length && keys.every(k => Object.hasOwn(v, k));
-const reject = () => new Error('worker_protocol_or_lifetime_rejected');
+const reject = (stage: string = 'protocol') => new RuntimeDiagnosticError('worker_protocol_or_lifetime_rejected', runtimeDiagnostic('launcher','worker_protocol_or_lifetime_rejected',stage));
+const cleanupError = () => new RuntimeDiagnosticError('worker_cleanup_failed',runtimeDiagnostic('launcher','worker_cleanup_failed','cleanup'));
 const finiteJson = (value: unknown): boolean => typeof value === 'number' ? Number.isFinite(value)
   : Array.isArray(value) ? value.every(finiteJson) : object(value) ? Object.values(value).every(finiteJson) : true;
 
@@ -31,7 +33,8 @@ export function createStdioLauncher(options: StdioLaunchOptions): GaryRuntimeLau
   if (!command.length || !command[0]?.startsWith('/') || command.some(x => !x || x.includes('\0'))
       || !cwd.startsWith('/') || typeof options.cleanup !== 'function') throw new Error('invalid worker launch specification');
   return async (manifest, handle, signal) => {
-    if (signal.aborted || Date.now() >= manifest.deadlineMs) throw reject();
+    let stage = "launch";
+    if (signal.aborted || Date.now() >= manifest.deadlineMs) throw reject('launch');
     const longTests=manifest.longTestPolicy===undefined ? undefined : snapshotLongTestPolicy(manifest.longTestPolicy);
     const maxPolls=longTests ? longTests.maxPolls*Object.values(longTests.commands).reduce((sum,rule)=>sum+rule.maxStarts,0) : 0;
     const cancellation = new AbortController();
@@ -44,8 +47,8 @@ export function createStdioLauncher(options: StdioLaunchOptions): GaryRuntimeLau
       detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'ignore'] }); }
     catch {
       clearTimeout(timer);
-      try { await cleanup(); } catch { throw new Error('worker_cleanup_failed'); }
-      throw reject();
+      try { await cleanup(); } catch { throw cleanupError(); }
+      throw reject('launch');
     }
     let stopped = false, exited = false, code: number | null = null, spawnFailed = false;
     const stop = () => {
@@ -70,38 +73,42 @@ export function createStdioLauncher(options: StdioLaunchOptions): GaryRuntimeLau
     child.stdin.on('error', () => { cancellation.abort(); });
     active.addEventListener('abort', stop, { once: true });
     if (active.aborted) stop();
-    const guard = () => { if (active.aborted || Date.now() >= manifest.deadlineMs) throw reject(); };
+    const guard = () => { if (active.aborted || Date.now() >= manifest.deadlineMs) throw reject(stage); };
     const write = async (value: unknown) => {
       guard();
       const bytes = Buffer.from(JSON.stringify(value) + '\n');
-      if (bytes.length > MAX_LINE || child.stdin.destroyed) throw reject();
-      await new Promise<void>((resolve, rejectWrite) => child.stdin.write(bytes, error => error ? rejectWrite(reject()) : resolve()));
+      if (bytes.length > MAX_LINE || child.stdin.destroyed) throw reject(stage);
+      await new Promise<void>((resolve, rejectWrite) => child.stdin.write(bytes, error => error ? rejectWrite(reject(stage)) : resolve()));
       guard();
     };
     let result: NativeRuntimeOutcome | undefined;
+
     try {
       await write({ type: 'start', payload: { ...manifest, transport: 'stdio' } });
+      stage = 'protocol';
       let pending = Buffer.alloc(0), nextId = 1, ordinaryRequests=0,pollRequests=0;
       for await (const chunk of child.stdout) {
         guard();
         pending = Buffer.concat([pending, Buffer.from(chunk)]);
         // At most one unread frame is allowed to accumulate, including its newline.
-        if (pending.length > MAX_LINE) throw reject();
+        if (pending.length > MAX_LINE) throw reject(stage);
         for (;;) {
           const end = pending.indexOf(10);
           if (end < 0) break;
           const bytes = pending.subarray(0, end);
           pending = pending.subarray(end + 1);
           const frame: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
-          if (!object(frame) || !finiteJson(frame) || result) throw reject();
+          if (!object(frame) || !finiteJson(frame) || result) throw reject(stage);
           if (frame.type === 'result') {
-            if (!exact(frame, ['type','result']) || !object(frame.result)) throw reject();
+            stage = 'result';
+            if (!exact(frame, ['type','result']) || !object(frame.result)) throw reject(stage);
             const value = frame.result;
             if (value.taskId !== manifest.taskId || value.requestId !== manifest.requestId
-                || value.publicationApproved !== false || typeof value.status !== 'string' || !statuses.has(value.status)) throw reject();
+                || value.publicationApproved !== false || typeof value.status !== 'string' || !statuses.has(value.status)) throw reject(stage);
             // Only the bound, typed outcome reaches the host. Prose is never authority.
             result = { taskId: manifest.taskId, requestId: manifest.requestId,
               status: value.status as NativeRuntimeOutcome['status'], publicationApproved: false };
+            if (value.status === 'error' || value.status === 'timeout') result.diagnostic = workerDiagnostic(value.diagnostic,value.reason);
             if (typeof value.text === 'string') {
               const redacted = value.text.replaceAll(manifest.capability, '[REDACTED]');
               // Phase context is untrusted data, bounded independently of frame size.
@@ -109,7 +116,7 @@ export function createStdioLauncher(options: StdioLaunchOptions): GaryRuntimeLau
             }
             if (value.history !== undefined) {
               const history = canonicalizeConversation(value.history, { requireResolved: true });
-              if (JSON.stringify(history).includes(manifest.capability)) throw reject();
+              if (JSON.stringify(history).includes(manifest.capability)) throw reject(stage);
               result.history = history;
             }
             child.stdin.end();
@@ -120,17 +127,18 @@ export function createStdioLauncher(options: StdioLaunchOptions): GaryRuntimeLau
               || typeof frame.path !== 'string' || (!paths.has(frame.path) && !(longTests && frame.path==='/tools/jobs/poll')) || !object(frame.body)
               || !object(frame.headers) || !exact(frame.headers, ['authorization','content-type'])
               || frame.headers.authorization !== 'Bearer ' + manifest.capability
-              || frame.headers['content-type'] !== 'application/json') throw reject();
-          if(frame.path==='/tools/jobs/poll') {if(++pollRequests>maxPolls)throw reject();}
-          else if(++ordinaryRequests>MAX_REQUESTS)throw reject();
+              || frame.headers['content-type'] !== 'application/json') throw reject(stage);
+          if(frame.path==='/tools/jobs/poll') {if(++pollRequests>maxPolls)throw reject(stage);}
+          else if(++ordinaryRequests>MAX_REQUESTS)throw reject(stage);
           nextId++;
+          stage = 'response';
           const response = await handle(new Request(new URL(frame.path, manifest.modelBaseUrl), {
             method: 'POST', headers: frame.headers as Record<string, string>, body: JSON.stringify(frame.body), signal: active,
           }));
           guard();
           // Bound responses before returning them to the untrusted worker.
           const reader = response.body?.getReader();
-          if (!reader) throw reject();
+          if (!reader) throw reject(stage);
           const chunks: Uint8Array[] = []; let length = 0;
           const abortRead = () => { void reader.cancel().catch(() => {}); };
           active.addEventListener('abort', abortRead, { once: true });
@@ -139,20 +147,30 @@ export function createStdioLauncher(options: StdioLaunchOptions): GaryRuntimeLau
               guard(); const part = await reader.read(); guard();
               if (part.done) break;
               length += part.value.byteLength;
-              if (length > MAX_LINE - 128) { void reader.cancel().catch(() => {}); throw reject(); }
+              if (length > MAX_LINE - 128) { void reader.cancel().catch(() => {}); throw reject(stage); }
               chunks.push(part.value);
             }
           } finally { active.removeEventListener('abort', abortRead); reader.releaseLock(); }
           const body: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
-          if (!object(body) || !finiteJson(body)) throw reject();
+          if (!object(body) || !finiteJson(body)) throw reject(stage);
+          stage = 'response_write';
           await write({ type: 'response', id: frame.id, status: response.status, body });
+          stage = 'protocol';
         }
       }
       await completion;
       guard();
-      if (spawnFailed || code !== 0 || !result || pending.length) throw reject();
+      if (!spawnFailed && code === 1 && result && !pending.length && ['error','timeout'].includes(result.status) && result.diagnostic) {
+        // The Python entrypoint deliberately exits 1 on a bound failure. Keep
+        // rejecting that exit; retain its validated diagnostic, not its authority.
+        throw new RuntimeDiagnosticError('worker_protocol_or_lifetime_rejected',result.diagnostic);
+      }
+      if (spawnFailed || code !== 0 || !result || pending.length) throw reject('exit');
       return result;
-    } catch { throw reject(); }
+    } catch (error) {
+      if (diagnosticFromError(error)) throw error;
+      throw reject(stage);
+    }
     finally {
       clearTimeout(timer);
       active.removeEventListener('abort', stop);
@@ -160,7 +178,7 @@ export function createStdioLauncher(options: StdioLaunchOptions): GaryRuntimeLau
       await completion;
       child.stdout.destroy();
       child.stdin.destroy();
-      try { await cleanup(); } catch { throw new Error('worker_cleanup_failed'); }
+      try { await cleanup(); } catch { throw cleanupError(); }
     }
   };
 }

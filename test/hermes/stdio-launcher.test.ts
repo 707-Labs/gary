@@ -112,3 +112,41 @@ describe('stdio launcher with real offline child and fake host',()=>{
     await expect(f.launch(manifest(),f.handle,signal.signal)).rejects.toThrow();expect(f.cleanups).toBe(0);
   });
 });
+
+for(const mode of ['diagnostic_valid','diagnostic_secret','diagnostic_extra','diagnostic_host']) test('stdio preserves only validated worker provenance: '+mode,async()=>{
+  const f=setup(mode),m=manifest();
+  const result=await f.launch(m,f.handle,new AbortController().signal);
+  expect(result.status).toBe('error');expect(result.publicationApproved).toBe(false);expect(f.cleanups).toBe(1);expect(f.calls).toBe(0);
+  expect(result.diagnostic).toEqual(mode==='diagnostic_valid'
+    ? {origin:'worker',code:'invalid_model_history_response',stage:'model_response',category:'none'}
+    : {origin:'worker',code:'diagnostic_rejected',stage:'unknown',category:'none'});
+  expect(JSON.stringify(result)).not.toContain(m.capability);expect(result.reason).toBeUndefined();
+});
+
+test('expected Python exit1 retains failure metadata while remaining rejected',async()=>{
+ const f=setup('diagnostic_exit1');
+ const error=await f.launch(manifest(),f.handle,new AbortController().signal).then(()=>null,error=>error);
+ expect(error.message).toBe('worker_protocol_or_lifetime_rejected');
+ expect(error.diagnostic).toEqual({origin:'worker',code:'invalid_model_history_response',stage:'model_response',category:'none'});
+ expect(f.cleanups).toBe(1);expect(f.calls).toBe(0);
+});
+test('a closed worker input records the response-write stage and awaits cleanup',async()=>{
+ const f=setup('response_write_closed');
+ const error=await f.launch(manifest(),async request=>{await f.handle(request);return Response.json({ok:true,padding:'x'.repeat(500000)});},new AbortController().signal).then(()=>null,error=>error);
+ expect(error.message).toBe('worker_protocol_or_lifetime_rejected');
+ expect(error.diagnostic).toEqual({origin:'launcher',code:'worker_protocol_or_lifetime_rejected',stage:'response_write',category:'none'});
+ expect(f.cleanups).toBe(1);expect(f.calls).toBe(1);
+});
+
+for(const mode of ['diagnostic_exit2','diagnostic_trailing']) test('unexpected failure framing/exit cannot inherit worker diagnostic: '+mode,async()=>{
+ const f=setup(mode),error=await f.launch(manifest(),f.handle,new AbortController().signal).then(()=>null,error=>error);
+ expect(error.diagnostic).toEqual({origin:'launcher',code:'worker_protocol_or_lifetime_rejected',stage:'exit',category:'none'});
+ expect(f.cleanups).toBe(1);
+});
+test('cleanup failure overrides a worker failure diagnostic while preserving rejection',async()=>{
+ const f=setup('diagnostic_exit1',async()=>{throw new Error('SECRET');});
+ const error=await f.launch(manifest(),f.handle,new AbortController().signal).then(()=>null,error=>error);
+ expect(error.message).toBe('worker_cleanup_failed');
+ expect(error.diagnostic).toEqual({origin:'launcher',code:'worker_cleanup_failed',stage:'cleanup',category:'none'});
+ expect(JSON.stringify(error)).not.toContain('SECRET');expect(f.cleanups).toBe(1);
+});

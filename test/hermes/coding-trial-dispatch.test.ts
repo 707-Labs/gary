@@ -1,3 +1,4 @@
+import { RuntimeDiagnosticError } from '../../src/hermes/runtime-diagnostics.ts';
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -271,4 +272,34 @@ test('runLoop awaits the current admitted cleanup and skips completed-tick callb
   release(); await running;
   expect(cleaned).toBe(true); expect(callbacks).toBe(0); expect(f.coding).toHaveBeenCalledTimes(1);
   expect(f.claim()?.phase).toBe('closed'); expect(f.ledger().status(f.issue.id)?.state).toBe('closed');
+});
+
+test('only branded validated diagnostics reach terminal canonical action and never reopen the claim',async()=>{
+  await tick(f.deps);
+  const diagnostic={origin:'worker',code:'invalid_history_content',stage:'model_response',category:'none'} as const;
+  f.coding.mockImplementation(async()=>{throw new RuntimeDiagnosticError('SECRET',diagnostic);});
+  expect((await tick(f.deps)).actionsTaken).toEqual(['start_coding']);
+  const row=f.db().query<{error_message:string},[]>('SELECT error_message FROM actions ORDER BY id DESC LIMIT 1').get()!;
+  expect(row.error_message).toBe('coding trial stopped; diagnostic='+JSON.stringify(diagnostic));expect(row.error_message).not.toContain('SECRET');
+  expect(f.actions()[1]).toMatchObject({success:0,outcome:'error'});expect(f.claim()?.phase).toBe('closed');
+  expect(f.ledger().status(f.issue.id)).toMatchObject({state:'closed',attemptCount:0,unknownAttempts:0});
+  f.restart();expect((await tick(f.deps)).actionsTaken).toEqual([]);expect(f.actions()).toHaveLength(2);
+});
+test('an arbitrary thrown object cannot smuggle diagnostic or raw exception into trial persistence',async()=>{
+  await tick(f.deps);
+  f.coding.mockImplementation(async()=>{throw Object.assign(new Error('SECRET'),{diagnostic:{origin:'worker',code:'SECRET',stage:'model_response',category:'none'}});});
+  await tick(f.deps);
+  const row=f.db().query<{error_message:string},[]>('SELECT error_message FROM actions ORDER BY id DESC LIMIT 1').get()!;
+  expect(row.error_message).toBe('coding trial stopped; see bounded audit evidence');
+});
+
+test('timeout metadata reaches canonical action while its original handled status and closed claim remain unchanged',async()=>{
+ await tick(f.deps);
+ const diagnostic={origin:'worker',code:'deadline_exceeded',stage:'stdio_read',category:'none'} as const;
+ f.coding.mockResolvedValue({status:'timeout',branch:'offline',summary:'Shared execution deadline exhausted; remaining work was stopped.',diagnostic});
+ await tick(f.deps);
+ const row=f.db().query<{success:number;outcome:string;error_message:string},[]>('SELECT success,outcome,error_message FROM actions ORDER BY id DESC LIMIT 1').get()!;
+ expect(row).toEqual({success:1,outcome:'timeout',error_message:'coding trial stopped; diagnostic='+JSON.stringify(diagnostic)});
+ expect(f.claim()?.phase).toBe('closed');expect(f.publications()).toBe(0);expect(f.fakeRequests()).toBe(0);
+ f.restart();expect((await tick(f.deps)).actionsTaken).toEqual([]);
 });

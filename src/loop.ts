@@ -1,3 +1,4 @@
+import { diagnosticFromError, readRuntimeDiagnostic, type RuntimeDiagnostic } from "./hermes/runtime-diagnostics.ts";
 import { guardAdapterCalls, throwIfExpired } from "./deadline.ts";
 import type { PinnedGitBase } from "./git.ts";
 import type { ActionVerification } from "./verification-policy.ts";
@@ -397,7 +398,9 @@ async function runOne(
     const observePublication = codeBinding && deps.onCodePublication
       ? (receipt: CodePublicationReceipt) => deps.onCodePublication!(codeBinding!.admission, receipt) : undefined;
     const assertCurrent = () => {throwIfExpired(deps);trialAction?.assertActive();codeBinding?.admission.assertActive();};
-    const execute = () => dispatch(slotDeps, action, codeLoop, codeBinding ? assertCurrent : undefined, observePublication, verification);
+    let terminalDiagnostic: RuntimeDiagnostic | undefined;
+    const observeDiagnostic = (value: RuntimeDiagnostic) => { terminalDiagnostic = readRuntimeDiagnostic(value); };
+    const execute = () => dispatch(slotDeps, action, codeLoop, codeBinding ? assertCurrent : undefined, observePublication, verification, observeDiagnostic);
     const scoped = () => deps.spend ? deps.spend.withSpendScope(action.issue.id, execute) : execute();
     const result = deps.spend && (trialAction || deps.signal)
       ? await deps.spend.withPaidRequestGuard(phase => {
@@ -414,8 +417,9 @@ async function runOne(
     const outcome = result === "pr_opened" ? result : exhausted ? "budget_exhausted" : result ?? "handled";
     // Keep normal handled outcomes cached, including escalations. The
     // independent outcome field is the delivery metric, not success=1.
-    if (trialAction) trialAction.complete(true,outcome);
-    else recordActionEnd(deps.db, { id: actionId, success: true, outcome });
+    const diagnosticMessage = terminalDiagnostic ? "coding trial stopped; diagnostic=" + JSON.stringify(terminalDiagnostic) : undefined;
+    if (trialAction) trialAction.complete(true,outcome,diagnosticMessage);
+    else recordActionEnd(deps.db, { id: actionId, success: true, outcome, ...(diagnosticMessage ? {errorMessage:diagnosticMessage} : {}) });
     if (deps.spend && outcome !== "handled") {
       deps.spend.markTerminal(action.issue.id, outcome);
     }
@@ -430,8 +434,10 @@ async function runOne(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (trialAction) {
-      trialAction.complete(false,err instanceof AllProvidersExhaustedError ? "rate_limited" : "error","coding trial stopped; see bounded audit evidence");
-      log.warn("coding trial stopped",{issue:action.issue.identifier});
+      const diagnostic = diagnosticFromError(err);
+      trialAction.complete(false,err instanceof AllProvidersExhaustedError ? "rate_limited" : "error",
+        diagnostic ? "coding trial stopped; diagnostic=" + JSON.stringify(diagnostic) : "coding trial stopped; see bounded audit evidence");
+      log.warn("coding trial stopped",{issue:action.issue.identifier,...(diagnostic ? {diagnostic} : {})});
       return action.type;
     }
     if (deps.spend && deps.spend.status(action.issue.id)?.state !== "active") {
@@ -620,14 +626,14 @@ function reopenTicket(
   clearTerminalState(db, issue.id);
 }
 
-async function dispatch(deps: LoopDeps, action: CandidateAction, codeLoop?: AdmittedCodeLoopRunner, assertCodeAction?: () => void, onPublicationReceipt?: (receipt: CodePublicationReceipt) => void | Promise<void>, verification?: ActionVerification): Promise<ActionOutcome | void> {
+async function dispatch(deps: LoopDeps, action: CandidateAction, codeLoop?: AdmittedCodeLoopRunner, assertCodeAction?: () => void, onPublicationReceipt?: (receipt: CodePublicationReceipt) => void | Promise<void>, verification?: ActionVerification, onRuntimeDiagnostic?: (value: RuntimeDiagnostic) => void): Promise<ActionOutcome | void> {
   throwIfExpired(deps);
   switch (action.type) {
     case "classify":
       await runClassify(deps, action);
       return;
     case "start_coding":
-      return runStartCoding(deps, action, codeLoop, assertCodeAction, onPublicationReceipt, verification);
+      return runStartCoding(deps, action, codeLoop, assertCodeAction, onPublicationReceipt, verification, onRuntimeDiagnostic);
     case "wait_for_blocker":
       await runWaitForBlocker(
         { db: deps.db, linear: deps.linear },
@@ -846,6 +852,7 @@ async function runStartCoding(
   assertCodeAction?: () => void,
   onPublicationReceipt?: (receipt: CodePublicationReceipt) => void | Promise<void>,
   verification?: ActionVerification,
+  onRuntimeDiagnostic?: (value: RuntimeDiagnostic) => void,
 ): Promise<ActionOutcome> {
   const issue = action.issue;
   const repo = deps.repoMap.get(issue.teamKey);
@@ -891,6 +898,8 @@ async function runStartCoding(
   // bump the signature and revisit_code fires; without comments it stays
   // stable and revisit_code is dormant.
   setRevisitMark(deps.db, issue.id, action.state.humanInputSignature);
+  const diagnostic = result.status === "timeout" ? readRuntimeDiagnostic(result.diagnostic) : undefined;
+  if (diagnostic) onRuntimeDiagnostic?.(diagnostic);
   return result.status;
 }
 

@@ -1124,5 +1124,84 @@ class LongTestProtocolTests(unittest.TestCase):
         self.assertEqual(result["reason"],"invalid_long_test_policy")
         self.assertEqual(factory.calls,[])
 
+
+class DiagnosticTests(unittest.TestCase):
+    def test_response_history_fault_survives_native_swallow_after_synthetic_http_200(self):
+        for response, code in [
+            ({"choices": []}, "invalid_model_history_response"),
+            ({"choices": [{"message": {"role": "assistant", "content": {"secret": CAPABILITY}}}]}, "invalid_history_content"),
+        ]:
+            with self.subTest(code=code):
+                transport = FakeTransport()
+                def action(agent):
+                    # This hook fixture models the already-HTTP-successful decoding boundary;
+                    # it does not invoke the real SDK, Hermes or a provider.
+                    agent.handlers.before_request({"model": "test-model", "messages": [{"role": "user", "content": "offline"}]})
+                    try:
+                        agent.handlers.record_model_response(response)
+                    except RuntimeFault:
+                        pass  # A native catch cannot clear the latched diagnostic.
+                result = run_task(payload(), native_factory=FakeFactory(action=action), transport=transport)
+                self.assertEqual(result["status"], "error")
+                self.assertEqual(result["diagnostic"], {"origin":"worker", "stage":"model_response", "code":code, "category":"none"})
+                self.assertEqual(transport.calls, [])
+                self.assertNotIn(CAPABILITY, json.dumps(result))
+
+    def test_sixty_second_stdio_deadline_with_delayed_200_is_specific_and_latched(self):
+        now = [1000.0]
+        class DelayedReader(io.StringIO):
+            def read(self, size=-1):
+                now[0] += 60.001  # Deterministic clock advance; no real wait.
+                return super().read(size)
+        with patch("gary_runtime.time.time", side_effect=lambda: now[0]):
+            manifest = payload(transport="stdio", deadlineMs=1120000)
+            output = io.StringIO()
+            channel = _StdioChannel(manifest, DelayedReader(response_frame(1, {"choices": []}, status=200)), output)
+            def action(agent):
+                try:
+                    channel.exchange(manifest["modelBaseUrl"]+"/chat/completions", {},
+                        {"Authorization":"Bearer "+CAPABILITY,"Content-Type":"application/json"}, 60.0)
+                except RuntimeFault:
+                    pass
+            result = run_task(manifest, native_factory=FakeFactory(action=action), transport=channel)
+            self.assertEqual(result["status"], "timeout")
+            self.assertEqual(result["diagnostic"], {"origin":"worker","code":"deadline_exceeded","stage":"stdio_read","category":"none"})
+            self.assertLess(now[0]*1000, manifest["deadlineMs"])  # Host action still has time.
+            self.assertEqual(len(output.getvalue().splitlines()), 1)
+            self.assertFalse(result["publicationApproved"])
+            self.assertNotIn(CAPABILITY, json.dumps(result))
+
+    def test_protocol_write_failure_and_native_exception_keep_distinct_safe_metadata(self):
+        class BrokenWriter(io.StringIO):
+            def write(self, value): raise OSError(CAPABILITY)
+        manifest=payload(transport="stdio")
+        channel=_StdioChannel(manifest,io.StringIO(),BrokenWriter())
+        def action(agent):
+            channel.exchange(manifest["modelBaseUrl"]+"/chat/completions",{},
+                {"Authorization":"Bearer "+CAPABILITY,"Content-Type":"application/json"},60)
+        result=run_task(manifest,native_factory=FakeFactory(action=action),transport=channel)
+        self.assertEqual(result["diagnostic"],{"origin":"worker","code":"invalid_stdio_response","stage":"stdio_write","category":"none"})
+        for exception,category in [(TypeError(CAPABILITY),"type_error"),(ValueError(CAPABILITY),"value_error"),(RuntimeError(CAPABILITY),"other_exception")]:
+            def action(agent): raise exception
+            result=run_task(payload(),native_factory=FakeFactory(action=action),transport=FakeTransport())
+            self.assertEqual(result["diagnostic"],{"origin":"worker","code":"native_runtime_error","stage":"native_run","category":category})
+            self.assertNotIn(CAPABILITY,json.dumps(result))
+
+    def test_unknown_runtime_fault_never_copies_arbitrary_code(self):
+        def action(agent): raise RuntimeFault(CAPABILITY)
+        result=run_task(payload(),native_factory=FakeFactory(action=action),transport=FakeTransport())
+        self.assertEqual(result["diagnostic"]["code"],"unknown_runtime_fault")
+        self.assertEqual(result["reason"],"unknown_runtime_fault")
+        self.assertNotIn(CAPABILITY,json.dumps(result))
+
+    def test_failure_flags_remain_error_without_persisting_flag_values(self):
+        for flag in ["error","failed","partial","interrupted"]:
+            def action(agent): agent.reply[flag]=CAPABILITY
+            result=run_task(payload(),native_factory=FakeFactory(action=action),transport=FakeTransport())
+            self.assertEqual(result["status"],"error")
+            self.assertEqual(result["diagnostic"],{"origin":"worker","code":"native_execution_failed","stage":"native_result","category":"none"})
+            self.assertFalse(result["publicationApproved"])
+            self.assertNotIn(CAPABILITY,json.dumps(result))
+
 if __name__ == "__main__":
     unittest.main()

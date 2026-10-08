@@ -9,6 +9,7 @@
  * and must revoke the host session. A failed/partial trailing write is never
  * retried or treated as a recorded result. This is not a spending ledger.
  */
+import { readRuntimeDiagnostic, type RuntimeDiagnostic } from "./runtime-diagnostics.ts";
 import { createHash } from "node:crypto";
 import { constants, closeSync, fchmodSync, fstatSync, fsyncSync, lstatSync, openSync, realpathSync, writeSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
@@ -58,6 +59,7 @@ export interface AuditOperationEnd {
   responseRejection?: AuditResponseRejection;
 }
 export interface AuditTerminal extends AuditContext {
+  diagnostic?: RuntimeDiagnostic;
   kind: "terminal"; status: AuditTerminalStatus; errorCode?: AuditErrorCode;
   trustedChangedFileCount?: number;
 }
@@ -227,8 +229,9 @@ export function createAuditTrace(options: AuditTraceOptions): AuditTrace {
         try {
           if (!object(event)) throw new AuditTraceError("invalid_trace_event");
           if (event.kind === "terminal") {
-            only(event, ["kind", "status", "iteration", "phase", "modelState", "errorCode", "trustedChangedFileCount"]);
+            only(event, ["kind", "status", "iteration", "phase", "modelState", "errorCode", "trustedChangedFileCount", "diagnostic"]);
             context(event);
+            if (Object.hasOwn(event,"diagnostic") && !readRuntimeDiagnostic(event.diagnostic)) throw new AuditTraceError("invalid_trace_event");
             if (!terminalStatuses.has(event.status as string) || (event.status === "finished" && active.size)) throw new AuditTraceError("invalid_trace_event");
           } else if (event.kind === "model" || event.kind === "tool") {
             if (!id(event.operationId)) throw new AuditTraceError("invalid_trace_event");

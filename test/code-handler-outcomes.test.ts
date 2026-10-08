@@ -1,3 +1,4 @@
+import { RuntimeDiagnosticError } from "../src/hermes/runtime-diagnostics.ts";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1079,4 +1080,20 @@ describe('CODE inherits host shutdown without abandoning cleanup', () => {
     expect(f.db.query('SELECT pr_number FROM prs').get()).toEqual({ pr_number: f.pr.number });
     expect(f.postComment).not.toHaveBeenCalled();
   });
+});
+
+it('preserves validated admitted runtime diagnostics through the CODE exception without later work',async()=>{
+  const diagnostic={origin:'worker',code:'invalid_model_history_response',stage:'model_response',category:'none'} as const;
+  f.deps.runAdmittedAgentLoop=async()=>({...loopResult('error'),diagnostic,errorMessage:'SECRET'});
+  const error=await f.invoke().then(()=>null,error=>error);
+  expect(error).toBeInstanceOf(RuntimeDiagnosticError);expect(error.diagnostic).toEqual(diagnostic);
+  expect(error.message).not.toContain('SECRET');expect(f.run).not.toHaveBeenCalled();expect(f.push).not.toHaveBeenCalled();expect(f.postComment).not.toHaveBeenCalled();
+});
+
+it('native timeout diagnostic retains the existing timeout escalation without publication',async()=>{
+ const diagnostic={origin:'worker',code:'deadline_exceeded',stage:'stdio_read',category:'none'} as const;
+ f.deps.runAdmittedAgentLoop=async()=>({...loopResult('timeout'),diagnostic});
+ const result=await f.invoke();
+ expect(result.status).toBe('timeout');expect(result.diagnostic).toEqual(diagnostic);
+ expect(f.postComment).toHaveBeenCalledTimes(1);expect(f.run).not.toHaveBeenCalled();expect(f.push).not.toHaveBeenCalled();
 });

@@ -1,3 +1,4 @@
+import { readRuntimeDiagnostic, diagnosticFromError, RuntimeDiagnosticError, RuntimeDiagnosticDeadlineError, type RuntimeDiagnostic } from "../hermes/runtime-diagnostics.ts";
 import { resolve } from "node:path";
 import type { ActionVerification } from "../verification-policy.ts";
 import type { TrustedHostCheckReceipt } from "../review/prompts.ts";
@@ -267,12 +268,14 @@ export interface CodeHandlerArgs {
 }
 
 export interface CodeHandlerResult {
+  diagnostic?: RuntimeDiagnostic;
   status: "pr_opened" | "no_changes" | "agent_failed" | "blocked" | "timeout" | "check_failed" | "review_failed";
   prUrl?: string;
   prNumber?: number;
   branch: string;
   summary: string | null;
 }
+
 
 /** The optional seam changes no credentials, providers, intake or publication authority. */
 async function runCodeAgentLoop(deps: CodeHandlerDeps, args: AgentLoopArgs): Promise<AgentLoopResult> {
@@ -285,7 +288,11 @@ async function runCodeAgentLoop(deps: CodeHandlerDeps, args: AgentLoopArgs): Pro
     // The legacy runner may salvage commits after an incomplete loop. A newly
     // admitted runtime must finish explicitly before checks/review/publication
     // proceed. Keep blocked/timeout handling in the existing caller branches.
+    const timeoutDiagnostic = result.status === "timeout" ? readRuntimeDiagnostic(result.diagnostic) : undefined;
+    if (timeoutDiagnostic) throw new RuntimeDiagnosticDeadlineError(timeoutDiagnostic);
     if (result.status !== "finished" && result.status !== "blocked" && result.status !== "timeout") {
+      const diagnostic = readRuntimeDiagnostic(result.diagnostic);
+      if (diagnostic) throw new RuntimeDiagnosticError("admitted_code_loop_failed",diagnostic);
       throw new Error(`Admitted code loop did not finish (${result.status})`);
     }
   }
@@ -321,6 +328,7 @@ export async function runCodeHandler(
       status: "timeout",
       branch: `${args.issue.identifier}-${slugify(args.issue.title)}`,
       summary: "Shared execution deadline exhausted; remaining work was stopped.",
+      ...(diagnosticFromError(err) ? {diagnostic:diagnosticFromError(err)!} : {}),
     };
   } finally {
     budget.dispose();

@@ -366,7 +366,7 @@ export function createSessionHost(options: SessionOptions) {
         ...(terminationReason === 'budget_exhausted' ? {errorMessage:'budget_exhausted'} : {}) };
     },
     get state() { return bridge.state; },
-    finalizeTrace(outcome: {status:AgentLoopResult['status'];terminationReason:TerminationReason}): boolean {
+    finalizeTrace(outcome: {status:AgentLoopResult['status'];terminationReason:TerminationReason;diagnostic?: import("./runtime-diagnostics.ts").RuntimeDiagnostic}): boolean {
       if(operations.size || job)return false;
       if(!options.trace) return true;
       if(options.trace.failed) return false;
@@ -374,6 +374,7 @@ export function createSessionHost(options: SessionOptions) {
       traceFinalized=true;
       try {
         options.trace.append({kind:'terminal',status:outcome.terminationReason==='budget_exhausted'?'budget_exhausted':outcome.status,...traceContext(),
+          ...(outcome.diagnostic ? {diagnostic:outcome.diagnostic} : {}),
           ...(outcome.terminationReason==='budget_exhausted'?{errorCode:'reservation_exhausted' as const}:outcome.status==='error'?{errorCode:'native_runtime_error' as const}:{})});
         options.trace.close();return true;
       } catch {return false;}

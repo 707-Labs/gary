@@ -439,3 +439,16 @@ test("Cloudflare tool requirements follow explicit service and database scopes",
     }
   }
 });
+
+test('custom native diagnostic is worker provenance only and cannot change outcome authority',async()=>{
+  for(const diagnostic of [
+    {origin:'worker',code:'invalid_model_history_response',stage:'model_response',category:'none'},
+    {origin:'host',code:'aborted',stage:'launch',category:'none'},
+  ]) {
+    const f=fixture();const outcome=await f.adapter(async m=>({...result(m,'error'),diagnostic:diagnostic as any,reason:TOKEN}))(f.args);
+    expect(outcome.status).toBe('error');expect(outcome.publicationApproved).toBe(false);
+    expect(outcome.diagnostic?.origin).toBe('worker');
+    expect(outcome.diagnostic?.code).toBe(diagnostic.origin==='worker'?'invalid_model_history_response':'diagnostic_rejected');
+    expect(JSON.stringify(outcome)).not.toContain(TOKEN);expect(f.upstream).toHaveLength(0);
+  }
+});

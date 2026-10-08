@@ -1,3 +1,5 @@
+import { createStdioLauncher } from '../../src/hermes/stdio-launcher.ts';
+import { fileURLToPath } from 'node:url';
 import { afterEach, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -412,3 +414,20 @@ test('read-only children receive neither long-test policy nor executor job autho
     expect(v.executions.filter(call => call.opts.testJob).every(call => call.opts.testJob!.requestId !== childManifest.requestId)).toBe(true);
   } finally { child.mockRestore(); }
 }, 10_000);
+
+test('real Python wrapper and stdio preserve post-200 fault through phase, adapter, production and private trace',async()=>{
+  let cleaned=0;
+  const launch=createStdioLauncher({command:['/usr/bin/python3','-I',fileURLToPath(new URL('./fixtures/diagnostic-worker.py',import.meta.url)),
+    fileURLToPath(new URL('../../hermes/python',import.meta.url))],cwd:'/tmp',env:{PATH:'/usr/bin:/bin',PYTHONDONTWRITEBYTECODE:'1'},async cleanup(){cleaned++;}});
+  const f=await fixture(launch);
+  const result=await f.runner()({...f.args,phases:[{name:'investigate',maxIter:3,allowedTools:new Set(['read_file','report_blocked'])},{name:'implement',maxIter:5}]});
+  const diagnostic={origin:'worker',code:'invalid_history_content',stage:'model_response',category:'none'} as const;
+  expect(result.status).toBe('error');expect(result.diagnostic).toEqual(diagnostic);expect(cleaned).toBe(1);
+  expect(f.counts().calls).toBe(1);expect(f.ledger.status(issue.id)?.unknownAttempts).toBe(0);
+  expect(readFileSync(join(f.root,'task.ts'),'utf8')).toBe('baseline\n');
+  const rows=readFileSync(f.traces[0]!,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+  expect(rows.map(row=>row.kind)).toEqual(['run_start','model','model','terminal']);
+  expect(rows[2]).toMatchObject({stage:'result',httpStatus:200,iteration:1,phase:'investigation'});
+  expect(rows[3]).toMatchObject({status:'error',errorCode:'native_runtime_error',diagnostic,pendingOperationIds:[],phase:'investigation',iteration:1});
+  expect(readFileSync(f.traces[0]!,'utf8')).not.toContain('offline-only');
+});

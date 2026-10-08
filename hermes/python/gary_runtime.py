@@ -54,6 +54,16 @@ class RuntimeFault(Exception):
         super().__init__(code)
 
 
+
+_DIAGNOSTIC_CODES = frozenset(['concurrent_task_denied', 'deadline_exceeded', 'diagnostic_rejected', 'duplicate_live_tool_call_id', 'endpoint_origin_mismatch', 'executor_state_invalidated', 'history_contains_capability', 'history_duplicate_tool_id', 'history_pending_tool_calls', 'history_too_large', 'history_tool_receipt_mismatch', 'invalid_capability', 'invalid_deadline', 'invalid_endpoint', 'invalid_history', 'invalid_history_content', 'invalid_history_fields', 'invalid_history_message', 'invalid_history_reasoning', 'invalid_history_tool_arguments', 'invalid_history_tool_call', 'invalid_history_tool_calls', 'invalid_history_tool_id', 'invalid_history_tool_name', 'invalid_identity', 'invalid_input_json', 'invalid_long_test_policy', 'invalid_maxIterations', 'invalid_maxTokens', 'invalid_model', 'invalid_model_history_response', 'invalid_native_result', 'invalid_native_source', 'invalid_payload', 'invalid_prompt', 'invalid_rpc_response', 'invalid_state_receipt', 'invalid_stdio_frame', 'invalid_stdio_request', 'invalid_stdio_response', 'invalid_stdio_transport', 'invalid_system_prompt', 'invalid_temperature', 'invalid_test_job', 'invalid_tool_arguments', 'invalid_tool_name', 'invalid_tool_schema', 'invalid_tools', 'invalid_transport', 'missing_original_tool_call_id', 'model_attempt_limit', 'model_authority_rejected', 'model_output_cap_exceeded', 'native_dotenv_present', 'native_execution_failed', 'native_pin_mismatch', 'native_process_reuse_denied', 'native_runtime_error', 'native_toolset_mismatch', 'registry_binding_mismatch', 'registry_toolset_mismatch', 'rpc_authority_rejected', 'rpc_http_error', 'rpc_redirect_denied', 'rpc_transport_error', 'stdio_closed', 'stdio_endpoint_denied', 'stdio_frame_too_large', 'stdio_method_denied', 'test_job_binding_rejected', 'test_job_poll_limit', 'test_job_receipt_rejected', 'tool_receipt_mismatch', 'unapproved_native_tool', 'unexpected_native_iteration_cap', 'unexpected_test_job', 'unknown_native_failure', 'unknown_runtime_fault', 'unresolved_live_tool_calls', 'unsupported_model_request', 'untraced_live_tool_call'])
+_DIAGNOSTIC_STAGES = frozenset(['unknown', 'input_validation', 'native_init', 'native_run', 'model_request', 'model_response', 'tool_call', 'state_read', 'native_result', 'stdio_write', 'stdio_read', 'stdio_response'])
+
+def _diagnostic(code, stage, exc=None):
+    category = {TypeError: "type_error", ValueError: "value_error", KeyError: "key_error",
+                AttributeError: "attribute_error", OSError: "os_error"}.get(type(exc), "other_exception" if exc else "none")
+    return {"origin": "worker", "code": code if code in _DIAGNOSTIC_CODES else "unknown_runtime_fault",
+            "stage": stage if stage in _DIAGNOSTIC_STAGES else "unknown", "category": category}
+
 _LONG_TEST_POLICY = {"version": 1, "commands": {
     "bun run ci:full": {"timeoutMs": 1800000, "maxStarts": 4},
     "bun run check": {"timeoutMs": 600000, "maxStarts": 8}},
@@ -358,10 +368,13 @@ class _StdioChannel:
         self.lock = threading.Lock()
         self.next_id = 1
         self.fault = None
+        self.diagnostic = None
+        self.exchange_stage = "stdio_write"
         self.on_fault = lambda code: None
 
     def fail(self, code):
         self.fault = self.fault or code
+        self.diagnostic = self.diagnostic or _diagnostic(self.fault, self.exchange_stage)
         self.on_fault(self.fault)
         raise RuntimeFault(self.fault)
 
@@ -399,9 +412,12 @@ class _StdioChannel:
                 if len(raw.encode("utf-8")) > MAX_INPUT_BYTES:
                     raise RuntimeFault("stdio_frame_too_large")
                 self.next_id += 1
+                self.exchange_stage = "stdio_write"
                 self.writer.write(raw)
                 self.writer.flush()
+                self.exchange_stage = "stdio_read"
                 response = _strict_json(self.reader.line(MAX_RESPONSE_BYTES, deadline_ms))
+                self.exchange_stage = "stdio_response"
                 _deadline({"deadlineMs": deadline_ms})
                 if self.fault:
                     raise RuntimeFault(self.fault)
@@ -420,10 +436,12 @@ class _StdioChannel:
                 # Latch before releasing the lock: a waiting caller must never
                 # emit another request after a fatal response or framing error.
                 self.fault = self.fault or exc.code
+                self.diagnostic = self.diagnostic or _diagnostic(self.fault, self.exchange_stage)
                 self.on_fault(self.fault)
                 raise
             except Exception:
                 self.fault = self.fault or "invalid_stdio_response"
+                self.diagnostic = self.diagnostic or _diagnostic(self.fault, self.exchange_stage)
                 self.on_fault(self.fault)
                 raise
             finally:
@@ -764,12 +782,25 @@ def run_task(payload, native_factory=None, transport=None):
         elif isinstance(transport, _StdioChannel):
             raise RuntimeFault("invalid_stdio_transport")
     except RuntimeFault as exc:
-        result.update(status="timeout" if exc.code == "deadline_exceeded" else "error", reason=exc.code)
+        result.update(status="timeout" if exc.code == "deadline_exceeded" else "error", reason=_diagnostic(exc.code, "input_validation")["code"],
+                      diagnostic=_diagnostic(exc.code, "input_validation"))
         return result
     if not _RUN_LOCK.acquire(blocking=False):
-        return dict(result, reason="concurrent_task_denied")
+        return dict(result, reason="concurrent_task_denied", diagnostic=_diagnostic("concurrent_task_denied", "input_validation"))
     capability = p["capability"]
     fault = [None]
+    stage = ["native_init"]
+    fault_diagnostic = [None]
+
+    def at_stage(name):
+        def decorate(fn):
+            def wrapped(*args, **kwargs):
+                previous = stage[0]; stage[0] = name
+                value = fn(*args, **kwargs)
+                stage[0] = previous
+                return value
+            return wrapped
+        return decorate
     count = [0]
     cap_exhausted = [False]
     history = [copy.deepcopy(p["history"]) + [{"role": "user", "content": p["prompt"]}]]
@@ -784,6 +815,7 @@ def run_task(payload, native_factory=None, transport=None):
 
     def fail(code):
         fault[0] = code
+        fault_diagnostic[0] = (transport.diagnostic if isinstance(transport, _StdioChannel) else None) or _diagnostic(code, stage[0])
 
     def guard():
         if fault[0]:
@@ -811,6 +843,7 @@ def run_task(payload, native_factory=None, transport=None):
     if handlers.stdio_channel is not None:
         handlers.stdio_channel.on_fault = fail
 
+    @at_stage("model_request")
     def before_request(kwargs):
         guard()
         if kwargs.get("stream") is True or kwargs.get("model") != p["model"]:
@@ -849,6 +882,7 @@ def run_task(payload, native_factory=None, transport=None):
             count[0] += 1
     handlers.before_request = before_request
 
+    @at_stage("model_response")
     def record_model_response(response):
         try:
             choices = response.get("choices") if isinstance(response, dict) else response.choices
@@ -890,6 +924,7 @@ def run_task(payload, native_factory=None, transport=None):
     handlers.iteration_exhausted = iteration_exhausted
 
     def bind(name):
+        @at_stage("tool_call")
         def call(arguments, *, tool_call_id=None, **kwargs):
             guard()
             if tool_call_id is None:
@@ -957,21 +992,25 @@ def run_task(payload, native_factory=None, transport=None):
                 agent._fallback_chain = []
                 agent._fallback_model = None
                 guard()
+                stage[0] = "native_run"
                 native = agent.run_conversation(p["prompt"], system_message=p.get("systemPrompt", ""),
                                                 conversation_history=copy.deepcopy(p["history"]), task_id=p["taskId"])
                 guard()
+                stage[0] = "native_result"
                 _assert_tools(agent, handlers, p["tools"])
                 if not isinstance(native, dict):
                     raise RuntimeFault("invalid_native_result")
                 text = native.get("final_response")
                 result["text"] = text.replace(capability, "[REDACTED]")[:65536] if isinstance(text, str) else ""
                 result["nativeCompleted"] = native.get("completed") is True
+                stage[0] = "state_read"
                 state_reply = rpc(p["stateUrl"], {"taskId": p["taskId"], "ownerEpoch": p["ownerEpoch"]})
                 state = state_reply.get("state")
                 if state_reply.get("ok") is not True or not isinstance(state, dict):
                     raise RuntimeFault("invalid_state_receipt")
                 if state.get("invalidated") is True:
                     raise RuntimeFault("executor_state_invalidated")
+                stage[0] = "native_result"
                 blocked = state.get("blockedReason")
                 summary = state.get("finishSummary")
                 native_failed = any(native.get(k) for k in ("interrupted", "failed", "partial", "error"))
@@ -980,7 +1019,8 @@ def run_task(payload, native_factory=None, transport=None):
                     native.get("turn_exit_reason") == f"max_iterations_reached({p['maxIterations']}/{p['maxIterations']})"
                     and type(native.get("api_calls")) is int and native["api_calls"] == p["maxIterations"]))
                 if native_failed:
-                    result.update(status="error", reason="native_execution_failed")
+                    result.update(status="error", reason="native_execution_failed",
+                                  diagnostic=_diagnostic("native_execution_failed", stage[0]))
                 elif isinstance(blocked, str) and blocked.strip():
                     result.update(status="blocked", reason="executor_reported_blocked",
                                   blockedReason=blocked.replace(capability, "[REDACTED]")[:65536])
@@ -999,9 +1039,11 @@ def run_task(payload, native_factory=None, transport=None):
                     result["history"] = _history(_redact_result(history[0], capability))
                 return result
     except RuntimeFault as exc:
-        return dict(result, status="timeout" if exc.code == "deadline_exceeded" else "error", reason=exc.code)
-    except Exception:
-        return dict(result, status="error", reason="native_runtime_error")
+        return dict(result, status="timeout" if exc.code == "deadline_exceeded" else "error", reason=_diagnostic(exc.code, stage[0])["code"],
+                    diagnostic=fault_diagnostic[0] or _diagnostic(exc.code, stage[0]))
+    except Exception as exc:
+        return dict(result, status="error", reason="native_runtime_error",
+                    diagnostic=_diagnostic("native_runtime_error", stage[0], exc))
     finally:
         _RUN_LOCK.release()
 

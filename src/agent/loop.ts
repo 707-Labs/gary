@@ -37,6 +37,8 @@ export interface RunLogEntry {
 }
 
 export interface AgentLoopResult {
+  /** Sanitized metadata only; never a finish or publication grant. */
+  diagnostic?: import("../hermes/runtime-diagnostics.ts").RuntimeDiagnostic;
   status: AgentLoopStatus;
   summary: string | null;
   iterations: number;

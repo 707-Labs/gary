@@ -188,3 +188,17 @@ describe("sanitized provider compatibility diagnostics", () => {
     expect(() => f.trace.append({ kind: "tool", stage: "error", operationId: "model-1", errorCode: "unsupported_provider_response", responseRejection: diagnostic() } as any)).toThrow(AuditTraceError);
   });
 });
+
+test('terminal independently validates exact diagnostic metadata, retaining operation evidence',()=>{
+  const diagnostic={origin:'worker',code:'invalid_model_history_response',stage:'model_response',category:'none'} as const;
+  const f=fixture();f.trace.append(start());f.trace.append({kind:'model',stage:'result',operationId:'model-1',httpStatus:200});
+  f.trace.append({...terminal('error'),errorCode:'native_runtime_error',diagnostic});f.trace.close();
+  expect(f.events().at(-1)).toMatchObject({diagnostic,status:'error',iteration:1,pendingOperationIds:[]});
+  let invoked=0;
+  for(const bad of [{...diagnostic,code:'SECRET'}, {...diagnostic,raw:'SECRET'}, {...diagnostic,[Symbol('secret')]:'SECRET'},
+    Object.defineProperty({...diagnostic},'code',{get(){invoked++;return diagnostic.code;}})]) {
+    const rejected=fixture();expect(()=>rejected.trace.append({...terminal('error'),diagnostic:bad as any})).toThrow(AuditTraceError);
+    expect(rejected.trace.failed).toBe(true);expect(readFileSync(rejected.path,'utf8')).not.toContain('SECRET');
+  }
+  expect(invoked).toBe(0);
+});

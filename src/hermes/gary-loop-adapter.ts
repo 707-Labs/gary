@@ -1,4 +1,5 @@
 /** Offline integration seam; importing or constructing it starts no listener/process. */
+import { diagnosticFromError, runtimeDiagnostic, workerDiagnostic, type RuntimeDiagnostic } from "./runtime-diagnostics.ts";
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { AgentLoopArgs, AgentLoopResult } from "../agent/loop.ts";
 import { createDeadline } from "../deadline.ts";
@@ -18,6 +19,7 @@ export interface NativeRuntimeOutcome {
   iterations?: number;
   text?: string;
   reason?: string;
+  diagnostic?: RuntimeDiagnostic;
   history?: ConversationMessage[];
 }
 export type RuntimeRequestHandler = (request: Request) => Promise<Response>;
@@ -154,9 +156,10 @@ export function createGaryLoopAdapter(options: GaryLoopAdapterOptions): (args: A
     let modelRequests = 0;
     let modelInFlight = false;
     let fatal: string | null = null;
+    let diagnostic: RuntimeDiagnostic | undefined;
     const failure = (code: string, status = 400): Response => Response.json({ error: { code } }, { status });
     const guard = () => { budget.throwIfExpired(); if (fatal) throw new Error("runtime_protocol_rejected"); };
-    const protocolFault = (code: string) => { fatal ??= code; cancellation.abort(); return failure(code); };
+    const protocolFault = (code: string) => { diagnostic ??= runtimeDiagnostic("host",code,"model_request"); fatal ??= code; cancellation.abort(); return failure(code); };
     const result = async (native: NativeRuntimeOutcome["status"], errorMessage?: string, nativeText?: string): Promise<GaryLoopAdapterResult> => {
       await host?.drain();
       const base = host ? host.result({ status: native, iterations: modelRequests }) : empty(errorMessage ?? "session_unavailable");
@@ -168,11 +171,12 @@ export function createGaryLoopAdapter(options: GaryLoopAdapterOptions): (args: A
         ...(configured.readOnly && status === "no_finish" && modelRequests > 0 && typeof nativeText === "string"
           ? { summary: nativeText.replaceAll(configured.capabilityToken, "[REDACTED]").slice(0, 65536) } : {}),
         phase: "single", iterations: modelRequests, ...(base.terminationReason === 'budget_exhausted' ? {errorMessage:'budget_exhausted'} : errorMessage ? { errorMessage } : {}),
+        ...(diagnostic ? {diagnostic} : {}),
         publicationApproved: false, requestId: configured.admission.requestId,
         usageSource: "unavailable-use-spend-ledger", iterationSource: "authenticated-model-router-requests",
         parityLimitations: SINGLE_PHASE_LIMITATIONS };
       if (!host) return finalizeUnhostedTrace(outcome);
-      return host.finalizeTrace({ status, terminationReason: base.terminationReason }) ? outcome : traceFailure(outcome);
+      return host.finalizeTrace({ status, terminationReason: base.terminationReason, ...(diagnostic ? {diagnostic} : {}) }) ? outcome : traceFailure(outcome);
     };
     try {
       guard();
@@ -245,10 +249,14 @@ export function createGaryLoopAdapter(options: GaryLoopAdapterOptions): (args: A
       guard();
       if (!native || native.taskId !== manifest.taskId || native.requestId !== manifest.requestId
           || native.publicationApproved !== false || !nativeStatuses.has(native.status)) {
+        diagnostic = runtimeDiagnostic("host","native_outcome_binding_rejected","result");
         return await result("error", "native_outcome_binding_rejected");
       }
+      if (native.status === "error" || native.status === "timeout") diagnostic ??= workerDiagnostic(native.diagnostic,native.reason);
       return await result(native.status, undefined, native.text);
-    } catch {
+    } catch (error) {
+      diagnostic ??= diagnosticFromError(error) ?? runtimeDiagnostic("host",Date.now() >= budget.deadlineMs ? "shared_deadline_exceeded"
+        : budget.signal.aborted ? "aborted" : "runtime_launch_or_admission_failed","launch");
       return await result("error", fatal ?? (Date.now() >= budget.deadlineMs ? "shared_deadline_exceeded"
         : budget.signal.aborted ? "aborted" : "runtime_launch_or_admission_failed"));
     } finally {

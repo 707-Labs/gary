@@ -1,4 +1,5 @@
 /** Production phase mechanics over one admitted host; no scheduler or live transport. */
+import { runtimeDiagnostic, RuntimeDiagnosticError } from "./runtime-diagnostics.ts";
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { AgentLoopArgs, PhaseSpec } from "../agent/loop.ts";
 import { renderTodos, type TodoItem } from "../agent/tools.ts";
@@ -265,27 +266,29 @@ export function createGaryPhaseCoordinator(options: GaryLoopAdapterOptions): (ar
           };
           let native: NativeRuntimeOutcome;
           try { native = await options.launch(phaseManifest, handle, signal); }
+          catch (error) { if (fault) throw new RuntimeDiagnosticError("phase_runtime_failed",runtimeDiagnostic("phase",fault,"request")); throw error; }
           finally { active = false; }
+          if (fault) throw new RuntimeDiagnosticError("phase_runtime_failed",runtimeDiagnostic("phase",fault,"request"));
           signal.throwIfAborted();
-          if(pendingJob){fail('phase_returned_with_pending_test');throw new Error(fault);}
+          if(pendingJob){fail('phase_returned_with_pending_test');throw new RuntimeDiagnosticError("phase_runtime_failed",runtimeDiagnostic("phase",fault!,"result"));}
           if (!native || native.taskId !== manifest.taskId || native.requestId !== manifest.requestId || native.publicationApproved !== false
-              || !["finished", "blocked", "no_finish", "iteration_cap", "timeout", "error"].includes(native.status)) { fail("native_phase_outcome_binding_rejected"); throw new Error(fault); }
+              || !["finished", "blocked", "no_finish", "iteration_cap", "timeout", "error"].includes(native.status)) { fail("native_phase_outcome_binding_rejected"); throw new RuntimeDiagnosticError("phase_runtime_failed",runtimeDiagnostic("phase",fault!,"result")); }
           if (native.status === "error" || native.status === "timeout") { trace.termination = native.status; return native; }
           let exported: ConversationMessage[];
           try { exported = canonicalizeConversation(native.history); }
-          catch { fail("native_phase_history_invalid"); throw new Error(fault); }
-          if (!sameConversation(exported, canonicalizeConversation(nativeHistory))) { fail("native_phase_history_mismatch"); throw new Error(fault); }
+          catch { fail("native_phase_history_invalid"); throw new RuntimeDiagnosticError("phase_runtime_failed",runtimeDiagnostic("phase",fault!,"result")); }
+          if (!sameConversation(exported, canonicalizeConversation(nativeHistory))) { fail("native_phase_history_mismatch"); throw new RuntimeDiagnosticError("phase_runtime_failed",runtimeDiagnostic("phase",fault!,"result")); }
           continued = canonicalizeConversation(providerHistory); trace.historyMessages = continued.length;
           const stateResponse = await hostHandle(new Request(manifest.stateUrl, { method: "POST", headers: { authorization: "Bearer " + manifest.capability, "content-type": "application/json" },
             body: JSON.stringify({ taskId: manifest.taskId, ownerEpoch: manifest.ownerEpoch }) }));
           const stateReceipt = await stateResponse.json(); signal.throwIfAborted();
-          if (!stateResponse.ok || stateReceipt.ok !== true || !object(stateReceipt.state)) { fail("phase_state_unavailable"); throw new Error(fault); }
+          if (!stateResponse.ok || stateReceipt.ok !== true || !object(stateReceipt.state)) { fail("phase_state_unavailable"); throw new RuntimeDiagnosticError("phase_runtime_failed",runtimeDiagnostic("phase",fault!,"result")); }
           const state = stateReceipt.state;
           if (Array.isArray(state.todos)) currentTodos = state.todos.length ? renderTodos(state.todos as TodoItem[]) : "";
           if (state.blockedReason) { trace.termination = "blocked"; return { ...native, status: "blocked" }; }
           if (native.status === "finished" && state.finishSummary && state.finishGateMet === true) { trace.termination = "finished"; return native; }
-          if (native.status === "finished" || native.status === "blocked") { fail("native_phase_terminal_not_verified"); throw new Error(fault); }
-          if (trace.modelRequests === 0) { fail("empty_phase_history"); throw new Error(fault); }
+          if (native.status === "finished" || native.status === "blocked") { fail("native_phase_terminal_not_verified"); throw new RuntimeDiagnosticError("phase_runtime_failed",runtimeDiagnostic("phase",fault!,"result")); }
+          if (trace.modelRequests === 0) { fail("empty_phase_history"); throw new RuntimeDiagnosticError("phase_runtime_failed",runtimeDiagnostic("phase",fault!,"result")); }
           trace.termination = native.status;
           if (index === phases.length - 1) return native;
         }

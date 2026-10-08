@@ -1,4 +1,5 @@
 /** Optional production composition. Construction never starts a process or changes a ledger. */
+import { diagnosticFromError, runtimeDiagnostic, type RuntimeDiagnostic } from "./runtime-diagnostics.ts";
 import type { ActionVerification } from '../verification-policy.ts';
 import type { ExecutorJobJournal } from '../executors/index.ts';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -47,9 +48,9 @@ export interface ProductionRuntimeOptions {
   readonlyChildren?: { imageDigest: string; dockerExecutable?: string; dockerHost?: string };
 }
 
-function failed(message: string): AgentLoopResult {
+function failed(message: string, diagnostic?: RuntimeDiagnostic): AgentLoopResult {
   return { status:'error', summary:null, iterations:0, inputTokens:0, outputTokens:0,
-    cacheCreationTokens:0, cacheReadTokens:0, phase:'hermes', runLog:[], errorMessage:message };
+    cacheCreationTokens:0, cacheReadTokens:0, phase:'hermes', runLog:[], errorMessage:message, ...(diagnostic ? {diagnostic} : {}) };
 }
 function grantedTools(bindings: ScopedIntegrationBindings, readOnly = false): string[] {
   const names: string[] = EXECUTOR_TOOL_NAMES.filter(name => !readOnly || !['write_file','edit_file','commit','finish'].includes(name));
@@ -90,6 +91,7 @@ export function createHermesCodeLoopFactory(options: ProductionRuntimeOptions): 
       busy = true;
       let trace: AuditTrace | undefined, traceHandedOff = false;
       let stage = "admission";
+      let failureDiagnostic: RuntimeDiagnostic | undefined;
       try {
         active();
         const incomingDeadline = Math.min(args.deadlineMs ?? Infinity, Date.now() + args.timeoutMs);
@@ -233,14 +235,16 @@ export function createHermesCodeLoopFactory(options: ProductionRuntimeOptions): 
         const result = await run({...args,executor:evidence.executor,deadlineMs});
         if (result.status === 'error' || result.status === 'timeout' || action.ledger.status(action.ticketId)?.state !== 'active') stopped = true;
         return result;
-      } catch {
+      } catch (error) {
         stopped = true;
-        return failed(action.ledger.status(action.ticketId)?.state === 'exhausted' ? 'budget_exhausted' : 'production_runtime_failed:' + stage);
+        failureDiagnostic = diagnosticFromError(error) ?? runtimeDiagnostic("host","production_runtime_failed",stage);
+        return failed(action.ledger.status(action.ticketId)?.state === 'exhausted' ? 'budget_exhausted' : 'production_runtime_failed:' + stage,failureDiagnostic);
       } finally {
         busy = false;
         if (trace && !traceHandedOff && !trace.failed) {
           try { trace.append({kind:'terminal',status:'error',iteration:0,phase:'hermes',modelState:{provider:options.route.provider,
-            model:options.route.model,thinking:thinking ?? 'unknown',effort:'unknown'},errorCode:'native_runtime_error'});trace.close(); } catch { stopped = true; }
+            model:options.route.model,thinking:thinking ?? 'unknown',effort:'unknown'},errorCode:'native_runtime_error',
+            ...(failureDiagnostic ? {diagnostic:failureDiagnostic} : {})});trace.close(); } catch { stopped = true; }
         }
       }
     };
