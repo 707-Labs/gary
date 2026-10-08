@@ -10,6 +10,7 @@ import {
   ensureBareClone,
   getCommitLog,
   getDiff,
+  getHeadSha,
   gitMust,
   hasCommitsAhead,
   pushBranch,
@@ -17,7 +18,7 @@ import {
   slugify,
 } from "../git.ts";
 import { createWorkspaceExecutor } from "../executors/factory.ts";
-import { bindExecutorDeadline, type Executor } from "../executors/index.ts";
+import { bindExecutorDeadline, type Executor, type ExecResult } from "../executors/index.ts";
 import { createDeadline, DeadlineExceededError, throwIfExpired, type DeadlineOptions } from "../deadline.ts";
 import { log } from "../logger.ts";
 import {
@@ -160,6 +161,36 @@ Examples:
 
 export type AdmittedCodeLoopRunner = typeof runAgentLoop;
 
+/** Point-in-time host observations, not a lock or an immutable workspace proof. */
+export interface CodeGitObservation {
+  headSha: string | null;
+  worktreeClean: boolean | null;
+}
+
+/** Emitted only after existing check/review/push/PR branches complete successfully.
+ * The caller must bind this receipt to its canonical action and independently
+ * confirm ledger closure. Different/missing SHAs never mean exact-head approval.
+ */
+export interface CodePublicationReceipt {
+  issueId: string;
+  repo: string;
+  branch: string;
+  prNumber: number;
+  prUrl: string;
+  draft: boolean;
+  admittedRuntime: boolean;
+  requiredCheck: {
+    command: string;
+    passed: boolean;
+    exitCode: number;
+    timedOut: boolean;
+    afterCheck: CodeGitObservation;
+  };
+  review: { fingerprint: string; verdict: "approve"; afterApproval: CodeGitObservation };
+  publication: { beforePush: CodeGitObservation; afterPush: CodeGitObservation; remoteHeadSha: string | null };
+  postRebaseCheck: "not_run" | "passed" | "failed_reverted" | "incomplete";
+}
+
 export interface CodeHandlerDeps {
   db: DB;
   linear: LinearAdapter;
@@ -181,6 +212,10 @@ export interface CodeHandlerDeps {
   review: ReviewConfig;
   /** Optional run-level guard checked before publishing any branch or PR. */
   assertCanPublish?: () => void;
+  /** Trusted host-only readiness persistence; never a publication authorization.
+   * Failure is recorded without relabeling an already-created PR as a failure.
+   */
+  onPublicationReceipt?: (receipt: Readonly<CodePublicationReceipt>) => void | Promise<void>;
 }
 
 export interface CodeHandlerArgs {
@@ -255,6 +290,19 @@ async function runCodeHandlerWithinDeadline(
 
   const branch = `${args.issue.identifier}-${slugify(args.issue.title)}`;
   const worktreePath = resolve(deps.workspacesDir, args.issue.identifier);
+  const observeGit = async (): Promise<CodeGitObservation> => {
+    if (!deps.onPublicationReceipt) return { headSha: null, worktreeClean: null };
+    try {
+      const head = await getHeadSha(worktreePath, budget);
+      const status = await gitMust(["status", "--porcelain=v1", "--untracked-files=normal"], { ...budget, cwd: worktreePath });
+      return { headSha: /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(head) ? head : null, worktreeClean: status.stdout.length === 0 };
+    } catch { return { headSha: null, worktreeClean: null }; }
+  };
+  let requiredCheck: CodePublicationReceipt["requiredCheck"] | undefined;
+  const observeRequiredCheck = deps.onPublicationReceipt ? async (result: ExecResult) => {
+    requiredCheck = { command: CHECK_COMMAND, passed: result.exitCode === 0 && !result.timedOut,
+      exitCode: result.exitCode, timedOut: result.timedOut, afterCheck: await observeGit() };
+  } : undefined;
 
   log.info("code handler starting", {
     issue: args.issue.identifier,
@@ -380,6 +428,7 @@ async function runCodeHandlerWithinDeadline(
     executor,
     system,
     budget,
+    ...(observeRequiredCheck ? { observeRequiredCheck } : {}),
   });
   if (checkPassed !== "passed") {
     return { status: checkPassed, branch, summary: loopResult.summary };
@@ -397,6 +446,7 @@ async function runCodeHandlerWithinDeadline(
     fingerprint: reviewFingerprint,
     worktreePath,
     budget,
+    ...(observeRequiredCheck ? { observeRequiredCheck } : {}),
   });
   if (reviewOutcome.kind === "escalated") {
     return {
@@ -406,6 +456,9 @@ async function runCodeHandlerWithinDeadline(
     };
   }
   const verificationReport = reviewOutcome.verificationReport;
+  const afterApproval = deps.onPublicationReceipt ? await observeGit() : { headSha: null, worktreeClean: null };
+  if (deps.onPublicationReceipt) budget.throwIfExpired();
+  let postRebaseCheck: CodePublicationReceipt["postRebaseCheck"] = "not_run";
 
   // Rebase onto fresh main so the PR opens on top of latest. Degrades
   // gracefully: conflict → push un-rebased; check fails after rebase →
@@ -430,6 +483,7 @@ async function runCodeHandlerWithinDeadline(
       timeoutMs: CHECK_TIMEOUT_MS,
     });
     if (recheck.exitCode !== 0) {
+      postRebaseCheck = "failed_reverted";
       log.warn("check failed after rebase; reverting and pushing pre-rebase", {
         issue: args.issue.identifier,
         branch,
@@ -441,6 +495,7 @@ async function runCodeHandlerWithinDeadline(
         signal: budget.signal,
       });
     } else {
+      postRebaseCheck = recheck.timedOut ? "incomplete" : "passed";
       log.info("rebased onto fresh main", {
         issue: args.issue.identifier,
         branch,
@@ -472,9 +527,13 @@ async function runCodeHandlerWithinDeadline(
   });
 
   budget.throwIfExpired();
+  const beforePush = deps.onPublicationReceipt ? await observeGit() : { headSha: null, worktreeClean: null };
+  if (deps.onPublicationReceipt) budget.throwIfExpired();
   deps.assertCanPublish?.();
   await pushBranch({ worktreePath, freshTokenUrl: freshUrlForPush, branch, deadlineMs: budget.deadlineMs, signal: budget.signal });
   budget.throwIfExpired();
+  const afterPush = deps.onPublicationReceipt ? await observeGit() : { headSha: null, worktreeClean: null };
+  if (deps.onPublicationReceipt) budget.throwIfExpired();
   deps.assertCanPublish?.();
   const pr = await deps.github.openPullRequest({
     owner,
@@ -493,6 +552,21 @@ async function runCodeHandlerWithinDeadline(
     prNumber: pr.number,
     branch,
   });
+
+  if (deps.onPublicationReceipt && requiredCheck) {
+    try {
+      await deps.onPublicationReceipt(Object.freeze({ issueId: args.issue.id, repo: args.repo, branch,
+        prNumber: pr.number, prUrl: pr.url, draft: pr.isDraft, admittedRuntime: !!deps.runAdmittedAgentLoop,
+        requiredCheck, review: { fingerprint: reviewFingerprint, verdict: "approve" as const, afterApproval },
+        publication: { beforePush, afterPush, remoteHeadSha: /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(pr.headSha) ? pr.headSha : null },
+        postRebaseCheck }));
+    } catch {
+      // A notification/persistence failure cannot erase the real PR delivery or
+      // trigger another coding attempt. Missing receipt remains unready.
+      try { recordEvent(deps.db, { eventType: "code_publication_receipt_failed", ticketLinearId: args.issue.id }); } catch { /* Delivery is already durable above. */ }
+      log.warn("publication receipt persistence failed", { issue: args.issue.identifier });
+    }
+  }
 
   // PR creation is a legacy non-cancellable API call. Once its response arrives,
   // preserve the real delivery outcome even if it crossed the execution deadline.
@@ -651,6 +725,7 @@ interface FixupContext {
   executor: Executor;
   system: string;
   budget: CodeBudget;
+  observeRequiredCheck?: (result: ExecResult) => Promise<void>;
 }
 
 /**
@@ -667,7 +742,7 @@ async function ensurePostFinishCheckPasses(
   const first = await ctx.executor.run(CHECK_COMMAND, {
     timeoutMs: CHECK_TIMEOUT_MS,
   });
-  if (first.exitCode === 0) return "passed";
+  if (first.exitCode === 0) { await ctx.observeRequiredCheck?.(first); return "passed"; }
 
   log.warn("post-finish check failed; running fix-up", {
     issue: args.issue.identifier,
@@ -716,7 +791,7 @@ async function ensurePostFinishCheckPasses(
   const second = await ctx.executor.run(CHECK_COMMAND, {
     timeoutMs: CHECK_TIMEOUT_MS,
   });
-  if (second.exitCode === 0) return "passed";
+  if (second.exitCode === 0) { await ctx.observeRequiredCheck?.(second); return "passed"; }
 
   log.warn("check still failing after fix-up; escalating", {
     issue: args.issue.identifier,
@@ -827,6 +902,7 @@ interface ReviewLoopCtx {
   fingerprint: string;
   worktreePath: string;
   budget: CodeBudget;
+  observeRequiredCheck?: (result: ExecResult) => Promise<void>;
 }
 
 type ReviewLoopOutcome =
@@ -1031,6 +1107,7 @@ async function runReviewLoop(
       executor: ctx.executor,
       system: primarySystem,
       budget: ctx.budget,
+      ...(ctx.observeRequiredCheck ? { observeRequiredCheck: ctx.observeRequiredCheck } : {}),
     });
     if (checkOk !== "passed") return { kind: "escalated", status: checkOk };
   }

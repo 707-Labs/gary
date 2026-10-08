@@ -6,7 +6,7 @@ import * as agent from "../src/agent/loop.ts";
 import * as executorFactory from "../src/executors/factory.ts";
 import type { ExecResult, Executor } from "../src/executors/index.ts";
 import * as git from "../src/git.ts";
-import { runCodeHandler, type CodeHandlerArgs, type CodeHandlerDeps } from "../src/handlers/code.ts";
+import { runCodeHandler, type CodeHandlerArgs, type CodeHandlerDeps, type CodePublicationReceipt } from "../src/handlers/code.ts";
 import { createProvider, createProviderChain } from "../src/providers.ts";
 import * as reviewer from "../src/review/runner.ts";
 import * as skills from "../src/skills.ts";
@@ -27,6 +27,128 @@ function restoreAfter<T extends { mockRestore(): void }>(spy: T): T {
   restores.push(spy);
   return spy;
 }
+
+const RECEIPT_HEAD = 'a'.repeat(40);
+const REBASED_HEAD = 'b'.repeat(40);
+function capturePublication() {
+  const receipts: Readonly<CodePublicationReceipt>[] = [];
+  const head = restoreAfter(spyOn(git, 'getHeadSha')).mockResolvedValue(RECEIPT_HEAD);
+  f.pr.headSha = RECEIPT_HEAD;
+  f.deps.runAdmittedAgentLoop = async () => loopResult('finished');
+  f.deps.onPublicationReceipt = receipt => {
+    expect(f.openPr).toHaveBeenCalledTimes(1);
+    expect(f.db.query('SELECT COUNT(*) AS n FROM prs').get()).toEqual({ n: 1 });
+    receipts.push(structuredClone(receipt));
+  };
+  return { receipts, head };
+}
+
+describe('CODE trusted publication receipts', () => {
+  it('records the admitted check/review/publication evidence only after the actual PR receipt persists', async () => {
+    const c = capturePublication();
+    expect((await f.invoke()).status).toBe('pr_opened');
+    expect(c.receipts).toHaveLength(1);
+    expect(c.receipts[0]).toEqual({ issueId: issue.id, repo: 'fixture/repo', branch: 'FIX-1-offline-handler-fixture',
+      prNumber: 1, prUrl: f.pr.url, draft: false, admittedRuntime: true,
+      requiredCheck: { command: 'bun run check', passed: true, exitCode: 0, timedOut: false, afterCheck: { headSha: RECEIPT_HEAD, worktreeClean: true } },
+      review: { fingerprint: `${issue.id}:1000000`, verdict: 'approve', afterApproval: { headSha: RECEIPT_HEAD, worktreeClean: true } },
+      publication: { beforePush: { headSha: RECEIPT_HEAD, worktreeClean: true }, afterPush: { headSha: RECEIPT_HEAD, worktreeClean: true }, remoteHeadSha: RECEIPT_HEAD },
+      postRebaseCheck: 'not_run' });
+    expect(c.head).toHaveBeenCalledTimes(4);
+    expect(f.gitCommand.mock.calls.every(([args]) => args.join(' ') === 'status --porcelain=v1 --untracked-files=normal')).toBe(true);
+  });
+
+  it('adds no Git observation calls when the receipt callback is omitted', async () => {
+    const head = restoreAfter(spyOn(git, 'getHeadSha')).mockRejectedValue(new Error('must not be called'));
+    expect((await f.invoke()).status).toBe('pr_opened');
+    expect(head).not.toHaveBeenCalled();
+    expect(f.gitCommand).not.toHaveBeenCalled();
+  });
+
+  it('does not claim a receipt when the admitted runtime is blocked', async () => {
+    const c = capturePublication();
+    f.deps.runAdmittedAgentLoop = async () => loopResult('blocked');
+    expect((await f.invoke()).status).toBe('blocked');
+    expect(c.receipts).toEqual([]);
+    expect(c.head).not.toHaveBeenCalled();
+  });
+
+  it('does not claim a receipt when independent review never approves', async () => {
+    const c = capturePublication();
+    f.review.mockResolvedValue({ kind: 'failed', reason: 'offline failure' });
+    expect((await f.invoke()).status).toBe('review_failed');
+    expect(c.receipts).toEqual([]);
+    expect(f.openPr).not.toHaveBeenCalled();
+  });
+
+  it('preserves unknown Git evidence instead of inventing an observed SHA', async () => {
+    const c = capturePublication();
+    c.head.mockRejectedValue(new Error('fixture Git observation failed'));
+    expect((await f.invoke()).status).toBe('pr_opened');
+    expect(c.receipts[0]?.requiredCheck.afterCheck).toEqual({ headSha: null, worktreeClean: null });
+    expect(c.receipts[0]?.review.afterApproval).toEqual({ headSha: null, worktreeClean: null });
+    expect(c.receipts[0]?.publication.remoteHeadSha).toBe(RECEIPT_HEAD);
+  });
+
+  it('records a dirty reviewer workspace even if HEAD is unchanged', async () => {
+    const c = capturePublication();
+    f.gitCommand.mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 })
+      .mockResolvedValueOnce({ stdout: ' M task.ts\n', stderr: '', exitCode: 0 });
+    expect((await f.invoke()).status).toBe('pr_opened');
+    expect(c.receipts[0]?.requiredCheck.afterCheck.worktreeClean).toBe(true);
+    expect(c.receipts[0]?.review.afterApproval).toEqual({ headSha: RECEIPT_HEAD, worktreeClean: false });
+  });
+
+  it('retains changed rebase/published SHAs without pretending that the reviewer approved them', async () => {
+    const c = capturePublication();
+    c.head.mockResolvedValueOnce(RECEIPT_HEAD).mockResolvedValueOnce(RECEIPT_HEAD).mockResolvedValue(REBASED_HEAD);
+    f.rebase.mockResolvedValue({ kind: 'clean', preRebaseSha: RECEIPT_HEAD, postRebaseSha: REBASED_HEAD });
+    f.pr.headSha = REBASED_HEAD;
+    expect((await f.invoke()).status).toBe('pr_opened');
+    expect(c.receipts[0]?.review.afterApproval.headSha).toBe(RECEIPT_HEAD);
+    expect(c.receipts[0]?.publication.beforePush.headSha).toBe(REBASED_HEAD);
+    expect(c.receipts[0]?.publication.remoteHeadSha).toBe(REBASED_HEAD);
+    expect(c.receipts[0]?.postRebaseCheck).toBe('passed');
+  });
+
+  it('updates the required-check evidence after reviewer-driven fixups', async () => {
+    const c = capturePublication();
+    c.head.mockResolvedValueOnce(RECEIPT_HEAD).mockResolvedValue(REBASED_HEAD);
+    f.review.mockResolvedValueOnce(reviewResult('changes_needed')).mockResolvedValueOnce(reviewResult('approve'));
+    f.pr.headSha = REBASED_HEAD;
+    expect((await f.invoke()).status).toBe('pr_opened');
+    expect(c.receipts[0]?.requiredCheck.afterCheck.headSha).toBe(REBASED_HEAD);
+    expect(c.receipts[0]?.review.afterApproval.headSha).toBe(REBASED_HEAD);
+    expect(f.run).toHaveBeenCalledTimes(2);
+  });
+
+  it('retains actual PR delivery when readiness persistence fails without leaking the exception', async () => {
+    capturePublication();
+    f.deps.onPublicationReceipt = async () => { throw new Error('sensitive fixture value'); };
+    expect((await f.invoke()).status).toBe('pr_opened');
+    expect(f.db.query('SELECT COUNT(*) AS n FROM prs').get()).toEqual({ n: 1 });
+    const events = f.db.query('SELECT event_type,payload_json FROM events').all();
+    expect(events).toContainEqual({ event_type: 'code_publication_receipt_failed', payload_json: null });
+    expect(JSON.stringify(events)).not.toContain('sensitive fixture value');
+  });
+
+  it('records the late-created PR without doing more Git reads after the publication deadline', async () => {
+    const c = capturePublication();
+    f.openPr.mockImplementation(async () => { f.expire(); return f.pr; });
+    expect((await f.invoke()).status).toBe('pr_opened');
+    expect(c.receipts).toHaveLength(1);
+    expect(c.head).toHaveBeenCalledTimes(4);
+    expect(f.postComment).not.toHaveBeenCalled();
+  });
+
+  it('does not emit a publication receipt after a failed push', async () => {
+    const c = capturePublication();
+    f.push.mockRejectedValue(new Error('fixture push failed'));
+    await expect(f.invoke()).rejects.toThrow('fixture push failed');
+    expect(c.receipts).toEqual([]);
+    expect(f.openPr).not.toHaveBeenCalled();
+  });
+});
 
 function loopResult(status: agent.AgentLoopStatus, summary = "Fixture summary"): agent.AgentLoopResult {
   return {
@@ -74,7 +196,7 @@ function makeFixture() {
   const hasCommits = restoreAfter(spyOn(git, "hasCommitsAhead")).mockResolvedValue(true);
   restoreAfter(spyOn(git, "getDiff")).mockResolvedValue("diff --git a/README.md b/README.md\n+fixture change\n");
   restoreAfter(spyOn(git, "getCommitLog")).mockResolvedValue("abc123 fixture change");
-  restoreAfter(spyOn(git, "gitMust")).mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 });
+  const gitCommand = restoreAfter(spyOn(git, "gitMust")).mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 });
   const rebase = restoreAfter(spyOn(git, "rebaseOntoFreshBase")).mockResolvedValue({ kind: "no_op", sha: "abc123" });
   const push = restoreAfter(spyOn(git, "pushBranch")).mockResolvedValue(undefined);
   const primary = restoreAfter(spyOn(agent, "runAgentLoop")).mockResolvedValue(loopResult("finished"));
@@ -94,7 +216,7 @@ function makeFixture() {
     review: { providerOrder: ["z.ai"], maxRounds: 2, iterationCap: 15, timeoutMs: 1000 },
   };
   return {
-    db, deps, run, hasCommits, primary, review, complete, push, openPr, rebase, postComment, pr,
+    db, deps, run, hasCommits, primary, review, complete, push, openPr, rebase, postComment, pr, gitCommand,
     expire() { now += 1001; },
     invoke: (options: Pick<CodeHandlerArgs, "draftPr"> = {}) => runCodeHandler(deps, { issue, comments: [], repo: "fixture/repo", scope: "S", ...options }),
   };

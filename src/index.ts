@@ -1,87 +1,13 @@
-import { mkdirSync } from "node:fs";
-import { CloudflareClient } from "./adapters/cloudflare.ts";
-import { GLMClient } from "./adapters/glm.ts";
-import { makeGitHubClient } from "./adapters/github.ts";
-import { LinearAdapter } from "./adapters/linear.ts";
-import { loadConfig } from "./config.ts";
-import { executorMode } from "./executors/factory.ts";
-import { log } from "./logger.ts";
-import { runLoop } from "./loop.ts";
-import { createProvider, createProviderChain } from "./providers.ts";
-import { closeDb, openDb } from "./state/db.ts";
-import { recordEvent } from "./state/queries.ts";
-import { openSpendLedger } from "./spend.ts";
-import { resolve } from "node:path";
+import { runGaryHost, type StartupDependencies } from './startup.ts';
+import { log } from './logger.ts';
 
-async function main(): Promise<void> {
-  const cfg = loadConfig();
+export async function main(deps: StartupDependencies = {}): Promise<void> { await runGaryHost(deps); }
 
-  mkdirSync(cfg.gary.home, { recursive: true });
-  mkdirSync(cfg.gary.stateDir, { recursive: true });
-  mkdirSync(cfg.gary.reposDir, { recursive: true });
-  mkdirSync(cfg.gary.workspacesDir, { recursive: true });
-
-  const db = openDb(cfg.gary.dbPath);
-  const spend = openSpendLedger(resolve(cfg.gary.stateDir, "spend.db"));
-  recordEvent(db, { eventType: "boot", payload: { version: "0.0.1" } });
-
-  const linear = new LinearAdapter({ gary: cfg.gary, linear: cfg.linear });
-  const github = makeGitHubClient(cfg.github);
-  // This bounded campaign uses the existing, priced DeepSeek API balance.
-  // Z.ai plan eligibility for Gary and Kimi Extra Usage pricing are unverified;
-  // neither is silently treated as subscription-covered or a paid fallback.
-  const chain = createProviderChain(cfg.providers.filter((p) => p.name === "deepseek")
-    .map((p) => createProvider(p, { fetch: spend.guardedFetch(p.name) })));
-  const glm = new GLMClient(chain);
-  const cloudflare = cfg.cloudflare ? new CloudflareClient(cfg.cloudflare) : null;
-
-  log.info("gary booted", {
-    name: cfg.gary.name,
-    dbPath: cfg.gary.dbPath,
-    githubAuth: cfg.github.kind,
-    providers: chain.providers.map((p) => `${p.name}:${p.model}`),
-    cloudflare: cloudflare ? cfg.cloudflare?.observabilityWorkers : "disabled",
-    pollIntervalMs: cfg.runtime.pollIntervalMs,
-    repoMap: Object.fromEntries(cfg.gary.repoMap),
-    mentionAllowlistSize: cfg.gary.allowlistedMentionUserIds.length,
-    executor: executorMode(),
+// Importing the actual entrypoint in offline integration tests cannot start Gary.
+if (import.meta.main) {
+  main().catch(() => {
+    // Host setup can touch credentials. Never reflect a raw startup exception.
+    log.error('fatal', { error: 'gary_startup_failed' });
+    process.exitCode = 1;
   });
-
-  const controller = new AbortController();
-  for (const sig of ["SIGINT", "SIGTERM"] as const) {
-    process.on(sig, () => {
-      log.info("signal received", { signal: sig });
-      controller.abort();
-    });
-  }
-
-  await runLoop({
-    db,
-    spend,
-    linear,
-    github,
-    glm,
-    cloudflare,
-    repoMap: cfg.gary.repoMap,
-    allowlistedMentionUserIds: cfg.gary.allowlistedMentionUserIds,
-    reposDir: cfg.gary.reposDir,
-    workspacesDir: cfg.gary.workspacesDir,
-    agentLoopMaxIterations: cfg.runtime.agentLoopMaxIterations,
-    agentLoopTimeoutMs: cfg.runtime.agentLoopTimeoutMs,
-    maxCiAttempts: cfg.runtime.maxCiAttempts,
-    maxAttemptsPerTicket: cfg.runtime.maxAttemptsPerTicket,
-    circuitBreakerWindowHours: cfg.runtime.circuitBreakerWindowHours,
-    stalePrAfterMs: cfg.runtime.stalePrAfterMs,
-    review: cfg.review,
-    intervalMs: cfg.runtime.pollIntervalMs,
-    signal: controller.signal,
-  });
-
-  closeDb(db);
-  spend.close();
 }
-
-main().catch((err) => {
-  log.error("fatal", { error: err instanceof Error ? err.message : String(err) });
-  process.exit(1);
-});

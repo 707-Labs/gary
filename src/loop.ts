@@ -13,7 +13,7 @@ import { runAnswerHandler } from "./handlers/answer.ts";
 import { runWaitForBlocker } from "./handlers/blocked.ts";
 import { runBounceHandler } from "./handlers/bounce.ts";
 import { runCiFailureHandler } from "./handlers/ci-failure.ts";
-import { runCodeHandler, type AdmittedCodeLoopRunner } from "./handlers/code.ts";
+import { runCodeHandler, type AdmittedCodeLoopRunner, type CodePublicationReceipt } from "./handlers/code.ts";
 import { bindCanonicalCodeAction, type CodeActionAdmission } from "./hermes/canonical-admission.ts";
 import { runNudgeReviewer } from "./handlers/nudge-reviewer.ts";
 import { runPickupHandler } from "./handlers/pickup.ts";
@@ -21,6 +21,7 @@ import { runPrReviewHandler } from "./handlers/pr-review.ts";
 import { analyzeMentions } from "./mention.ts";
 import { log } from "./logger.ts";
 import {
+  type ActionType,
   type CandidateAction,
   pickActionForMention,
   pickActionForTicket,
@@ -63,8 +64,14 @@ export interface LoopDeps {
   db: DB;
   /** Production intake requires a funded, explicitly enrolled ticket. */
   spend?: SpendLedger;
+  /** Exact Linear issue IDs eligible for any intake/dispatch. Omitted is unrestricted; empty or malformed denies all. */
+  allowedIssueIds?: ReadonlySet<string>;
+  /** Optional action scope; omitted preserves all legacy handlers. Empty or malformed denies all. */
+  allowedActionTypes?: ReadonlySet<ActionType>;
   /** Optional migration runner. Omitted keeps existing production behavior. */
   createAdmittedCodeLoop?: (admission: CodeActionAdmission) => AdmittedCodeLoopRunner;
+  /** Trusted host observation, bound to this canonical action before handler dispatch. */
+  onCodePublication?: (admission: CodeActionAdmission, receipt: CodePublicationReceipt) => void | Promise<void>;
   linear: LinearAdapter;
   github: GitHubClient;
   glm: GLMClient;
@@ -85,6 +92,26 @@ export interface LoopDeps {
   stalePrAfterMs: number;
   /** Reviewer pass config — threaded into runCodeHandler. */
   review: ReviewConfig;
+}
+
+function issueAllowed(deps: LoopDeps, issueId: string): boolean {
+  const allowed = deps.allowedIssueIds;
+  if (allowed === undefined) return true;
+  if (!(allowed instanceof Set)) return false;
+  for (const id of allowed) {
+    if (typeof id !== "string" || !id.trim() || id !== id.trim()) return false;
+  }
+  return allowed.has(issueId);
+}
+
+const ACTION_TYPES: ReadonlySet<ActionType> = new Set([
+  "fix_ci_failure", "respond_to_pr_review", "pickup_ticket", "revisit_code", "classify", "start_coding",
+  "wait_for_blocker", "answer_mention", "write_answer", "bounce", "nudge_reviewer",
+]);
+function actionAllowed(deps: LoopDeps, actionType: ActionType): boolean {
+  const allowed = deps.allowedActionTypes;
+  if (allowed === undefined) return true;
+  return allowed instanceof Set && [...allowed].every(type => ACTION_TYPES.has(type)) && allowed.has(actionType);
 }
 
 export interface TickResult {
@@ -130,6 +157,7 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
 
   const candidates: CandidateAction[] = [];
   for (const issue of issues) {
+    if (!issueAllowed(deps, issue.id)) continue;
     upsertTicket(deps.db, { linearId: issue.id, identifier: issue.identifier });
     if (deps.spend && !deps.spend.canDispatch(issue.id)) continue;
 
@@ -215,7 +243,7 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
       lastRespondedHumanSignature,
       staleAfterMs: deps.stalePrAfterMs,
     });
-    if (!candidate) continue;
+    if (!candidate || !actionAllowed(deps, candidate.type)) continue;
     const fp = fingerprintDerivedState(state);
     if (hasActedOn(deps.db, {
       ticketLinearId: issue.id,
@@ -297,6 +325,7 @@ async function runOne(
   slot: number,
 ): Promise<string | null> {
   // Recheck admission immediately before dispatch, after async state reads.
+  if (!issueAllowed(deps, action.issue.id) || !actionAllowed(deps, action.type)) return null;
   if (deps.spend && !deps.spend.canDispatch(action.issue.id)) return null;
   const fp = fingerprintDerivedState(action.state);
   const primary = glm.chain.providers[0]!;
@@ -328,9 +357,11 @@ async function runOne(
         fingerprint:fp, issue:action.issue, provider, model, repo:deps.repoMap.get(action.issue.teamKey) ?? "" });
       codeLoop = deps.createAdmittedCodeLoop(codeBinding.admission);
     }
+    const observePublication = codeBinding && deps.onCodePublication
+      ? (receipt: CodePublicationReceipt) => deps.onCodePublication!(codeBinding!.admission, receipt) : undefined;
     const result = deps.spend
-      ? await deps.spend.withSpendScope(action.issue.id, () => dispatch(slotDeps, action, codeLoop, codeBinding?.admission.assertActive))
-      : await dispatch(slotDeps, action, codeLoop, codeBinding?.admission.assertActive);
+      ? await deps.spend.withSpendScope(action.issue.id, () => dispatch(slotDeps, action, codeLoop, codeBinding?.admission.assertActive, observePublication))
+      : await dispatch(slotDeps, action, codeLoop, codeBinding?.admission.assertActive, observePublication);
     // A completed call may leave less than the next reservation requires.
     // That alone must not relabel successful work or prevent publication.
     const exhausted = deps.spend && deps.spend.status(action.issue.id)?.state !== "active";
@@ -378,6 +409,8 @@ async function runOne(
       });
       return null;
     }
+    // An explicitly selected canary must not retry a failed action on later polls.
+    if (deps.allowedIssueIds !== undefined) deps.spend?.markTerminal(action.issue.id, "canary_dispatch_failed");
     log.error("action failed", {
       action: action.type,
       issue: action.issue.identifier,
@@ -439,6 +472,7 @@ async function collectMentionCandidates(
   stats.mentionOnly = mentionOnly.length;
 
   for (const issue of mentionOnly) {
+    if (!issueAllowed(deps, issue.id)) continue;
     if (deps.spend && !deps.spend.canDispatch(issue.id)) continue;
     upsertTicket(deps.db, { linearId: issue.id, identifier: issue.identifier });
     const ticketRow = getTicket(deps.db, issue.id);
@@ -489,7 +523,7 @@ async function collectMentionCandidates(
     };
 
     const candidate = pickActionForMention({ issue, state, mention: analysis });
-    if (!candidate) continue;
+    if (!candidate || !actionAllowed(deps, candidate.type)) continue;
     const fp = fingerprintDerivedState(state);
     if (
       hasActedOn(deps.db, {
@@ -534,13 +568,13 @@ function reopenTicket(
   clearTerminalState(db, issue.id);
 }
 
-async function dispatch(deps: LoopDeps, action: CandidateAction, codeLoop?: AdmittedCodeLoopRunner, assertCodeAction?: () => void): Promise<ActionOutcome | void> {
+async function dispatch(deps: LoopDeps, action: CandidateAction, codeLoop?: AdmittedCodeLoopRunner, assertCodeAction?: () => void, onPublicationReceipt?: (receipt: CodePublicationReceipt) => void | Promise<void>): Promise<ActionOutcome | void> {
   switch (action.type) {
     case "classify":
       await runClassify(deps, action);
       return;
     case "start_coding":
-      return runStartCoding(deps, action, codeLoop, assertCodeAction);
+      return runStartCoding(deps, action, codeLoop, assertCodeAction, onPublicationReceipt);
     case "wait_for_blocker":
       await runWaitForBlocker(
         { db: deps.db, linear: deps.linear },
@@ -754,6 +788,7 @@ async function runStartCoding(
   action: CandidateAction,
   codeLoop?: AdmittedCodeLoopRunner,
   assertCodeAction?: () => void,
+  onPublicationReceipt?: (receipt: CodePublicationReceipt) => void | Promise<void>,
 ): Promise<ActionOutcome> {
   const issue = action.issue;
   const repo = deps.repoMap.get(issue.teamKey);
@@ -783,6 +818,7 @@ async function runStartCoding(
       agentLoopTimeoutMs: deps.agentLoopTimeoutMs,
       review: deps.review,
       ...(codeLoop ? { runAdmittedAgentLoop: codeLoop } : {}),
+      ...(onPublicationReceipt ? { onPublicationReceipt } : {}),
       ...publicationGuard(deps, issue.id),
       ...(assertCodeAction ? {assertCanPublish:()=>{assertCodeAction();publicationGuard(deps,issue.id).assertCanPublish?.();}} : {}),
     },
@@ -917,20 +953,26 @@ async function derivePr(
 export interface RunLoopArgs extends LoopDeps {
   intervalMs: number;
   signal?: AbortSignal;
+  /** Awaited after a successful tick has fully settled. Failure stops the loop. */
+  onTickComplete?: (result: TickResult) => Promise<void> | void;
 }
 
 /** Runs the poll loop forever (until aborted). One tick per interval. */
 export async function runLoop(args: RunLoopArgs): Promise<void> {
   log.info("loop starting", { intervalMs: args.intervalMs });
   while (!args.signal?.aborted) {
+    let result: TickResult | undefined;
     try {
-      const result = await tick(args);
+      result = await tick(args);
       log.debug("tick complete", { ...result });
     } catch (err) {
       log.error("tick failed", {
         error: err instanceof Error ? err.message : String(err),
       });
     }
+    // Keep this outside the recoverable tick catch: readiness/receipt failures
+    // must not silently continue admitting work on the next poll.
+    if (result) await args.onTickComplete?.(result);
     await sleep(args.intervalMs, args.signal);
   }
   log.info("loop stopping");

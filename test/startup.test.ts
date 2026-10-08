@@ -1,0 +1,103 @@
+import { afterEach, expect, test } from 'bun:test';
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { main } from '../src/index.ts';
+import type { Config } from '../src/config.ts';
+import type { StartupDependencies } from '../src/startup.ts';
+import { HERMES_CANARY_WORKER_IMAGE, HERMES_CANARY_CHILD_IMAGE, type HermesActivationConfig } from '../src/hermes/activation.ts';
+import { bindCanonicalCodeAction } from '../src/hermes/canonical-admission.ts';
+import { openDb } from '../src/state/db.ts';
+import { SpendLedger } from '../src/spend.ts';
+import { recordActionStart, upsertTicket } from '../src/state/queries.ts';
+import { LocalExecutor } from '../src/executors/local.ts';
+import type { AssignedIssue, LinearAdapter } from '../src/adapters/linear.ts';
+import type { GitHubClient } from '../src/adapters/github.ts';
+
+const roots: string[] = [];
+afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+const issueId = '11111111-1111-4111-8111-111111111111';
+function fixture() {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'gary-main-fixture-'))); roots.push(root); chmodSync(root, 0o700);
+  const traces = join(root, 'traces'); mkdirSync(traces, { mode: 0o700 });
+  const workspace = join(root, 'workspace'); mkdirSync(workspace);
+  const command = (...args:string[]) => {
+    const result = spawnSync('/usr/bin/git', args, { cwd: workspace, env: { PATH: '/usr/bin:/bin', HOME: root,
+      GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' }, encoding: 'utf8' });
+    if (result.status !== 0) throw new Error('fixture_git_failed'); return result.stdout.trim();
+  };
+  command('init','-q'); command('config','user.email','fixture@example.invalid'); command('config','user.name','Fixture');
+  command('config','core.hooksPath','/dev/null'); writeFileSync(join(workspace,'task.ts'),'baseline\n');
+  command('add','task.ts'); command('commit','-qm','baseline');
+  const activation: HermesActivationConfig = { version:1, issueId, repo:'fixture/repo', provider:'deepseek', model:'deepseek-v4-pro',
+    workerImage:HERMES_CANARY_WORKER_IMAGE, childImage:HERMES_CANARY_CHILD_IMAGE,
+    dockerExecutable:'/usr/local/bin/docker', dockerHost:'unix:///Users/tanner/.colima/default/docker.sock', traceDirectory:traces,
+    policy:{baseCommit:command('rev-parse','HEAD'),task:{allowedFiles:['task.ts'],criteria:[{id:'check',description:'Check allowed change',requiredCommands:['bun run check']}]},
+      progress:{maxModelRequests:50,maxModelRequestsWithoutProgress:20,maxSuccessfulToolCalls:100,toolRepeatWindow:10,maxRepeatedToolCalls:5},
+      instructions:[],voicePrinciples:'Use Gary voice.',readTicketIdentifiers:['ERT-1'],publicFetch:{policy:{kind:'urls',urls:[]}},
+      cloudflare:{allowedServices:[],allowedDatabases:[]},preparationCommands:[]}};
+  const activationPath=join(root,'activation.json'); writeFileSync(activationPath,JSON.stringify(activation),{mode:0o600});
+  const config:Config={
+    gary:{name:'Gary fixture',linearUserId:'fixture-user',home:root,stateDir:join(root,'state'),reposDir:join(root,'repos'),workspacesDir:join(root,'workspaces'),
+      dbPath:join(root,'state','gary.db'),repoMap:new Map([['ERT','fixture/repo']]),allowlistedMentionUserIds:[]},
+    linear:{apiKey:'fake-linear',teamId:'fixture-team',inProgressStateId:'fixture-progress'},
+    github:{kind:'pat',token:'fake-github',username:'fixture'},
+    providers:[{name:'deepseek',apiKey:'fixture-model-key',baseUrl:'https://api.deepseek.com/anthropic',model:'deepseek-v4-pro',defaultBackoffMs:1000}],
+    cloudflare:null,runtime:{pollIntervalMs:1,maxAttemptsPerTicket:1,circuitBreakerWindowHours:6,maxCiAttempts:1,agentLoopMaxIterations:50,agentLoopTimeoutMs:30_000,stalePrAfterMs:1000},
+    review:{providerOrder:['deepseek'],maxRounds:1,iterationCap:5,timeoutMs:1000},
+  };
+  const env={GARY_RUNTIME_MODE:'hermes-canary',GARY_HERMES_ACTIVATION_PATH:activationPath,GARY_EXECUTOR:'docker',GARY_EXECUTOR_NETWORK:'none',GARY_EXECUTOR_IMAGE:HERMES_CANARY_CHILD_IMAGE,
+    DOCKER_HOST:'unix:///Users/tanner/.colima/default/docker.sock'};
+  let networkCalls=0;
+  const deps:StartupDependencies={env,config:()=>config,linear:()=>({} as LinearAdapter),github:()=>({} as GitHubClient),
+    db:()=>openDb(':memory:'),ledger:()=>new SpendLedger(':memory:'),fetch:(async()=>{networkCalls++;throw new Error('fixture_network_forbidden');}) as unknown as typeof fetch};
+  return{root,workspace,activation,activationPath,config,env,deps,networkCalls:()=>networkCalls};
+}
+test('actual main selects the real Hermes factory and an injected failure never invokes a legacy coding loop',async()=>{
+  const f=fixture(); let launched=0, polls=0;
+  const beforeSignals=process.listenerCount('SIGTERM');
+  await main({...f.deps,launch:async manifest=>{launched++;return{taskId:manifest.taskId,requestId:manifest.requestId,status:'error',publicationApproved:false,reason:'offline_fixture_stop'};},
+    runLoop:async args=>{
+      polls++;expect([...args.allowedIssueIds!]).toEqual([issueId]);expect([...args.allowedActionTypes!]).toEqual(['classify','start_coding']);
+      expect(typeof args.onCodePublication).toBe('function');
+      args.spend!.createCampaign('fixture',10);args.spend!.enrollTicket('fixture',issueId,10,{draftPr:true});
+      upsertTicket(args.db,{linearId:issueId,identifier:'ERT-1'});
+      const actionId=recordActionStart(args.db,{ticketLinearId:issueId,stateFingerprint:'fixture-fp',actionType:'start_coding',provider:'deepseek',model:'deepseek-v4-pro'});
+      const issue={id:issueId,identifier:'ERT-1',teamId:'fixture-team',teamKey:'ERT'} as AssignedIssue;
+      const binding=bindCanonicalCodeAction({db:args.db,ledger:args.spend!,actionId,fingerprint:'fixture-fp',issue,repo:'fixture/repo',provider:'deepseek',model:'deepseek-v4-pro'});
+      try {
+        const runner=args.createAdmittedCodeLoop!(binding.admission);
+        const result=await runner({glm:args.glm,executor:new LocalExecutor(f.workspace),systemPrompt:'Offline Gary fixture',task:'Investigate fixture',
+          maxIterations:50,maxTokensPerTurn:128,timeoutMs:30_000,deadlineMs:Date.now()+30_000,finishGateCommand:'bun run check',disableSubagent:true});
+        expect(result.status).toBe('error');
+        expect(args.spend!.status(issueId)?.attemptCount).toBe(0);
+      } finally {binding.close();}
+    }});
+  expect({launched,polls,network:f.networkCalls()}).toEqual({launched:1,polls:1,network:0});
+  expect(process.listenerCount('SIGTERM')).toBe(beforeSignals);
+});
+test('actual legacy main preserves the existing DeepSeek-only campaign and omits all canary hooks',async()=>{
+  const f=fixture(); let polls=0;
+  f.config.providers=[...f.config.providers,{name:'z.ai',apiKey:'fake-zai',baseUrl:'https://api.z.ai/api/anthropic',model:'glm-5.3',defaultBackoffMs:1000}];
+  await main({...f.deps,env:{},runLoop:async args=>{polls++;expect(args.createAdmittedCodeLoop).toBeUndefined();expect(args.allowedIssueIds).toBeUndefined();
+    expect(args.glm.chain.providers.map(p=>p.name)).toEqual(['deepseek']);}});
+  expect(polls).toBe(1);expect(f.networkCalls()).toBe(0);
+});
+test('unsafe executor, missing activation and mismatched route stop before polling or network',async()=>{
+  for(const kind of ['executor','missing','route'] as const){const f=fixture();let polls=0;
+    if(kind==='executor')f.env.GARY_EXECUTOR='local';
+    if(kind==='missing')f.env.GARY_HERMES_ACTIVATION_PATH=join(f.root,'missing.json');
+    if(kind==='route')f.config.providers=[{...f.config.providers[0]!,baseUrl:'https://other.invalid'}];
+    await expect(main({...f.deps,runLoop:async()=>{polls++;}})).rejects.toThrow();expect(polls).toBe(0);expect(f.networkCalls()).toBe(0);
+  }
+});
+test('startup closes canonical handles and signal listeners on polling failure',async()=>{
+  const f=fixture();let dbClosed=false,ledgerClosed=false;
+  const signalCount=process.listenerCount('SIGTERM');
+  const db=openDb(':memory:'),ledger=new SpendLedger(':memory:');
+  const closeDb=db.close.bind(db),closeLedger=ledger.close.bind(ledger);
+  db.close=()=>{dbClosed=true;closeDb();};ledger.close=()=>{ledgerClosed=true;closeLedger();};
+  await expect(main({...f.deps,db:()=>db,ledger:()=>ledger,runLoop:async()=>{throw new Error('fixture');}})).rejects.toThrow('fixture');
+  expect({dbClosed,ledgerClosed}).toEqual({dbClosed:true,ledgerClosed:true});expect(process.listenerCount('SIGTERM')).toBe(signalCount);
+});
