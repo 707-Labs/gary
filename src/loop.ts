@@ -1,3 +1,5 @@
+import { guardAdapterCalls, throwIfExpired } from "./deadline.ts";
+import type { PinnedGitBase } from "./git.ts";
 import type { ActionVerification } from "./verification-policy.ts";
 import type { CloudflareClient } from "./adapters/cloudflare.ts";
 import type { GitHubClient, PullRequestRef } from "./adapters/github.ts";
@@ -65,12 +67,16 @@ import {
 
 export interface LoopDeps {
   db: DB;
+  /** Trusted host lifetime; omission preserves legacy standalone calls. */
+  signal?: AbortSignal;
   /** Production intake requires a funded, explicitly enrolled ticket. */
   spend?: SpendLedger;
   /** Durable one-issue classify/code admission, enabled only by the explicit Hermes activation. */
   codingTrial?: CodingTrial;
   /** Fixed in-process profile for the admitted trial, never caller/model environment. */
   codingExecutorProfile?: typeof HERMES_CODING_RUNTIME_POLICY.executor;
+  /** Selected by the protected activation and shared with host publication. */
+  codingBase?: Readonly<PinnedGitBase>;
   /** Exact Linear issue IDs eligible for any intake/dispatch. Omitted is unrestricted; empty or malformed denies all. */
   allowedIssueIds?: ReadonlySet<string>;
   /** Optional action scope; omitted preserves all legacy handlers. Empty or malformed denies all. */
@@ -140,6 +146,11 @@ export interface TickResult {
  * doesn't collide on `.git` locks.
  */
 export async function tick(deps: LoopDeps): Promise<TickResult> {
+  throwIfExpired(deps);
+  // Legacy Linear methods cannot cancel in flight; await them, then forbid
+  // further reads/writes. Do not post-guard GitHub PR creation: its real
+  // delivery response must remain recordable when shutdown races the call.
+  if (deps.signal) deps = { ...deps, linear: guardAdapterCalls(deps.linear, { signal: deps.signal }) };
   if (deps.codingTrial ? deps.codingExecutorProfile !== HERMES_CODING_RUNTIME_POLICY.executor : deps.codingExecutorProfile !== undefined) {
     throw new Error("invalid_coding_executor_profile");
   }
@@ -160,6 +171,7 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
   }
 
   const issues = await deps.linear.fetchAssignedIssues();
+  throwIfExpired(deps);
   recordEvent(deps.db, { eventType: "poll", payload: { count: issues.length } });
 
   // Hoisted once per tick so derivePr can do an O(1) membership check
@@ -168,6 +180,7 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
 
   const candidates: CandidateAction[] = [];
   for (const issue of issues) {
+    throwIfExpired(deps);
     if (!issueAllowed(deps, issue.id)) continue;
     upsertTicket(deps.db, { linearId: issue.id, identifier: issue.identifier });
     if (deps.spend && !deps.spend.canDispatch(issue.id)) continue;
@@ -218,6 +231,7 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
       : null;
 
     const pr = await derivePr(deps, issue.id, mappedRepos);
+    throwIfExpired(deps);
 
     // The fingerprint includes a hash of human-only inputs (description +
     // non-Gary comment ids) so that Gary's own comments don't invalidate the
@@ -232,6 +246,7 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
         garyUserId: deps.linear.linearUserId,
       });
     } catch (err) {
+      throwIfExpired(deps);
       log.warn("could not fetch comment meta; falling back to updatedAt", {
         issue: issue.identifier,
         error: err instanceof Error ? err.message : String(err),
@@ -273,6 +288,7 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
     await collectMentionCandidates(deps, issues, candidates);
   }
 
+  throwIfExpired(deps);
   if (candidates.length === 0) {
     return { candidatesConsidered: 0, actionsTaken: [] };
   }
@@ -303,7 +319,7 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
     dispatched.map((action, slotIdx) => {
       const primary = unarmed[slotIdx]!;
       const slotChain = chainStartingWith(deps.glm.chain, primary);
-      const slotGlm = new GLMClient(slotChain);
+      const slotGlm = new GLMClient(slotChain, deps.signal ? { signal: deps.signal } : {});
       return runOne(deps, action, slotGlm, slotIdx);
     }),
   );
@@ -337,6 +353,7 @@ async function runOne(
   slot: number,
 ): Promise<string | null> {
   // Recheck admission immediately before dispatch, after async state reads.
+  if (deps.signal?.aborted) return null;
   if (!issueAllowed(deps, action.issue.id) || !actionAllowed(deps, action.type)) return null;
   if (deps.spend && !deps.spend.canDispatch(action.issue.id)) return null;
   const fp = fingerprintDerivedState(action.state);
@@ -379,12 +396,18 @@ async function runOne(
     }
     const observePublication = codeBinding && deps.onCodePublication
       ? (receipt: CodePublicationReceipt) => deps.onCodePublication!(codeBinding!.admission, receipt) : undefined;
-    const assertCurrent = () => {trialAction?.assertActive();codeBinding?.admission.assertActive();};
+    const assertCurrent = () => {throwIfExpired(deps);trialAction?.assertActive();codeBinding?.admission.assertActive();};
     const execute = () => dispatch(slotDeps, action, codeLoop, codeBinding ? assertCurrent : undefined, observePublication, verification);
     const scoped = () => deps.spend ? deps.spend.withSpendScope(action.issue.id, execute) : execute();
-    const result = trialAction && deps.spend
-      ? await deps.spend.withPaidRequestGuard(phase => {trialAction!.assertActive(phase === 'before_send');codeBinding?.admission.assertActive();}, scoped)
+    const result = deps.spend && (trialAction || deps.signal)
+      ? await deps.spend.withPaidRequestGuard(phase => {
+        throwIfExpired(deps);
+        trialAction?.assertActive(phase === 'before_send');codeBinding?.admission.assertActive();
+      }, scoped)
       : await scoped();
+    // Preserve a real PR response already in flight; other late results cannot
+    // turn a host cancellation into successful classification or more work.
+    if (result !== "pr_opened") throwIfExpired(deps);
     // A completed call may leave less than the next reservation requires.
     // That alone must not relabel successful work or prevent publication.
     const exhausted = deps.spend && deps.spend.status(action.issue.id)?.state !== "active";
@@ -598,6 +621,7 @@ function reopenTicket(
 }
 
 async function dispatch(deps: LoopDeps, action: CandidateAction, codeLoop?: AdmittedCodeLoopRunner, assertCodeAction?: () => void, onPublicationReceipt?: (receipt: CodePublicationReceipt) => void | Promise<void>, verification?: ActionVerification): Promise<ActionOutcome | void> {
+  throwIfExpired(deps);
   switch (action.type) {
     case "classify":
       await runClassify(deps, action);
@@ -677,7 +701,9 @@ function firstName(full: string | null): string | null {
 
 function publicationGuard(deps: LoopDeps, ticketId: string): { assertCanPublish?: () => void } {
   const spend = deps.spend;
-  return spend ? { assertCanPublish: () => {
+  return spend || deps.signal ? { assertCanPublish: () => {
+    throwIfExpired(deps);
+    if (!spend) return;
     const status=spend.status(ticketId);
     if (status?.state !== "active" || (deps.codingTrial && status.unknownAttempts !== 0)) throw new Error("spend allocation closed or uncertain before publication");
   } } : {};
@@ -835,6 +861,7 @@ async function runStartCoding(
     return "escalated";
   }
   const comments = await deps.linear.fetchComments(issue.id);
+  throwIfExpired(deps);
   const scope = action.state.classification?.scope ?? "M";
   const result = await runCodeHandler(
     {
@@ -848,8 +875,10 @@ async function runStartCoding(
       agentLoopMaxIterations: deps.agentLoopMaxIterations,
       agentLoopTimeoutMs: deps.agentLoopTimeoutMs,
       review: deps.review,
+      ...(deps.signal ? { signal: deps.signal } : {}),
       ...(codeLoop ? { runAdmittedAgentLoop: codeLoop } : {}),
       ...(verification ? {verification} : {}),
+      ...(deps.codingBase ? {codeBase: deps.codingBase} : {}),
       ...(deps.codingTrial ? { strictPublicationArtifact: true as const,
         workspaceExecutorProfile: deps.codingExecutorProfile! } : {}),
       ...(onPublicationReceipt ? { onPublicationReceipt } : {}),
@@ -881,7 +910,9 @@ async function runClassify(
 ): Promise<void> {
   const issue = action.issue;
   const comments = await deps.linear.fetchComments(issue.id);
+  throwIfExpired(deps);
   const classification = await classifyTicket(deps, { issue, comments });
+  throwIfExpired(deps);
   setClassification(deps.db, {
     linearId: issue.id,
     classification: classification.classification,
@@ -911,10 +942,12 @@ async function runClassify(
     });
   }
 
+  throwIfExpired(deps);
   const body = await generateClassificationComment(deps, {
     issue,
     classification,
   });
+  throwIfExpired(deps);
   await deps.linear.postComment(issue.id, body);
   log.info("classified and commented", {
     issue: issue.identifier,
@@ -927,6 +960,7 @@ async function derivePr(
   ticketLinearId: string,
   mappedRepos: ReadonlySet<string>,
 ): Promise<DerivedPrState | null> {
+  throwIfExpired(deps);
   const row = getPrForTicket(deps.db, ticketLinearId);
   if (!row) return null;
   if (!mappedRepos.has(row.repo)) return null;
@@ -934,7 +968,9 @@ async function derivePr(
   let pr: PullRequestRef;
   try {
     pr = await deps.github.getPullRequest(owner, name, row.pr_number);
+    throwIfExpired(deps);
   } catch (err) {
+    throwIfExpired(deps);
     log.warn("could not fetch PR", {
       repo: row.repo,
       number: row.pr_number,
@@ -946,6 +982,7 @@ async function derivePr(
     markPrClosed(deps.db, { githubId: row.github_id, merged: pr.merged });
   }
   const ciStatus = await deps.github.aggregateCiStatus(owner, name, pr.headSha);
+  throwIfExpired(deps);
 
   // Compute the pending-comment signature so the priority logic knows whether
   // there are reviewer comments Gary still owes a response to. Skip this for
@@ -958,12 +995,14 @@ async function derivePr(
         name,
         pr.number,
       );
+      throwIfExpired(deps);
       const respondedIds = getRespondedPrCommentIds(deps.db, row.github_id);
       prCommentSignature = computePrCommentSignature({
         comments,
         alreadyRespondedIds: respondedIds,
       });
     } catch (err) {
+      throwIfExpired(deps);
       log.warn("could not fetch PR comments; skipping review-response check", {
         repo: row.repo,
         number: row.pr_number,
@@ -986,7 +1025,6 @@ async function derivePr(
 
 export interface RunLoopArgs extends LoopDeps {
   intervalMs: number;
-  signal?: AbortSignal;
   /** Awaited after a successful tick has fully settled. Failure stops the loop. */
   onTickComplete?: (result: TickResult) => Promise<void> | void;
 }
@@ -1006,7 +1044,7 @@ export async function runLoop(args: RunLoopArgs): Promise<void> {
     }
     // Keep this outside the recoverable tick catch: readiness/receipt failures
     // must not silently continue admitting work on the next poll.
-    if (result) await args.onTickComplete?.(result);
+    if (result && !args.signal?.aborted) await args.onTickComplete?.(result);
     await sleep(args.intervalMs, args.signal);
   }
   log.info("loop stopping");

@@ -8,6 +8,9 @@ import type { AssignedIssue, IssueComment, LinearAdapter } from "../adapters/lin
 import { type AgentLoopArgs, type AgentLoopResult, type PhaseSpec, runAgentLoop, type RunLogEntry } from "../agent/loop.ts";
 import { composeSystemPrompt } from "../agent/prompts.ts";
 import {
+  assertRemoteBase,
+  validatePinnedGitBase,
+  type PinnedGitBase,
   createWorktree,
   ensureBareClone,
   getCommitLog,
@@ -201,10 +204,14 @@ export interface CodePublicationReceipt {
     afterCheck: CodeGitObservation;
   };
   review: { fingerprint: string; verdict: "approve"; afterApproval: CodeGitObservation };
-  publication: { beforePush: CodeGitObservation; afterPush: CodeGitObservation; remoteHeadSha: string | null };
+  publication: { beforePush: CodeGitObservation; afterPush: CodeGitObservation; remoteHeadSha: string | null;
+    /** Actual base returned with PR creation, never copied from intended configuration. */
+    remoteBase?: PinnedGitBase | null };
   postRebaseCheck: "not_run" | "passed" | "failed_reverted" | "incomplete";
   /** Present only after strict check/review/publication artifact comparisons pass. */
   exactArtifact?: CodePublicationArtifact;
+  /** Explicit host-selected PR base, also bound by exactArtifact.baseSha. */
+  publicationBase?: PinnedGitBase;
 }
 
 export interface CodeHandlerDeps {
@@ -217,6 +224,8 @@ export interface CodeHandlerDeps {
   workspacesDir: string;
   agentLoopMaxIterations: number;
   agentLoopTimeoutMs: number;
+  /** Trusted host lifetime, composed with this action's existing deadline. */
+  signal?: AbortSignal;
   /**
    * Optional runner supplied by a host that admits each invocation against the
    * existing owner, executor, ledger and shared deadline. Used for the primary
@@ -230,6 +239,8 @@ export interface CodeHandlerDeps {
   assertCanPublish?: () => void;
   /** Trusted canary opt-in. Legacy publication behavior is unchanged on omission. */
   strictPublicationArtifact?: true;
+  /** Protected activation base; task/model text cannot select a PR base. */
+  codeBase?: PinnedGitBase;
   /** Trusted coding-only profile shared by primary, fixups, checks and reviewer. */
   workspaceExecutorProfile?: WorkspaceExecutorProfile;
   /** Shared host-owned command ceilings and attempt counts for this coding action. */
@@ -266,8 +277,9 @@ export interface CodeHandlerResult {
 /** The optional seam changes no credentials, providers, intake or publication authority. */
 async function runCodeAgentLoop(deps: CodeHandlerDeps, args: AgentLoopArgs): Promise<AgentLoopResult> {
   const admitted = deps.runAdmittedAgentLoop;
-  if (admitted) throwIfExpired(args);
+  if (admitted || deps.signal) throwIfExpired(args);
   const result = await (admitted ?? runAgentLoop)(args);
+  if (deps.signal) throwIfExpired(args);
   if (admitted) {
     throwIfExpired(args);
     // The legacy runner may salvage commits after an incomplete loop. A newly
@@ -296,11 +308,13 @@ export async function runCodeHandler(
   deps: CodeHandlerDeps,
   args: CodeHandlerArgs,
 ): Promise<CodeHandlerResult> {
-  const budget = createDeadline({ timeoutMs: deps.agentLoopTimeoutMs });
+  const budget = createDeadline({ timeoutMs: deps.agentLoopTimeoutMs, ...(deps.signal ? { signal: deps.signal } : {}) });
   try {
     deps.verification?.bindDeadline(budget.deadlineMs, budget.signal);
     return await runCodeHandlerWithinDeadline(deps, args, budget);
   } catch (err) {
+    // Host shutdown drains in-flight work but starts no timeout escalation writes.
+    if (deps.signal?.aborted) throw deps.signal.reason ?? err;
     if (!(err instanceof DeadlineExceededError) && !budget.signal.aborted) throw err;
     await escalateToReporter(deps, args, "timeout");
     return {
@@ -328,18 +342,26 @@ async function runCodeHandlerWithinDeadline(
   const checkCommand = selectedCheckCommand(deps);
   const strictArtifact = deps.strictPublicationArtifact === true;
   if (deps.strictPublicationArtifact !== undefined && !strictArtifact) throw new Error("invalid_strict_publication_policy");
+  const codeBase = deps.codeBase === undefined ? undefined : Object.freeze({ ...deps.codeBase });
+  if (codeBase) {
+    validatePinnedGitBase(codeBase);
+    if (!strictArtifact || codeBase.branch === branch) throw new Error("invalid_code_base_policy");
+  }
+  const baseBranch = codeBase?.branch ?? BASE_BRANCH;
+  const baseRef = codeBase?.commit ?? baseBranch;
   const sameArtifact = (left: CodePublicationArtifact, right: CodePublicationArtifact) =>
     left.headSha === right.headSha && left.baseSha === right.baseSha && left.treeSha === right.treeSha;
   const observeArtifact = async (): Promise<CodePublicationArtifact> => {
     budget.throwIfExpired();
     try {
-      const refs = ["rev-parse", "HEAD", "HEAD^{tree}", `${BASE_BRANCH}^{commit}`, `refs/heads/${branch}^{commit}`];
+      const refs = ["rev-parse", "HEAD", "HEAD^{tree}", `${codeBase ? "refs/heads/" : ""}${baseBranch}^{commit}`, `refs/heads/${branch}^{commit}`];
       const before = await gitMust(refs, { ...budget, cwd: worktreePath });
       const status = await gitMust(["status", "--porcelain=v1", "--untracked-files=all"], { ...budget, cwd: worktreePath });
       const after = await gitMust(refs, { ...budget, cwd: worktreePath });
       const parts = before.stdout.trim().split("\n");
       if (before.stdout !== after.stdout || status.stdout !== "" || parts.length !== 4
-          || parts.some(sha => !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha)) || parts[0] !== parts[3]) throw new Error();
+          || parts.some(sha => !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha)) || parts[0] !== parts[3]
+          || (codeBase && parts[2] !== codeBase.commit)) throw new Error();
       budget.throwIfExpired();
       return { headSha: parts[0]!, treeSha: parts[1]!, baseSha: parts[2]!, worktreeClean: true };
     } catch { budget.throwIfExpired(); throw new Error("strict_publication_artifact_unverified"); }
@@ -393,6 +415,7 @@ async function runCodeHandlerWithinDeadline(
     owner,
     repo: name,
     reposDir: deps.reposDir,
+    ...(codeBase ? { base: codeBase } : {}),
     freshTokenUrl: freshUrl,
     deadlineMs: budget.deadlineMs,
     signal: budget.signal,
@@ -406,7 +429,8 @@ async function runCodeHandlerWithinDeadline(
     bareDir,
     worktreePath,
     branch,
-    baseBranch: BASE_BRANCH,
+    baseBranch,
+    ...(codeBase ? { expectedBaseCommit: codeBase.commit } : {}),
     authorName: viewer.login,
     authorEmail,
     deadlineMs: budget.deadlineMs,
@@ -469,7 +493,6 @@ async function runCodeHandlerWithinDeadline(
   budget.throwIfExpired();
   if (loopResult.status === "timeout") throw new DeadlineExceededError();
 
-  const baseRef = BASE_BRANCH;
   const hasCommits = await hasCommitsAhead(worktreePath, baseRef, budget);
 
   if (loopResult.status !== "finished") {
@@ -522,6 +545,7 @@ async function runCodeHandlerWithinDeadline(
     primaryRunLog: loopResult.runLog,
     reviewerGlm,
     fingerprint: reviewFingerprint,
+    baseRef,
     worktreePath,
     budget,
     ...(beforeRequiredCheck ? { beforeRequiredCheck } : {}),
@@ -551,7 +575,8 @@ async function runCodeHandlerWithinDeadline(
     bareDir,
     worktreePath,
     freshTokenUrl: freshUrlForPush,
-    baseBranch: BASE_BRANCH,
+    baseBranch,
+    ...(codeBase ? { expectedBaseCommit: codeBase.commit } : {}),
     deadlineMs: budget.deadlineMs,
     signal: budget.signal,
   });
@@ -592,7 +617,7 @@ async function runCodeHandlerWithinDeadline(
   const diff = await getDiff(worktreePath, baseRef, budget);
   const log_ = await getCommitLog(worktreePath, baseRef, budget);
 
-  const prBody = await composePrBody(deps, {
+  const generatedPrBody = await composePrBody(deps, {
     issue: args.issue,
     branch,
     summary: loopResult.summary,
@@ -602,6 +627,9 @@ async function runCodeHandlerWithinDeadline(
     deadlineMs: budget.deadlineMs,
     signal: budget.signal,
   });
+  const prBody = codeBase && baseBranch !== BASE_BRANCH
+    ? `${generatedPrBody}\n\nStacked base: \`${baseBranch}\` (\`${codeBase.commit}\`). This draft's diff is relative to that prerequisite branch.`
+    : generatedPrBody;
   const prTitle = await composePrTitle(deps, {
     issue: args.issue,
     summary: loopResult.summary,
@@ -613,6 +641,8 @@ async function runCodeHandlerWithinDeadline(
   budget.throwIfExpired();
   const beforePush = deps.onPublicationReceipt ? await observeGit() : { headSha: null, worktreeClean: null };
   if (deps.onPublicationReceipt) budget.throwIfExpired();
+  if (codeBase) await assertRemoteBase({ base: codeBase, freshTokenUrl: freshUrlForPush, worktreePath,
+    deadlineMs: budget.deadlineMs, signal: budget.signal });
   await assertCheckedArtifact?.();
   deps.assertCanPublish?.();
   await pushBranch({ worktreePath, freshTokenUrl: freshUrlForPush, branch,
@@ -621,13 +651,15 @@ async function runCodeHandlerWithinDeadline(
   budget.throwIfExpired();
   const afterPush = deps.onPublicationReceipt ? await observeGit() : { headSha: null, worktreeClean: null };
   if (deps.onPublicationReceipt) budget.throwIfExpired();
+  if (codeBase) await assertRemoteBase({ base: codeBase, freshTokenUrl: freshUrlForPush, worktreePath,
+    deadlineMs: budget.deadlineMs, signal: budget.signal });
   await assertCheckedArtifact?.();
   deps.assertCanPublish?.();
   const pr = await deps.github.openPullRequest({
     owner,
     repo: name,
     head: branch,
-    base: BASE_BRANCH,
+    base: baseBranch,
     title: prTitle,
     body: prBody,
     draft: args.draftPr ?? false,
@@ -641,13 +673,31 @@ async function runCodeHandlerWithinDeadline(
     branch,
   });
 
+  // GitHub cannot lock the base branch across the API call. Preserve the real
+  // delivery first, then reject unknown/drifted response evidence as unverified.
+  const remoteBase = typeof pr.baseRef === "string" && typeof pr.baseSha === "string"
+    ? { branch: pr.baseRef, commit: pr.baseSha } : null;
+  if (codeBase && (remoteBase?.branch !== codeBase.branch || remoteBase.commit !== codeBase.commit
+      || pr.headSha !== checkedArtifact?.headSha || pr.isDraft !== (args.draftPr ?? false))) {
+    const summary = `PR created at ${pr.url}, but GitHub did not confirm the checked base, head and draft state. Publication is unverified; the recorded PR must be inspected before any further work.`;
+    recordEvent(deps.db, { eventType: "code_publication_unverified", ticketLinearId: args.issue.id,
+      payload: { prNumber: pr.number, prUrl: pr.url, intendedBase: codeBase, remoteBase,
+        expectedHead: checkedArtifact?.headSha ?? null, remoteHead: pr.headSha, draft: pr.isDraft } });
+    log.warn("created PR publication is unverified; preserving delivery without successful receipt", {
+      issue: args.issue.identifier, pr: pr.url,
+    });
+    return { status: "blocked", branch, prUrl: pr.url, prNumber: pr.number, summary };
+  }
+
   if (deps.onPublicationReceipt && requiredCheck) {
     try {
       await deps.onPublicationReceipt(Object.freeze({ issueId: args.issue.id, repo: args.repo, branch,
         prNumber: pr.number, prUrl: pr.url, draft: pr.isDraft, admittedRuntime: !!deps.runAdmittedAgentLoop,
         requiredCheck, review: { fingerprint: reviewFingerprint, verdict: "approve" as const, afterApproval },
-        publication: { beforePush, afterPush, remoteHeadSha: /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(pr.headSha) ? pr.headSha : null },
-        postRebaseCheck, ...(strictArtifact && checkedArtifact ? { exactArtifact: { ...checkedArtifact } } : {}) }));
+        publication: { beforePush, afterPush, remoteHeadSha: /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(pr.headSha) ? pr.headSha : null,
+          ...(codeBase ? { remoteBase } : {}) },
+        postRebaseCheck, ...(codeBase ? { publicationBase: { ...codeBase } } : {}),
+        ...(strictArtifact && checkedArtifact ? { exactArtifact: { ...checkedArtifact } } : {}) }));
     } catch {
       // A notification/persistence failure cannot erase the real PR delivery or
       // trigger another coding attempt. Missing receipt remains unready.
@@ -902,6 +952,7 @@ async function postCheckFailureEscalation(
   args: CodeHandlerArgs,
   failed: { stdout: string; stderr: string },
 ): Promise<void> {
+  throwIfExpired(deps);
   const tail = `${failed.stdout}\n${failed.stderr}`
     .trim()
     .split("\n")
@@ -930,6 +981,7 @@ async function reassignToReporter(
   deps: CodeHandlerDeps,
   args: CodeHandlerArgs,
 ): Promise<void> {
+  throwIfExpired(deps);
   if (args.issue.creatorId) {
     try {
       await deps.linear.reassign(args.issue.id, args.issue.creatorId);
@@ -957,6 +1009,7 @@ async function escalateToReporter(
   reason: string,
   detail?: string | null,
 ): Promise<void> {
+  throwIfExpired(deps);
   const messages: Record<string, string> = {
     blocked: "i'm blocked and haven't verified this work. handing it back with the evidence below.",
     review_failed:
@@ -985,6 +1038,7 @@ async function escalateToReporter(
 
 interface ReviewLoopCtx {
   executor: Executor;
+  baseRef: string;
   primaryRunLog: readonly RunLogEntry[];
   reviewerGlm: GLMClient;
   fingerprint: string;
@@ -1020,7 +1074,7 @@ async function runReviewLoop(
     ctx.budget.throwIfExpired();
     round++;
     await ctx.assertCheckedArtifact?.();
-    const diff = await getDiff(ctx.worktreePath, BASE_BRANCH, ctx.budget);
+    const diff = await getDiff(ctx.worktreePath, ctx.baseRef, ctx.budget);
     const grepFn = async (pattern: string, glob?: string) =>
       ctx.executor.grep(pattern, glob);
     const untested = await findUntestedExports({ diff, grep: grepFn });

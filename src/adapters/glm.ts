@@ -126,9 +126,17 @@ export interface CompleteArgs extends DeadlineOptions {
  */
 export class GLMClient {
   readonly chain: ProviderChain;
+  private readonly parentSignal: AbortSignal | undefined;
 
-  constructor(chain: ProviderChain) {
+  constructor(chain: ProviderChain, options: { signal?: AbortSignal } = {}) {
     this.chain = chain;
+    this.parentSignal = options.signal;
+  }
+
+  private requestBudget(options: DeadlineOptions): Deadline {
+    const signals = [this.parentSignal, options.signal].filter((signal): signal is AbortSignal => signal !== undefined);
+    return createDeadline({ ...options,
+      ...(signals.length ? { signal: signals.length === 1 ? signals[0]! : AbortSignal.any(signals) } : {}) });
   }
 
   /**
@@ -151,7 +159,7 @@ export class GLMClient {
    * deliberately different — a tool-use turn legitimately has no text.
    */
   async complete(args: CompleteArgs): Promise<string> {
-    const budget = createDeadline(args);
+    const budget = this.requestBudget(args);
     try {
       return await this.runWithFallback(async (provider) => {
         const response = await provider.client.messages.create({
@@ -161,7 +169,7 @@ export class GLMClient {
           system: args.system,
           messages: [{ role: "user", content: args.user }],
           ...(args.stopSequences ? { stop_sequences: [...args.stopSequences] } : {}),
-        }, requestOptions(budget));
+        }, requestOptions(budget, this.parentSignal !== undefined || args.signal !== undefined));
         const text = response.content
           .filter((b): b is Anthropic.TextBlock => b.type === "text")
           .map((b) => b.text)
@@ -191,13 +199,13 @@ export class GLMClient {
     options: DeadlineOptions = {},
   ): Promise<Anthropic.Message> {
     const cached = withCacheControl(args);
-    const budget = createDeadline(options);
+    const budget = this.requestBudget(options);
     try {
       return await this.runWithFallback((provider) =>
         provider.client.messages.create({
           ...cached,
           model: provider.model,
-        }, requestOptions(budget)),
+        }, requestOptions(budget, this.parentSignal !== undefined || options.signal !== undefined)),
         budget,
       );
     } finally {
@@ -271,15 +279,15 @@ export class GLMClient {
   }
 }
 
-function requestOptions(budget: Deadline) {
+function requestOptions(budget: Deadline, explicitlySignaled: boolean) {
   budget.throwIfExpired();
   return {
     signal: budget.signal,
     // SDK retry sleeps are not abortable in the installed SDK. During a
-    // budgeted run, disable hidden retries; provider fallback remains bounded
+    // budgeted or explicitly signaled run, disable hidden retries; provider fallback remains bounded
     // by this same signal/deadline. Unbudgeted callers retain SDK defaults.
+    ...(explicitlySignaled || Number.isFinite(budget.deadlineMs) ? { maxRetries: 0 } : {}),
     ...(Number.isFinite(budget.deadlineMs) ? {
-      maxRetries: 0,
       timeout: Math.max(1, Math.min(600_000, budget.remainingMs())),
     } : {}),
   };

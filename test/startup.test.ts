@@ -65,6 +65,7 @@ test('actual main selects the real Hermes factory and an injected failure never 
       polls++;expect([...args.allowedIssueIds!]).toEqual([issueId]);expect([...args.allowedActionTypes!]).toEqual(['classify','start_coding']);
       expect(typeof args.onCodePublication).toBe('function');expect(typeof args.createCodeVerification).toBe('function');expect(args.agentLoopTimeoutMs).toBe(9_000_000);
       expect(args.codingExecutorProfile).toBe(HERMES_CODING_RUNTIME_POLICY.executor);
+      expect(args.codingBase).toEqual({branch:'main',commit:f.activation.policy.baseCommit});
       expect(args.review).toEqual({providerOrder:['deepseek'],maxRounds:1,iterationCap:6,timeoutMs:180_000});
       expect(f.config.review.iterationCap).toBe(5); // Legacy config cannot widen or shrink the fixed trial review contract.
       args.spend!.createCampaign('fixture',10);args.spend!.enrollTicket('fixture',issueId,10,{draftPr:true});
@@ -90,7 +91,7 @@ test('actual main selects the real Hermes factory and an injected failure never 
 test('actual legacy main preserves the existing DeepSeek-only campaign and omits all canary hooks',async()=>{
   const f=fixture(); let polls=0;
   f.config.providers=[...f.config.providers,{name:'z.ai',apiKey:'fake-zai',baseUrl:'https://api.z.ai/api/anthropic',model:'glm-5.3',defaultBackoffMs:1000}];
-  await main({...f.deps,env:{},runLoop:async args=>{polls++;expect(args.createAdmittedCodeLoop).toBeUndefined();expect(args.allowedIssueIds).toBeUndefined();expect(args.codingTrial).toBeUndefined();expect(args.codingExecutorProfile).toBeUndefined();
+  await main({...f.deps,env:{},runLoop:async args=>{polls++;expect(args.createAdmittedCodeLoop).toBeUndefined();expect(args.allowedIssueIds).toBeUndefined();expect(args.codingTrial).toBeUndefined();expect(args.codingExecutorProfile).toBeUndefined();expect(args.codingBase).toBeUndefined();
     expect(args.glm.chain.providers.map(p=>p.name)).toEqual(['deepseek']);expect(args.review).toEqual(f.config.review);}});
   expect(polls).toBe(1);expect(f.networkCalls()).toBe(0);
 });
@@ -181,4 +182,17 @@ test('coding journal reconciliation completes before adapters or admissions; fai
   if(rejected)await expect(run).rejects.toThrow('unreconciled');else await run;
   expect(events).toEqual(rejected?['create','reconcile','close']:['create','reconcile','linear','loop','close']);expect(f.networkCalls()).toBe(0);
  }
+});
+
+
+test('actual main carries the protected stacked branch and commit to the dispatcher without I/O', async () => {
+  const f = fixture(); f.activation.policy.baseBranch = 'codex/baseline-test-repairs-20261008';
+  writeFileSync(f.activationPath, JSON.stringify(f.activation), { mode: 0o600 });
+  let polls = 0;
+  await main({ ...f.deps, runLoop: async args => {
+    polls++;
+    expect(args.codingBase).toEqual({ branch: f.activation.policy.baseBranch!, commit: f.activation.policy.baseCommit });
+    expect(Object.isFrozen(args.codingBase)).toBe(true);
+  } });
+  expect(polls).toBe(1); expect(f.networkCalls()).toBe(0);
 });

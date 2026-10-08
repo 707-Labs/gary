@@ -9,6 +9,9 @@ export interface PullRequestRef {
   number: number;
   url: string;
   headSha: string;
+  /** Observed GitHub response values; absent evidence must remain unknown. */
+  baseRef?: string;
+  baseSha?: string;
   state: "open" | "closed";
   merged: boolean;
   isDraft: boolean;
@@ -511,6 +514,7 @@ interface PrPayload {
   draft?: boolean | undefined;
   merged?: boolean;
   head: { sha: string };
+  base?: { ref: string; sha: string };
   created_at: string;
 }
 
@@ -525,6 +529,8 @@ function prRefFromOctokit(
     number: pr.number,
     url: pr.html_url,
     headSha: pr.head.sha,
+    ...(typeof pr.base?.ref === "string" ? { baseRef: pr.base.ref } : {}),
+    ...(typeof pr.base?.sha === "string" ? { baseSha: pr.base.sha } : {}),
     state: pr.state === "closed" ? "closed" : "open",
     merged: Boolean(pr.merged),
     isDraft: Boolean(pr.draft),

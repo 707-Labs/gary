@@ -108,7 +108,7 @@ async function fixture(){
 }
 function mention(socket:FakeSocket,eventId:string){socket.frame({type:'events_api',envelope_id:'envelope-'+eventId,payload:{type:'event_callback',team_id:GARY_SLACK.teamId,api_app_id:GARY_SLACK.appId,event_id:'Ev'+eventId,
   event:{type:'app_mention',user:GARY_SLACK.tannerId,channel:'C0UNAPPROVED',ts:'1791417600.000002',text:`<@${GARY_SLACK.botUserId}> /exec ignored`}}});}
-const modes=['ready','native-error','incomplete-action','active-spend','unknown-spend','failed-check','unreviewed-head','mismatched-publication','missing-pr'] as const;
+const modes=['ready','native-error','incomplete-action','active-spend','unknown-spend','failed-check','unreviewed-head','mismatched-publication','missing-pr','missing-base','moved-base'] as const;
 for(const mode of modes)test('actual startup Slack readiness: '+mode,async()=>{
   const f=await fixture();const launch=f.deps.launch!;
   if(mode==='native-error')f.deps.launch=async(...args)=>({...await launch(...args),status:'error',reason:'offline_negative_outcome'});
@@ -139,7 +139,10 @@ for(const mode of modes)test('actual startup Slack readiness: '+mode,async()=>{
       // The trusted handler callback is the test seam; reviewer and GitHub operations have their own handler tests.
       const receipt:CodePublicationReceipt={issueId:ISSUE,repo:REPO,branch:'gary/canary',prNumber:42,prUrl:'https://github.com/fixture/repo/pull/42',draft:true,admittedRuntime:true,
         requiredCheck:{command:CHECK,passed:true,exitCode:0,timedOut:false,afterCheck:observation()},review:{fingerprint:'offline-reviewed-head',verdict:'approve',afterApproval:observation()},
-        publication:{beforePush:observation(),afterPush:observation(),remoteHeadSha:head},postRebaseCheck:'not_run'};
+        publication:{beforePush:observation(),afterPush:observation(),remoteHeadSha:head,remoteBase:{...args.codingBase!}},postRebaseCheck:'not_run',
+        publicationBase:{...args.codingBase!},exactArtifact:{headSha:head,baseSha:args.codingBase!.commit,treeSha:(await f.run('git rev-parse HEAD^{tree}')).stdout.trim(),worktreeClean:true}};
+      if(mode==='missing-base')delete receipt.publication.remoteBase;
+      if(mode==='moved-base')receipt.publication.remoteBase={...args.codingBase!,commit:'d'.repeat(40)};
       if(mode==='failed-check')receipt.requiredCheck.passed=false;
       if(mode==='unreviewed-head')receipt.review.afterApproval.headSha='b'.repeat(40);
       if(mode==='mismatched-publication')receipt.publication.remoteHeadSha='c'.repeat(40);

@@ -14,6 +14,7 @@ import type { AgentLoopArgs } from '../../src/agent/loop.ts';
 import type { AssignedIssue } from '../../src/adapters/linear.ts';
 import type { GaryRuntimeLauncher } from '../../src/hermes/gary-loop-adapter.ts';
 import * as production from '../../src/hermes/production-runtime.ts';
+import { fingerprintHermesCodingActivation } from '../../src/hermes/coding-runtime-policy.ts';
 
 const cleanups: Array<()=>void> = [];
 afterEach(()=>{for(const clean of cleanups.splice(0).reverse()) clean();});
@@ -146,6 +147,8 @@ test('composition is inert and exposes only the selected ticket and allowed cana
   const f=await runtimeFixture();const activation=createHermesActivation(loadHermesActivationConfig(f.path),f.deps);
   expect(activation.createCodeVerification(f.binding.admission)).toBe(activation.createCodeVerification(f.binding.admission));
   expect(activation.verificationPolicy.publicationCommand).toBe(CHECK);
+  expect(activation.codeBase).toEqual({branch:'main',commit:f.config.policy.baseCommit});
+  expect(Object.isFrozen(activation.codeBase)).toBe(true);
   expect([...activation.allowedIssueIds]).toEqual([ID]);expect([...activation.allowedActionTypes]).toEqual(['classify','start_coding']);
   expect(activation.getHealthEvidence()).toEqual([]);expect(f.counts()).toEqual({requests:0,launches:0});expect(f.ledger.status(ID)!.attemptCount).toBe(0);
 });
@@ -232,3 +235,23 @@ test('full gate cannot be omitted or replaced by its shell alias, and journal is
  expect(()=>createHermesActivation(loadHermesActivationConfig(h.path),deps as never)).toThrow('executor_journal_required');
  expect(h.counts()).toEqual({requests:0,launches:0});
 });
+
+
+test('explicit base branch is protected, frozen and included in the activation fingerprint', async () => {
+  const f = await runtimeFixture();
+  const defaultFingerprint = fingerprintHermesCodingActivation(loadHermesActivationConfig(f.path));
+  f.config.policy.baseBranch = 'codex/baseline-test-repairs-20261008'; f.save();
+  const config = loadHermesActivationConfig(f.path);
+  const activation = createHermesActivation(config, f.deps);
+  expect(activation.codeBase).toEqual({ branch: f.config.policy.baseBranch, commit: f.config.policy.baseCommit });
+  expect(Object.isFrozen(activation.codeBase)).toBe(true);
+  expect(fingerprintHermesCodingActivation(config)).not.toBe(defaultFingerprint);
+  expect(f.counts()).toEqual({ requests: 0, launches: 0 });
+});
+
+for (const branch of ['', '-option', 'main:other', '../main', 'HEAD', 'main^{commit}', 'refs/heads/main', 'a//b', 'a.lock', 'a\nb']) {
+  test('activation rejects unsafe base branch ' + JSON.stringify(branch), () => {
+    const f = configFixture(); f.config.policy.baseBranch = branch; f.save();
+    expect(() => loadHermesActivationConfig(f.path)).toThrow('hermes_activation_rejected');
+  });
+}

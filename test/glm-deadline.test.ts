@@ -150,3 +150,51 @@ describe("GLMClient shared deadlines", () => {
     expect(attempts).toBe(0);
   });
 });
+
+
+describe('GLM trusted host cancellation', () => {
+  for (const method of ['complete', 'createMessage'] as const) it(method + ' composes inherited and explicit signals and awaits transport cleanup', async () => {
+    const host = new AbortController(), local = new AbortController(), reason = new Error('host stopped');
+    let entered!: () => void, released!: () => void, sawAbort!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const drain = new Promise<void>(resolve => { released = resolve; });
+    const aborted = new Promise<void>(resolve => { sawAbort = resolve; });
+    let cleaned = false, settled = false, attempts = 0, fallbacks = 0;
+    let captured: RequestOptions | undefined;
+    const primary = provider('deepseek', async (_body, options) => {
+      attempts++; captured = options; entered();
+      await new Promise<void>(resolve => options!.signal!.addEventListener('abort', () => { sawAbort(); resolve(); }, { once: true }));
+      await drain; cleaned = true;
+      throw Object.assign(new Error('retryable transport failure during shutdown'), { status: 429 });
+    });
+    const glm = new GLMClient(createProviderChain([primary, provider('kimi', async () => { fallbacks++; return message(); })]), { signal: host.signal });
+    const pending = method === 'complete' ? glm.complete({ system: '', user: 'offline', signal: local.signal })
+      : glm.createMessage({ max_tokens: 8, messages: [{ role: 'user', content: 'offline' }] }, { signal: local.signal });
+    const result = pending.then(() => { settled = true; throw new Error('unexpected success'); }, error => { settled = true; return error; });
+    await started; host.abort(reason); await aborted; await Bun.sleep(5);
+    expect(settled).toBe(false); expect(cleaned).toBe(false); expect(local.signal.aborted).toBe(false);
+    expect(captured?.signal?.aborted).toBe(true); expect(captured?.maxRetries).toBe(0);
+    released(); expect(await result).toBe(reason); expect(cleaned).toBe(true);
+    expect(attempts).toBe(1); expect(fallbacks).toBe(0); expect(primary.gate.isArmed()).toBe(false);
+  });
+
+  it('disables real SDK retry sleeps for signal-only calls with a completely fake transport', async () => {
+    const controller = new AbortController(); let physicalRequests = 0;
+    const primary = createProvider({ name: 'deepseek', model: 'deepseek-v4-pro', apiKey: 'fake-only',
+      baseUrl: 'https://offline.invalid', defaultBackoffMs: 1000 }, { fetch: (async () => {
+        physicalRequests++; return Response.json({ type: 'error', error: { type: 'api_error', message: 'offline failure' } }, { status: 500 });
+      }) as unknown as typeof fetch });
+    await expect(new GLMClient(createProviderChain([primary]), { signal: controller.signal }).complete({ system: '', user: 'offline' })).rejects.toThrow('offline failure');
+    expect(physicalRequests).toBe(1);
+  });
+
+  it('an already-aborted host starts no request and omitted signal keeps legacy SDK defaults', async () => {
+    const host = new AbortController(); host.abort(new Error('already stopped'));
+    let requests = 0, options: RequestOptions | undefined;
+    const chain = createProviderChain([provider('deepseek', async (_body, opts) => { requests++; options = opts; return message(); })]);
+    await expect(new GLMClient(chain, { signal: host.signal }).complete({ system: '', user: 'offline' })).rejects.toThrow('already stopped');
+    expect(requests).toBe(0);
+    await new GLMClient(chain).complete({ system: '', user: 'offline' });
+    expect(requests).toBe(1); expect(options?.maxRetries).toBeUndefined(); expect(options?.timeout).toBeUndefined();
+  });
+});

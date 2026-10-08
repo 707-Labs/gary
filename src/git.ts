@@ -155,10 +155,51 @@ export async function gitMust(
   return r;
 }
 
+/** Host-owned branch and immutable commit for an explicitly selected coding base. */
+export interface PinnedGitBase {
+  readonly branch: string;
+  readonly commit: string;
+}
+
+/** Conservative literal branch names only: no revision syntax, refspecs or options. */
+export function isSafeGitBranch(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 200
+    && value !== "HEAD" && !value.startsWith("refs/") && !value.includes("..")
+    && value.split("/").every(part => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(part)
+      && !part.endsWith(".") && !part.endsWith(".lock"));
+}
+
+export function validatePinnedGitBase(base: PinnedGitBase): void {
+  if (!base || !isSafeGitBranch(base.branch) || typeof base.commit !== "string" || !/^[a-f0-9]{40}$/.test(base.commit)) {
+    throw new Error("invalid_pinned_git_base");
+  }
+}
+
+async function verifyLocalBase(base: PinnedGitBase, cwd: string, opts: DeadlineOptions): Promise<void> {
+  const result = await gitMust(["rev-parse", "--verify", `refs/heads/${base.branch}^{commit}`], { ...opts, cwd });
+  if (result.stdout.trim() !== base.commit) throw new Error("pinned_git_base_changed");
+}
+
+/** Point-in-time remote check before each publication boundary. Never follows a moved base. */
+export async function assertRemoteBase(args: {
+  base: PinnedGitBase;
+  freshTokenUrl: string;
+  worktreePath: string;
+} & DeadlineOptions): Promise<void> {
+  validatePinnedGitBase(args.base);
+  const ref = `refs/heads/${args.base.branch}`;
+  const result = await gitMust(["ls-remote", "--exit-code", "--heads", args.freshTokenUrl, ref], {
+    ...args, cwd: args.worktreePath,
+  });
+  if (result.stdout.trim() !== `${args.base.commit}\t${ref}`) throw new Error("pinned_remote_base_changed");
+}
+
 export interface EnsureBareCloneArgs extends DeadlineOptions {
   owner: string;
   repo: string;
   reposDir: string;
+  /** Explicit trial base; omitted preserves the legacy main refresh. */
+  base?: PinnedGitBase;
   /**
    * Clone URL with a fresh installation token embedded. Used for the initial
    * clone and for subsequent fetches; we don't persist it in the bare repo's
@@ -173,6 +214,7 @@ export interface EnsureBareCloneArgs extends DeadlineOptions {
  */
 export async function ensureBareClone(args: EnsureBareCloneArgs): Promise<string> {
   throwIfExpired(args);
+  if (args.base) validatePinnedGitBase(args.base);
   await mkdir(args.reposDir, { recursive: true });
   const bareDir = `${args.reposDir}/${args.repo}.git`;
   const cleanUrl = `https://github.com/${args.owner}/${args.repo}.git`;
@@ -181,19 +223,15 @@ export async function ensureBareClone(args: EnsureBareCloneArgs): Promise<string
     if (!existsSync(bareDir)) {
       await gitMust(["clone", "--bare", args.freshTokenUrl, bareDir], args);
       await gitMust(["remote", "set-url", "origin", cleanUrl], { ...args, cwd: bareDir });
-    } else {
-      // Fetch latest from origin. We only refresh `main` because Gary's
-      // active worktree branches live in `refs/heads/*` of this same bare
-      // clone — fetching `+refs/heads/*:refs/heads/*` would refuse to update
-      // any branch that's currently checked out in a worktree.
-      await gitMust(
-        [
-          "fetch",
-          args.freshTokenUrl,
-          "+refs/heads/main:refs/heads/main",
-        ],
-        { ...args, cwd: bareDir },
-      );
+    } else if (!args.base) {
+      // Refresh only main: wildcard fetches collide with active worktree branches.
+      await gitMust(["fetch", args.freshTokenUrl, "+refs/heads/main:refs/heads/main"], { ...args, cwd: bareDir });
+    }
+    if (args.base) {
+      // Fetch even after a new clone. Missing/deleted selected refs must not use a stale local copy.
+      const ref = `refs/heads/${args.base.branch}`;
+      await gitMust(["fetch", args.freshTokenUrl, `+${ref}:${ref}`], { ...args, cwd: bareDir });
+      await verifyLocalBase(args.base, bareDir, args);
     }
     return bareDir;
   }, args);
@@ -204,6 +242,7 @@ export interface CreateWorktreeArgs extends DeadlineOptions {
   worktreePath: string;
   branch: string;
   baseBranch: string;
+  expectedBaseCommit?: string;
   authorName: string;
   authorEmail: string;
 }
@@ -214,11 +253,17 @@ export interface CreateWorktreeArgs extends DeadlineOptions {
  * worktree so commits are attributed to Gary.
  */
 export async function createWorktree(args: CreateWorktreeArgs): Promise<void> {
+  const base = args.expectedBaseCommit === undefined ? undefined : { branch: args.baseBranch, commit: args.expectedBaseCommit };
+  if (base) {
+    validatePinnedGitBase(base);
+    if (base.branch === args.branch) throw new Error("pinned_git_base_is_work_branch");
+  }
   // Lock the bare repo for the duration: `worktree add` mutates the bare
   // repo's worktree metadata and refs. `worktree remove` does the same.
   // Per-worktree config (user.name/user.email) is local to the worktree
   // path so we leave it outside the lock.
   await withBareLock(args.bareDir, async () => {
+    if (base) await verifyLocalBase(base, args.bareDir, args);
     if (existsSync(args.worktreePath)) {
       // Best-effort cleanup of any prior worktree state.
       await gitRun(["worktree", "remove", "--force", args.worktreePath], {
@@ -237,7 +282,7 @@ export async function createWorktree(args: CreateWorktreeArgs): Promise<void> {
         "-B",
         args.branch,
         args.worktreePath,
-        args.baseBranch,
+        base?.commit ?? args.baseBranch,
       ],
       { ...args, cwd: args.bareDir },
     );
@@ -261,6 +306,7 @@ export interface RebaseOntoBaseArgs extends DeadlineOptions {
   worktreePath: string;
   freshTokenUrl: string;
   baseBranch: string;
+  expectedBaseCommit?: string;
 }
 
 export type RebaseOutcome =
@@ -278,6 +324,8 @@ export type RebaseOutcome =
 export async function rebaseOntoFreshBase(
   args: RebaseOntoBaseArgs,
 ): Promise<RebaseOutcome> {
+  const base = args.expectedBaseCommit === undefined ? undefined : { branch: args.baseBranch, commit: args.expectedBaseCommit };
+  if (base) validatePinnedGitBase(base);
   await withBareLock(args.bareDir, async () => {
     await gitMust(
       [
@@ -287,11 +335,13 @@ export async function rebaseOntoFreshBase(
       ],
       { ...args, cwd: args.bareDir },
     );
+    // Fail before rebase can mutate the reviewed artifact if the selected branch moved.
+    if (base) await verifyLocalBase(base, args.bareDir, args);
   }, args);
   const pre = (
     await gitMust(["rev-parse", "HEAD"], { ...args, cwd: args.worktreePath })
   ).stdout.trim();
-  const r = await gitRun(["rebase", args.baseBranch], {
+  const r = await gitRun(["rebase", base?.commit ?? args.baseBranch], {
     ...args,
     cwd: args.worktreePath,
   });

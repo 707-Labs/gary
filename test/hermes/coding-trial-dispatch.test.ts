@@ -11,11 +11,11 @@ import * as codeHandler from '../../src/handlers/code.ts';
 import { createCodingTrial, type CodingTrial } from '../../src/hermes/coding-trial.ts';
 import { HERMES_CODING_RUNTIME_POLICY } from '../../src/hermes/coding-runtime-policy.ts';
 import type { CodeActionAdmission } from '../../src/hermes/canonical-admission.ts';
-import { tick, type LoopDeps } from '../../src/loop.ts';
+import { runLoop, tick, type LoopDeps } from '../../src/loop.ts';
 import { AllProvidersExhaustedError, createProvider, createProviderChain } from '../../src/providers.ts';
 import { SpendLedger } from '../../src/spend.ts';
 import { openDb } from '../../src/state/db.ts';
-import { recordActionStart, upsertTicket } from '../../src/state/queries.ts';
+import { recordActionStart, recordPr, upsertTicket } from '../../src/state/queries.ts';
 
 const repo='fixture/repo',policyFingerprint='sha256:'+'a'.repeat(64);
 const result={status:'finished' as const,summary:'offline',iterations:0,inputTokens:0,outputTokens:0,
@@ -48,6 +48,7 @@ function makeFixture(){
       deps.codingTrial!.assertCodingAction(action);return result;
     };},
   };
+  const realClassify=classifier.classifyTicket,realComment=classifier.generateClassificationComment;
   const classify=spyOn(classifier,'classifyTicket').mockResolvedValue({...classification});
   const comment=spyOn(classifier,'generateClassificationComment').mockResolvedValue('offline classification');
   const coding=spyOn(codeHandler,'runCodeHandler').mockImplementation(async(handler,args)=>{
@@ -57,7 +58,7 @@ function makeFixture(){
     handler.assertCanPublish!();publications++;
     return {status:'pr_opened',branch:'offline-trial',summary:'offline only'};
   });
-  return {deps,issue,classify,comment,coding,
+  return {deps,issue,classify,comment,coding,realClassify,realComment,
     db:()=>db,ledger:()=>ledger,admission:()=>admission,publications:()=>publications,fakeRequests:()=>fakeRequests,
     actions:()=>db.query<ActionRow,[]>('SELECT id,action_type,completed_at,success,outcome,state_fingerprint FROM actions ORDER BY id').all(),
     claim:()=>db.query<ClaimRow,[]>('SELECT phase,classify_action,code_action,policy_fingerprint,epoch FROM hermes_coding_trials').get(),
@@ -160,4 +161,114 @@ for(const kind of ['missing','foreign','without-trial'] as const)test('executor 
     await expect(tick(f.deps)).rejects.toThrow('invalid_coding_executor_profile');
     expect(poll).not.toHaveBeenCalled();expect(f.actions()).toEqual([]);expect(f.classify).not.toHaveBeenCalled();expect(f.coding).not.toHaveBeenCalled();
   }finally{poll.mockRestore();}
+});
+
+
+test('actual dispatcher preserves the protected stacked base for the sole admitted code handler', async () => {
+  f.deps.codingBase = Object.freeze({ branch: 'codex/baseline-test-repairs', commit: 'b'.repeat(40) });
+  expect((await tick(f.deps)).actionsTaken).toEqual(['classify']);
+  expect((await tick(f.deps)).actionsTaken).toEqual(['start_coding']);
+  expect(f.coding).toHaveBeenCalledTimes(1);
+  expect(f.coding.mock.calls[0]?.[0].codeBase).toBe(f.deps.codingBase);
+  expect(f.fakeRequests()).toBe(0);
+});
+
+
+test('an unverified created draft closes the sole trial and retains its identity without retry', async () => {
+  expect((await tick(f.deps)).actionsTaken).toEqual(['classify']);
+  f.coding.mockImplementation(async (_deps, args) => {
+    recordPr(f.db(), { githubId: 42, ticketLinearId: f.issue.id, repo, prNumber: 42, branch: 'preserved-draft' });
+    return { status: 'blocked', branch: 'preserved-draft', prNumber: 42,
+      prUrl: 'https://github.invalid/fixture/repo/pull/42', summary: 'Actual returned base is unverified.' };
+  });
+  expect((await tick(f.deps)).actionsTaken).toEqual(['start_coding']);
+  expect(f.actions()[1]).toMatchObject({ action_type: 'start_coding', outcome: 'blocked' });
+  expect(f.claim()?.phase).toBe('closed'); expect(f.ledger().status(f.issue.id)?.state).toBe('closed');
+  expect(f.db().query('SELECT pr_number,branch FROM prs').get()).toEqual({ pr_number: 42, branch: 'preserved-draft' });
+  const before = f.actions(); f.restart();
+  expect((await tick(f.deps)).actionsTaken).toEqual([]); expect(f.actions()).toEqual(before);
+  expect(f.coding).toHaveBeenCalledTimes(1); expect(f.fakeRequests()).toBe(0);
+});
+
+
+test('host cancellation before polling or between intake reads starts no canonical attempt', async () => {
+  const host = new AbortController(); f.deps.signal = host.signal;
+  const poll = spyOn(f.deps.linear, 'fetchAssignedIssues');
+  try {
+    host.abort(new Error('host stopped'));
+    await expect(tick(f.deps)).rejects.toThrow('host stopped'); expect(poll).not.toHaveBeenCalled(); expect(f.actions()).toEqual([]);
+    const second = new AbortController(); f.deps.signal = second.signal;
+    poll.mockImplementation(async () => { second.abort(new Error('stopped during intake')); return [f.issue]; });
+    await expect(tick(f.deps)).rejects.toThrow('stopped during intake'); expect(f.actions()).toEqual([]);
+    expect(f.classify).not.toHaveBeenCalled(); expect(f.fakeRequests()).toBe(0);
+  } finally { poll.mockRestore(); }
+});
+
+for (const stage of ['classifier', 'classification-comment'] as const) test('host stop cancels physical ' + stage + ' request, drains it, and retains unknown liability', async () => {
+  const host = new AbortController(); f.deps.signal = host.signal;
+  f.classify.mockImplementation(f.realClassify); f.comment.mockImplementation(f.realComment);
+  const post = spyOn(f.deps.linear, 'postComment');
+  let entered!: () => void, sawAbort!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const aborted = new Promise<void>(resolve => { sawAbort = resolve; });
+  const drain = new Promise<void>(resolve => { release = resolve; });
+  let physicalRequests = 0, cleaned = false, settled = false;
+  const transport = f.ledger().guardedFetch('deepseek', (async (input: RequestInfo | URL) => {
+    const request = input as Request; physicalRequests++;
+    if (stage === 'classification-comment' && physicalRequests === 1) return Response.json({
+      id: 'offline-classification', type: 'message', role: 'assistant', model: 'deepseek-v4-pro',
+      content: [{ type: 'text', text: JSON.stringify(classification) }], stop_reason: 'end_turn',
+      usage: { input_tokens: 10, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+    });
+    entered();
+    await new Promise<void>(resolve => request.signal.addEventListener('abort', () => { sawAbort(); resolve(); }, { once: true }));
+    await drain; cleaned = true; throw new Error('offline transport aborted after cleanup');
+  }) as typeof fetch);
+  const provider = createProvider({ name: 'deepseek', model: 'deepseek-v4-pro', apiKey: 'offline-only',
+    baseUrl: 'https://api.deepseek.com/anthropic', defaultBackoffMs: 1000 }, { fetch: transport });
+  f.deps.glm = new GLMClient(createProviderChain([provider]));
+  const running = tick(f.deps).then(result => { settled = true; return result; });
+  try {
+    await started; const chargedBefore = f.ledger().status(f.issue.id)!.chargedMicros;
+    host.abort(new Error('host stopped')); await aborted; await Bun.sleep(5);
+    expect(settled).toBe(false); expect(cleaned).toBe(false); expect(f.ledger().status(f.issue.id)?.state).toBe('active');
+    release(); expect((await running).actionsTaken).toEqual(['classify']); expect(cleaned).toBe(true);
+    expect(f.ledger().status(f.issue.id)).toMatchObject({ state: 'closed', unknownAttempts: 1,
+      chargedMicros: chargedBefore, attemptCount: stage === 'classifier' ? 1 : 2 });
+    expect(f.claim()?.phase).toBe('closed'); expect(f.actions()[0]).toMatchObject({ success: 0, outcome: 'error' });
+    expect(f.coding).not.toHaveBeenCalled(); expect(post).not.toHaveBeenCalled();
+    expect(physicalRequests).toBe(stage === 'classifier' ? 1 : 2);
+  } finally { host.abort(); release(); await running; post.mockRestore(); }
+});
+
+test('host stop fences a caught late result, new paid reservation, and publication', async () => {
+  expect((await tick(f.deps)).actionsTaken).toEqual(['classify']);
+  const host = new AbortController(); f.deps.signal = host.signal;
+  f.coding.mockImplementation(async deps => {
+    expect(deps.signal).toBe(host.signal); host.abort(new Error('host stopped'));
+    await expect(f.fakeModel()).rejects.toThrow('host stopped');
+    expect(() => deps.assertCanPublish!()).toThrow('host stopped');
+    return { status: 'blocked', branch: 'offline', summary: 'caught cancellation' };
+  });
+  expect((await tick(f.deps)).actionsTaken).toEqual(['start_coding']);
+  expect(f.fakeRequests()).toBe(0); expect(f.ledger().status(f.issue.id)).toMatchObject({ state: 'closed', attemptCount: 0 });
+  expect(f.actions()[1]).toMatchObject({ success: 0, outcome: 'error' }); expect(f.claim()?.phase).toBe('closed');
+});
+
+test('runLoop awaits the current admitted cleanup and skips completed-tick callbacks after host abort', async () => {
+  expect((await tick(f.deps)).actionsTaken).toEqual(['classify']);
+  const host = new AbortController(); let entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const drain = new Promise<void>(resolve => { release = resolve; });
+  let finished = false, callbacks = 0, cleaned = false;
+  f.coding.mockImplementation(async deps => {
+    expect(deps.signal).toBe(host.signal); entered();
+    await new Promise<void>(resolve => deps.signal!.addEventListener('abort', () => resolve(), { once: true }));
+    await drain; cleaned = true; throw new Error('host stopped');
+  });
+  const running = runLoop({ ...f.deps, signal: host.signal, intervalMs: 60_000, onTickComplete: () => { callbacks++; } }).then(() => { finished = true; });
+  await started; host.abort(); await Bun.sleep(5); expect(finished).toBe(false);
+  release(); await running;
+  expect(cleaned).toBe(true); expect(callbacks).toBe(0); expect(f.coding).toHaveBeenCalledTimes(1);
+  expect(f.claim()?.phase).toBe('closed'); expect(f.ledger().status(f.issue.id)?.state).toBe('closed');
 });

@@ -207,3 +207,27 @@ test('opt-in readiness requires the exact full gate while legacy omission keeps 
   f.receipt.requiredCheck.command='bun run ci:full';f.monitor.recordPublication(f.admission,f.receipt);expect(f.monitor.check().ready).toBe(true);
  } finally {f.db.close();}
 });
+
+
+test('selected base readiness requires actual remote base and exact artifact evidence', () => {
+  const cases = ['valid', 'missing-intended', 'wrong-intended', 'missing-remote', 'moved-remote', 'wrong-remote-branch', 'missing-artifact', 'wrong-artifact-base', 'wrong-artifact-head'] as const;
+  for (const kind of cases) {
+    const f = fixture();
+    try {
+      const base = { branch: 'codex/baseline-test-repairs', commit: 'b'.repeat(40) };
+      (f.activation as { codeBase: typeof base }).codeBase = base;
+      f.receipt.publicationBase = { ...base }; f.receipt.publication.remoteBase = { ...base };
+      f.receipt.exactArtifact = { headSha: f.receipt.publication.remoteHeadSha!, baseSha: base.commit, treeSha: 'c'.repeat(40), worktreeClean: true };
+      if (kind === 'missing-intended') delete f.receipt.publicationBase;
+      if (kind === 'wrong-intended') f.receipt.publicationBase = { ...base, branch: 'main' };
+      if (kind === 'missing-remote') delete f.receipt.publication.remoteBase;
+      if (kind === 'moved-remote') f.receipt.publication.remoteBase = { ...base, commit: 'd'.repeat(40) };
+      if (kind === 'wrong-remote-branch') f.receipt.publication.remoteBase = { ...base, branch: 'main' };
+      if (kind === 'missing-artifact') delete f.receipt.exactArtifact;
+      if (kind === 'wrong-artifact-base') f.receipt.exactArtifact!.baseSha = 'd'.repeat(40);
+      if (kind === 'wrong-artifact-head') f.receipt.exactArtifact!.headSha = 'd'.repeat(40);
+      f.complete(); f.monitor.recordPublication(f.admission, f.receipt);
+      expect(f.monitor.check().ready).toBe(kind === 'valid');
+    } finally { f.db.close(); }
+  }
+});

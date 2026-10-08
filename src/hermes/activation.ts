@@ -2,6 +2,7 @@
 import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve, relative } from 'node:path';
 import { z } from 'zod';
+import { isSafeGitBranch, type PinnedGitBase } from '../git.ts';
 import { createActionVerification, type ActionVerification } from '../verification-policy.ts';
 import type { CodeActionAdmission } from './canonical-admission.ts';
 import type { ExecutorJobJournal } from '../executors/index.ts';
@@ -39,7 +40,7 @@ const progressSchema = z.object({
 const criterion = z.object({ id: name, description: text(2048), requiredCommands: unique(checkCommand, 8, 1) }).strict();
 const policySchema = z.object({
   task: z.object({ allowedFiles: unique(filePath, 128, 1), criteria: z.array(criterion).min(1).max(16).refine(a => new Set(a.map(c => c.id)).size === a.length) }).strict(),
-  baseCommit: z.string().regex(/^[a-f0-9]{40}$/), progress: progressSchema,
+  baseCommit: z.string().regex(/^[a-f0-9]{40}$/), baseBranch: z.string().refine(isSafeGitBranch).optional(), progress: progressSchema,
   instructions: z.array(z.object({ source: text(512), text: z.string().max(98_304).refine(s => !s.includes('\0')) }).strict()).max(64),
   voicePrinciples: text(65_536), readTicketIdentifiers: unique(z.string().regex(/^[A-Z]+-\d+$/), 256, 1),
   publicFetch: z.object({ policy: fetchPolicy }).strict(),
@@ -147,6 +148,7 @@ export interface HermesActivationDependencies {
   executorJobJournal: ExecutorJobJournal;
 }
 export interface HermesActivationBinding {
+  readonly codeBase: Readonly<PinnedGitBase>;
   readonly allowedIssueIds: ReadonlySet<string>;
   readonly allowedActionTypes: NonNullable<LoopDeps['allowedActionTypes']>;
   readonly createAdmittedCodeLoop: NonNullable<LoopDeps['createAdmittedCodeLoop']>;
@@ -239,6 +241,7 @@ export function createHermesActivation(input: HermesActivationConfig, deps: Herm
       return result;
     };
   };
-  return Object.freeze({ allowedIssueIds: new Set([config.issueId]), allowedActionTypes: new Set(['classify','start_coding'] as const),
+  return Object.freeze({ codeBase: Object.freeze({ branch: config.policy.baseBranch ?? 'main', commit: config.policy.baseCommit }),
+    allowedIssueIds: new Set([config.issueId]), allowedActionTypes: new Set(['classify','start_coding'] as const),
     codingTrial, createAdmittedCodeLoop, createCodeVerification, verificationPolicy:HERMES_CODING_RUNTIME_POLICY.verification, getHealthEvidence: () => Object.freeze([...health]) });
 }

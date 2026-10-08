@@ -1,4 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { runProcess } from "../src/executors/process.ts";
 import type { GitHubClient, PullRequestRef } from "../src/adapters/github.ts";
 import { GLMClient } from "../src/adapters/glm.ts";
 import type { AssignedIssue, LinearAdapter } from "../src/adapters/linear.ts";
@@ -310,14 +314,15 @@ function makeFixture() {
   const factory = restoreAfter(spyOn(executorFactory, "createWorkspaceExecutor")).mockReturnValue(executor);
   restoreAfter(spyOn(skills, "loadProjectContext")).mockReturnValue({ claudeMd: null, agentsMd: null, hasBeads: false });
   restoreAfter(spyOn(skills, "loadSkillIndex")).mockReturnValue([]);
-  restoreAfter(spyOn(git, "ensureBareClone")).mockResolvedValue("/offline/repos/fixture.git");
-  restoreAfter(spyOn(git, "createWorktree")).mockResolvedValue(undefined);
+  const clone = restoreAfter(spyOn(git, "ensureBareClone")).mockResolvedValue("/offline/repos/fixture.git");
+  const worktree = restoreAfter(spyOn(git, "createWorktree")).mockResolvedValue(undefined);
   const hasCommits = restoreAfter(spyOn(git, "hasCommitsAhead")).mockResolvedValue(true);
-  restoreAfter(spyOn(git, "getDiff")).mockResolvedValue("diff --git a/README.md b/README.md\n+fixture change\n");
-  restoreAfter(spyOn(git, "getCommitLog")).mockResolvedValue("abc123 fixture change");
+  const diff = restoreAfter(spyOn(git, "getDiff")).mockResolvedValue("diff --git a/README.md b/README.md\n+fixture change\n");
+  const commitLog = restoreAfter(spyOn(git, "getCommitLog")).mockResolvedValue("abc123 fixture change");
   const gitCommand = restoreAfter(spyOn(git, "gitMust")).mockResolvedValue({ stdout: "", stderr: "", exitCode: 0 });
   const rebase = restoreAfter(spyOn(git, "rebaseOntoFreshBase")).mockResolvedValue({ kind: "no_op", sha: "abc123" });
   const push = restoreAfter(spyOn(git, "pushBranch")).mockResolvedValue(undefined);
+  const remoteBase = restoreAfter(spyOn(git, "assertRemoteBase")).mockResolvedValue(undefined);
   const primary = restoreAfter(spyOn(agent, "runAgentLoop")).mockResolvedValue(loopResult("finished"));
   const review = restoreAfter(spyOn(reviewer, "runReviewer")).mockResolvedValue(reviewResult());
   const pr: PullRequestRef = {
@@ -336,6 +341,7 @@ function makeFixture() {
   };
   return {
     db, deps, run, hasCommits, primary, review, complete, push, openPr, rebase, postComment, pr, gitCommand, factory,
+    clone, worktree, diff, commitLog, remoteBase,
     expire() { now += 1001; },
     invoke: (options: Pick<CodeHandlerArgs, "draftPr"> = {}) => runCodeHandler(deps, { issue, comments: [], repo: "fixture/repo", scope: "S", ...options }),
   };
@@ -889,5 +895,188 @@ describe("CODE shared verification policy", () => {
     expect(f.run.mock.calls[0]?.[0]).toBe("bun run check");
     expect(f.run.mock.calls[0]?.[1]?.timeoutMs).toBe(600_000);
     expect(f.review.mock.calls[0]?.[0].hostCheck).toBeUndefined();
+  });
+});
+
+
+describe('CODE host-selected stacked base', () => {
+  const base = { branch: 'codex/baseline-test-repairs', commit: 'c'.repeat(40) };
+
+  it('uses one pinned base for checkout, review, commit range, fresh-base check and draft PR', async () => {
+    const c = strictPublication();
+    f.deps.codeBase = base;
+    Object.assign(f.pr, { baseRef: base.branch, baseSha: base.commit, isDraft: true });
+    expect((await f.invoke({ draftPr: true })).status).toBe('pr_opened');
+    expect(f.clone.mock.calls[0]?.[0].base).toEqual(base);
+    expect(f.worktree.mock.calls[0]?.[0]).toMatchObject({ baseBranch: base.branch, expectedBaseCommit: base.commit });
+    expect(f.hasCommits.mock.calls[0]?.[1]).toBe(base.commit);
+    expect(f.diff.mock.calls.map(call => call[1])).toEqual([base.commit, base.commit]);
+    expect(f.commitLog.mock.calls[0]?.[1]).toBe(base.commit);
+    expect(f.rebase.mock.calls[0]?.[0]).toMatchObject({ baseBranch: base.branch, expectedBaseCommit: base.commit });
+    expect(f.remoteBase.mock.calls.map(call => call[0].base)).toEqual([base, base]);
+    expect(f.openPr.mock.calls[0]?.[0]).toMatchObject({ base: base.branch, draft: true });
+    expect(f.openPr.mock.calls[0]?.[0].body).toContain('Stacked base: `' + base.branch + '` (`' + base.commit + '`)');
+    expect(c.receipts[0]?.publicationBase).toEqual(base);
+    expect(c.receipts[0]?.publication.remoteBase).toEqual(base);
+    expect(c.receipts[0]?.exactArtifact?.baseSha).toBe(base.commit);
+    expect(f.push.mock.calls[0]?.[0].sourceCommit).toBe(RECEIPT_HEAD);
+  });
+
+  it('keeps all legacy base choices on main when the host does not select a base', async () => {
+    expect((await f.invoke()).status).toBe('pr_opened');
+    expect(f.clone.mock.calls[0]?.[0].base).toBeUndefined();
+    expect(f.worktree.mock.calls[0]?.[0].baseBranch).toBe('main');
+    expect(f.diff.mock.calls.map(call => call[1])).toEqual(['main', 'main']);
+    expect(f.rebase.mock.calls[0]?.[0].baseBranch).toBe('main');
+    expect(f.remoteBase).not.toHaveBeenCalled();
+    expect(f.openPr.mock.calls[0]?.[0].base).toBe('main');
+    expect(f.openPr.mock.calls[0]?.[0].body).toBe('Fixture PR text');
+  });
+
+  it('does not fall back to main when the selected remote ref is unavailable', async () => {
+    strictPublication(); f.deps.codeBase = base;
+    f.clone.mockRejectedValue(new Error('selected ref missing'));
+    await expect(f.invoke()).rejects.toThrow('selected ref missing');
+    expect(f.clone).toHaveBeenCalledTimes(1);
+    expect(f.worktree).not.toHaveBeenCalled(); expect(f.primary).not.toHaveBeenCalled();
+    expect(f.complete).not.toHaveBeenCalled(); expect(f.review).not.toHaveBeenCalled();
+    expect(f.push).not.toHaveBeenCalled(); expect(f.openPr).not.toHaveBeenCalled();
+  });
+
+  for (const boundary of ['push', 'pr'] as const) it('rejects remote base drift at the ' + boundary + ' boundary', async () => {
+    const c = strictPublication(); f.deps.codeBase = base;
+    if (boundary === 'pr') f.remoteBase.mockResolvedValueOnce(undefined);
+    f.remoteBase.mockRejectedValueOnce(new Error('pinned_remote_base_changed'));
+    await expect(f.invoke()).rejects.toThrow('pinned_remote_base_changed');
+    expect(f.review).toHaveBeenCalledTimes(1);
+    expect(f.push).toHaveBeenCalledTimes(boundary === 'push' ? 0 : 1);
+    expect(f.openPr).not.toHaveBeenCalled(); expect(c.receipts).toEqual([]);
+  });
+
+  it('rejects even a stable local artifact if its selected base differs from the activation pin', async () => {
+    strictPublication(); f.deps.codeBase = { ...base, commit: 'e'.repeat(40) };
+    await expect(f.invoke()).rejects.toThrow('strict_publication_artifact_unverified');
+    expect(f.run).not.toHaveBeenCalled(); expect(f.review).not.toHaveBeenCalled();
+    expect(f.push).not.toHaveBeenCalled(); expect(f.openPr).not.toHaveBeenCalled();
+  });
+
+  for (const kind of ['unsafe-ref', 'unpinned', 'without-strict', 'same-work-branch'] as const) it('rejects ' + kind + ' before any repository or model work', async () => {
+    strictPublication();
+    f.deps.codeBase = kind === 'unsafe-ref' ? { ...base, branch: 'main:other' }
+      : kind === 'unpinned' ? { ...base, commit: 'main' }
+      : kind === 'same-work-branch' ? { ...base, branch: 'FIX-1-offline-handler-fixture' } : base;
+    if (kind === 'without-strict') delete f.deps.strictPublicationArtifact;
+    await expect(f.invoke()).rejects.toThrow();
+    expect(f.clone).not.toHaveBeenCalled(); expect(f.primary).not.toHaveBeenCalled();
+    expect(f.complete).not.toHaveBeenCalled(); expect(f.push).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('CODE observes the actual created PR base', () => {
+  const base = { branch: 'codex/baseline-test-repairs', commit: 'c'.repeat(40) };
+  for (const kind of ['missing-base', 'wrong-branch', 'moved-base', 'wrong-head', 'not-draft'] as const) {
+    it('preserves real PR identity without successful publication when GitHub returns ' + kind, async () => {
+      const c = strictPublication(); f.deps.codeBase = base;
+      Object.assign(f.pr, { baseRef: base.branch, baseSha: base.commit, isDraft: true });
+      // The final remote preflight succeeds. Drift is reported only by the subsequent creation response.
+      if (kind === 'missing-base') { delete f.pr.baseRef; delete f.pr.baseSha; }
+      if (kind === 'wrong-branch') f.pr.baseRef = 'main';
+      if (kind === 'moved-base') f.pr.baseSha = 'e'.repeat(40);
+      if (kind === 'wrong-head') f.pr.headSha = 'f'.repeat(40);
+      if (kind === 'not-draft') f.pr.isDraft = false;
+      const result = await f.invoke({ draftPr: true });
+      expect(result).toMatchObject({ status: 'blocked', prUrl: f.pr.url, prNumber: f.pr.number });
+      expect(result.summary).toContain('Publication is unverified');
+      expect(f.remoteBase).toHaveBeenCalledTimes(2); expect(f.openPr).toHaveBeenCalledTimes(1);
+      expect(f.db.query('SELECT pr_number, branch FROM prs').get()).toEqual({ pr_number: f.pr.number, branch: result.branch });
+      expect(c.receipts).toEqual([]); expect(f.postComment).not.toHaveBeenCalled();
+      expect(f.db.query("SELECT count(*) AS n FROM events WHERE event_type='code_publication_unverified'").get()).toEqual({ n: 1 });
+    });
+  }
+});
+
+
+describe('CODE inherits host shutdown without abandoning cleanup', () => {
+  it('an already-aborted host starts no Git/model work and sends no timeout escalation', async () => {
+    const host = new AbortController(), reason = new Error('host stopped'); host.abort(reason); f.deps.signal = host.signal;
+    await expect(f.invoke()).rejects.toBe(reason);
+    expect(f.clone).not.toHaveBeenCalled(); expect(f.primary).not.toHaveBeenCalled();
+    expect(f.postComment).not.toHaveBeenCalled(); expect(f.push).not.toHaveBeenCalled();
+  });
+
+  for (const stage of ['primary', 'check', 'check-repair', 'review', 'review-repair', 'pr-body', 'pr-title'] as const) {
+    it('cancels ' + stage + ', awaits its cleanup, and starts no subsequent work or publication', async () => {
+      const host = new AbortController(), reason = new Error('host stopped'); f.deps.signal = host.signal;
+      f.deps.agentLoopTimeoutMs = 9_000_000;
+      f.deps.runAdmittedAgentLoop = args => f.primary(args);
+      let entered!: () => void, sawAbort!: () => void, release!: () => void;
+      const started = new Promise<void>(resolve => { entered = resolve; });
+      const aborted = new Promise<void>(resolve => { sawAbort = resolve; });
+      const cleanup = new Promise<void>(resolve => { release = resolve; });
+      let cleaned = false, settled = false;
+      const pendingStage = async (signal: AbortSignal | undefined): Promise<never> => {
+        expect(signal).toBeInstanceOf(AbortSignal); entered();
+        await new Promise<void>(resolve => signal!.addEventListener('abort', () => { sawAbort(); resolve(); }, { once: true }));
+        await cleanup; cleaned = true; throw signal!.reason;
+      };
+      if (stage === 'primary') f.primary.mockImplementation(args => pendingStage(args.signal));
+      if (stage === 'check') f.run.mockImplementation((_cmd, opts) => pendingStage(opts?.signal));
+      if (stage === 'check-repair') {
+        f.run.mockResolvedValueOnce(checkResult(1));
+        f.primary.mockResolvedValueOnce(loopResult('finished')).mockImplementationOnce(args => pendingStage(args.signal));
+      }
+      if (stage === 'review') f.review.mockImplementation(args => pendingStage(args.signal));
+      if (stage === 'review-repair') {
+        f.review.mockResolvedValueOnce(reviewResult('changes_needed'));
+        f.primary.mockResolvedValueOnce(loopResult('finished')).mockImplementationOnce(args => pendingStage(args.signal));
+      }
+      if (stage === 'pr-body') f.complete.mockImplementation(args => pendingStage(args.signal));
+      if (stage === 'pr-title') f.complete.mockResolvedValueOnce('body').mockImplementationOnce(args => pendingStage(args.signal));
+      const result = f.invoke().then(() => { settled = true; throw new Error('unexpected success'); }, error => { settled = true; return error; });
+      await started; host.abort(reason); await aborted; await Bun.sleep(5);
+      expect(settled).toBe(false); expect(cleaned).toBe(false);
+      const calls = [f.primary.mock.calls.length, f.run.mock.calls.length, f.review.mock.calls.length, f.complete.mock.calls.length];
+      release(); expect(await result).toBe(reason); expect(cleaned).toBe(true);
+      expect([f.primary.mock.calls.length, f.run.mock.calls.length, f.review.mock.calls.length, f.complete.mock.calls.length]).toEqual(calls);
+      expect(f.postComment).not.toHaveBeenCalled(); expect(f.push).not.toHaveBeenCalled(); expect(f.openPr).not.toHaveBeenCalled();
+    });
+  }
+
+  it('kills a real full-check process and its descendant before the host-aborted action returns', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gary-host-full-check-')), pidsPath = join(root, 'pids');
+    const host = new AbortController(), reason = new Error('host stopped full check');
+    f.deps.signal = host.signal; f.deps.agentLoopTimeoutMs = 9_000_000;
+    f.deps.verification = createActionVerification({ policy: CODING_VERIFICATION_POLICY, assertActive() {} });
+    f.run.mockImplementation(async (command, options) => {
+      expect(command).toBe('bun run ci:full');
+      return runProcess('/bin/bash', ['-c', 'sleep 300 & child=$!; printf "%s %s" "$$" "$child" > "$GARY_FIXTURE_PIDS"; wait'], {
+        ...options, timeoutMs: options!.timeoutMs!, cwd: root, env: { PATH: '/usr/bin:/bin', GARY_FIXTURE_PIDS: pidsPath },
+      });
+    });
+    let pids: number[] = [];
+    const result = f.invoke().then(() => new Error('unexpected success'), error => error);
+    try {
+      for (let attempt = 0; attempt < 100 && !existsSync(pidsPath); attempt++) await Bun.sleep(10);
+      expect(existsSync(pidsPath)).toBe(true);
+      pids = readFileSync(pidsPath, 'utf8').split(' ').map(Number); expect(pids).toHaveLength(2);
+      host.abort(reason); expect(await result).toBe(reason);
+      for (const pid of pids) expect(() => process.kill(pid, 0)).toThrow();
+      expect(f.review).not.toHaveBeenCalled(); expect(f.complete).not.toHaveBeenCalled();
+      expect(f.push).not.toHaveBeenCalled(); expect(f.postComment).not.toHaveBeenCalled();
+    } finally {
+      host.abort(reason); await result;
+      for (const pid of pids) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('retains a PR creation already in flight at host abort and suppresses all follow-up writes', async () => {
+    const host = new AbortController(); f.deps.signal = host.signal;
+    f.openPr.mockImplementation(async () => { host.abort(new Error('host stopped during creation')); return f.pr; });
+    const result = await f.invoke();
+    expect(result).toMatchObject({ status: 'pr_opened', prUrl: f.pr.url });
+    expect(f.db.query('SELECT pr_number FROM prs').get()).toEqual({ pr_number: f.pr.number });
+    expect(f.postComment).not.toHaveBeenCalled();
   });
 });

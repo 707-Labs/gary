@@ -52,6 +52,12 @@ export function createCanaryReadiness(options: CanaryReadinessOptions) {
       if (!receipt.admittedRuntime || !receipt.draft || !requiredCheck.passed || requiredCheck.exitCode !== 0 || requiredCheck.timedOut
           || requiredCheck.command !== (options.activation.verificationPolicy?.publicationCommand ?? 'bun run check') || review.verdict !== 'approve'
           || receipt.postRebaseCheck === 'incomplete' || !head || !/^[a-f0-9]{40}$/.test(head)) return NOT_READY;
+      const selectedBase = options.activation.codeBase;
+      if (selectedBase && (receipt.publicationBase?.branch !== selectedBase.branch
+          || receipt.publicationBase?.commit !== selectedBase.commit
+          || published.remoteBase?.branch !== selectedBase.branch || published.remoteBase?.commit !== selectedBase.commit
+          || receipt.exactArtifact?.baseSha !== selectedBase.commit || receipt.exactArtifact?.headSha !== head
+          || receipt.exactArtifact?.worktreeClean !== true)) return NOT_READY;
       // Observations are not an isolation claim: any missing/changed/dirty snapshot
       // blocks notification instead of equating an old review with the new head.
       if ([requiredCheck.afterCheck, review.afterApproval, published.beforePush, published.afterPush]
@@ -60,7 +66,7 @@ export function createCanaryReadiness(options: CanaryReadinessOptions) {
         'SELECT repo,pr_number,branch,closed_at,merged FROM prs WHERE ticket_linear_id=? AND repo=? AND pr_number=?')
         .get(options.issueId, options.repo, receipt.prNumber);
       if (!pr || pr.branch !== receipt.branch || pr.closed_at !== null || pr.merged !== 0) return NOT_READY;
-      const evidence = { actionId, fingerprint, ownerEpoch, verificationPolicy:options.activation.verificationPolicy ?? null, nativeRequestId: native.requestId, head, repo: pr.repo, prNumber: pr.pr_number };
+      const evidence = { actionId, fingerprint, ownerEpoch, selectedBase: selectedBase ?? null, remoteBase: published.remoteBase ?? null, verificationPolicy:options.activation.verificationPolicy ?? null, nativeRequestId: native.requestId, head, repo: pr.repo, prNumber: pr.pr_number };
       return { ready: true, hermesCanarySucceeded: true,
         receiptId: 'sha256:' + createHash('sha256').update(JSON.stringify(evidence)).digest('hex') };
     } catch { return NOT_READY; }
