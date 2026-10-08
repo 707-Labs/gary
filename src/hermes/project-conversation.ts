@@ -37,6 +37,14 @@ function audience(value: unknown): ProjectAudience {
   return Object.freeze({ surface: value.surface, requesterId: value.requesterId, teamId: value.teamId,
     channelId: value.channelId, threadTs: value.threadTs }) as ProjectAudience;
 }
+/** Hermes' pinned registry sorts its schema list; order grants no authority. */
+function toolSetBinding(value: unknown): string {
+  if (!Array.isArray(value) || value.some(tool => !object(tool) || !object(tool.function) || typeof tool.function.name !== 'string')) {
+    fail('project_tools_rejected');
+  }
+  const sorted = [...value].sort((a, b) => a.function.name < b.function.name ? -1 : a.function.name > b.function.name ? 1 : 0);
+  return canonicalArguments({ tools: sorted });
+}
 function freeze<T>(value: T): T {
   if (value && typeof value === 'object') { Object.freeze(value); for (const v of Object.values(value)) freeze(v); }
   return value;
@@ -102,7 +110,7 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
           || typeof t.function.name !== 'string' || !/^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(t.function.name)
           || special.has(t.function.name) || typeof t.function.description !== 'string' || !object(t.function.parameters))) fail('project_tools_rejected');
       const names = new Set(tools.map(t => t.function.name)); if (names.size !== tools.length) fail('project_tools_rejected');
-      const toolBinding = canonicalArguments({ tools }); safeText(toolBinding, p.maxToolSchemaBytes);
+      const toolBinding = toolSetBinding(tools); safeText(toolBinding, p.maxToolSchemaBytes);
       const context = await deps.projects.context(authority, signal); guard();
       if (typeof context !== 'string') fail('project_context_rejected'); safeText(context, p.maxProjectContextBytes);
       const reference = { role: 'user', content: JSON.stringify({ kind: 'project_reference_data', dataOnly: true, content: context }) };
@@ -153,7 +161,7 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
           }
           if (url.pathname !== '/v1/chat/completions' || answer || pending.size || modelCalls >= p.maxRequestsPerMessage || inFlight
             || !Array.isArray(body.messages) || body.model !== p.model || body.max_tokens !== p.maxTokens || body.temperature !== p.temperature
-            || canonicalArguments({ tools: body.tools }) !== toolBinding
+            || toolSetBinding(body.tools) !== toolBinding
             || Object.keys(body).some(k => !['model', 'messages', 'max_tokens', 'temperature', 'tools', 'stream', 'tool_choice', 'parallel_tool_calls'].includes(k))
             || (body.stream !== undefined && body.stream !== false)
             || (body.tool_choice !== undefined && body.tool_choice !== 'auto')

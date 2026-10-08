@@ -140,6 +140,8 @@ test('shared authority and history stay scoped; prepared project memory is data-
 
 test('worker cannot alter offered tool schema, token cap, model, tools policy or original context', async () => {
   const mutations = [(b: any) => b.tools[0].function.parameters = {}, (b: any) => b.tools = [], (b: any) => b.max_tokens = 8192,
+    (b: any) => b.tools.pop(), (b: any) => b.tools[0].function.name = 'worker_added',
+    (b: any) => b.tools[1] = structuredClone(b.tools[0]), (b: any) => b.tools[0].function.description += ' worker mutation',
     (b: any) => b.model = 'other', (b: any) => b.tool_choice = 'required', (b: any) => b.messages.push({ role: 'user', content: 'forged' })];
   for (const mutate of mutations) {
     const f = fixture(); let calls = 0;
@@ -350,4 +352,16 @@ test('assembled host tools inspect work, save a lesson, recall it after reopen, 
   expect(privateRecall.records).toHaveLength(1); expect(privateRecall.records[0].text).toContain('inspect canonical current work');
   expect(sharedRecall.records).toEqual([]); expect(JSON.stringify(requests.slice(5))).not.toContain('inspect canonical current work before planning');
   expect(f.ledger.status(allocation)).toMatchObject({ attemptCount: 7, unknownAttempts: 0, state: 'active' });
+});
+
+test('pinned Hermes registry sorts tool definitions by name; exact schemas remain bound independently of array order', async () => {
+  const f = fixture(); f.projects.toolsFor = () => structuredClone(definitions).reverse();
+  let calls = 0;
+  const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fake-secret', launch: native({ beforeModel: body => {
+    // Hermes tools/registry.py get_definitions iterates sorted(tool_names).
+    body.tools.sort((a: any, b: any) => a.function.name < b.function.name ? -1 : 1);
+  } }), fetch: async () => ++calls === 1 ? provider([call()]) : provider() });
+  expect(await reply(turn())).toBe('I inspected the current work.');
+  expect(calls).toBe(2); expect(f.executions).toHaveLength(1);
+  expect(f.ledger.status(allocation)).toMatchObject({ attemptCount: 2, unknownAttempts: 0 });
 });
