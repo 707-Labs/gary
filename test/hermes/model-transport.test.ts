@@ -1,8 +1,8 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createModelTransport, type ModelTransportCapability, type ModelTransportOptions, type ModelTransportFailure, type ModelResponseRejection } from "../../src/hermes/model-transport.ts";
+import { createModelTransport, MODEL_REQUEST_TIMEOUT_MS, type ModelTransportCapability, type ModelTransportOptions, type ModelTransportFailure, type ModelResponseRejection } from "../../src/hermes/model-transport.ts";
 import { SpendLedger, spendReservationMicros } from "../../src/spend.ts";
 
 type Body = Record<string, unknown>;
@@ -287,6 +287,62 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
     expect(canceled).toBe(true);
     expect(ledger.status("TICKET-1")!.unknownAttempts).toBe(1);
     expect(ledger.status("TICKET-1")!.chargedMicros).toBe(spendReservationMicros("deepseek", 128));
+  });
+
+  test("responses past sixty seconds succeed but requests cannot extend the original action deadline", async () => {
+    let now = Date.now(), calls = 0;
+    const clock = spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      const { options } = setup();
+      const handler = createModelTransport({ ...options, capability: { ...options.capability, deadlineMs: now + 90_000 },
+        fetch: async () => { now += ++calls === 1 ? 61_500 : 30_000; return Response.json(providerBody()); } });
+      expect((await handler(request())).status).toBe(200);
+      expect(ledger.status("TICKET-1")!.unknownAttempts).toBe(0);
+      expect((await handler(request())).status).toBe(408);
+      expect(calls).toBe(2);
+      expect(ledger.status("TICKET-1")!.attemptCount).toBe(2);
+      expect(ledger.status("TICKET-1")!.unknownAttempts).toBe(1);
+      expect((await handler(request())).status).toBe(408);
+      expect(calls).toBe(2);
+    } finally { clock.mockRestore(); }
+  });
+
+  test("fixed host request ceiling aborts physical fetch and awaits cleanup without refund or retry", async () => {
+    let now = Date.now(), calls = 0, settled = false, transportCleaned = false;
+    let entered!: () => void, receivedAbort!: () => void, release!: () => void, expire: (() => void) | undefined;
+    const entry = new Promise<void>(resolve => { entered = resolve; });
+    const aborted = new Promise<void>(resolve => { receivedAbort = resolve; });
+    const drain = new Promise<void>(resolve => { release = resolve; });
+    const realTimer = globalThis.setTimeout;
+    const clock = spyOn(Date, "now").mockImplementation(() => now);
+    const timer = spyOn(globalThis, "setTimeout").mockImplementation(((fn: Parameters<typeof setTimeout>[0], ms?: number, ...args: unknown[]) => {
+      if (ms === MODEL_REQUEST_TIMEOUT_MS) expire = () => fn();
+      return realTimer(fn, ms, ...args);
+    }) as typeof setTimeout);
+    let pending: Promise<Response> | undefined;
+    try {
+      expect(MODEL_REQUEST_TIMEOUT_MS).toBe(120_000);
+      const { options } = setup();
+      const handler = createModelTransport({ ...options, capability: { ...options.capability, deadlineMs: now + 150 * 60_000 },
+        fetch: async req => {
+          calls++;req.signal.addEventListener("abort", receivedAbort, {once:true});entered();
+          await aborted;await drain;transportCleaned = true;
+          throw new Error("offline cancelled transport");
+        } });
+      pending = handler(request()).then(response => { settled = true;return response; });
+      await Promise.race([entry,pending.then(() => { throw new Error("provider entry missing"); })]);
+      expect(expire).toBeDefined();now += MODEL_REQUEST_TIMEOUT_MS;expire!();
+      await aborted;await Promise.resolve();
+      expect(settled).toBe(false);expect(transportCleaned).toBe(false);
+      release();expect((await pending).status).toBe(408);expect(transportCleaned).toBe(true);
+      expect(calls).toBe(1);
+      expect(ledger.status("TICKET-1")!.unknownAttempts).toBe(1);
+      expect(ledger.status("TICKET-1")!.chargedMicros).toBe(spendReservationMicros("deepseek",128));
+      expect(ledger.status("TICKET-1")!.attemptCount).toBe(1);
+    } finally {
+      receivedAbort();release();if (pending) await pending;
+      timer.mockRestore();clock.mockRestore();
+    }
   });
 
   test("host abort is forwarded to the actual provider request", async () => {

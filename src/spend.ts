@@ -20,6 +20,22 @@ type PricedProvider = keyof typeof POLICIES;
 type Policy = (typeof POLICIES)[PricedProvider];
 type TicketState = "active" | "exhausted" | "closed";
 
+/** Host-only request purpose. Never read from model messages or HTTP fields. */
+export type CodingSpendRole = "work" | "review" | "publication_body" | "publication_title";
+/** One next reviewer request and publication, not a promise to fund every review iteration. */
+export const CODING_SPEND_RESERVE_POLICY = Object.freeze({
+  version: 1,
+  capMicros: 10_000_000,
+  provider: "deepseek",
+  workFloorMicros: 4_173_145,
+  reviewFloorMicros: 2_772_804,
+  publicationBodyFloorMicros: 1_384_628,
+  publicationTitleFloorMicros: 0,
+  reviewMaxTokens: 4096,
+  publicationBodyMaxTokens: 1024,
+  publicationTitleMaxTokens: 128,
+} as const);
+
 /** The in-flight reservation is deliberately unknown during before_send. */
 export type PaidRequestGuardPhase = "before_request" | "before_send" | "after_response";
 export type PaidRequestGuard = (phase: PaidRequestGuardPhase) => void;
@@ -188,6 +204,7 @@ function receiptInput(body: unknown, policy: Policy, maxTokens: number): Receipt
 export class SpendLedger {
   private readonly db: Database;
   private readonly scope = new AsyncLocalStorage<string>();
+  private readonly codingRole = new AsyncLocalStorage<CodingSpendRole>();
   private readonly paidRequestGuards = new AsyncLocalStorage<readonly PaidRequestGuard[]>();
 
   constructor(path: string) {
@@ -198,7 +215,8 @@ export class SpendLedger {
       CREATE TABLE IF NOT EXISTS spend_tickets (ticket_id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL REFERENCES spend_campaigns(id), cap_micros INTEGER NOT NULL CHECK(cap_micros>0), draft_pr INTEGER NOT NULL CHECK(draft_pr IN (0,1)), state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','exhausted','closed')), terminal_reason TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
       CREATE TABLE IF NOT EXISTS spend_attempts (id INTEGER PRIMARY KEY, ticket_id TEXT NOT NULL REFERENCES spend_tickets(ticket_id), provider TEXT NOT NULL, model TEXT NOT NULL, max_tokens INTEGER NOT NULL, reserved_micros INTEGER NOT NULL, charged_micros INTEGER NOT NULL, state TEXT NOT NULL DEFAULT 'reserved' CHECK(state IN ('reserved','unknown','settled')), input_tokens INTEGER, http_status INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, settled_at TEXT);
       CREATE TABLE IF NOT EXISTS spend_receipts (attempt_id INTEGER PRIMARY KEY REFERENCES spend_attempts(id), reason TEXT NOT NULL, details_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-      CREATE INDEX IF NOT EXISTS spend_attempts_ticket ON spend_attempts(ticket_id);`);
+      CREATE INDEX IF NOT EXISTS spend_attempts_ticket ON spend_attempts(ticket_id);
+      CREATE TABLE IF NOT EXISTS spend_coding_policies (ticket_id TEXT PRIMARY KEY REFERENCES spend_tickets(ticket_id), version INTEGER NOT NULL CHECK(version=1));`);
   }
 
   createCampaign(campaignId: string, capUsd: number): void {
@@ -214,22 +232,33 @@ export class SpendLedger {
     }).immediate();
   }
 
-  enrollTicket(campaignId: string, ticketId: string, capUsd: number, options: { draftPr?: boolean } = {}): void {
+  enrollTicket(campaignId: string, ticketId: string, capUsd: number, options: { draftPr?: boolean; codingReviewReserve?: boolean } = {}): void {
     assertId(campaignId); assertId(ticketId);
     const cap = usdToMicros(capUsd);
     const draft = options.draftPr === true ? 1 : 0;
+    const protectedCoding = options.codingReviewReserve === true;
     this.db.transaction(() => {
       const existing = this.ticket(ticketId);
       if (existing) {
-        if (existing.campaign_id !== campaignId || existing.cap_micros !== cap || existing.draft_pr !== draft) throw new SpendLimitError("ticket enrollment is immutable");
+        if (existing.campaign_id !== campaignId || existing.cap_micros !== cap || existing.draft_pr !== draft || this.hasCodingReviewReserve(ticketId) !== protectedCoding) throw new SpendLimitError("ticket enrollment is immutable");
         return; // Existing closure, exhaustion and reservations survive enrollment/restart.
       }
       const campaign = this.db.query<{ cap_micros: number }, [string]>("SELECT cap_micros FROM spend_campaigns WHERE id=?").get(campaignId);
       if (!campaign) throw new SpendLimitError("missing campaign");
+      if (protectedCoding && (!draft || cap !== CODING_SPEND_RESERVE_POLICY.capMicros || campaign.cap_micros !== cap)) {
+        throw new SpendLimitError("coding reserve requires one exact $10 draft allocation");
+      }
       const allocated = this.db.query<{ n: number }, [string]>("SELECT COALESCE(SUM(cap_micros),0) AS n FROM spend_tickets WHERE campaign_id=?").get(campaignId)!.n;
       if (allocated + cap > campaign.cap_micros) throw new SpendLimitError("campaign allocation exceeded");
       this.db.query("INSERT INTO spend_tickets(ticket_id,campaign_id,cap_micros,draft_pr) VALUES(?,?,?,?)").run(ticketId, campaignId, cap, draft);
+      if (protectedCoding) this.db.query("INSERT INTO spend_coding_policies(ticket_id,version) VALUES(?,?)").run(ticketId, CODING_SPEND_RESERVE_POLICY.version);
     }).immediate();
+  }
+
+  hasCodingReviewReserve(ticketId: string): boolean {
+    const policy = this.db.query<{ version: number }, [string]>("SELECT version FROM spend_coding_policies WHERE ticket_id=?").get(ticketId);
+    if (policy && policy.version !== CODING_SPEND_RESERVE_POLICY.version) throw new SpendLimitError("unsupported coding reserve policy");
+    return policy !== null;
   }
 
   status(ticketId: string): SpendStatus | null {
@@ -254,12 +283,14 @@ export class SpendLedger {
   assertCanDispatch(ticketId: string): void {
     if (!this.canDispatch(ticketId)) throw new SpendLimitError("ticket is not eligible for dispatch");
   }
-  withSpendScope<T>(ticketId: string, fn: () => T): T {
+  withSpendScope<T>(ticketId: string, fn: () => T, options: { codingRole?: CodingSpendRole } = {}): T {
     const current = this.scope.getStore();
     if (current !== undefined && current !== ticketId) throw new SpendLimitError("cannot switch ticket inside a spending scope");
     const status = this.status(ticketId);
     if (!status || status.state !== "active") throw new SpendLimitError("ticket is not actively enrolled");
-    return this.scope.run(ticketId, fn);
+    const role = options.codingRole ?? this.codingRole.getStore() ?? "work";
+    if (!["work", "review", "publication_body", "publication_title"].includes(role)) throw new SpendLimitError("invalid coding role");
+    return this.scope.run(ticketId, () => this.codingRole.run(role, fn));
   }
   markTerminal(ticketId: string, reason: string): void {
     // Only an operator-defined enum-like reason is persisted; no prompts/errors.
@@ -373,6 +404,24 @@ export class SpendLedger {
     const outcome = this.db.transaction((): number | SpendLimitError => {
       const status = this.status(ticketId);
       if (!status || status.state !== "active") return new SpendLimitError("ticket is not actively enrolled");
+      if (this.hasCodingReviewReserve(ticketId)) {
+        const p = CODING_SPEND_RESERVE_POLICY;
+        if (!status.draftPr || status.capMicros !== p.capMicros || status.campaignCapMicros !== p.capMicros || provider !== p.provider) {
+          return new SpendLimitError("coding reserve allocation binding changed");
+        }
+        if (status.unknownAttempts !== 0) return new SpendLimitError("coding allocation has an unresolved request");
+        const role = this.codingRole.getStore() ?? "work";
+        const [floor, outputCap] = role === "review" ? [p.reviewFloorMicros, p.reviewMaxTokens]
+          : role === "publication_body" ? [p.publicationBodyFloorMicros, p.publicationBodyMaxTokens]
+          : role === "publication_title" ? [p.publicationTitleFloorMicros, p.publicationTitleMaxTokens]
+          : [p.workFloorMicros, SPEND_MAX_OUTPUT_TOKENS];
+        if (maxTokens > outputCap) return new SpendLimitError("coding role output limit exceeded");
+        // Check and insert under this same SQLite writer transaction. The floor
+        // is an earmark within the immutable cap, never another charge or ledger.
+        if (reserved + floor > status.remainingMicros || reserved + floor > status.campaignCapMicros - status.campaignChargedMicros) {
+          return new SpendLimitError("protected coding reserve would be consumed");
+        }
+      }
       if (reserved > status.remainingMicros || reserved > status.campaignCapMicros - status.campaignChargedMicros) {
         this.db.query("UPDATE spend_tickets SET state='exhausted',terminal_reason='reservation_exhausted' WHERE ticket_id=?").run(ticketId);
         return new SpendLimitError("allocation exhausted"); // Commit latch before throwing.

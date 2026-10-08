@@ -40,6 +40,40 @@ function rows(db:Database):any[]{return db.query('SELECT * FROM gary_slack_outbo
 function dm(overrides:Record<string,unknown>={},payloadOverrides:Record<string,unknown>={}) {
   return envelope({type:'message',channel_type:'im',channel:'D0FIXTURE1',text:'private inbound fixture',...overrides},payloadOverrides);
 }
+test('shared conversation uses independent trusted runtime health without claiming coding readiness or sending a ready DM',async()=>{
+  let calls=0;const f=fixture({checkConversationHealth:()=>true,sharedConversation:{ready:()=>true,close:()=>({drained:true}),async respond(input,deliver,_signal,available){
+    calls++;expect(input.requesterId).toBe('U0MEMBER11');expect(input.teamId).toBe(GARY_SLACK.teamId);expect(available?.()).toBe(true);expect(await deliver('Shared answer')).toBe('sent');
+  }}});f.health={...healthy,ready:false,hermesCanarySucceeded:false};await f.service.start();expect(f.fake.sends).toEqual([]);
+  await f.fake.emit(envelope({user:'U0MEMBER11'}));expect(calls).toBe(1);expect(f.fake.sends).toEqual([{channel:'C0APPROVED',threadTs:'1791417600.000002',text:'Shared answer'}]);
+  expect(f.service.health.hostReady).toBe(false);expect(f.service.health.readinessKind).toBe(null);expect(rows(f.db)).toEqual([]);
+  await f.fake.emit(envelope({user:'U0MEMBER11'}));expect(calls).toBe(1);
+});
+test('shared route requires explicit mention each turn and rejects bots, DM, foreign workspace and SlackConnect envelope hints',async()=>{
+  let calls=0;const f=fixture({checkConversationHealth:()=>true,sharedConversation:{ready:()=>true,close:()=>({drained:true}),async respond(){calls++;}}});f.health={...healthy,ready:false};await f.service.start();
+  for(const event of [{type:'message',channel_type:'channel'},{user:GARY_SLACK.botUserId},{bot_id:'B0OTHER11'},{subtype:'bot_message'},{channel:'D0PRIVATE1'},{text:'no mention'},{team:'TFOREIGN'}])await f.fake.emit(envelope(event));
+  for(const payload of [{team_id:'TFOREIGN'},{api_app_id:'AFOREIGN'},{context_team_id:'TFOREIGN'},{is_ext_shared_channel:true}])await f.fake.emit(envelope({},payload));
+  expect(calls).toBe(0);expect(f.fake.sends).toEqual([]);
+  await f.fake.emit(envelope({thread_ts:'1791400000.000001'}));expect(calls).toBe(1);
+});
+test('shared readiness does not enable private DMs and revoked conversation health blocks post-await send',async()=>{
+  let allowed=true,sharedCalls=0;const f=fixture({checkConversationHealth:()=>allowed,sharedConversation:{ready:()=>true,close:()=>({drained:true}),async respond(_input,deliver,_signal,available){
+    sharedCalls++;allowed=false;expect(available?.()).toBe(false);expect(await deliver('must not leave')).toBe('not_sent');
+  }}});f.health={...healthy,ready:false};await f.service.start();await f.fake.emit(dm());expect(sharedCalls).toBe(0);
+  await f.fake.emit(envelope());expect(sharedCalls).toBe(1);expect(f.fake.sends).toEqual([]);
+});
+test('private DM trusted health can remain available independently of unavailable coding/shared readiness',async()=>{
+  const initial=fixture({tannerDirectMessages:true});initial.health=readonlyHealthy;await initial.service.start();await initial.service.stop();let calls=0;
+  const f=fixture({db:initial.db,tannerDirectMessages:true,checkConversationHealth:()=>true,conversation:{ready:()=>true,close:()=>({drained:true}),async respond(_i,deliver){calls++;expect(await deliver('Private answer')).toBe('sent');}},
+    sharedConversation:{ready:()=>false,close:()=>({drained:true}),async respond(){throw new Error('shared unavailable');}}});f.health={...healthy,ready:false};await f.service.start();
+  await f.fake.emit(dm());expect(calls).toBe(1);expect(f.fake.sends[0]?.text).toBe('Private answer');expect(f.service.health.hostReady).toBe(false);
+});
+test('an unready store may send a fixed typed notice but never a paid answer or repeat unknown delivery',async()=>{
+  let calls=0;const f=fixture({checkConversationHealth:()=>true,sharedConversation:{ready:()=>false,close:()=>({drained:false}),async respond(_input,deliver){
+    calls++;expect(await deliver('unready paid answer','answer')).toBe('not_sent');expect(await deliver('Fixed bounded stop notice','notice')).toBe('unknown');
+  }}});f.health={...healthy,ready:false};await f.service.start();f.fake.send=async()=>({ok:false,outcome:'unknown',code:'fixture'});
+  await f.fake.emit(envelope());await f.fake.emit(envelope());expect(calls).toBe(1);expect(f.fake.sends).toEqual([{channel:'C0APPROVED',threadTs:'1791417600.000002',text:'Fixed bounded stop notice'}]);
+  expect(f.db.query('SELECT status FROM gary_slack_shared_outbox').get()).toEqual({status:'unknown'});
+});
 test('free-form dispatch keeps Tanner/app/team/DM/readiness boundary and authenticates exact delivered content',async()=>{
   let calls=0;const f=fixture({tannerDirectMessages:true,conversation:{ready:()=>true,close:()=>({drained:true}),async respond(input,deliver){
     calls++;expect(input.text).toBe('private inbound fixture');expect(await deliver('A real conversational answer.')).toBe('sent');

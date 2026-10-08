@@ -15,7 +15,7 @@ function fixture(){
  const root=mkdtempSync(join(tmpdir(),'coding-trial-'));cleanup.push(()=>rmSync(root,{recursive:true,force:true}));
  const path=join(root,'gary.db'),db=openDb(path);cleanup.push(()=>db.close());
  const ledger=new SpendLedger(':memory:');cleanup.push(()=>ledger.close());
- ledger.createCampaign('trial',20);ledger.enrollTicket('trial','ticket',10,{draftPr:true});
+ ledger.createCampaign('trial',10);ledger.enrollTicket('trial','ticket',10,{draftPr:true,codingReviewReserve:true});
  upsertTicket(db,{linearId:'ticket',identifier:'ERT-1'});
  const options={db,ledger,issueId:'ticket',repo:'fixture/repo',policyFingerprint:'sha256:'+'a'.repeat(64)};
  const controller=createCodingTrial(options);
@@ -80,7 +80,7 @@ test('unclaimed action cannot call activated coding factory binding',()=>{
 
 test('a different issue cannot bypass an unfinished classification claim without a code owner',()=>{
  const f=fixture();f.controller.admit(f.input);
- upsertTicket(f.db,{linearId:'other',identifier:'ERT-2'});f.ledger.enrollTicket('trial','other',10,{draftPr:true});
+ upsertTicket(f.db,{linearId:'other',identifier:'ERT-2'});f.ledger.createCampaign('other',10);f.ledger.enrollTicket('other','other',10,{draftPr:true,codingReviewReserve:true});
  const other=createCodingTrial({...f.options,issueId:'other'});
  expect(()=>other.admit({...f.input,issueId:'other'})).toThrow('other_trial_unfinished');expect(f.rows()).toHaveLength(1);
 });
@@ -89,4 +89,11 @@ test('oversized trial allocation is rejected before claim or action',()=>{
  f.ledger.createCampaign('large',11);f.ledger.enrollTicket('large','large',11,{draftPr:true});
  const large=createCodingTrial({...f.options,issueId:'large'});
  expect(()=>large.admit({...f.input,issueId:'large'})).toThrow('allocation');expect(f.rows()).toHaveLength(0);
+});
+
+test('unprotected draft allocation cannot enter new coding trial',()=>{
+ const f=fixture();upsertTicket(f.db,{linearId:'unprotected',identifier:'ERT-4'});
+ f.ledger.createCampaign('unprotected',10);f.ledger.enrollTicket('unprotected','unprotected',10,{draftPr:true});
+ const trial=createCodingTrial({...f.options,issueId:'unprotected'});
+ expect(()=>trial.admit({...f.input,issueId:'unprotected'})).toThrow('allocation');expect(f.rows()).toHaveLength(0);
 });

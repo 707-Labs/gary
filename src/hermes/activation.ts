@@ -18,7 +18,7 @@ import { createCodingTrial, type CodingTrial } from './coding-trial.ts';
 import { HERMES_CODING_RUNTIME_POLICY, fingerprintHermesCodingActivation } from './coding-runtime-policy.ts';
 
 export const HERMES_CANARY_WORKER_IMAGE = 'sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab';
-export const HERMES_CODING_WORKER_IMAGE = 'sha256:f572a3fa49dbf933adb7e6a2671d929ec04186a4b9bef829ddd5082304bc0325';
+export const HERMES_CODING_WORKER_IMAGE = 'sha256:f95c4beac523b93e8a74ea840a9916818465965bf3b99833deb50bab2f239c32';
 export const HERMES_CANARY_CHILD_IMAGE = 'sha256:e77edfc6e20402c7ed9f447dca81dc61e277c2a39199963f455a37a03dfcedf4';
 const MAX_CONFIG_BYTES = 262_144;
 const text = (max: number) => z.string().min(1).max(max).refine(s => s.trim().length > 0 && !s.includes('\0'));

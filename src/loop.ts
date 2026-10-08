@@ -873,6 +873,7 @@ async function runStartCoding(
   const result = await runCodeHandler(
     {
       db: deps.db,
+      ...(deps.spend?{spend:deps.spend}:{}),
       linear: deps.linear,
       github: deps.github,
       glm: deps.glm,

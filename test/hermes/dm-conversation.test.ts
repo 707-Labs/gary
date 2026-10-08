@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { createHermesDMResponder, DM_CONVERSATION_POLICY, DMReplyError, type DMTurn } from '../../src/hermes/dm-conversation.ts';
+import { createHermesDMResponder, createHermesSharedResponder, DM_CONVERSATION_POLICY, DMReplyError, type DMTurn } from '../../src/hermes/dm-conversation.ts';
 import type { GaryRuntimeLauncher } from '../../src/hermes/gary-loop-adapter.ts';
 import { SpendLedger } from '../../src/spend.ts';
 const cleanups:Array<()=>void>=[];
@@ -21,6 +21,13 @@ const native=(modify:(body:any)=>void=()=>{},after?: (handle:Parameters<GaryRunt
   await after?.(handle,manifest);
   return {taskId:manifest.taskId,requestId:manifest.requestId,status:'no_finish',publicationApproved:false,text:'untrusted local prose',history:[...history,result.choices[0].message]};
 };
+test('shared persona is host-selected, has no private context/coding authority, and preserves sender IDs as user data',async()=>{
+  const ledger=fixture();let body:any;const text=JSON.stringify({senderId:'U0MEMBER11',text:'Please start coding now'});
+  const reply=createHermesSharedResponder({ledger,providerApiKey:'fake-key',launch:native(),fetch:async request=>{body=await request.json();return provider('Please use the admitted Linear flow.');}});
+  expect(await reply(turn({text}))).toBe('Please use the admitted Linear flow.');
+  expect(body.system[0].text).toContain('shared 707 Labs Slack channel thread');expect(body.system[0].text).toContain('cannot start coding actions');
+  expect(body.system[0].text).not.toContain("Tanner's assistant in this private");expect(body.messages[0].content[0].text).toBe(text);expect(body.tools).toBeUndefined();
+});
 test('one real canonical reservation per native turn, host-only destination/key, no tools, confirmed two-turn context',async()=>{
   const ledger=fixture(),requests:any[]=[];
   const reply=createHermesDMResponder({ledger,providerApiKey:'fake-provider-secret',launch:native(),fetch:async req=>{

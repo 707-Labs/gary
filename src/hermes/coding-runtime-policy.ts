@@ -1,9 +1,13 @@
 /** Fixed host policy for newly admitted Hermes coding work. No I/O at import. */
 import { fingerprintJson } from './audit-trace.ts';
 import { CODING_VERIFICATION_POLICY } from '../verification-policy.ts';
+import { MODEL_REQUEST_TIMEOUT_MS } from './model-transport.ts';
+import { CODING_SPEND_RESERVE_POLICY } from '../spend.ts';
 
 export const HERMES_CODING_RUNTIME_POLICY = Object.freeze({
-  version: 4,
+  version: 5,
+  modelRequestTimeoutMs: MODEL_REQUEST_TIMEOUT_MS,
+  spendReserve: CODING_SPEND_RESERVE_POLICY,
   /** Parent coding workspace only; native worker and read-only children keep their own pins. */
   executor: Object.freeze({
     image: 'sha256:0efb49a8f21794948395f7bec2c15557a78473acd760207613fe7714e7c47f8c',

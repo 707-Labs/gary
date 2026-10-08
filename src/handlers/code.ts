@@ -1,3 +1,4 @@
+import type { SpendLedger, CodingSpendRole } from "../spend.ts";
 import { readRuntimeDiagnostic, diagnosticFromError, RuntimeDiagnosticError, RuntimeDiagnosticDeadlineError, type RuntimeDiagnostic } from "../hermes/runtime-diagnostics.ts";
 import { resolve } from "node:path";
 import type { ActionVerification } from "../verification-policy.ts";
@@ -217,6 +218,8 @@ export interface CodePublicationReceipt {
 
 export interface CodeHandlerDeps {
   db: DB;
+  /** Same canonical host ledger; roles only surround trusted review/publication calls. */
+  spend?: SpendLedger;
   linear: LinearAdapter;
   github: GitHubClient;
   glm: GLMClient;
@@ -250,6 +253,10 @@ export interface CodeHandlerDeps {
    * Failure is recorded without relabeling an already-created PR as a failure.
    */
   onPublicationReceipt?: (receipt: Readonly<CodePublicationReceipt>) => void | Promise<void>;
+}
+
+function withCodingSpendRole<T>(deps: CodeHandlerDeps, issueId: string, role: CodingSpendRole, fn: () => T): T {
+  return deps.spend ? deps.spend.withSpendScope(issueId, fn, { codingRole: role }) : fn();
 }
 
 export interface CodeHandlerArgs {
@@ -625,7 +632,7 @@ async function runCodeHandlerWithinDeadline(
   const diff = await getDiff(worktreePath, baseRef, budget);
   const log_ = await getCommitLog(worktreePath, baseRef, budget);
 
-  const generatedPrBody = await composePrBody(deps, {
+  const generatedPrBody = await withCodingSpendRole(deps, args.issue.id, "publication_body", () => composePrBody(deps, {
     issue: args.issue,
     branch,
     summary: loopResult.summary,
@@ -634,17 +641,17 @@ async function runCodeHandlerWithinDeadline(
     verificationReport,
     deadlineMs: budget.deadlineMs,
     signal: budget.signal,
-  });
+  }));
   const prBody = codeBase && baseBranch !== BASE_BRANCH
     ? `${generatedPrBody}\n\nStacked base: \`${baseBranch}\` (\`${codeBase.commit}\`). This draft's diff is relative to that prerequisite branch.`
     : generatedPrBody;
-  const prTitle = await composePrTitle(deps, {
+  const prTitle = await withCodingSpendRole(deps, args.issue.id, "publication_title", () => composePrTitle(deps, {
     issue: args.issue,
     summary: loopResult.summary,
     diff,
     deadlineMs: budget.deadlineMs,
     signal: budget.signal,
-  });
+  }));
 
   budget.throwIfExpired();
   const beforePush = deps.onPublicationReceipt ? await observeGit() : { headSha: null, worktreeClean: null };
@@ -1095,7 +1102,7 @@ async function runReviewLoop(
     };
 
     await ctx.assertCheckedArtifact?.();
-    let outcome: ReviewerResult = await runReviewer({
+    let outcome: ReviewerResult = await withCodingSpendRole(deps, args.issue.id, "review", () => runReviewer({
       db: deps.db,
       glm: ctx.reviewerGlm,
       executor: reviewExecutor,
@@ -1113,7 +1120,7 @@ async function runReviewLoop(
       timeoutMs: deps.review.timeoutMs,
       deadlineMs: ctx.budget.deadlineMs,
       signal: ctx.budget.signal,
-    });
+    }));
 
     ctx.budget.throwIfExpired();
     await ctx.assertCheckedArtifact?.();
@@ -1125,7 +1132,7 @@ async function runReviewLoop(
         round,
         reason: outcome.reason,
       });
-      outcome = await runReviewer({
+      outcome = await withCodingSpendRole(deps, args.issue.id, "review", () => runReviewer({
         db: deps.db,
         glm: ctx.reviewerGlm,
         executor: reviewExecutor,
@@ -1143,7 +1150,7 @@ async function runReviewLoop(
         timeoutMs: deps.review.timeoutMs,
         deadlineMs: ctx.budget.deadlineMs,
         signal: ctx.budget.signal,
-      });
+      }));
       ctx.budget.throwIfExpired();
       await ctx.assertCheckedArtifact?.();
       if (outcome.kind === "failed") {

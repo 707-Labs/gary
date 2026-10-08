@@ -15,6 +15,12 @@ function fixture(){const dir=realpathSync(mkdtempSync(join(tmpdir(),'gary-dm-con
 const signal=new AbortController().signal;
 const input=(n:number,extra:Partial<SlackConversationInput>={}):SlackConversationInput=>({eventId:'EvFixture'+n,channel:'D0FIXTURE1',ts:'1791417600.'+String(n).padStart(6,'0'),threadTs:'1791417600.'+String(n).padStart(6,'0'),text:'private fabricated phrase violet sparrow',...extra});
 const sent=async()=> 'sent' as const;
+test('trusted host composition revocation stops private DM inference and delivery without reading shared state',async()=>{
+  const f=fixture();let allowed=false,calls=0,sends=0;
+  const service=createSlackConversation({...f,reply:async turn=>{calls++;allowed=false;expect(()=>turn.assertActive()).toThrow('dm_owner_changed');return 'must not send';}});
+  await service.respond(input(1),async()=>{sends++;return 'sent';},signal,()=>allowed);expect(calls).toBe(0);
+  allowed=true;await service.respond(input(2),async()=>{sends++;return 'sent';},signal,()=>allowed);expect(calls).toBe(1);expect(sends).toBe(0);service.close();
+});
 test('private config rejects loose modes, duplicate fields, extra scope, or noncanonical IDs',()=>{
   const f=fixture();expect(fingerprintSlackConversationConfig(f.config)).toMatch(/^[a-f0-9]{64}$/);
   chmodSync(f.path,0o644);expect(()=>loadSlackConversationConfig(f.path)).toThrow('private_path');chmodSync(f.path,0o600);

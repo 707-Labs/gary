@@ -4,7 +4,12 @@ export interface SlackIdentity { readonly appId: string; readonly teamId: string
 export interface SlackMessage { readonly channel: string; readonly text: string; readonly threadTs?: string }
 export type SlackSendResult = { ok: true; channel: string; ts: string }
   | { ok: false; outcome: "definitely_not_sent" | "unknown"; code: string };
+export interface SlackMemberMetadata { readonly id:string; readonly teamId:string; readonly deleted:boolean; readonly isBot:boolean; readonly isAppUser:boolean; readonly isRestricted:boolean; readonly isUltraRestricted:boolean; readonly isStranger:boolean; readonly observedAt:number }
+export interface SlackChannelMetadata { readonly id:string; readonly teamId:string; readonly isMember:boolean; readonly isArchived:boolean; readonly isPrivate:boolean; readonly isShared:boolean; readonly isExtShared:boolean; readonly isOrgShared:boolean; readonly isPendingExtShared:boolean; readonly observedAt:number }
 export interface SlackTransport {
+  /** Host-only metadata for explicit channel mentions; never history or profile text. */
+  memberInfo?(userId:string,signal?:AbortSignal):Promise<SlackMemberMetadata>;
+  channelInfo?(channelId:string,signal?:AbortSignal):Promise<SlackChannelMetadata>;
   identity(signal?: AbortSignal): Promise<SlackIdentity>;
   socketHealthy(): boolean;
   sendMessage(message: SlackMessage, signal?: AbortSignal): Promise<SlackSendResult>;
@@ -122,7 +127,7 @@ export function createSlackTransport(options: SlackTransportOptions): SlackTrans
   let unlinkStartSignal: (() => void) | undefined;
   let pendingHandlers = 0;
 
-  async function request(method: "auth.test" | "apps.connections.open" | "chat.postMessage",
+  async function request(method: "auth.test" | "apps.connections.open" | "chat.postMessage" | "users.info" | "conversations.info",
     body: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
     if (stopped) return fail("slack_transport_stopped");
     if (signal?.aborted) return fail("slack_request_cancelled");
@@ -257,6 +262,32 @@ export function createSlackTransport(options: SlackTransportOptions): SlackTrans
   }
 
   const transport: SlackTransport = {
+    async memberInfo(userId, signal) {
+      if(userId==='USLACKBOT'||!/^[UW][A-Z0-9]{5,32}$/.test(userId)||!transport.socketHealthy())return fail("slack_response_rejected");
+      const value=await request("users.info",{user:userId},signal), user=value.user;
+      const fields=["deleted","is_bot","is_app_user","is_restricted","is_ultra_restricted"];
+      if(value.ok!==true||!record(user)||user.id!==userId||typeof user.team_id!=="string"
+        ||fields.some(key=>typeof user[key]!=="boolean")||(user.is_stranger!==undefined&&typeof user.is_stranger!=="boolean")
+        ||["is_external","suspended","is_invited_user","is_profile_only_user"].some(key=>user[key]!==undefined&&user[key]!==false))return fail("slack_response_rejected");
+      return Object.freeze({id:userId,teamId:user.team_id,deleted:user.deleted as boolean,isBot:user.is_bot as boolean,isAppUser:user.is_app_user as boolean,
+        isRestricted:user.is_restricted as boolean,isUltraRestricted:user.is_ultra_restricted as boolean,isStranger:user.is_stranger===true,observedAt:Date.now()});
+    },
+    async channelInfo(channelId, signal) {
+      if(!/^[CG][A-Z0-9]{5,32}$/.test(channelId)||!transport.socketHealthy())return fail("slack_response_rejected");
+      const value=await request("conversations.info",{channel:channelId},signal), channel=value.channel;
+      const fields=["is_member","is_archived","is_private","is_shared","is_ext_shared","is_org_shared","is_pending_ext_shared"];
+      if(value.ok!==true||!record(channel)||channel.id!==channelId||typeof channel.context_team_id!=="string"
+        ||fields.some(key=>typeof channel[key]!=="boolean")||channel.is_im!==false||channel.is_mpim!==false
+        ||!(channel.is_channel===true||channel.is_group===true&&channel.is_private===true)
+        ||(channel.is_frozen!==undefined&&channel.is_frozen!==false)
+        ||(channel.is_ext_ws_shared!==undefined&&channel.is_ext_ws_shared!==false)
+        ||(channel.conversation_host_id!==undefined&&channel.conversation_host_id!==APPROVED_SLACK_IDENTITY.teamId)
+        ||["shared_team_ids","internal_team_ids","connected_team_ids"].some(key=>channel[key]!==undefined&&(!Array.isArray(channel[key])||(channel[key] as unknown[]).some(team=>team!==APPROVED_SLACK_IDENTITY.teamId)))
+        ||["pending_shared","pending_connected_team_ids"].some(key=>channel[key]!==undefined&&(!Array.isArray(channel[key])||(channel[key] as unknown[]).length!==0)))return fail("slack_response_rejected");
+      return Object.freeze({id:channelId,teamId:channel.context_team_id,isMember:channel.is_member as boolean,isArchived:channel.is_archived as boolean,
+        isPrivate:channel.is_private as boolean,isShared:channel.is_shared as boolean,isExtShared:channel.is_ext_shared as boolean,
+        isOrgShared:channel.is_org_shared as boolean,isPendingExtShared:channel.is_pending_ext_shared as boolean,observedAt:Date.now()});
+    },
     async identity(signal) {
       if (!transport.socketHealthy() || !helloAppId) return fail("slack_socket_unhealthy");
       const current = socket;

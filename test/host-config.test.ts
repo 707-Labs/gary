@@ -10,7 +10,7 @@ const canary = {
   DOCKER_HOST: 'unix:///Users/tanner/.colima/default/docker.sock',
 };
 test('free-form conversation requires explicit private DM, clean release pin and private absolute config path',()=>{
-  const env={...canary,GARY_RUNTIME_MODE:'hermes-readonly-canary',GARY_SLACK_ENABLED:'1',GARY_SLACK_CREDENTIALS_FILE:'/private/runtime/slack.env',
+  const env={...canary,GARY_RUNTIME_MODE:'hermes-readonly-canary',GARY_EXECUTOR_IMAGE:READONLY_IMAGE,GARY_BUN_CACHE_VOLUME:'gary-bun-cache',GARY_SLACK_ENABLED:'1',GARY_SLACK_CREDENTIALS_FILE:'/private/runtime/slack.env',
     GARY_SLACK_TANNER_DM_ENABLED:'1',GARY_READONLY_SLACK_RELEASE_COMMIT:'a'.repeat(40),GARY_SLACK_CONVERSATION_CONFIG:'/private/runtime/conversation.json'};
   expect(loadHostStartupConfig(env).slackConversationConfigPath).toBe(env.GARY_SLACK_CONVERSATION_CONFIG);
   for(const key of ['GARY_SLACK_TANNER_DM_ENABLED','GARY_READONLY_SLACK_RELEASE_COMMIT','GARY_SLACK_ENABLED'])expect(()=>loadHostStartupConfig({...env,[key]:undefined})).toThrow();
@@ -79,4 +79,25 @@ test('Tanner DM opt-in and exact Slack release pin are restricted to readonly mo
   for(const update of [{GARY_RUNTIME_MODE:'legacy'},{GARY_RUNTIME_MODE:'hermes-canary'},{GARY_SLACK_ENABLED:'0'},
     {GARY_SLACK_TANNER_DM_ENABLED:'yes'},{GARY_SLACK_TANNER_DM_ENABLED:'0'},{GARY_READONLY_SLACK_RELEASE_COMMIT:'main'}])
     expect(()=>loadHostStartupConfig({...env,...update})).toThrow();
+});
+
+
+test('combined conversations require an exact independent release and preserve coding executor policy',()=>{
+  const env={...canary,GARY_SLACK_ENABLED:'1',GARY_SLACK_CREDENTIALS_FILE:'/private/runtime/slack.env',
+    GARY_SLACK_TANNER_DM_ENABLED:'1',GARY_SLACK_CONVERSATION_CONFIG:'/private/dm/conversation.json',
+    GARY_SLACK_SHARED_CONVERSATION_CONFIG:'/private/shared/conversation.json',GARY_CONVERSATION_RUNTIME_RELEASE:'c'.repeat(40)};
+  expect(loadHostStartupConfig(env)).toMatchObject({mode:'hermes-canary',conversationRuntimeRelease:'c'.repeat(40),
+    slackConversationConfigPath:'/private/dm/conversation.json',slackSharedConversationConfigPath:'/private/shared/conversation.json',slack:{approvedChannelIds:[],tannerDirectMessages:true}});
+  for(const change of [{GARY_CONVERSATION_RUNTIME_RELEASE:undefined},{GARY_CONVERSATION_RUNTIME_RELEASE:'main'},
+    {GARY_RUNTIME_MODE:'legacy'},{GARY_RUNTIME_MODE:'hermes-readonly-canary'},{GARY_READONLY_SLACK_RELEASE_COMMIT:'b'.repeat(40)},
+    {GARY_SLACK_ENABLED:'0'},{GARY_SLACK_TANNER_DM_ENABLED:'0'},{GARY_SLACK_ALLOWED_CHANNEL_IDS:'C0123456789'},
+    {GARY_SLACK_SHARED_CONVERSATION_CONFIG:env.GARY_SLACK_CONVERSATION_CONFIG},{GARY_EXECUTOR_IMAGE:READONLY_IMAGE}])
+    expect(()=>loadHostStartupConfig({...env,...change})).toThrow();
+});
+test('shared-only runtime needs pinned explicit configuration and grants no private DM access',()=>{
+  const env={...canary,GARY_SLACK_ENABLED:'1',GARY_SLACK_CREDENTIALS_FILE:'/private/runtime/slack.env',
+    GARY_SLACK_SHARED_CONVERSATION_CONFIG:'/private/shared/conversation.json',GARY_CONVERSATION_RUNTIME_RELEASE:'c'.repeat(40)};
+  expect(loadHostStartupConfig(env).slack?.tannerDirectMessages).toBeUndefined();
+  expect(()=>loadHostStartupConfig({...env,GARY_SLACK_TANNER_DM_ENABLED:'1'})).toThrow();
+  expect(()=>loadHostStartupConfig({...env,GARY_SLACK_SHARED_CONVERSATION_CONFIG:undefined})).toThrow();
 });

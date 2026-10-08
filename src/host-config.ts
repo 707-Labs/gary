@@ -8,6 +8,9 @@ export interface HostStartupConfig {
   /** Exact reviewed Slack-only host release; original canary receipt remains immutable. */
   readonlySlackReleaseCommit?:string;
   slackConversationConfigPath?:string;
+  slackSharedConversationConfigPath?:string;
+  /** Exact independently reviewed combined runtime, separate from prior readonly canary proof. */
+  conversationRuntimeRelease?:string;
   slack?: { credentialsPath: string; approvedChannelIds: readonly string[]; tannerDirectMessages?:true };
 }
 
@@ -25,10 +28,18 @@ export function loadHostStartupConfig(env: Readonly<Record<string, string | unde
   const direct=env.GARY_SLACK_TANNER_DM_ENABLED;
   const slackRelease=env.GARY_READONLY_SLACK_RELEASE_COMMIT;
   const conversation=env.GARY_SLACK_CONVERSATION_CONFIG;
-  if(conversation!==undefined&&(mode!=='hermes-readonly-canary'||enabled!=='1'||direct!=='1'||!slackRelease))throw new Error('dm_conversation_requires_pinned_readonly_slack');
+  const sharedConversation=env.GARY_SLACK_SHARED_CONVERSATION_CONFIG;
+  const conversationRelease=env.GARY_CONVERSATION_RUNTIME_RELEASE;
+  const combinedConversation=mode==='hermes-canary'&&enabled==='1'&&conversationRelease!==undefined;
+  if(conversationRelease!==undefined&&(!combinedConversation||!/^[a-f0-9]{40}$/.test(conversationRelease)
+      ||(!conversation&&!sharedConversation)||slackRelease!==undefined))throw new Error('invalid_conversation_runtime_release');
+  if(sharedConversation!==undefined&&!combinedConversation)throw new Error('shared_conversation_requires_pinned_runtime');
+  if(conversation!==undefined&&(enabled!=='1'||direct!=='1'
+      ||!(mode==='hermes-readonly-canary'&&!!slackRelease||combinedConversation)))throw new Error('dm_conversation_requires_pinned_readonly_slack');
+  if(sharedConversation!==undefined&&sharedConversation===conversation)throw new Error('conversation_contexts_must_be_separate');
   if(direct!==undefined&&direct!=='0'&&direct!=='1')throw new Error('invalid_slack_dm_switch');
-  if((direct==='1'||slackRelease!==undefined)&&(mode!=='hermes-readonly-canary'||enabled!=='1'))throw new Error('private_dm_requires_readonly_slack');
-  if(slackRelease!==undefined&&(!/^[a-f0-9]{40}$/.test(slackRelease)||direct!=='1'))throw new Error('invalid_slack_release_commit');
+  if(direct==='1'&&!(mode==='hermes-readonly-canary'&&enabled==='1'||combinedConversation&&!!conversation))throw new Error('private_dm_requires_readonly_slack');
+  if(slackRelease!==undefined&&(mode!=='hermes-readonly-canary'||enabled!=='1'||!/^[a-f0-9]{40}$/.test(slackRelease)||direct!=='1'))throw new Error('invalid_slack_release_commit');
   if (enabled !== undefined && enabled !== '0' && enabled !== '1') throw new Error('invalid_slack_enable_switch');
   if (mode === 'legacy') {
     if (env.GARY_HERMES_ACTIVATION_PATH || enabled === '1' || env.GARY_SLACK_CREDENTIALS_FILE || env.GARY_SLACK_ALLOWED_CHANNEL_IDS) {
@@ -59,10 +70,13 @@ export function loadHostStartupConfig(env: Readonly<Record<string, string | unde
       || approvedChannelIds.some(channel => !/^[CG][A-Z0-9]{8,20}$/.test(channel))) {
     throw new Error('invalid_slack_channel_allowlist');
   }
+  if(combinedConversation&&approvedChannelIds.length)throw new Error('conversation_runtime_disallows_static_channel_bypass');
   if (mode === 'hermes-readonly-canary' && approvedChannelIds.length) throw new Error('readonly_canary_shared_channels_disabled');
   return Object.freeze({ mode, activationPath,
     ...(slackRelease?{readonlySlackReleaseCommit:slackRelease}:{}),
     ...(conversation!==undefined?{slackConversationConfigPath:path(conversation)}:{}),
+    ...(sharedConversation!==undefined?{slackSharedConversationConfigPath:path(sharedConversation)}:{}),
+    ...(conversationRelease?{conversationRuntimeRelease:conversationRelease}:{}),
     slack: Object.freeze({ credentialsPath: path(env.GARY_SLACK_CREDENTIALS_FILE), approvedChannelIds: Object.freeze(approvedChannelIds),
       ...(direct==='1'?{tannerDirectMessages:true as const}:{}) }) });
 }

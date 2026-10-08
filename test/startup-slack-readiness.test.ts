@@ -118,7 +118,7 @@ for(const mode of modes)test('actual startup Slack readiness: '+mode,async()=>{
     const noSend=()=>{expect(f.posts).toEqual([]);expect(args.db.query('SELECT count(*) AS n FROM gary_slack_outbox').get()).toEqual({n:0});};
     noSend();expect(f.counts()).toEqual({modelCalls:0,launches:0,credentialLoads:1});
     mention(f.sockets[0]!,'Before');await flush();noSend();expect(f.sockets[0]!.sent).toHaveLength(1);
-    args.spend!.createCampaign('offline',10);args.spend!.enrollTicket('offline',ISSUE,10,{draftPr:true});upsertTicket(args.db,{linearId:ISSUE,identifier:'ERT-1'});
+    args.spend!.createCampaign('offline',10);args.spend!.enrollTicket('offline',ISSUE,10,{draftPr:true,codingReviewReserve:true});upsertTicket(args.db,{linearId:ISSUE,identifier:'ERT-1'});
     const admitted={issueId:ISSUE,fingerprint:'fp',humanSignature:'fixture-human',provider:'deepseek',model:'deepseek-v4-pro',repo:REPO};
     const classify=args.codingTrial!.admit({...admitted,actionType:'classify'});
     setClassification(args.db,{linearId:ISSUE,classification:'CODE',confidence:.99,scope:'S'});classify.complete(true,'handled');

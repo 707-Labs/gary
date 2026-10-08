@@ -62,7 +62,7 @@ async function runtimeFixture(configure?:(config:HermesActivationConfig,workspac
   writeFileSync(join(workspace,'task.ts'),'base\n');writeFileSync(join(workspace,'package.json'),JSON.stringify({scripts:{'ci:full':'bun run check',check:'test \"$(cat task.ts)\" = updated'}}));expect((await run('git add task.ts package.json && git commit -qm baseline')).exitCode).toBe(0);
   f.config.policy.baseCommit=(await run('git rev-parse HEAD')).stdout.trim();configure?.(f.config,workspace);f.save();
   const db=openDb(':memory:');cleanups.push(()=>db.close());const ledger=new SpendLedger(':memory:');cleanups.push(()=>ledger.close());
-  ledger.createCampaign('offline',10);ledger.enrollTicket('offline',ID,5,{draftPr:true});
+  ledger.createCampaign('offline',10);ledger.enrollTicket('offline',ID,10,{draftPr:true,codingReviewReserve:true});
   const issue:AssignedIssue={id:ID,identifier:'ERT-1',title:'Fixture',description:'Change task.ts',url:'https://linear.invalid/ERT-1',stateName:'Todo',stateType:'unstarted',
     createdAt:'2026-10-08T00:00:00Z',updatedAt:'2026-10-08T00:00:00Z',creatorId:null,creatorName:null,teamId:'team',teamKey:'ERT',blockedBy:[]};
   upsertTicket(db,{linearId:ID,identifier:'ERT-1'});
@@ -90,7 +90,7 @@ async function runtimeFixture(configure?:(config:HermesActivationConfig,workspac
 
 test('coding activation accepts the async worker pin and rejects the previous read-only worker',()=>{
   const f=configFixture();
-  expect(HERMES_CODING_WORKER_IMAGE).toBe('sha256:f572a3fa49dbf933adb7e6a2671d929ec04186a4b9bef829ddd5082304bc0325');
+  expect(HERMES_CODING_WORKER_IMAGE).toBe('sha256:f95c4beac523b93e8a74ea840a9916818465965bf3b99833deb50bab2f239c32');
   expect(loadHermesActivationConfig(f.path).workerImage).toBe(HERMES_CODING_WORKER_IMAGE);
   f.save({...f.config,workerImage:HERMES_CANARY_WORKER_IMAGE});
   expect(()=>loadHermesActivationConfig(f.path)).toThrow('hermes_activation_rejected:config_unavailable_or_invalid');

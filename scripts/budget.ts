@@ -4,7 +4,7 @@ import { openSpendLedger } from "../src/spend.ts";
 
 const [path, command, ...args] = process.argv.slice(2);
 if (!path || !["enroll", "status", "close"].includes(command ?? "")) {
-  throw new Error("usage: budget.ts <ledger-path> enroll <campaign> <campaign-USD> <ticket-id> <ticket-USD> [--draft] | status <ticket-id> | close <ticket-id> <reason>");
+  throw new Error("usage: budget.ts <ledger-path> enroll <campaign> <campaign-USD> <ticket-id> <ticket-USD> [--draft] [--coding-reserve] | status <ticket-id> | close <ticket-id> <reason>");
 }
 function amount(raw: string | undefined): number {
   if (!raw || !/^\d+(?:\.\d{1,6})?$/.test(raw) || Number(raw) <= 0) throw new Error("USD amount must be positive, with at most six decimal places");
@@ -13,11 +13,11 @@ function amount(raw: string | undefined): number {
 const spend = openSpendLedger(path);
 try {
   if (command === "enroll") {
-    const [campaign, campaignCap, ticket, ticketCap, draft] = args;
-    if (!campaign || !ticket || args.length > 5 || (draft && draft !== "--draft")) throw new Error("invalid enrollment arguments");
+    const [campaign, campaignCap, ticket, ticketCap, ...flags] = args;
+    if (!campaign || !ticket || flags.some(f => !["--draft", "--coding-reserve"].includes(f)) || new Set(flags).size !== flags.length) throw new Error("invalid enrollment arguments");
     const campaignUsd = amount(campaignCap), ticketUsd = amount(ticketCap);
     spend.createCampaign(campaign, campaignUsd);
-    spend.enrollTicket(campaign, ticket, ticketUsd, { draftPr: draft === "--draft" });
+    spend.enrollTicket(campaign, ticket, ticketUsd, { draftPr: flags.includes("--draft"), codingReviewReserve: flags.includes("--coding-reserve") });
     console.log(JSON.stringify(spend.status(ticket), null, 2));
   } else {
     const [ticket, reason] = args;

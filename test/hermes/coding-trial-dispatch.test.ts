@@ -33,7 +33,7 @@ function makeFixture(){
     url:'https://linear.invalid/FIX-123',stateName:'Todo',stateType:'unstarted',createdAt:'2026-10-08T00:00:00Z',updatedAt:'2026-10-08T00:00:00Z',
     creatorId:null,creatorName:null,teamId:'fixture',teamKey:'FIX',blockedBy:[]};
   upsertTicket(db,{linearId:issue.id,identifier:issue.identifier});
-  ledger.createCampaign('offline-trial',10);ledger.enrollTicket('offline-trial',issue.id,5,{draftPr:true});
+  ledger.createCampaign('offline-trial',10);ledger.enrollTicket('offline-trial',issue.id,10,{draftPr:true,codingReviewReserve:true});
   let forbiddenNetwork=0,fakeRequests=0,publications=0,admission:CodeActionAdmission|undefined;
   const provider=createProvider({name:'deepseek',model:'deepseek-v4-pro',apiKey:'fake-only',baseUrl:'https://provider.invalid',defaultBackoffMs:1000},
     {fetch:(async()=>{forbiddenNetwork++;throw new Error('network forbidden in offline dispatcher test');}) as unknown as typeof fetch});

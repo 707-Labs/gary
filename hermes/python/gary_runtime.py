@@ -69,11 +69,11 @@ _LONG_TEST_POLICY = {"version": 1, "commands": {
     "bun run check": {"timeoutMs": 600000, "maxStarts": 8}},
     "pollWaitMs": 20000, "heartbeatMs": 1000, "maxPolls": 96}
 
-def _deadline(payload: dict) -> float:
+def _deadline(payload: dict, *, model_stdio=False) -> float:
     remaining = (payload["deadlineMs"] - time.time() * 1000) / 1000
     if remaining <= 0:
         raise RuntimeFault("deadline_exceeded")
-    return min(remaining, 60.0)
+    return remaining if model_stdio else min(remaining, 60.0)
 
 
 def _url(value, *, suffix=None):
@@ -384,7 +384,12 @@ class _StdioChannel:
         try:
             if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
                 raise RuntimeFault("deadline_exceeded")
-            deadline_ms = min(self.payload["deadlineMs"], time.time() * 1000 + timeout * 1000)
+            parsed = urllib.parse.urlsplit(_url(url))
+            # The host owns the model request's lifetime, including provider
+            # cancellation and accounting. A shorter SDK/local pipe timeout
+            # must not abandon a request that is still pending at the host.
+            deadline_ms = self.payload["deadlineMs"] if parsed.path == "/v1/chat/completions" else min(
+                self.payload["deadlineMs"], time.time() * 1000 + timeout * 1000)
             remaining = (deadline_ms - time.time() * 1000) / 1000
             if remaining <= 0 or not self.lock.acquire(timeout=remaining):
                 raise RuntimeFault("deadline_exceeded")
@@ -392,7 +397,6 @@ class _StdioChannel:
                 if self.fault:
                     raise RuntimeFault(self.fault)
                 _deadline({"deadlineMs": deadline_ms})
-                parsed = urllib.parse.urlsplit(_url(url))
                 expected = urllib.parse.urlsplit(self.payload["modelBaseUrl"])
                 if ((parsed.scheme, parsed.hostname, parsed.port) !=
                         (expected.scheme, expected.hostname, expected.port)
@@ -684,7 +688,8 @@ def _native_factory(*, agent_kwargs, tools, tool_handlers):
             opts = dict(client_kwargs)
             opts.update(api_key=agent_kwargs["api_key"], base_url=agent_kwargs["base_url"], max_retries=0)
             # The SDK is still only a caller of Gary's guarded local endpoint.
-            opts["timeout"] = min(60.0, max(0.01, (self._gary_deadline - time.time() * 1000) / 1000))
+            opts["timeout"] = _deadline({"deadlineMs": self._gary_deadline},
+                                        model_stdio=tool_handlers.stdio_channel is not None)
             if tool_handlers.stdio_channel is not None:
                 opts["http_client"] = _stdio_http_client(tool_handlers.stdio_channel, opts["timeout"])
             native = super()._create_openai_client(opts, reason=reason, shared=shared)

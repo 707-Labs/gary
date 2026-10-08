@@ -68,7 +68,7 @@ test('actual main selects the real Hermes factory and an injected failure never 
       expect(args.codingBase).toEqual({branch:'main',commit:f.activation.policy.baseCommit});
       expect(args.review).toEqual({providerOrder:['deepseek'],maxRounds:1,iterationCap:6,timeoutMs:180_000});
       expect(f.config.review.iterationCap).toBe(5); // Legacy config cannot widen or shrink the fixed trial review contract.
-      args.spend!.createCampaign('fixture',10);args.spend!.enrollTicket('fixture',issueId,10,{draftPr:true});
+      args.spend!.createCampaign('fixture',10);args.spend!.enrollTicket('fixture',issueId,10,{draftPr:true,codingReviewReserve:true});
       upsertTicket(args.db,{linearId:issueId,identifier:'ERT-1'});
       expect(args.codingTrial).toBeDefined();
       const admitted={issueId,fingerprint:'fixture-fp',humanSignature:'fixture-human',provider:'deepseek',model:'deepseek-v4-pro',repo:'fixture/repo'};
@@ -195,4 +195,42 @@ test('actual main carries the protected stacked branch and commit to the dispatc
     expect(Object.isFrozen(args.codingBase)).toBe(true);
   } });
   expect(polls).toBe(1); expect(f.networkCalls()).toBe(0);
+});
+
+test('combined conversation source verification fails before credentials, ledger or polling',async()=>{
+  const f=slackFixture();let verified=0,configured=0,polls=0;
+  await expect(main({...f.deps,env:{...f.env,GARY_CONVERSATION_RUNTIME_RELEASE:'c'.repeat(40),
+    GARY_SLACK_SHARED_CONVERSATION_CONFIG:'/private/shared/config.json'},
+    verifyConversationRelease:expected=>{expect(expected).toBe('c'.repeat(40));verified++;throw new Error('fixture_release_mismatch');},
+    config:()=>{configured++;return f.config;},runLoop:async()=>{polls++;}})).rejects.toThrow('fixture_release_mismatch');
+  expect({verified,configured,polls,network:f.networkCalls()}).toEqual({verified:1,configured:0,polls:0,network:0});
+});
+
+test('combined startup separates private and shared contexts from coding publication readiness and drains both',async()=>{
+  for(const metadataAvailable of [true,false]){
+    const f=slackFixture(),ledger=new SpendLedger(':memory:'),db=openDb(':memory:');
+    const dmDir=join(f.root,'private-dm'),sharedDir=join(f.root,'shared');
+    mkdirSync(dmDir,{mode:0o700});mkdirSync(sharedDir,{mode:0o700});
+    const dmPath=join(dmDir,'config.json'),sharedPath=join(sharedDir,'config.json');
+    writeFileSync(dmPath,JSON.stringify({version:1,runId:'hermes-dm-20261008',campaignId:'hermes-dm-20261008',allocationId:'local:hermes-dm-20261008-tanner'}),{mode:0o600});
+    writeFileSync(sharedPath,JSON.stringify({version:1,runId:'hermes-shared-20261008',campaignId:'hermes-shared-20261008',allocationId:'local:hermes-shared-20261008',
+      teamId:'T0AA24R7VUZ',appId:'A0C7QFW3PEG',botUserId:'U0C7NPEUG1F',trigger:'explicit_mention'}),{mode:0o600});
+    ledger.createCampaign('hermes-dm-20261008',5);ledger.enrollTicket('hermes-dm-20261008','local:hermes-dm-20261008-tanner',5);
+    ledger.createCampaign('hermes-shared-20261008',5);ledger.enrollTicket('hermes-shared-20261008','local:hermes-shared-20261008',5);
+    if(metadataAvailable){f.transport.memberInfo=async()=>{throw new Error('no_event_expected');};f.transport.channelInfo=async()=>{throw new Error('no_event_expected');};}
+    let verified=0,polls=0,ledgerClosed=false;
+    const originalClose=ledger.close.bind(ledger);ledger.close=()=>{ledgerClosed=true;originalClose();};
+    await main({...f.deps,env:{...f.env,GARY_CONVERSATION_RUNTIME_RELEASE:'c'.repeat(40),GARY_SLACK_TANNER_DM_ENABLED:'1',
+      GARY_SLACK_CONVERSATION_CONFIG:dmPath,GARY_SLACK_SHARED_CONVERSATION_CONFIG:sharedPath},verifyConversationRelease:()=>{verified++;},
+      db:()=>db,ledger:()=>ledger,slackTransport:()=>f.transport,runLoop:async args=>{
+        polls++;expect(verified).toBe(1);expect(f.stats()).toMatchObject({started:true,sends:0});
+        expect(args.codingTrial).toBeDefined();expect([...args.allowedIssueIds!]).toEqual([issueId]);
+        expect(ledger.status('local:hermes-dm-20261008-tanner')?.attemptCount).toBe(0);
+        expect(ledger.status('local:hermes-shared-20261008')?.attemptCount).toBe(0);
+        expect(db.query('SELECT count(*) n FROM gary_slack_outbox').get()).toEqual({n:0});
+        await args.onTickComplete!({} as never);expect(f.stats().sends).toBe(0);
+      }});
+    expect({verified,polls,ledgerClosed,network:f.networkCalls()}).toEqual({verified:1,polls:1,ledgerClosed:true,network:0});
+    expect(f.stats()).toMatchObject({stopped:true,sends:0});
+  }
 });

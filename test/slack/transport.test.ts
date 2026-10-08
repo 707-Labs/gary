@@ -8,6 +8,9 @@ const hello = { type: "hello", connection_info: { app_id: APPROVED_SLACK_IDENTIT
 const auth = { ok: true, team_id: APPROVED_SLACK_IDENTITY.teamId, user_id: APPROVED_SLACK_IDENTITY.botUserId, bot_id: "BFAKE123" };
 const envelope = { type: "events_api", envelope_id: "fake-envelope-id", payload: { type: "event_callback", event_id: "EvFAKE" } };
 const message = { channel: "CFAKE123", text: "Offline transport fixture", threadTs: "123.456" };
+const memberMetadata={id:'U0MEMBER11',team_id:APPROVED_SLACK_IDENTITY.teamId,deleted:false,is_bot:false,is_app_user:false,is_restricted:false,is_ultra_restricted:false,profile:{email:'private@example.invalid',real_name:'Do not retain'}};
+const channelMetadata={id:'C0CHANNEL1',context_team_id:APPROVED_SLACK_IDENTITY.teamId,is_channel:true,is_group:false,is_private:false,is_im:false,is_mpim:false,
+  is_member:true,is_archived:false,is_shared:false,is_ext_shared:false,is_org_shared:false,is_pending_ext_shared:false,shared_team_ids:[APPROVED_SLACK_IDENTITY.teamId],pending_shared:[],pending_connected_team_ids:[]};
 class FakeSocket implements SlackSocket {
   readyState = 1;
   sent: string[] = [];
@@ -60,6 +63,25 @@ function harness(options: Partial<SlackTransportOptions> = {}, authReply: unknow
 }
 
 describe("Slack transport, fake fetch and WebSocket only", () => {
+  test('shared metadata uses only exact bot-authenticated info routes, rejects foreign/pending facts, and discards profile text',async()=>{
+    const calls:Array<{url:string;body:any;headers:Headers}>=[];let user:any={...memberMetadata},channel:any={...channelMetadata};
+    const h=harness({fetch:async(url,init)=>{calls.push({url,body:JSON.parse(String(init.body)),headers:new Headers(init.headers)});
+      if(url.endsWith('auth.test'))return Response.json(auth);if(url.endsWith('apps.connections.open'))return Response.json({ok:true,url:socketUrl});
+      if(url.endsWith('users.info'))return Response.json({ok:true,user});if(url.endsWith('conversations.info'))return Response.json({ok:true,channel});throw new Error('forbidden route');}});
+    await h.start();const member=await h.transport.memberInfo!('U0MEMBER11'),facts=await h.transport.channelInfo!('C0CHANNEL1');
+    expect(member).toMatchObject({id:'U0MEMBER11',teamId:APPROVED_SLACK_IDENTITY.teamId,isRestricted:false,isStranger:false});expect(facts).toMatchObject({isMember:true,isShared:false});
+    expect(JSON.stringify(member)).not.toContain('private@example');expect(JSON.stringify(member)).not.toContain('Do not retain');
+    for(const call of calls.filter(call=>call.url.endsWith('.info')))expect(call.headers.get('authorization')).toBe('Bearer '+credentials.botToken);
+    expect(calls.filter(call=>call.url.endsWith('.info')).map(call=>call.body)).toEqual([{user:'U0MEMBER11'},{channel:'C0CHANNEL1'}]);
+    for(const bad of [{id:'C0FOREIGN'},{context_team_id:undefined},{is_member:undefined},{is_im:true},{connected_team_ids:['TFOREIGN']},{shared_team_ids:['TFOREIGN']},{pending_connected_team_ids:[APPROVED_SLACK_IDENTITY.teamId]},{pending_shared:['TFOREIGN']},{is_ext_ws_shared:true},{is_ext_ws_shared:'false'},{conversation_host_id:'TFOREIGN'}]){
+      channel={...channelMetadata,...bad};await expect(h.transport.channelInfo!('C0CHANNEL1')).rejects.toThrow('slack_response_rejected');
+    }
+    for(const bad of [{id:'U0FOREIGN'},{team_id:undefined},{is_restricted:undefined},{is_stranger:'false'},{is_external:true},{suspended:true},{is_invited_user:true},{is_profile_only_user:true},{is_external:'false'},{suspended:null}]){
+      user={...memberMetadata,...bad};await expect(h.transport.memberInfo!('U0MEMBER11')).rejects.toThrow('slack_response_rejected');
+    }
+    await expect(h.transport.memberInfo!('USLACKBOT')).rejects.toThrow('slack_response_rejected');
+    expect(calls.every(call=>!call.url.includes('history')&&!call.url.includes('replies')&&!call.url.includes('list'))).toBe(true);
+  });
   test("construction is inert; authenticated bot and socket hello bind identity without extra scopes", async () => {
     const h = harness(); expect(h.calls).toEqual([]); expect(h.sockets).toEqual([]);
     await expect(h.transport.identity()).rejects.toThrow("slack_socket_unhealthy");

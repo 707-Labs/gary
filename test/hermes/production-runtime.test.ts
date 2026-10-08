@@ -431,3 +431,44 @@ test('real Python wrapper and stdio preserve post-200 fault through phase, adapt
   expect(rows[3]).toMatchObject({status:'error',errorCode:'native_runtime_error',diagnostic,pendingOperationIds:[],phase:'investigation',iteration:1});
   expect(readFileSync(f.traces[0]!,'utf8')).not.toContain('offline-only');
 });
+
+for (const mode of ['host-abort','shared-deadline'] as const) {
+  test('real stdio '+mode+' waits for physical provider cleanup and retains unknown liability',async()=>{
+    let cleaned=0,calls=0,settled=false,transportCleaned=false;
+    let entered!:()=>void,receivedAbort!:()=>void,release!:()=>void;
+    const entry=new Promise<void>(resolve=>{entered=resolve;});
+    const aborted=new Promise<void>(resolve=>{receivedAbort=resolve;});
+    const drain=new Promise<void>(resolve=>{release=resolve;});
+    const controller=new AbortController();
+    const launch=createStdioLauncher({command:['/usr/bin/python3','-I',fileURLToPath(new URL('./fixtures/diagnostic-worker.py',import.meta.url)),
+      fileURLToPath(new URL('../../hermes/python',import.meta.url))],cwd:'/tmp',env:{PATH:'/usr/bin:/bin',PYTHONDONTWRITEBYTECODE:'1'},async cleanup(){cleaned++;}});
+    const f=await fixture(launch);
+    f.options.route.fetch=async request=>{
+      calls++;request.signal.addEventListener('abort',receivedAbort,{once:true});entered();
+      await aborted;await drain;transportCleaned=true;
+      throw new Error('offline cancelled provider');
+    };
+    const runner=f.runner(),timeoutMs=mode==='host-abort'?5000:3000;
+    const pending=runner({...f.args,timeoutMs,deadlineMs:Date.now()+timeoutMs,signal:controller.signal})
+      .then(result=>{settled=true;return result;});
+    try{
+      await Promise.race([entry,pending.then(()=>{throw new Error('provider entry missing');})]);
+      if(mode==='host-abort')controller.abort();
+      await Promise.race([aborted,pending.then(()=>{throw new Error('physical abort missing');})]);
+      await new Promise(resolve=>setTimeout(resolve,20));
+      expect(settled).toBe(false);expect(transportCleaned).toBe(false);
+      release();const result=await pending;
+      expect(['error','timeout']).toContain(result.status);expect(transportCleaned).toBe(true);
+      expect(calls).toBe(1);expect(cleaned).toBe(1);
+      const held=f.ledger.status(issue.id)!;expect(held.unknownAttempts).toBe(1);expect(held.chargedMicros).toBeGreaterThan(0);
+      const rows=readFileSync(f.traces[0]!,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+      expect(rows.filter(row=>row.kind==='model'&&row.stage==='start')).toHaveLength(1);
+      expect(rows.filter(row=>row.kind==='tool')).toHaveLength(0);
+      expect(rows.at(-1)).toMatchObject({kind:'terminal',pendingOperationIds:[]});
+      recordActionEnd(f.db,{id:f.actionId,success:false,outcome:'error'});f.ledger.markTerminal(issue.id,'offline_fixture_closed');f.binding.close();
+      expect((await runner(f.args)).status).toBe('error');expect(calls).toBe(1);
+      expect(f.ledger.status(issue.id)!.chargedMicros).toBe(held.chargedMicros);
+      expect(f.ledger.status(issue.id)!.unknownAttempts).toBe(1);
+    }finally{controller.abort();release();await pending;}
+  },10_000);
+}

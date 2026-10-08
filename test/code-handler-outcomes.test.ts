@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { RuntimeDiagnosticError } from "../src/hermes/runtime-diagnostics.ts";
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -1096,4 +1097,23 @@ it('native timeout diagnostic retains the existing timeout escalation without pu
  const result=await f.invoke();
  expect(result.status).toBe('timeout');expect(result.diagnostic).toEqual(diagnostic);
  expect(f.postComment).toHaveBeenCalledTimes(1);expect(f.run).not.toHaveBeenCalled();expect(f.push).not.toHaveBeenCalled();
+});
+
+
+describe('canonical coding reserve role binding',()=>{
+ it('funds real guarded reviewer then PR body/title at exact protected floor',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'handler-floor-')),path=join(dir,'spend.db'),ledger=new SpendLedger(path);
+  try {
+   ledger.createCampaign('protected',10);ledger.enrollTicket('protected',issue.id,10,{draftPr:true,codingReviewReserve:true});
+   const sql=new Database(path);sql.query("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES(?,'deepseek','deepseek-v4-pro',8192,5826855,5826855,'settled')").run(issue.id);sql.close();
+   f.deps.spend=ledger;
+   const limits:number[]=[];
+   const fetch=ledger.guardedFetch('deepseek',(async(request:Request)=>{const body=await request.json();limits.push(body.max_tokens);return Response.json({id:'offline',type:'message',role:'assistant',model:'deepseek-v4-pro',content:[{type:'text',text:'offline'}],stop_reason:'end_turn',stop_sequence:null,usage:{input_tokens:1048576,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}});}) as unknown as typeof globalThis.fetch);
+   const call=(max:number)=>fetch('https://api.deepseek.com/anthropic/v1/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek-v4-pro',max_tokens:max,messages:[{role:'user',content:'offline'}]})});
+   f.review.mockImplementation(async()=>{await call(4096);return reviewResult();});
+   f.complete.mockImplementation(async opts=>{await call(opts.maxTokens!);return 'offline PR text';});
+   expect((await ledger.withSpendScope(issue.id,()=>f.invoke({draftPr:true}))).status).toBe('pr_opened');
+   expect(limits).toEqual([4096,1024,128]);expect(ledger.status(issue.id)?.remainingMicros).toBe(0);expect(f.openPr).toHaveBeenCalledTimes(1);
+  }finally{ledger.close();rmSync(dir,{recursive:true,force:true});}
+ });
 });

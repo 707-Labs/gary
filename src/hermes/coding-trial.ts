@@ -24,7 +24,7 @@ export function createCodingTrial(options:{db:DB;ledger:SpendLedger;issueId:stri
   const reject=(reason:string):never=>{throw new Error('coding_trial_rejected:'+reason);};
   const funding=(claim?:Claim,allowPending=false)=>{
     const s=ledger.status(issueId);
-    if(!s||s.state!=='active'||!s.draftPr||s.capMicros>HERMES_CODING_RUNTIME_POLICY.maxAllocationMicros||(s.unknownAttempts>(allowPending?1:0)))return reject('allocation');
+    if(!s||s.state!=='active'||!s.draftPr||!ledger.hasCodingReviewReserve(issueId)||s.capMicros>HERMES_CODING_RUNTIME_POLICY.maxAllocationMicros||(s.unknownAttempts>(allowPending?1:0)))return reject('allocation');
     if(claim&&(s.campaignId!==claim.campaign_id||s.capMicros!==claim.cap_micros))return reject('allocation_changed');
     return s;
   };

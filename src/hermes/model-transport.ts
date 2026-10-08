@@ -2,6 +2,9 @@ import { timingSafeEqual } from "node:crypto";
 import { createDeadline, type Deadline } from "../deadline.ts";
 import { SpendLedger, SpendLimitError, SPEND_MAX_OUTPUT_TOKENS } from "../spend.ts";
 
+/** Host-owned ceiling for one request, always clamped to the shared action deadline. */
+export const MODEL_REQUEST_TIMEOUT_MS = 120_000;
+
 /** These are Gary's existing priced Anthropic routes, not new pricing policies. */
 const ROUTES = {
   "z.ai": { model: "glm-5.3", url: "https://api.z.ai/api/anthropic/v1/messages" },
@@ -391,7 +394,7 @@ export function createModelTransport(options: ModelTransportOptions): ModelTrans
       const url = new URL(request.url);
       if (request.method !== "POST" || url.pathname !== "/v1/chat/completions" || url.search || url.hash) throw new TransportError(404, "unsupported_route");
       if (request.headers.has("content-encoding") || !/^application\/json(?:;|$)/i.test(request.headers.get("content-type") ?? "")) invalid();
-      deadline = createDeadline({ deadlineMs: capability.deadlineMs,
+      deadline = createDeadline({ timeoutMs: MODEL_REQUEST_TIMEOUT_MS, deadlineMs: capability.deadlineMs,
         signal: capability.signal ? AbortSignal.any([capability.signal, request.signal]) : request.signal });
       const currentDeadline = deadline;
       const guard = async () => {

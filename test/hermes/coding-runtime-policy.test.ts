@@ -45,7 +45,7 @@ test('fixed trial policy bounds every stage and freezes nested review settings',
 
 test('fixed coding executor and environment are deeply frozen and included in admission identity', () => {
   const executor=HERMES_CODING_RUNTIME_POLICY.executor;
-  expect(HERMES_CODING_RUNTIME_POLICY.version).toBe(4);
+  expect(HERMES_CODING_RUNTIME_POLICY.version).toBe(5);
   expect(executor.image).toBe('sha256:0efb49a8f21794948395f7bec2c15557a78473acd760207613fe7714e7c47f8c');
   expect(executor.bunCacheVolume).toBe('gary-bun-cache-20261007-node24');
   expect({cpus:executor.cpus,memory:executor.memory,pidsLimit:executor.pidsLimit}).toEqual({cpus:'4',memory:'12g',pidsLimit:512});

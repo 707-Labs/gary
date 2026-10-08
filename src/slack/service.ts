@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import type { DB } from '../state/db.ts';
 import type { SlackTransport } from './transport.ts';
 import type { SlackConversation } from './conversation.ts';
+import type { SlackSharedConversation } from './shared-conversation.ts';
 
 export const GARY_SLACK = Object.freeze({ appId:'A0C7QFW3PEG', teamId:'T0AA24R7VUZ', botUserId:'U0C7NPEUG1F',
   tannerId:'U0A9M5W16F8', benId:'U0A97PBGXE3', readyRequest:'Sentinel_ecc85c3dae948191965308b6414c1165' });
@@ -44,6 +45,9 @@ export interface SlackServiceOptions {
   /** Explicitly approved Tanner-only status replies; no model or history access. */
   tannerDirectMessages?:true;
   conversation?:SlackConversation;
+  sharedConversation?:SlackSharedConversation;
+  /** Trusted exact-release/runtime composition proof; never coding/publication authority. */
+  checkConversationHealth?():boolean;
 }
 export interface SlackServiceHealth {
   running:boolean; identityVerified:boolean; socketHealthy:boolean; hostReady:boolean;
@@ -62,6 +66,7 @@ interface OutboxRow { status:'sent'|'unknown'|'not_sent'; }
 export function createSlackService(options:SlackServiceOptions):SlackService {
   if(options.tannerDirectMessages!==undefined&&options.tannerDirectMessages!==true)throw new Error('invalid_slack_dm_switch');
   if(options.conversation&&(!options.tannerDirectMessages||options.approvedChannelIds?.length))throw new Error('dm_conversation_boundary_rejected');
+  if(options.sharedConversation&&options.approvedChannelIds?.length)throw new Error('shared_conversation_boundary_rejected');
   const channels=[...(options.approvedChannelIds??[])], users=[...(options.allowedUserIds??[GARY_SLACK.tannerId])];
   if (channels.length>64 || new Set(channels).size!==channels.length || channels.some(id=>!CHANNEL.test(id))) throw new Error('invalid_slack_channel_allowlist');
   if (new Set(users).size!==users.length || users.some(id=>id!==GARY_SLACK.tannerId && id!==GARY_SLACK.benId)) throw new Error('invalid_slack_user_allowlist');
@@ -72,6 +77,10 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
   let readinessKind:SlackReadinessKind|null=null;
   let startPromise:Promise<SlackServiceHealth>|undefined, stopPromise:Promise<void>|undefined, refreshPromise:Promise<SlackServiceHealth>|undefined;
   const live=()=>running&&!stopped&&!cancellation.signal.aborted;
+  const conversationAvailable=()=>{
+    if(!live()||!identityVerified||!options.transport.socketHealthy())return false;
+    try{return options.checkConversationHealth?options.checkConversationHealth()===true:hostReady&&readinessKind==='readonly_runtime';}catch{return false;}
+  };
   function track<T>(promise:Promise<T>):Promise<T> {
     pending.add(promise);void promise.then(()=>pending.delete(promise),()=>pending.delete(promise));return promise;
   }
@@ -86,8 +95,8 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
       }
     } catch {throw new Error('slack_durability_unverified');}
     // A separate DM outbox leaves every historical ready/mention claim intact.
-    for(const table of options.tannerDirectMessages?['gary_slack_outbox','gary_slack_dm_outbox']:['gary_slack_outbox'])options.db.exec(`CREATE TABLE IF NOT EXISTS ${table} (
-      delivery_key TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN (${table==='gary_slack_dm_outbox'?"'dm'":"'ready','mention'"})),
+    for(const table of ['gary_slack_outbox',...(options.tannerDirectMessages?['gary_slack_dm_outbox']:[]),...(options.sharedConversation?['gary_slack_shared_outbox']:[])])options.db.exec(`CREATE TABLE IF NOT EXISTS ${table} (
+      delivery_key TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN (${table==='gary_slack_dm_outbox'?"'dm'":table==='gary_slack_shared_outbox'?"'shared'":"'ready','mention'"})),
       request_id TEXT NOT NULL, app_id TEXT NOT NULL, team_id TEXT NOT NULL, bot_user_id TEXT NOT NULL,
       recipient_id TEXT NOT NULL, target_channel TEXT NOT NULL, thread_ts TEXT,
       content_sha256 TEXT NOT NULL, readiness_receipt_id TEXT, claim_id TEXT NOT NULL,
@@ -111,9 +120,9 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
     } catch {identityVerified=false;}
     return identityVerified;
   }
-  async function sendOnce(input:{key:string;kind:'ready'|'mention'|'dm';requestId:string;recipient:string;channel:string;threadTs?:string;text:string}):Promise<void> {
+  async function sendOnce(input:{key:string;kind:'ready'|'mention'|'dm'|'shared';requestId:string;recipient:string;channel:string;threadTs?:string;text:string}):Promise<void> {
     if(!live()||!identityVerified||!options.transport.socketHealthy())return;
-    const table=input.kind==='dm'?'gary_slack_dm_outbox':'gary_slack_outbox';
+    const table=input.kind==='dm'?'gary_slack_dm_outbox':input.kind==='shared'?'gary_slack_shared_outbox':'gary_slack_outbox';
     const claim=randomUUID();
     // An exclusive durable UNKNOWN claim precedes the network request. A process
     // crash, ambiguous response, or duplicate process can never trigger an automatic retry.
@@ -186,18 +195,44 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
       const eventId=payload.event_id,channel=event.channel,ts=event.ts,user=event.user,threadTs=(event.thread_ts??event.ts) as string;
       const key=`dm:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${eventId}`;
       if(options.conversation) {
-        if(!hostReady||readinessKind!=='readonly_runtime'||options.db.query('SELECT 1 FROM gary_slack_dm_outbox WHERE delivery_key=?').get(key))return;
+        if(!conversationAvailable()||options.db.query('SELECT 1 FROM gary_slack_dm_outbox WHERE delivery_key=?').get(key))return;
         // Incoming text is passed only after every existing identity/channel/health gate.
-        await options.conversation.respond({eventId,channel,ts,threadTs,text:event.text},async text=>{
-          if(!live()||!hostReady||!identityVerified||!options.transport.socketHealthy())return 'not_sent';
+        await options.conversation.respond({eventId,channel,ts,threadTs,text:event.text},async (text,kind='answer')=>{
+          if(!conversationAvailable()||(kind!=='answer'&&kind!=='notice')||(kind==='answer'&&!options.conversation!.ready()))return 'not_sent';
           await sendOnce({key,kind:'dm',requestId:eventId,recipient:user,channel,threadTs,text});
           const row=options.db.query<{status:OutboxRow['status'];content_sha256:string;recipient_id:string;target_channel:string;thread_ts:string},[string]>('SELECT status,content_sha256,recipient_id,target_channel,thread_ts FROM gary_slack_dm_outbox WHERE delivery_key=?').get(key);
           if(!row)return 'not_sent';
           if(row.content_sha256!==hash(text)||row.recipient_id!==user||row.target_channel!==channel||row.thread_ts!==threadTs)return 'unknown';
           return row.status;
-        },cancellation.signal);
+        },cancellation.signal,conversationAvailable);
       } else await sendOnce({key,kind:'dm',requestId:eventId,recipient:user,channel,threadTs,
         text:hostReady?PRIVATE_DM_STATUS:NOT_READY_STATUS});
+      return;
+    }
+    if(options.sharedConversation&&event.type==='app_mention') {
+      if(event.bot_id!==undefined||event.subtype!==undefined||event.user===GARY_SLACK.botUserId
+        ||typeof event.user!=='string'||!/^[UW][A-Z0-9]{5,32}$/.test(event.user)
+        ||typeof event.channel!=='string'||!CHANNEL.test(event.channel)||typeof event.text!=='string'||!event.text.trim()
+        ||event.text.length>40_000||!event.text.includes(`<@${GARY_SLACK.botUserId}>`)
+        ||typeof event.ts!=='string'||!TIMESTAMP.test(event.ts)||(event.thread_ts!==undefined&&(typeof event.thread_ts!=='string'||!TIMESTAMP.test(event.thread_ts)))
+        ||(event.team!==undefined&&event.team!==GARY_SLACK.teamId)||(payload.context_team_id!==undefined&&payload.context_team_id!==GARY_SLACK.teamId)
+        ||(payload.is_ext_shared_channel!==undefined&&payload.is_ext_shared_channel!==false))return;
+      const eventId=payload.event_id,channel=event.channel,user=event.user,ts=event.ts,threadTs=(event.thread_ts??event.ts) as string;
+      const key=`shared:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${eventId}`,oldKey=`mention:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${eventId}`;
+      if(options.db.query('SELECT 1 FROM gary_slack_shared_outbox WHERE delivery_key=?').get(key)
+        ||options.db.query('SELECT 1 FROM gary_slack_outbox WHERE delivery_key=?').get(oldKey))return;
+      await refreshHealth();
+      if(!conversationAvailable())return;
+      await options.sharedConversation.respond({type:'app_mention',appId:GARY_SLACK.appId,teamId:GARY_SLACK.teamId,botUserId:GARY_SLACK.botUserId,
+        requesterId:user,eventId,channel,ts,threadTs,text:event.text},async (text,kind='answer')=>{
+        if(!conversationAvailable()||(kind!=='answer'&&kind!=='notice')||(kind==='answer'&&!options.sharedConversation!.ready()))return 'not_sent';
+        await sendOnce({key,kind:'shared',requestId:eventId,recipient:user,channel,threadTs,text});
+        const row=options.db.query<{status:OutboxRow['status'];content_sha256:string;recipient_id:string;target_channel:string;thread_ts:string},[string]>(
+          'SELECT status,content_sha256,recipient_id,target_channel,thread_ts FROM gary_slack_shared_outbox WHERE delivery_key=?').get(key);
+        if(!row)return 'not_sent';
+        if(row.content_sha256!==hash(text)||row.recipient_id!==user||row.target_channel!==channel||row.thread_ts!==threadTs)return 'unknown';
+        return row.status;
+      },cancellation.signal,conversationAvailable);
       return;
     }
     if(event.type!=='app_mention'||event.bot_id!==undefined||event.subtype!==undefined||typeof event.user!=='string'

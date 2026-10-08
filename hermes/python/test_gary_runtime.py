@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from gary_runtime import (MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGES, MAX_INPUT_BYTES, MAX_RESPONSE_BYTES,
-                          RuntimeFault, _LONG_TEST_POLICY, _StdioChannel, _history, _stdio_http_client, main, run_task)
+                          RuntimeFault, _LONG_TEST_POLICY, _StdioChannel, _deadline, _history, _stdio_http_client, main, run_task)
 
 
 CAPABILITY = "test-task-capability-" + "x" * 40
@@ -631,6 +631,65 @@ class FakeHttpx(types.ModuleType):
 
 
 class StdioProtocolTests(unittest.TestCase):
+    def test_model_stdio_timeout_uses_remaining_host_budget_and_legacy_cap_is_unchanged(self):
+        with patch("gary_runtime.time.time", return_value=1000.0):
+            self.assertEqual(_deadline({"deadlineMs": 1120000}, model_stdio=True), 120)
+            self.assertEqual(_deadline({"deadlineMs": 1120000}), 60)
+            self.assertEqual(_deadline({"deadlineMs": 1030000}, model_stdio=True), 30)
+            self.assertEqual(_deadline({"deadlineMs": 1030000}), 30)
+            with self.assertRaisesRegex(RuntimeFault, "deadline_exceeded"):
+                _deadline({"deadlineMs": 1000000}, model_stdio=True)
+
+    def test_model_response_past_sixty_seconds_keeps_original_cumulative_host_deadline(self):
+        now = [1000.0]
+        replies = iter([(61.5, response_frame(1, {"choices": []})),
+                        (58.501, response_frame(2, {"choices": []}))])
+        class DelayedReader(io.StringIO):
+            def read(self, size=-1):
+                elapsed, reply = next(replies)
+                now[0] += elapsed
+                return reply
+        with patch("gary_runtime.time.time", side_effect=lambda: now[0]), patch.dict(sys.modules, {"httpx": FakeHttpx("httpx")}):
+            output = io.StringIO()
+            channel = _StdioChannel(payload(transport="stdio", deadlineMs=1120000), DelayedReader(), output)
+            client = _stdio_http_client(channel, 60)
+            send = lambda: client.send(url="http://127.0.0.1:9001/v1/chat/completions", body={"model":"test-model","messages":[]})
+            self.assertEqual(send().status_code, 200)
+            self.assertIsNone(channel.fault)
+            self.assertEqual(now[0], 1061.5)
+            with self.assertRaisesRegex(RuntimeFault, "deadline_exceeded"):
+                send()
+            self.assertEqual(channel.diagnostic, {"origin":"worker","code":"deadline_exceeded","stage":"stdio_read","category":"none"})
+            with self.assertRaisesRegex(RuntimeFault, "deadline_exceeded"):
+                send()
+            self.assertEqual(len(output.getvalue().splitlines()), 2)
+
+    def test_model_pipe_wait_is_still_bounded_by_host_deadline(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            with os.fdopen(read_fd, "rb") as pipe:
+                output = io.StringIO()
+                channel = _StdioChannel(payload(transport="stdio", deadlineMs=time.time()*1000+20), pipe, output)
+                started = time.monotonic()
+                with self.assertRaisesRegex(RuntimeFault, "deadline_exceeded"):
+                    channel.exchange("http://127.0.0.1:9001/v1/chat/completions", {},
+                        {"Authorization":"Bearer "+CAPABILITY,"Content-Type":"application/json"}, 60)
+                self.assertLess(time.monotonic()-started, 1)
+                self.assertEqual(channel.fault, "deadline_exceeded")
+                self.assertEqual(len(output.getvalue().splitlines()), 1)
+        finally:
+            os.close(write_fd)
+
+    def test_invalid_model_call_timeout_never_reaches_pipe(self):
+        for timeout in [0, -1, True, float("nan"), float("inf")]:
+            with self.subTest(timeout=timeout):
+                output = io.StringIO()
+                channel = _StdioChannel(payload(transport="stdio"), io.StringIO(), output)
+                with self.assertRaisesRegex(RuntimeFault, "deadline_exceeded"):
+                    channel.exchange("http://127.0.0.1:9001/v1/chat/completions", {},
+                        {"Authorization":"Bearer "+CAPABILITY,"Content-Type":"application/json"}, timeout)
+                self.assertEqual(output.getvalue(), "")
+
     def make_channel(self, replies=None, **overrides):
         self.manifest = payload(transport="stdio", **overrides)
         self.output = io.StringIO()
@@ -1147,11 +1206,11 @@ class DiagnosticTests(unittest.TestCase):
                 self.assertEqual(transport.calls, [])
                 self.assertNotIn(CAPABILITY, json.dumps(result))
 
-    def test_sixty_second_stdio_deadline_with_delayed_200_is_specific_and_latched(self):
+    def test_shared_stdio_deadline_with_delayed_200_is_specific_and_latched(self):
         now = [1000.0]
         class DelayedReader(io.StringIO):
             def read(self, size=-1):
-                now[0] += 60.001  # Deterministic clock advance; no real wait.
+                now[0] += 120.001  # Deterministic clock advance; no real wait.
                 return super().read(size)
         with patch("gary_runtime.time.time", side_effect=lambda: now[0]):
             manifest = payload(transport="stdio", deadlineMs=1120000)
@@ -1166,7 +1225,7 @@ class DiagnosticTests(unittest.TestCase):
             result = run_task(manifest, native_factory=FakeFactory(action=action), transport=channel)
             self.assertEqual(result["status"], "timeout")
             self.assertEqual(result["diagnostic"], {"origin":"worker","code":"deadline_exceeded","stage":"stdio_read","category":"none"})
-            self.assertLess(now[0]*1000, manifest["deadlineMs"])  # Host action still has time.
+            self.assertGreaterEqual(now[0]*1000, manifest["deadlineMs"])
             self.assertEqual(len(output.getvalue().splitlines()), 1)
             self.assertFalse(result["publicationApproved"])
             self.assertNotIn(CAPABILITY, json.dumps(result))

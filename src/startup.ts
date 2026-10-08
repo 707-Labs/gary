@@ -20,11 +20,16 @@ import { openSpendLedger } from './spend.ts';
 import { loadSlackCredentials, type SlackCredentials } from './slack/credentials.ts';
 import { createSlackTransport, type SlackTransport } from './slack/transport.ts';
 import { createSlackService, type SlackService } from './slack/service.ts';
-import { runReadonlyGaryHost, type ReadonlyStartupDependencies } from './readonly-startup.ts';
+import { runReadonlyGaryHost, verifyReadonlyRelease, type ReadonlyStartupDependencies } from './readonly-startup.ts';
+import { createSlackConversation, loadSlackConversationConfig, fingerprintSlackConversationConfig, type SlackConversation } from './slack/conversation.ts';
+import { createSlackSharedConversation, loadSlackSharedConversationConfig, fingerprintSlackSharedConversationConfig, type SlackSharedConversation } from './slack/shared-conversation.ts';
+import { createHermesDMResponder, createHermesSharedResponder } from './hermes/dm-conversation.ts';
 
 /** Test dependencies are trusted code, never environment or task JSON. */
 export interface StartupDependencies extends ReadonlyStartupDependencies {
   env?: Readonly<Record<string, string | undefined>>;
+  /** Exact release verification seam for offline fixtures only. */
+  verifyConversationRelease?: (expected:string)=>void;
   config?: () => Config;
   linear?: (config: Config) => LinearAdapter;
   github?: typeof makeGitHubClient;
@@ -44,6 +49,10 @@ export interface StartupDependencies extends ReadonlyStartupDependencies {
 export async function runGaryHost(deps: StartupDependencies = {}): Promise<void> {
   const host = loadHostStartupConfig(deps.env ?? process.env);
   if (host.mode === 'hermes-readonly-canary') return runReadonlyGaryHost(host, deps);
+  if(host.conversationRuntimeRelease)(deps.verifyConversationRelease??verifyReadonlyRelease)(host.conversationRuntimeRelease);
+  const conversationConfig=host.slackConversationConfigPath?loadSlackConversationConfig(host.slackConversationConfigPath):undefined;
+  const sharedConfig=host.slackSharedConversationConfigPath?loadSlackSharedConversationConfig(host.slackSharedConversationConfigPath):undefined;
+  if(conversationConfig&&sharedConfig&&conversationConfig.contextDirectory===sharedConfig.contextDirectory)throw new Error('conversation_contexts_must_be_separate');
   const activationConfig = host.activationPath ? loadHermesActivationConfig(host.activationPath) : undefined;
   const cfg = (deps.config ?? loadConfig)();
   const providerConfigs = cfg.providers.filter(provider => provider.name === 'deepseek');
@@ -55,6 +64,8 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
   const db = (deps.db ?? openDb)(cfg.gary.dbPath);
   let spend: ReturnType<typeof openSpendLedger> | undefined;
   let slack: SlackService | undefined;
+  let conversation:SlackConversation|undefined;
+  let sharedConversation:SlackSharedConversation|undefined;
   let executorJobJournal: ExecutorJobJournal | undefined;
   const controller = new AbortController();
   const abort = () => {
@@ -93,10 +104,26 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
     if (controller.signal.aborted) return;
     if (host.slack && slackCredentials && readiness) {
       const transport = deps.slackTransport ? deps.slackTransport(slackCredentials) : createSlackTransport({ credentials: slackCredentials });
-      slack = createSlackService({ db, transport, checkHostHealth: readiness.check, approvedChannelIds: host.slack.approvedChannelIds });
+      const responderDeps={ledger:spend,providerApiKey:providerConfigs[0]!.apiKey,fetch:(request:Request)=>rawFetch(request),...(deps.launch?{launch:deps.launch}:{})};
+      if(conversationConfig)conversation=createSlackConversation({config:conversationConfig,ledger:spend,reply:createHermesDMResponder(responderDeps)});
+      if(sharedConfig){
+        try {
+          if(!transport.memberInfo||!transport.channelInfo)throw new Error('shared_metadata_unavailable');
+          sharedConversation=createSlackSharedConversation({config:sharedConfig,ledger:spend,reply:createHermesSharedResponder(responderDeps),
+            metadata:{memberInfo:(id,signal)=>transport.memberInfo!(id,signal),channelInfo:(id,signal)=>transport.channelInfo!(id,signal)}});
+        }catch{log.warn('shared conversation unavailable',{reason:'shared_runtime_initialization_rejected'});}
+      }
+      slack = createSlackService({ db, transport, checkHostHealth: readiness.check, approvedChannelIds: host.slack.approvedChannelIds,
+        ...(conversation?{conversation,tannerDirectMessages:true as const}:{}),...(sharedConversation?{sharedConversation}:{}),
+        ...(host.conversationRuntimeRelease?{checkConversationHealth:()=>!controller.signal.aborted}: {}) });
       const health = await slack.start();
       if (controller.signal.aborted) return;
       if (!health.running || !health.identityVerified || !health.socketHealthy) throw new Error('slack_startup_health_failed');
+      if(conversationConfig&&conversation){if(!conversation.ready())throw new Error('dm_conversation_not_ready');
+        log.info('conversation runtime ready',{kind:'private_dm',runId:conversationConfig.runId,allocationId:conversationConfig.allocationId,
+          configFingerprint:fingerprintSlackConversationConfig(conversationConfig),release:host.conversationRuntimeRelease,tools:'none'});}
+      if(sharedConfig&&sharedConversation)log.info('conversation runtime ready',{kind:'shared_channel',ready:sharedConversation.ready(),runId:sharedConfig.runId,
+        allocationId:sharedConfig.allocationId,configFingerprint:fingerprintSlackSharedConversationConfig(sharedConfig),release:host.conversationRuntimeRelease,tools:'none',trigger:'explicit_mention'});
     }
     recordEvent(db, { eventType: 'boot', payload: { version: '0.0.1', runtime: host.mode } });
     log.info('gary booted', { name: cfg.gary.name, dbPath: cfg.gary.dbPath, githubAuth: cfg.github.kind,
@@ -123,7 +150,10 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
     process.off('SIGINT', onInt); process.off('SIGTERM', onTerm);
     deps.signal?.removeEventListener('abort', abort);
     try { await slack?.stop(); } finally {
-      try { executorJobJournal?.close(); } finally { try { spend?.close(); } finally { db.close(); } }
+      try {
+        try{if(conversation)log.info('conversation runtime stopped',{kind:'private_dm',drained:conversation.close().drained});}
+        finally{if(sharedConversation)log.info('conversation runtime stopped',{kind:'shared_channel',drained:sharedConversation.close().drained});}
+      } finally {try { executorJobJournal?.close(); } finally { try { spend?.close(); } finally { db.close(); } }}
     }
   }
 }
