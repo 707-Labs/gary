@@ -3,13 +3,14 @@ import { Database } from 'bun:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createSlackService, GARY_SLACK, READY_DM_TEXT, type SlackHostHealth, type SlackService, type SlackServiceOptions } from '../../src/slack/service.ts';
+import { createSlackService, GARY_SLACK, READY_DM_TEXT, READONLY_READY_DM_TEXT, type SlackHostHealth, type SlackService, type SlackServiceOptions } from '../../src/slack/service.ts';
 import type { SlackTransport } from '../../src/slack/transport.ts';
 
 const cleanups:Array<()=>void|Promise<void>>=[];
 afterEach(async()=>{for(const cleanup of cleanups.splice(0).reverse())await cleanup();});
 type SendArgs=Parameters<SlackTransport['sendMessage']>[0];
 const healthy:SlackHostHealth={ready:true,hermesCanarySucceeded:true,receiptId:'canary-action-123:deployment-456'};
+const readonlyHealthy:SlackHostHealth={kind:'readonly_runtime',ready:true,readonlyCanarySucceeded:true,receiptId:'readonly-canary-123:runtime-456'};
 function fakeTransport() {
   const sends:SendArgs[]=[];let callback:((event:unknown)=>void|Promise<void>)|undefined;
   let connected=false,starts=0,stops=0;
@@ -26,7 +27,7 @@ function fakeTransport() {
 }
 function fixture(extra:Partial<SlackServiceOptions>={}) {
   const db=extra.db??new Database(':memory:',{strict:true});if(!extra.db)cleanups.push(()=>db.close());
-  const fake=fakeTransport();let health={...healthy},healthCalls=0;
+  const fake=fakeTransport();let health:SlackHostHealth={...healthy},healthCalls=0;
   const service=createSlackService({db,transport:fake.transport,checkHostHealth:async()=>{healthCalls++;return {...health};},...extra});
   cleanups.push(()=>service.stop().catch(()=>{}));
   return {db,fake,service,set health(value:SlackHostHealth){health=value;},get healthCalls(){return healthCalls;}};
@@ -43,6 +44,29 @@ test('construction validates policy without schema mutation, socket startup or s
   for(const policy of [{approvedChannelIds:['D0PRIVATE']},{approvedChannelIds:['C0APPROVED','C0APPROVED']},{allowedUserIds:['U0STRANGER']}]) {
     expect(()=>createSlackService({db:f.db,transport:f.fake.transport,checkHostHealth:()=>healthy,...policy})).toThrow('allowlist');
   }
+});
+test('service requires verified FULL synchronous before creating or claiming its WAL outbox',async()=>{
+  const root=mkdtempSync(join(tmpdir(),'gary-slack-full-sync-'));cleanups.push(()=>rmSync(root,{recursive:true,force:true}));
+  const db=new Database(join(root,'state.db'),{strict:true});cleanups.push(()=>db.close());
+  db.exec('PRAGMA journal_mode = WAL');db.exec('PRAGMA synchronous = NORMAL');
+  const level=()=>db.query<{synchronous:number},[]>('PRAGMA synchronous').get()!.synchronous;
+  expect(level()).toBe(1);
+  const f=fixture({db});expect(level()).toBe(1);
+  f.fake.send=async()=>{
+    expect(level()).toBe(2);expect(rows(db)[0].status).toBe('unknown');
+    return {ok:true,channel:'D0FIXTURE1',ts:'1791417600.000001'};
+  };
+  expect((await f.service.start()).readyDelivery).toBe('sent');expect(level()).toBe(2);
+  expect(f.fake.starts).toBe(1);expect(f.fake.sends).toHaveLength(1);
+});
+test('durability configuration failure propagates before outbox writes or transport startup',async()=>{
+  const f=fixture();f.db.exec('PRAGMA synchronous = NORMAL');f.db.exec('BEGIN');
+  try {
+    // SQLite forbids changing synchronous inside an active transaction.
+    await expect(f.service.start()).rejects.toThrow('slack_durability_unverified');
+    expect(f.fake.starts).toBe(0);expect(f.fake.sends).toEqual([]);
+    expect(f.db.query("SELECT name FROM sqlite_master WHERE name='gary_slack_outbox'").all()).toEqual([]);
+  } finally {f.db.exec('ROLLBACK');}
 });
 test('ready DM requires exact identity, live socket and explicit successful host canary',async()=>{
   for(const mode of ['app','team','bot','not-ready','no-canary','bad-receipt']) {
@@ -64,6 +88,62 @@ test('one ready DM claims durably before send and records only safe delivery rec
   const row=rows(f.db)[0];expect(row).toMatchObject({kind:'ready',request_id:GARY_SLACK.readyRequest,app_id:GARY_SLACK.appId,
     team_id:GARY_SLACK.teamId,bot_user_id:GARY_SLACK.botUserId,recipient_id:GARY_SLACK.tannerId,status:'sent',slack_channel:'D0FIXTURE1',slack_ts:'1791417600.000001',readiness_receipt_id:healthy.receiptId});
   expect(row.content_sha256).toMatch(/^[a-f0-9]{64}$/);expect(JSON.stringify(row)).not.toContain(READY_DM_TEXT);
+});
+test('verified readonly runtime uses fixed accurate wording and typed status with the same recipient and one claim',async()=>{
+  const f=fixture();f.health=readonlyHealthy;
+  expect(READONLY_READY_DM_TEXT).toBe("i'm gary. the Hermes runtime is up, my read-only model/tool check passed, and this Slack connection is verified. coding still follows the approved Linear flow.");
+  const status=await f.service.start();await f.service.refreshHealth();await f.fake.emit(envelope());
+  expect(status).toMatchObject({hostReady:true,readinessKind:'readonly_runtime',readinessReceiptId:readonlyHealthy.receiptId,readyDelivery:'sent'});
+  expect(f.fake.sends).toEqual([{channel:GARY_SLACK.tannerId,text:READONLY_READY_DM_TEXT}]);
+  expect(rows(f.db)).toHaveLength(1);
+  expect(rows(f.db)[0]).toMatchObject({kind:'ready',request_id:GARY_SLACK.readyRequest,app_id:GARY_SLACK.appId,
+    team_id:GARY_SLACK.teamId,bot_user_id:GARY_SLACK.botUserId,recipient_id:GARY_SLACK.tannerId,
+    delivery_key:`ready:${GARY_SLACK.readyRequest}:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${GARY_SLACK.tannerId}`});
+  expect(f.fake.sends[0]!.text).not.toContain('publication');
+});
+test('readonly proof cannot satisfy coding readiness and malformed or mixed proof variants fail closed',async()=>{
+  const cases:unknown[]=[
+    {...readonlyHealthy,ready:false}, {...readonlyHealthy,readonlyCanarySucceeded:false}, {...readonlyHealthy,receiptId:''},
+    {ready:true,readonlyCanarySucceeded:true,receiptId:'read-only-proof'},
+    {...healthy,kind:'coding_publication',hermesCanarySucceeded:false,readonlyCanarySucceeded:true},
+    {...healthy,readonlyCanarySucceeded:true}, {...readonlyHealthy,hermesCanarySucceeded:true},
+    {...healthy,kind:'unknown'}, {...healthy,kind:null}, {...healthy,kind:17},
+    {...readonlyHealthy,kind:'coding_publication'}, {...healthy,kind:'readonly_runtime'},
+  ];
+  for(const proof of cases) {
+    const f=fixture({checkHostHealth:()=>proof as SlackHostHealth});
+    expect(await f.service.start()).toMatchObject({hostReady:false,readinessKind:null,readinessReceiptId:null,readyDelivery:'none'});
+    expect(f.fake.sends).toEqual([]);expect(rows(f.db)).toEqual([]);
+  }
+  const coding=fixture({checkHostHealth:()=>({...healthy,kind:'coding_publication'})});
+  expect((await coding.service.start()).readinessKind).toBe('coding_publication');
+  expect(coding.fake.sends).toEqual([{channel:GARY_SLACK.tannerId,text:READY_DM_TEXT}]);
+});
+test('readonly status replies identify the readonly proof and clear its kind when health becomes invalid',async()=>{
+  const f=fixture({approvedChannelIds:['C0APPROVED']});f.health=readonlyHealthy;await f.service.start();
+  await f.fake.emit(envelope());
+  expect(f.fake.sends[1]).toEqual({channel:'C0APPROVED',threadTs:'1791417600.000002',text:READONLY_READY_DM_TEXT});
+  f.health={...readonlyHealthy,readonlyCanarySucceeded:false};await f.service.refreshHealth();
+  expect(f.service.health).toMatchObject({hostReady:false,readinessKind:null,readinessReceiptId:null});
+  await f.fake.emit(envelope({}, {event_id:'EvAfterFailure'}));
+  expect(f.fake.sends[2]!.text).toContain('not passed');
+  expect(f.fake.sends[2]!.text).not.toContain('my read-only model/tool check passed');
+});
+test('switching readonly and coding proof kinds shares the original durable ready key without another DM',async()=>{
+  for(const [initial,next] of [[readonlyHealthy,healthy],[healthy,readonlyHealthy]] as const) {
+    const db=new Database(':memory:',{strict:true});cleanups.push(()=>db.close());
+    const first=fixture({db,checkHostHealth:()=>initial});await first.service.start();await first.service.stop();
+    const second=fixture({db,checkHostHealth:()=>next});
+    expect((await second.service.start()).readyDelivery).toBe('sent');expect(second.fake.sends).toEqual([]);
+    expect(rows(db)).toHaveLength(1);expect(first.fake.sends).toHaveLength(1);
+    expect(rows(db)[0].delivery_key).toBe(`ready:${GARY_SLACK.readyRequest}:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${GARY_SLACK.tannerId}`);
+  }
+});
+test('ambiguous readonly readiness delivery remains unknown after switching to coding readiness',async()=>{
+  const f=fixture();f.health=readonlyHealthy;f.fake.send=async()=>({ok:false,outcome:'unknown',code:'offline-fixture'});
+  expect((await f.service.start()).readyDelivery).toBe('unknown');
+  f.health=healthy;expect((await f.service.refreshHealth()).readyDelivery).toBe('unknown');
+  expect(f.fake.sends).toHaveLength(1);expect(rows(f.db)).toHaveLength(1);
 });
 test('durable sentinel key suppresses another DM across restart, deployment and canary changes',async()=>{
   const root=mkdtempSync(join(tmpdir(),'gary-slack-outbox-'));cleanups.push(()=>rmSync(root,{recursive:true,force:true}));

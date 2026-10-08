@@ -33,3 +33,10 @@ test('Slack defaults to no shared channels and requires an explicit absolute cre
   expect(() => loadHostStartupConfig({ ...canary, GARY_SLACK_CREDENTIALS_FILE: '/private/slack.env' })).toThrow();
   expect(() => loadHostStartupConfig({ ...canary, GARY_SLACK_ENABLED: 'yes' })).toThrow();
 });
+
+test('read-only startup requires Slack and prohibits shared-channel responses',()=>{
+  const env={...canary,GARY_RUNTIME_MODE:'hermes-readonly-canary',GARY_SLACK_ENABLED:'1',GARY_SLACK_CREDENTIALS_FILE:'/private/runtime/slack.env'};
+  expect(loadHostStartupConfig(env).mode).toBe('hermes-readonly-canary');
+  expect(()=>loadHostStartupConfig({...env,GARY_SLACK_ENABLED:'0'})).toThrow('readonly_canary_requires_slack');
+  expect(()=>loadHostStartupConfig({...env,GARY_SLACK_ALLOWED_CHANNEL_IDS:'C0123456789'})).toThrow('readonly_canary_shared_channels_disabled');
+});

@@ -2,7 +2,7 @@
 import { isAbsolute, normalize } from 'node:path';
 
 export interface HostStartupConfig {
-  mode: 'legacy' | 'hermes-canary';
+  mode: 'legacy' | 'hermes-canary' | 'hermes-readonly-canary';
   activationPath?: string;
   slack?: { credentialsPath: string; approvedChannelIds: readonly string[] };
 }
@@ -16,7 +16,7 @@ function path(value: string | undefined): string {
 
 export function loadHostStartupConfig(env: Readonly<Record<string, string | undefined>> = process.env): HostStartupConfig {
   const mode = env.GARY_RUNTIME_MODE ?? 'legacy';
-  if (mode !== 'legacy' && mode !== 'hermes-canary') throw new Error('invalid_runtime_mode');
+  if (mode !== 'legacy' && mode !== 'hermes-canary' && mode !== 'hermes-readonly-canary') throw new Error('invalid_runtime_mode');
   const enabled = env.GARY_SLACK_ENABLED;
   if (enabled !== undefined && enabled !== '0' && enabled !== '1') throw new Error('invalid_slack_enable_switch');
   if (mode === 'legacy') {
@@ -34,6 +34,7 @@ export function loadHostStartupConfig(env: Readonly<Record<string, string | unde
     throw new Error('hermes_requires_reviewed_docker_executor');
   }
   const activationPath = path(env.GARY_HERMES_ACTIVATION_PATH);
+  if (mode === 'hermes-readonly-canary' && enabled !== '1') throw new Error('readonly_canary_requires_slack');
   if (enabled !== '1') {
     if (env.GARY_SLACK_CREDENTIALS_FILE || env.GARY_SLACK_ALLOWED_CHANNEL_IDS) throw new Error('slack_configuration_requires_enable');
     return Object.freeze({ mode, activationPath });
@@ -44,6 +45,7 @@ export function loadHostStartupConfig(env: Readonly<Record<string, string | unde
       || approvedChannelIds.some(channel => !/^[CG][A-Z0-9]{8,20}$/.test(channel))) {
     throw new Error('invalid_slack_channel_allowlist');
   }
+  if (mode === 'hermes-readonly-canary' && approvedChannelIds.length) throw new Error('readonly_canary_shared_channels_disabled');
   return Object.freeze({ mode, activationPath,
     slack: Object.freeze({ credentialsPath: path(env.GARY_SLACK_CREDENTIALS_FILE), approvedChannelIds: Object.freeze(approvedChannelIds) }) });
 }

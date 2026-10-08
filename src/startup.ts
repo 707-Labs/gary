@@ -18,9 +18,10 @@ import { openSpendLedger } from './spend.ts';
 import { loadSlackCredentials, type SlackCredentials } from './slack/credentials.ts';
 import { createSlackTransport, type SlackTransport } from './slack/transport.ts';
 import { createSlackService, type SlackService } from './slack/service.ts';
+import { runReadonlyGaryHost, type ReadonlyStartupDependencies } from './readonly-startup.ts';
 
 /** Test dependencies are trusted code, never environment or task JSON. */
-export interface StartupDependencies {
+export interface StartupDependencies extends ReadonlyStartupDependencies {
   env?: Readonly<Record<string, string | undefined>>;
   config?: () => Config;
   linear?: (config: Config) => LinearAdapter;
@@ -38,6 +39,7 @@ export interface StartupDependencies {
 /** Both production and fixture entrypoints use this composition; imports are inert. */
 export async function runGaryHost(deps: StartupDependencies = {}): Promise<void> {
   const host = loadHostStartupConfig(deps.env ?? process.env);
+  if (host.mode === 'hermes-readonly-canary') return runReadonlyGaryHost(host, deps);
   const activationConfig = host.activationPath ? loadHermesActivationConfig(host.activationPath) : undefined;
   const cfg = (deps.config ?? loadConfig)();
   const providerConfigs = cfg.providers.filter(provider => provider.name === 'deepseek');
