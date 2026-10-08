@@ -310,7 +310,16 @@ export async function pushBranch(args: {
   worktreePath: string;
   freshTokenUrl: string;
   branch: string;
+  /** Publish this exact checked commit even if the local branch moves. */
+  sourceCommit?: string;
 } & DeadlineOptions): Promise<void> {
+  const { branch, freshTokenUrl, worktreePath, sourceCommit } = args;
+  if (sourceCommit !== undefined && (typeof sourceCommit !== "string" || !/^[a-fA-F0-9]{40}$/.test(sourceCommit))) {
+    throw new Error("invalid_push_source_commit");
+  }
+  const sourceRefspec = sourceCommit === undefined
+    ? `${branch}:${branch}`
+    : `${sourceCommit}:refs/heads/${branch}`;
   // `--force-with-lease` (no value) compares against the local remote-tracking
   // ref. Bare clones with worktrees never populate `refs/remotes/origin/*`, so
   // that form refuses every push with "stale info" once the branch exists on
@@ -319,18 +328,18 @@ export async function pushBranch(args: {
   // lease has accurate input. An empty value tells git to expect the ref to
   // be absent, which is correct for first-time pushes.
   const lsr = await gitRun(
-    ["ls-remote", args.freshTokenUrl, `refs/heads/${args.branch}`],
-    { ...args, cwd: args.worktreePath },
+    ["ls-remote", freshTokenUrl, `refs/heads/${branch}`],
+    { ...args, cwd: worktreePath },
   );
   const expectedSha = lsr.stdout.trim().split(/\s+/)[0] ?? "";
   await gitMust(
     [
       "push",
-      args.freshTokenUrl,
-      `${args.branch}:${args.branch}`,
-      `--force-with-lease=${args.branch}:${expectedSha}`,
+      freshTokenUrl,
+      sourceRefspec,
+      `--force-with-lease=${branch}:${expectedSha}`,
     ],
-    { ...args, cwd: args.worktreePath },
+    { ...args, cwd: worktreePath },
   );
 }
 

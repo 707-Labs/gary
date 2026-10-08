@@ -113,3 +113,18 @@ CREATE TABLE IF NOT EXISTS hermes_action_owners (
   action_id INTEGER PRIMARY KEY REFERENCES actions(id),
   owner_epoch TEXT NOT NULL
 );
+
+-- Immutable one-issue coding trial: crashes consume the active phase.
+CREATE TABLE IF NOT EXISTS hermes_coding_trials (
+  issue_id TEXT PRIMARY KEY REFERENCES tickets(linear_id),
+  policy_fingerprint TEXT NOT NULL,
+  campaign_id TEXT NOT NULL,
+  cap_micros INTEGER NOT NULL,
+  phase TEXT NOT NULL CHECK(phase IN ('classifying','classified','coding','closed')),
+  epoch TEXT NOT NULL,
+  classify_action INTEGER NOT NULL UNIQUE REFERENCES actions(id),
+  code_action INTEGER UNIQUE REFERENCES actions(id),
+  human_signature TEXT NOT NULL,
+  confidence REAL,
+  scope TEXT
+);

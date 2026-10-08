@@ -7,6 +7,7 @@ import { LinearAdapter } from './adapters/linear.ts';
 import { loadConfig, type Config } from './config.ts';
 import { loadHostStartupConfig } from './host-config.ts';
 import { createHermesActivation, loadHermesActivationConfig } from './hermes/activation.ts';
+import { HERMES_CODING_RUNTIME_POLICY } from './hermes/coding-runtime-policy.ts';
 import { createCanaryReadiness } from './hermes/host-readiness.ts';
 import type { GaryRuntimeLauncher } from './hermes/gary-loop-adapter.ts';
 import { log } from './logger.ts';
@@ -91,12 +92,12 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
     await (deps.runLoop ?? runLoop)({ db, spend, linear, github, glm, cloudflare,
       repoMap: cfg.gary.repoMap, allowlistedMentionUserIds: cfg.gary.allowlistedMentionUserIds,
       reposDir: cfg.gary.reposDir, workspacesDir: cfg.gary.workspacesDir,
-      agentLoopMaxIterations: cfg.runtime.agentLoopMaxIterations, agentLoopTimeoutMs: cfg.runtime.agentLoopTimeoutMs,
+      agentLoopMaxIterations: cfg.runtime.agentLoopMaxIterations, agentLoopTimeoutMs: activation ? HERMES_CODING_RUNTIME_POLICY.actionTimeoutMs : cfg.runtime.agentLoopTimeoutMs,
       maxCiAttempts: cfg.runtime.maxCiAttempts, maxAttemptsPerTicket: cfg.runtime.maxAttemptsPerTicket,
       circuitBreakerWindowHours: cfg.runtime.circuitBreakerWindowHours, stalePrAfterMs: cfg.runtime.stalePrAfterMs,
-      review: cfg.review, intervalMs: cfg.runtime.pollIntervalMs, signal: controller.signal,
+      review: activation ? {...HERMES_CODING_RUNTIME_POLICY.review,providerOrder:[...HERMES_CODING_RUNTIME_POLICY.review.providerOrder]} : cfg.review, intervalMs: cfg.runtime.pollIntervalMs, signal: controller.signal,
       ...(activation ? { allowedIssueIds: activation.allowedIssueIds, allowedActionTypes: activation.allowedActionTypes,
-        createAdmittedCodeLoop: activation.createAdmittedCodeLoop, onCodePublication: readiness!.recordPublication } : {}),
+        codingTrial: activation.codingTrial, createAdmittedCodeLoop: activation.createAdmittedCodeLoop, onCodePublication: readiness!.recordPublication } : {}),
       ...(slack ? { onTickComplete: async () => {
         if (controller.signal.aborted) return;
         const health = await slack!.refreshHealth();

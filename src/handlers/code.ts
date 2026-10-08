@@ -167,6 +167,14 @@ export interface CodeGitObservation {
   worktreeClean: boolean | null;
 }
 
+/** Exact committed artifact observed throughout the opt-in publication guard. */
+export interface CodePublicationArtifact {
+  headSha: string;
+  baseSha: string;
+  treeSha: string;
+  worktreeClean: true;
+}
+
 /** Emitted only after existing check/review/push/PR branches complete successfully.
  * The caller must bind this receipt to its canonical action and independently
  * confirm ledger closure. Different/missing SHAs never mean exact-head approval.
@@ -189,6 +197,8 @@ export interface CodePublicationReceipt {
   review: { fingerprint: string; verdict: "approve"; afterApproval: CodeGitObservation };
   publication: { beforePush: CodeGitObservation; afterPush: CodeGitObservation; remoteHeadSha: string | null };
   postRebaseCheck: "not_run" | "passed" | "failed_reverted" | "incomplete";
+  /** Present only after strict check/review/publication artifact comparisons pass. */
+  exactArtifact?: CodePublicationArtifact;
 }
 
 export interface CodeHandlerDeps {
@@ -212,6 +222,8 @@ export interface CodeHandlerDeps {
   review: ReviewConfig;
   /** Optional run-level guard checked before publishing any branch or PR. */
   assertCanPublish?: () => void;
+  /** Trusted canary opt-in. Legacy publication behavior is unchanged on omission. */
+  strictPublicationArtifact?: true;
   /** Trusted host-only readiness persistence; never a publication authorization.
    * Failure is recorded without relabeling an already-created PR as a failure.
    */
@@ -290,6 +302,33 @@ async function runCodeHandlerWithinDeadline(
 
   const branch = `${args.issue.identifier}-${slugify(args.issue.title)}`;
   const worktreePath = resolve(deps.workspacesDir, args.issue.identifier);
+  const strictArtifact = deps.strictPublicationArtifact === true;
+  if (deps.strictPublicationArtifact !== undefined && !strictArtifact) throw new Error("invalid_strict_publication_policy");
+  const sameArtifact = (left: CodePublicationArtifact, right: CodePublicationArtifact) =>
+    left.headSha === right.headSha && left.baseSha === right.baseSha && left.treeSha === right.treeSha;
+  const observeArtifact = async (): Promise<CodePublicationArtifact> => {
+    budget.throwIfExpired();
+    try {
+      const refs = ["rev-parse", "HEAD", "HEAD^{tree}", `${BASE_BRANCH}^{commit}`, `refs/heads/${branch}^{commit}`];
+      const before = await gitMust(refs, { ...budget, cwd: worktreePath });
+      const status = await gitMust(["status", "--porcelain=v1", "--untracked-files=all"], { ...budget, cwd: worktreePath });
+      const after = await gitMust(refs, { ...budget, cwd: worktreePath });
+      const parts = before.stdout.trim().split("\n");
+      if (before.stdout !== after.stdout || status.stdout !== "" || parts.length !== 4
+          || parts.some(sha => !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(sha)) || parts[0] !== parts[3]) throw new Error();
+      budget.throwIfExpired();
+      return { headSha: parts[0]!, treeSha: parts[1]!, baseSha: parts[2]!, worktreeClean: true };
+    } catch { budget.throwIfExpired(); throw new Error("strict_publication_artifact_unverified"); }
+  };
+  let checkStartedArtifact: CodePublicationArtifact | undefined;
+  let checkedArtifact: CodePublicationArtifact | undefined;
+  const beforeRequiredCheck = strictArtifact ? async () => {
+    checkedArtifact = undefined;
+    checkStartedArtifact = await observeArtifact();
+  } : undefined;
+  const assertCheckedArtifact = strictArtifact ? async () => {
+    if (!checkedArtifact || !sameArtifact(checkedArtifact, await observeArtifact())) throw new Error("strict_publication_artifact_changed");
+  } : undefined;
   const observeGit = async (): Promise<CodeGitObservation> => {
     if (!deps.onPublicationReceipt) return { headSha: null, worktreeClean: null };
     try {
@@ -299,7 +338,12 @@ async function runCodeHandlerWithinDeadline(
     } catch { return { headSha: null, worktreeClean: null }; }
   };
   let requiredCheck: CodePublicationReceipt["requiredCheck"] | undefined;
-  const observeRequiredCheck = deps.onPublicationReceipt ? async (result: ExecResult) => {
+  const observeRequiredCheck = deps.onPublicationReceipt || strictArtifact ? async (result: ExecResult) => {
+    if (strictArtifact) {
+      const after = await observeArtifact();
+      if (result.exitCode !== 0 || result.timedOut || !checkStartedArtifact || !sameArtifact(checkStartedArtifact, after)) throw new Error("strict_publication_check_unverified");
+      checkedArtifact = after;
+    }
     requiredCheck = { command: CHECK_COMMAND, passed: result.exitCode === 0 && !result.timedOut,
       exitCode: result.exitCode, timedOut: result.timedOut, afterCheck: await observeGit() };
   } : undefined;
@@ -428,6 +472,7 @@ async function runCodeHandlerWithinDeadline(
     executor,
     system,
     budget,
+    ...(beforeRequiredCheck ? { beforeRequiredCheck } : {}),
     ...(observeRequiredCheck ? { observeRequiredCheck } : {}),
   });
   if (checkPassed !== "passed") {
@@ -446,6 +491,8 @@ async function runCodeHandlerWithinDeadline(
     fingerprint: reviewFingerprint,
     worktreePath,
     budget,
+    ...(beforeRequiredCheck ? { beforeRequiredCheck } : {}),
+    ...(assertCheckedArtifact ? { assertCheckedArtifact } : {}),
     ...(observeRequiredCheck ? { observeRequiredCheck } : {}),
   });
   if (reviewOutcome.kind === "escalated") {
@@ -456,6 +503,7 @@ async function runCodeHandlerWithinDeadline(
     };
   }
   const verificationReport = reviewOutcome.verificationReport;
+  await assertCheckedArtifact?.();
   const afterApproval = deps.onPublicationReceipt ? await observeGit() : { headSha: null, worktreeClean: null };
   if (deps.onPublicationReceipt) budget.throwIfExpired();
   let postRebaseCheck: CodePublicationReceipt["postRebaseCheck"] = "not_run";
@@ -473,6 +521,10 @@ async function runCodeHandlerWithinDeadline(
     deadlineMs: budget.deadlineMs,
     signal: budget.signal,
   });
+  if (strictArtifact) {
+    if (rebase.kind !== "no_op" || rebase.sha !== checkedArtifact?.headSha) throw new Error("strict_publication_rebase_changed");
+    await assertCheckedArtifact!();
+  }
   if (rebase.kind === "conflict") {
     log.warn("rebase onto main conflicted; pushing un-rebased branch", {
       issue: args.issue.identifier,
@@ -529,11 +581,15 @@ async function runCodeHandlerWithinDeadline(
   budget.throwIfExpired();
   const beforePush = deps.onPublicationReceipt ? await observeGit() : { headSha: null, worktreeClean: null };
   if (deps.onPublicationReceipt) budget.throwIfExpired();
+  await assertCheckedArtifact?.();
   deps.assertCanPublish?.();
-  await pushBranch({ worktreePath, freshTokenUrl: freshUrlForPush, branch, deadlineMs: budget.deadlineMs, signal: budget.signal });
+  await pushBranch({ worktreePath, freshTokenUrl: freshUrlForPush, branch,
+    ...(strictArtifact ? { sourceCommit: checkedArtifact!.headSha } : {}),
+    deadlineMs: budget.deadlineMs, signal: budget.signal });
   budget.throwIfExpired();
   const afterPush = deps.onPublicationReceipt ? await observeGit() : { headSha: null, worktreeClean: null };
   if (deps.onPublicationReceipt) budget.throwIfExpired();
+  await assertCheckedArtifact?.();
   deps.assertCanPublish?.();
   const pr = await deps.github.openPullRequest({
     owner,
@@ -559,7 +615,7 @@ async function runCodeHandlerWithinDeadline(
         prNumber: pr.number, prUrl: pr.url, draft: pr.isDraft, admittedRuntime: !!deps.runAdmittedAgentLoop,
         requiredCheck, review: { fingerprint: reviewFingerprint, verdict: "approve" as const, afterApproval },
         publication: { beforePush, afterPush, remoteHeadSha: /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(pr.headSha) ? pr.headSha : null },
-        postRebaseCheck }));
+        postRebaseCheck, ...(strictArtifact && checkedArtifact ? { exactArtifact: { ...checkedArtifact } } : {}) }));
     } catch {
       // A notification/persistence failure cannot erase the real PR delivery or
       // trigger another coding attempt. Missing receipt remains unready.
@@ -726,6 +782,7 @@ interface FixupContext {
   system: string;
   budget: CodeBudget;
   observeRequiredCheck?: (result: ExecResult) => Promise<void>;
+  beforeRequiredCheck?: () => Promise<void>;
 }
 
 /**
@@ -739,6 +796,7 @@ async function ensurePostFinishCheckPasses(
   ctx: FixupContext,
 ): Promise<"passed" | "blocked" | "check_failed"> {
   ctx.budget.throwIfExpired();
+  await ctx.beforeRequiredCheck?.();
   const first = await ctx.executor.run(CHECK_COMMAND, {
     timeoutMs: CHECK_TIMEOUT_MS,
   });
@@ -788,6 +846,7 @@ async function ensurePostFinishCheckPasses(
   ctx.budget.throwIfExpired();
   if (fixupResult.status === "timeout") throw new DeadlineExceededError();
 
+  await ctx.beforeRequiredCheck?.();
   const second = await ctx.executor.run(CHECK_COMMAND, {
     timeoutMs: CHECK_TIMEOUT_MS,
   });
@@ -903,6 +962,8 @@ interface ReviewLoopCtx {
   worktreePath: string;
   budget: CodeBudget;
   observeRequiredCheck?: (result: ExecResult) => Promise<void>;
+  beforeRequiredCheck?: () => Promise<void>;
+  assertCheckedArtifact?: () => Promise<void>;
 }
 
 type ReviewLoopOutcome =
@@ -921,6 +982,7 @@ async function runReviewLoop(
   while (round < deps.review.maxRounds) {
     ctx.budget.throwIfExpired();
     round++;
+    await ctx.assertCheckedArtifact?.();
     const diff = await getDiff(ctx.worktreePath, BASE_BRANCH, ctx.budget);
     const grepFn = async (pattern: string, glob?: string) =>
       ctx.executor.grep(pattern, glob);
@@ -933,6 +995,7 @@ async function runReviewLoop(
       description: args.issue.description ?? null,
     };
 
+    await ctx.assertCheckedArtifact?.();
     let outcome: ReviewerResult = await runReviewer({
       db: deps.db,
       glm: ctx.reviewerGlm,
@@ -953,6 +1016,7 @@ async function runReviewLoop(
     });
 
     ctx.budget.throwIfExpired();
+    await ctx.assertCheckedArtifact?.();
 
     if (outcome.kind === "failed") {
       const firstReason = outcome.reason;
@@ -980,6 +1044,7 @@ async function runReviewLoop(
         signal: ctx.budget.signal,
       });
       ctx.budget.throwIfExpired();
+      await ctx.assertCheckedArtifact?.();
       if (outcome.kind === "failed") {
         recordEvent(deps.db, {
           eventType: "review_failed",
@@ -1107,6 +1172,7 @@ async function runReviewLoop(
       executor: ctx.executor,
       system: primarySystem,
       budget: ctx.budget,
+      ...(ctx.beforeRequiredCheck ? { beforeRequiredCheck: ctx.beforeRequiredCheck } : {}),
       ...(ctx.observeRequiredCheck ? { observeRequiredCheck: ctx.observeRequiredCheck } : {}),
     });
     if (checkOk !== "passed") return { kind: "escalated", status: checkOk };

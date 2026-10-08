@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,6 +14,7 @@ import type { AssignedIssue } from '../../src/adapters/linear.ts';
 import type { Executor } from '../../src/executors/index.ts';
 import { runProcess } from '../../src/executors/process.ts';
 import type { GaryRuntimeLauncher } from '../../src/hermes/gary-loop-adapter.ts';
+import * as readonlyChild from '../../src/hermes/readonly-child.ts';
 
 const dispose:Array<()=>void> = [];
 afterEach(()=>{for(const close of dispose.splice(0).reverse()) close();});
@@ -63,7 +64,9 @@ async function fixture(launch:GaryRuntimeLauncher=fakeNative){
     const used=body.messages.flatMap((message:any)=>Array.isArray(message.content)?message.content.filter((x:any)=>x.type==='tool_use').map((x:any)=>x.name):[]);
     const implementation=body.tools.some((tool:any)=>tool.name==='write_file');
     const done=used.includes('finish') || (!implementation && used.includes('read_file'));
-    const step=used.includes('run_bash')?steps[3]:used.includes('write_file')?steps[2]:used.includes('read_file')?steps[1]:steps[0];
+    const step=body.tools.some((tool:any)=>tool.name==='dispatch_subagent') && !used.includes('dispatch_subagent')
+      ? ['dispatch_subagent',{task:'Read task.ts and report the fixture baseline.'}] as const
+      : used.includes('run_bash')?steps[3]:used.includes('write_file')?steps[2]:used.includes('read_file')?steps[1]:steps[0];
     return Response.json({id:'reply-'+calls,type:'message',role:'assistant',model:'deepseek-v4-pro',content:done?[{type:'text',text:'Verified fixture context.'}]:[{type:'tool_use',id:'call-'+calls,name:step[0],input:step[1]}],stop_reason:done?'end_turn':'tool_use',usage:{input_tokens:10,output_tokens:8,cache_creation_input_tokens:0,cache_read_input_tokens:0}});
   }},launch,createTrace:binding=>{const path=join(traceRoot,binding.requestId+'.jsonl');traces.push(path);return createAuditTrace({path,binding});},
     taskPolicy:()=>{policies++;return{baseCommit,task:{allowedFiles:['task.ts'],criteria:[{id:'fix',description:'Update fixture and pass the exact check',requiredCommands:[CHECK]}]},
@@ -77,6 +80,7 @@ test('production factory shares actual ledger and Git evidence, retains check ga
   expect({status:result.status,error:result.errorMessage,calls:f.counts()}).toEqual({status:'finished',error:undefined,calls:{calls:4,policies:1}});expect(result.summary).toBe('Verified fixture');
   expect(readFileSync(join(f.root,'task.ts'),'utf8')).toBe('updated\n');expect(f.ledger.status(issue.id)?.attemptCount).toBe(4);
   expect(f.counts()).toEqual({calls:4,policies:1});expect(JSON.stringify(f.seen[0].system)).toContain('You are Gary.');
+  expect(f.seen.every(body=>!Object.hasOwn(body,'thinking'))).toBe(true);
   const trace=readFileSync(f.traces[0]!,'utf8');expect(trace).toContain('"kind":"terminal"');expect(trace).toContain('"status":"finished"');expect(trace).not.toContain('offline-only');
 });
 test('completed, superseded and closed action bindings are revoked without spending',async()=>{
@@ -101,10 +105,11 @@ test('fixup calls keep original baseline and evidence policy; changed workspace 
   expect((await runner({...f.args,deadlineMs:f.args.deadlineMs!+60_000,timeoutMs:100_000})).status).toBe('error');expect(f.counts().calls).toBe(8);
 });
 test('failed deterministic preparation propagates pipeline status before any model or worker',async()=>{
-  let launched=false;const f=await fixture(async()=>{launched=true;throw new Error('must not launch');});
+  let launched=false;const f=await fixture(async()=>{launched=true;throw new Error('must not launch');});f.options.thinking='disabled';
   const original=f.options.taskPolicy;f.options.taskPolicy=async(...args)=>({...await original(...args),preparationCommands:['false | true']});
   expect((await f.runner()(f.args)).status).toBe('error');expect(launched).toBe(false);expect(f.counts().calls).toBe(0);
-  expect(readFileSync(f.traces[0]!,'utf8')).toContain('"kind":"terminal"');
+  const trace=readFileSync(f.traces[0]!,'utf8');expect(trace).toContain('"kind":"terminal"');
+  expect(JSON.parse(trace.trim().split('\n').at(-1)!).modelState.thinking).toBe('disabled');
 });
 
 test('one durable action owner cannot be claimed twice, including through a second binding',async()=>{
@@ -120,7 +125,7 @@ test('current ticket and repository must match the canonical dispatch action',as
 test.skipIf(!process.env.GARY_HERMES_NATIVE_TEST_IMAGE)('actual immutable Hermes container completes production host phases with fake provider and real Git/check/ledger/trace',async()=>{
   const launch=createDockerRuntimeLauncher({imageDigest:process.env.GARY_HERMES_NATIVE_TEST_IMAGE!,
     dockerHost:process.env.GARY_HERMES_NATIVE_TEST_DOCKER_HOST??'unix:///var/run/docker.sock'});
-  const f=await fixture(launch);
+  const f=await fixture(launch);f.options.thinking='disabled';
   const result=await f.runner()({...f.args,phases:[
     {name:'investigate',maxIter:3,allowedTools:new Set(['read_file','todo_write','report_blocked']),nudgeMessage:'Finish exploring.'},
     {name:'implement',maxIter:5,entryMessage:'Implement and verify the admitted task.'},
@@ -128,6 +133,7 @@ test.skipIf(!process.env.GARY_HERMES_NATIVE_TEST_IMAGE)('actual immutable Hermes
   expect({status:result.status,error:result.errorMessage}).toEqual({status:'finished',error:undefined});
   expect(readFileSync(join(f.root,'task.ts'),'utf8')).toBe('updated\n');
   expect(f.ledger.status(issue.id)?.attemptCount).toBe(6);expect(result.iterations).toBe(6);
+  expect(f.seen.map(body=>body.thinking)).toEqual(Array.from({length:6},()=>({type:'disabled'})));
   expect(f.seen[2].messages.some((message:any)=>message.content.some?.((x:any)=>x.type==='tool_result'))).toBe(true);
   expect(readFileSync(f.traces[0]!,'utf8')).toContain('"status":"finished"');
 },60_000);
@@ -148,3 +154,124 @@ test('progress policy must leave an implementation opportunity after read-only i
 test('another factory cannot run the same admitted action concurrently',async()=>{
   const f=await fixture();f.runner();expect(()=>f.runner()).toThrow('production_action_already_bound');expect(f.counts().calls).toBe(0);
 });
+
+test('trusted disabled thinking reaches upstream in both phases and successive check/reviewer repairs',async()=>{
+  const f=await fixture();f.options.thinking='disabled';const runner=f.runner();
+  const result=await runner({...f.args,phases:[
+    {name:'investigate',maxIter:3,allowedTools:new Set(['read_file','todo_write','report_blocked'])},
+    {name:'implement',maxIter:5,entryMessage:'Implement and verify the admitted task.'},
+  ]});
+  expect({status:result.status,error:result.errorMessage}).toEqual({status:'finished',error:undefined});
+  const primaryCalls=f.seen.length;
+  expect(f.seen.some(body=>!body.tools.some((tool:any)=>tool.name==='write_file'))).toBe(true);
+  expect(f.seen.some(body=>body.tools.some((tool:any)=>tool.name==='write_file'))).toBe(true);
+  for(const task of ['Repair the post-finish check failure in task.ts.','Address the independent reviewer finding in task.ts.']){
+    const before=f.seen.length;
+    const repaired=await runner({...f.args,task,maxIterations:15});
+    expect({status:repaired.status,error:repaired.errorMessage}).toEqual({status:'finished',error:undefined});
+    expect(f.seen.length-before).toBe(4);
+  }
+  expect(f.seen.length-primaryCalls).toBe(8);
+  expect(f.seen.map(body=>body.thinking)).toEqual(Array.from({length:f.seen.length},()=>({type:'disabled'})));
+  expect(f.ledger.status(issue.id)?.attemptCount).toBe(f.seen.length);
+  expect(f.counts().policies).toBe(1);
+},10_000);
+
+test('invalid trusted thinking and non-DeepSeek thinking fail before binding or work',async()=>{
+  let launches=0;const f=await fixture(async(...args)=>{launches++;return fakeNative(...args);});
+  for(const thinking of ['enabled',null,{type:'disabled'},true]){
+    expect(()=>createHermesCodeLoopFactory({...f.options,thinking} as unknown as ProductionRuntimeOptions))
+      .toThrow('invalid_host_thinking_policy');
+  }
+  expect(()=>createHermesCodeLoopFactory({...f.options,thinking:'disabled',route:{...f.options.route,provider:'z.ai',model:'glm-5.3'}}))
+    .toThrow('invalid_host_thinking_policy');
+  expect({launches,...f.counts(),traces:f.traces.length}).toEqual({launches:0,calls:0,policies:0,traces:0});
+  expect(f.ledger.status(issue.id)?.attemptCount).toBe(0);
+  f.binding.admission.assertActive();
+  f.options.thinking='disabled';expect((await f.runner()(f.args)).status).toBe('finished');
+  expect(f.seen.every(body=>body.thinking?.type==='disabled')).toBe(true);
+});
+
+test('factory snapshots trusted thinking and provider before caller mutation',async()=>{
+  const f=await fixture();f.options.thinking='disabled';
+  const factory=createHermesCodeLoopFactory(f.options);
+  delete f.options.thinking;f.options.route.provider='z.ai';f.options.route.model='glm-5.3';
+  f.options.route.fetch=async()=>{throw new Error('mutated caller transport must not run');};
+  const result=await factory(f.binding.admission)(f.args);
+  expect({status:result.status,error:result.errorMessage}).toEqual({status:'finished',error:undefined});
+  expect(f.seen).toHaveLength(4);
+  expect(f.seen.map(body=>({model:body.model,thinking:body.thinking}))).toEqual(
+    Array.from({length:4},()=>({model:'deepseek-v4-pro',thinking:{type:'disabled'}})));
+});
+
+test('trusted disabled thinking reaches actual child host requests and parent resumes after cleanup',async()=>{
+  const f=await fixture();f.options.thinking='disabled';
+  f.options.readonlyChildren={imageDigest:'sha256:'+'a'.repeat(64)};
+  let closed=0,reads=0;
+  const fetch=f.options.route.fetch!;
+  f.options.route.fetch=async request=>{
+    const body=await request.clone().json();
+    const parent=body.tools.some((tool:any)=>tool.name==='dispatch_subagent');
+    const resumed=body.messages.some((message:any)=>message.content?.some?.((block:any)=>block.type==='tool_use' && block.name==='dispatch_subagent'));
+    if(parent && resumed)expect(closed).toBe(1);
+    return fetch(request);
+  };
+  const executor:Executor={...f.args.executor,
+    readFile:async(path,opts)=>{reads++;return f.args.executor.readFile(path,opts);},
+    writeFile:async()=>{throw new Error('child write forbidden');},
+    run:async()=>{throw new Error('child shell not required by this fixture');},
+  };
+  const createChild=spyOn(readonlyChild,'createReadonlyChildExecutor').mockImplementation(async options=>{
+    expect(options.workspaceRoot).toBe(f.root);expect(options.parentDepth).toBe(0);
+    expect(options.admission.ownerEpoch).toBe(f.binding.admission.ownerEpoch);
+    options.assertActive(options.admission);
+    return{executor,depth:1,admission:options.admission,close:async()=>{closed++;}};
+  });
+  try{
+    const result=await f.runner()({...f.args,disableSubagent:false});
+    expect({status:result.status,error:result.errorMessage}).toEqual({status:'finished',error:undefined});
+    expect(createChild).toHaveBeenCalledTimes(1);expect(closed).toBe(1);expect(reads).toBe(1);
+    const childCalls=f.seen.filter(body=>!body.tools.some((tool:any)=>tool.name==='dispatch_subagent'));
+    const parentCalls=f.seen.filter(body=>body.tools.some((tool:any)=>tool.name==='dispatch_subagent'));
+    expect(childCalls).toHaveLength(2);expect(parentCalls).toHaveLength(5);
+    expect(childCalls.every(body=>!body.tools.some((tool:any)=>['write_file','edit_file','commit','finish'].includes(tool.name)))).toBe(true);
+    expect(f.seen.map(body=>body.thinking)).toEqual(Array.from({length:7},()=>({type:'disabled'})));
+    expect(f.ledger.status(issue.id)?.attemptCount).toBe(7);
+    expect(readFileSync(join(f.root,'task.ts'),'utf8')).toBe('updated\n');
+  }finally{createChild.mockRestore();}
+});
+
+
+test.skipIf(!process.env.GARY_HERMES_NATIVE_TEST_IMAGE)('actual native stdio retains the outer paid guard and rejects unknown usage before any tool or second request',async()=>{
+  const launch=createDockerRuntimeLauncher({imageDigest:process.env.GARY_HERMES_NATIVE_TEST_IMAGE!,
+    dockerExecutable:'/usr/local/bin/docker',dockerHost:process.env.GARY_HERMES_NATIVE_TEST_DOCKER_HOST??'unix:///var/run/docker.sock'});
+  const f=await fixture(launch);f.options.thinking='disabled';
+  const guardedPhases:string[]=[];let paidRequests=0;
+  f.options.route.fetch=async request=>{
+    const body=await request.json();paidRequests++;
+    expect(body.thinking).toEqual({type:'disabled'});
+    // A valid read tool request must remain unavailable when its usage receipt is unpriced.
+    return Response.json({id:'offline-unknown-usage',type:'message',role:'assistant',model:'deepseek-v4-pro',
+      content:[{type:'tool_use',id:'do-not-run',name:'read_file',input:{path:'task.ts'}}],stop_reason:'tool_use',usage:{}});
+  };
+  const result=await f.ledger.withPaidRequestGuard(phase=>{
+    guardedPhases.push(phase);f.binding.admission.assertActive();
+    if(f.ledger.status(issue.id)!.unknownAttempts>(phase==='before_send'?1:0))throw new Error('offline_unknown_usage_stop');
+  },()=>f.runner()(f.args));
+  expect(result.status).toBe('error');expect(result.summary).toBeNull();
+  expect(paidRequests).toBe(1);
+  expect(guardedPhases).toEqual(['before_request','before_send','after_response']);
+  const status=f.ledger.status(issue.id)!;
+  expect(status.attemptCount).toBe(1);expect(status.unknownAttempts).toBe(1);
+  expect(status.chargedMicros).toBe(1_384_628);
+  expect(f.traces).toHaveLength(1);
+  const trace=readFileSync(f.traces[0]!,'utf8').trim().split('\n').map(line=>JSON.parse(line));
+  expect(trace.filter(row=>row.kind==='model'&&row.stage==='start')).toHaveLength(1);
+  expect(trace.filter(row=>row.kind==='tool')).toEqual([]);
+  expect(trace.filter(row=>row.kind==='terminal')).toHaveLength(1);
+  expect(trace.at(-1).status).toBe('error');
+  expect(readFileSync(join(f.root,'task.ts'),'utf8')).toBe('baseline\n');
+  expect(f.db.query('SELECT count(*) AS n FROM prs').get()).toEqual({n:0});
+  f.ledger.markTerminal(issue.id,'offline_unknown_usage_stop');f.binding.close();
+  expect(f.ledger.status(issue.id)).toMatchObject({state:'closed',unknownAttempts:1,chargedMicros:1_384_628});
+},60_000);

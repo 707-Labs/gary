@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { loadHermesActivationConfig, createHermesActivation, HERMES_CANARY_CHILD_IMAGE, HERMES_CANARY_WORKER_IMAGE, type HermesActivationConfig } from '../../src/hermes/activation.ts';
 import { bindCanonicalCodeAction } from '../../src/hermes/canonical-admission.ts';
 import { openDb } from '../../src/state/db.ts';
-import { recordActionStart, upsertTicket } from '../../src/state/queries.ts';
+import { setClassification, upsertTicket } from '../../src/state/queries.ts';
 import { SpendLedger } from '../../src/spend.ts';
 import { runProcess } from '../../src/executors/process.ts';
 import type { Executor } from '../../src/executors/index.ts';
@@ -49,31 +49,36 @@ const native:GaryRuntimeLauncher=async(m,handle)=>{
   }
   return{taskId:m.taskId,requestId:m.requestId,status:'iteration_cap',publicationApproved:false,history};
 };
-async function runtimeFixture(draft=true) {
+async function runtimeFixture(configure?:(config:HermesActivationConfig,workspace:string)=>void) {
   const f=configFixture();const workspace=join(f.directory,'workspace');mkdirSync(workspace);
   const env={PATH:'/opt/homebrew/bin:/Users/tanner/.bun/bin:/usr/bin:/bin',HOME:workspace,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null'};
   const run=(command:string)=>runProcess('/bin/bash',['-c',command],{cwd:workspace,env,timeoutMs:10_000});
   for(const command of ['git init -q','git config user.email fixture@example.invalid','git config user.name Fixture','git config core.hooksPath /dev/null'])expect((await run(command)).exitCode).toBe(0);
   writeFileSync(join(workspace,'task.ts'),'base\n');writeFileSync(join(workspace,'package.json'),JSON.stringify({scripts:{check:'test \"$(cat task.ts)\" = updated'}}));expect((await run('git add task.ts package.json && git commit -qm baseline')).exitCode).toBe(0);
-  f.config.policy.baseCommit=(await run('git rev-parse HEAD')).stdout.trim();f.save();
+  f.config.policy.baseCommit=(await run('git rev-parse HEAD')).stdout.trim();configure?.(f.config,workspace);f.save();
   const db=openDb(':memory:');cleanups.push(()=>db.close());const ledger=new SpendLedger(':memory:');cleanups.push(()=>ledger.close());
-  ledger.createCampaign('offline',10);ledger.enrollTicket('offline',ID,5,{draftPr:draft});
+  ledger.createCampaign('offline',10);ledger.enrollTicket('offline',ID,5,{draftPr:true});
   const issue:AssignedIssue={id:ID,identifier:'ERT-1',title:'Fixture',description:'Change task.ts',url:'https://linear.invalid/ERT-1',stateName:'Todo',stateType:'unstarted',
     createdAt:'2026-10-08T00:00:00Z',updatedAt:'2026-10-08T00:00:00Z',creatorId:null,creatorName:null,teamId:'team',teamKey:'ERT',blockedBy:[]};
   upsertTicket(db,{linearId:ID,identifier:'ERT-1'});
-  const admit=()=>{const actionId=recordActionStart(db,{ticketLinearId:ID,stateFingerprint:'fp',actionType:'start_coding',provider:'deepseek',model:'deepseek-v4-pro'});
-    return bindCanonicalCodeAction({db,ledger,actionId,fingerprint:'fp',issue,provider:'deepseek',model:'deepseek-v4-pro',repo:'fixture/repo'});};
-  const binding=admit();
   const executor:Executor={workspaceRoot:workspace,readFile:async path=>readFileSync(join(workspace,path),'utf8'),writeFile:async(path,content)=>{writeFileSync(join(workspace,path),content);},
     listFiles:async()=>[],grep:async()=>[],run:async(command,opts)=>runProcess('/bin/bash',['-c',command],{...opts,cwd:workspace,env,timeoutMs:opts?.timeoutMs??10_000})};
   let requests=0,launches=0;
   const route={provider:'deepseek' as const,model:'deepseek-v4-pro' as const,providerApiKey:'offline-fixture-key',fetch:async(request:Request)=>{
-    const body=await request.json();expect(body.model).toBe('deepseek-v4-pro');requests++;
+    const body=await request.json();expect(body.model).toBe('deepseek-v4-pro');expect(body.thinking).toEqual({type:'disabled'});requests++;
     const steps=[['read_file',{path:'task.ts'}],['write_file',{path:'task.ts',content:'updated\n'}],['run_bash',{command:CHECK}],['finish',{summary:'Verified fixture'}]] as const;
     const step=steps[(requests-1)%4]!;
     return Response.json({id:'reply-'+requests,type:'message',role:'assistant',model:'deepseek-v4-pro',content:[{type:'tool_use',id:'call-'+requests,name:step[0],input:step[1]}],stop_reason:'tool_use',usage:{input_tokens:10,output_tokens:8,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
   }};
   const deps={db,ledger,route,launch:async(...args:Parameters<GaryRuntimeLauncher>)=>{launches++;return native(...args);}};
+  const admissionActivation=createHermesActivation(loadHermesActivationConfig(f.path),deps);
+  const admitted={issueId:ID,fingerprint:'fp',humanSignature:'human-fp',provider:'deepseek',model:'deepseek-v4-pro',repo:'fixture/repo'};
+  const classify=admissionActivation.codingTrial.admit({...admitted,actionType:'classify'});
+  setClassification(db,{linearId:ID,classification:'CODE',confidence:.99,scope:'S'});
+  classify.complete(true,'handled');
+  const admit=()=>{const trial=admissionActivation.codingTrial.admit({...admitted,actionType:'start_coding'});
+    return bindCanonicalCodeAction({db,ledger,actionId:trial.actionId,fingerprint:'fp',issue,provider:'deepseek',model:'deepseek-v4-pro',repo:'fixture/repo'});};
+  const binding=admit();
   const args:AgentLoopArgs={glm:{} as AgentLoopArgs['glm'],executor,systemPrompt:'Gary admitted instructions.',task:'Change task.ts',maxIterations:5,maxTokensPerTurn:128,timeoutMs:30_000,deadlineMs:Date.now()+30_000,finishGateCommand:CHECK,disableSubagent:true};
   return{...f,workspace,db,ledger,binding,admit,deps,args,counts:()=>({requests,launches})};
 }
@@ -137,18 +142,25 @@ test('different host route, canonical ledger, repository or ticket cannot bind',
   expect(f.counts()).toEqual({requests:0,launches:0});
 });
 test('non-draft enrollment and second coding attempt fail before native launch or model spend',async()=>{
-  const nondraft=await runtimeFixture(false);const non=createHermesActivation(loadHermesActivationConfig(nondraft.path),nondraft.deps);
-  expect(()=>non.createAdmittedCodeLoop(nondraft.binding.admission)).toThrow('active_draft_allocation_required');
-  const f=await runtimeFixture();const activation=createHermesActivation(loadHermesActivationConfig(f.path),f.deps);
-  const second=f.admit();expect(()=>activation.createAdmittedCodeLoop(second.admission)).toThrow('canary_already_attempted');
-  expect(f.ledger.status(ID)!.state).toBe('closed');expect(f.counts()).toEqual({requests:0,launches:0});
+  const nondraft=configFixture(),db=openDb(':memory:'),ledger=new SpendLedger(':memory:');
+  cleanups.push(()=>db.close(),()=>ledger.close());ledger.createCampaign('offline',5);ledger.enrollTicket('offline',ID,5);
+  upsertTicket(db,{linearId:ID,identifier:'ERT-1'});
+  const non=createHermesActivation(loadHermesActivationConfig(nondraft.path),{db,ledger,route:{provider:'deepseek',model:'deepseek-v4-pro',providerApiKey:'offline',fetch:async()=>{throw new Error('must not fetch');}},launch:async()=>{throw new Error('must not launch');}});
+  expect(()=>non.codingTrial.admit({issueId:ID,actionType:'classify',fingerprint:'fp',humanSignature:'human-fp',provider:'deepseek',model:'deepseek-v4-pro',repo:'fixture/repo'})).toThrow('coding_trial_rejected:allocation');
+  expect(db.query('SELECT count(*) AS n FROM actions').get()).toEqual({n:0});
+  const f=await runtimeFixture();const before=f.db.query('SELECT * FROM actions ORDER BY id').all();
+  expect(()=>f.admit()).toThrow('coding_trial_rejected:unfinished_owner');
+  expect(f.db.query('SELECT * FROM actions ORDER BY id').all()).toEqual(before);
+  expect(f.counts()).toEqual({requests:0,launches:0});expect(f.ledger.status(ID)!.attemptCount).toBe(0);
 });
 test('base mismatch, dirty starting workspace and trace-inside-workspace fail before launch',async()=>{
   for(const mode of ['base','dirty','trace']){
-    const f=await runtimeFixture();if(mode==='base')f.config.policy.baseCommit='b'.repeat(40);
+    const f=await runtimeFixture((config,workspace)=>{
+      if(mode==='base')config.policy.baseCommit='b'.repeat(40);
+      if(mode==='trace'){config.traceDirectory=join(workspace,'trace');mkdirSync(config.traceDirectory,{mode:0o700});}
+    });
     if(mode==='dirty')writeFileSync(join(f.workspace,'task.ts'),'preexisting\n');
-    if(mode==='trace'){f.config.traceDirectory=join(f.workspace,'trace');mkdirSync(f.config.traceDirectory,{mode:0o700});}
-    f.save();const activation=createHermesActivation(loadHermesActivationConfig(f.path),f.deps);
+    const activation=createHermesActivation(loadHermesActivationConfig(f.path),f.deps);
     expect((await activation.createAdmittedCodeLoop(f.binding.admission)(f.args)).status).toBe('error');
     expect(f.counts()).toEqual({requests:0,launches:0});expect(activation.getHealthEvidence()).toEqual([]);
   }

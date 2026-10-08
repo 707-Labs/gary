@@ -10,6 +10,8 @@ import { createDockerRuntimeLauncher } from './docker-launcher.ts';
 import { createAuditTrace, type AuditTraceBinding, type AuditTerminalStatus } from './audit-trace.ts';
 import type { GaryRuntimeLauncher } from './gary-loop-adapter.ts';
 import { buildTaskContext } from './task-context.ts';
+import { createCodingTrial, type CodingTrial } from './coding-trial.ts';
+import { HERMES_CODING_RUNTIME_POLICY, fingerprintHermesCodingActivation } from './coding-runtime-policy.ts';
 
 export const HERMES_CANARY_WORKER_IMAGE = 'sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab';
 export const HERMES_CANARY_CHILD_IMAGE = 'sha256:e77edfc6e20402c7ed9f447dca81dc61e277c2a39199963f455a37a03dfcedf4';
@@ -143,6 +145,7 @@ export interface HermesActivationBinding {
   readonly allowedIssueIds: ReadonlySet<string>;
   readonly allowedActionTypes: NonNullable<LoopDeps['allowedActionTypes']>;
   readonly createAdmittedCodeLoop: NonNullable<LoopDeps['createAdmittedCodeLoop']>;
+  readonly codingTrial: CodingTrial;
   getHealthEvidence(): readonly RuntimeHealthEvidence[];
 }
 
@@ -151,9 +154,10 @@ export function createHermesActivation(input: HermesActivationConfig, deps: Herm
   const config = validate(input);
   if (deps.route.provider !== config.provider || deps.route.model !== config.model || typeof deps.route.fetch !== 'function'
       || typeof deps.route.providerApiKey !== 'string' || !deps.route.providerApiKey) reject('host_route_mismatch');
+  const codingTrial = createCodingTrial({db:deps.db,ledger:deps.ledger,issueId:config.issueId,repo:config.repo,policyFingerprint:fingerprintHermesCodingActivation(config)});
   const health: RuntimeHealthEvidence[] = [];
   const records: Array<{ binding: AuditTraceBinding; path: string; status?: AuditTerminalStatus; closed: boolean }> = [];
-  const create = createHermesCodeLoopFactory({ route: deps.route,
+  const create = createHermesCodeLoopFactory({ route: deps.route, thinking: HERMES_CODING_RUNTIME_POLICY.thinking,
     launch: deps.launch ?? createDockerRuntimeLauncher({ imageDigest: config.workerImage, dockerExecutable: config.dockerExecutable, dockerHost: config.dockerHost }),
     readonlyChildren: { imageDigest: config.childImage, dockerExecutable: config.dockerExecutable, dockerHost: config.dockerHost },
     taskPolicy: async (action, args): Promise<ProductionTaskPolicy> => {
@@ -194,6 +198,7 @@ export function createHermesActivation(input: HermesActivationConfig, deps: Herm
     if (prior.n !== 0) { deps.ledger.markTerminal(config.issueId, 'canary_already_attempted'); return reject('canary_already_attempted'); }
     const allocation = deps.ledger.status(config.issueId);
     if (!allocation || allocation.state !== 'active' || !allocation.draftPr) reject('active_draft_allocation_required');
+    codingTrial.assertCodingAction(action);
     const run = create(action);
     return async args => {
       health.splice(0); // A subsequent repair must establish new completion evidence.
@@ -210,5 +215,5 @@ export function createHermesActivation(input: HermesActivationConfig, deps: Herm
     };
   };
   return Object.freeze({ allowedIssueIds: new Set([config.issueId]), allowedActionTypes: new Set(['classify','start_coding'] as const),
-    createAdmittedCodeLoop, getHealthEvidence: () => Object.freeze([...health]) });
+    codingTrial, createAdmittedCodeLoop, getHealthEvidence: () => Object.freeze([...health]) });
 }

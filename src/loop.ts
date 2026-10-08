@@ -40,6 +40,7 @@ import {
 } from "./state-fingerprint.ts";
 import type { DB } from "./state/db.ts";
 import type { SpendLedger } from "./spend.ts";
+import type { CodingTrial, CodingTrialAction } from "./hermes/coding-trial.ts";
 import {
   clearClassification,
   clearTerminalState,
@@ -64,6 +65,8 @@ export interface LoopDeps {
   db: DB;
   /** Production intake requires a funded, explicitly enrolled ticket. */
   spend?: SpendLedger;
+  /** Durable one-issue classify/code admission, enabled only by the explicit Hermes activation. */
+  codingTrial?: CodingTrial;
   /** Exact Linear issue IDs eligible for any intake/dispatch. Omitted is unrestricted; empty or malformed denies all. */
   allowedIssueIds?: ReadonlySet<string>;
   /** Optional action scope; omitted preserves all legacy handlers. Empty or malformed denies all. */
@@ -163,6 +166,7 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
 
     let ticketRow = getTicket(deps.db, issue.id);
     if (ticketRow?.terminal_state) {
+      if (deps.codingTrial) continue;
       // The ticket is back in Gary's queue despite being previously
       // concluded — a human reassigned it. Reopen and let the action
       // cache decide whether there's anything new to do (it'll block
@@ -331,13 +335,19 @@ async function runOne(
   const primary = glm.chain.providers[0]!;
   const provider = primary.name;
   const model = primary.model;
-  const actionId = recordActionStart(deps.db, {
-    ticketLinearId: action.issue.id,
-    stateFingerprint: fp,
-    actionType: action.type,
-    provider,
-    model,
-  });
+  let trialAction: CodingTrialAction | undefined;
+  let actionId: number;
+  try {
+    trialAction = deps.codingTrial?.admit({issueId:action.issue.id,actionType:action.type,fingerprint:fp,
+      humanSignature:action.state.humanInputSignature,provider,model,repo:deps.repoMap.get(action.issue.teamKey) ?? ""});
+    actionId = trialAction?.actionId ?? recordActionStart(deps.db, {
+      ticketLinearId:action.issue.id,stateFingerprint:fp,actionType:action.type,provider,model,
+    });
+  } catch {
+    deps.spend?.markTerminal(action.issue.id,"coding_trial_admission_denied");
+    log.warn("coding trial admission refused", {issue:action.issue.identifier});
+    return null;
+  }
   recordEvent(deps.db, {
     eventType: "action_dispatched",
     ticketLinearId: action.issue.id,
@@ -359,16 +369,20 @@ async function runOne(
     }
     const observePublication = codeBinding && deps.onCodePublication
       ? (receipt: CodePublicationReceipt) => deps.onCodePublication!(codeBinding!.admission, receipt) : undefined;
-    const result = deps.spend
-      ? await deps.spend.withSpendScope(action.issue.id, () => dispatch(slotDeps, action, codeLoop, codeBinding?.admission.assertActive, observePublication))
-      : await dispatch(slotDeps, action, codeLoop, codeBinding?.admission.assertActive, observePublication);
+    const assertCurrent = () => {trialAction?.assertActive();codeBinding?.admission.assertActive();};
+    const execute = () => dispatch(slotDeps, action, codeLoop, codeBinding ? assertCurrent : undefined, observePublication);
+    const scoped = () => deps.spend ? deps.spend.withSpendScope(action.issue.id, execute) : execute();
+    const result = trialAction && deps.spend
+      ? await deps.spend.withPaidRequestGuard(phase => {trialAction!.assertActive(phase === 'before_send');codeBinding?.admission.assertActive();}, scoped)
+      : await scoped();
     // A completed call may leave less than the next reservation requires.
     // That alone must not relabel successful work or prevent publication.
     const exhausted = deps.spend && deps.spend.status(action.issue.id)?.state !== "active";
     const outcome = result === "pr_opened" ? result : exhausted ? "budget_exhausted" : result ?? "handled";
     // Keep normal handled outcomes cached, including escalations. The
     // independent outcome field is the delivery metric, not success=1.
-    recordActionEnd(deps.db, { id: actionId, success: true, outcome });
+    if (trialAction) trialAction.complete(true,outcome);
+    else recordActionEnd(deps.db, { id: actionId, success: true, outcome });
     if (deps.spend && outcome !== "handled") {
       deps.spend.markTerminal(action.issue.id, outcome);
     }
@@ -382,6 +396,11 @@ async function runOne(
     return action.type;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    if (trialAction) {
+      trialAction.complete(false,err instanceof AllProvidersExhaustedError ? "rate_limited" : "error","coding trial stopped; see bounded audit evidence");
+      log.warn("coding trial stopped",{issue:action.issue.identifier});
+      return action.type;
+    }
     if (deps.spend && deps.spend.status(action.issue.id)?.state !== "active") {
       deps.spend.markTerminal(action.issue.id, "budget_exhausted");
       recordActionEnd(deps.db, { id: actionId, success: false, outcome: "budget_exhausted", errorMessage: "spend allocation unavailable; no further paid attempts allowed" });
@@ -649,7 +668,8 @@ function firstName(full: string | null): string | null {
 function publicationGuard(deps: LoopDeps, ticketId: string): { assertCanPublish?: () => void } {
   const spend = deps.spend;
   return spend ? { assertCanPublish: () => {
-    if (spend.status(ticketId)?.state !== "active") throw new Error("spend allocation closed before publication");
+    const status=spend.status(ticketId);
+    if (status?.state !== "active" || (deps.codingTrial && status.unknownAttempts !== 0)) throw new Error("spend allocation closed or uncertain before publication");
   } } : {};
 }
 
@@ -818,6 +838,7 @@ async function runStartCoding(
       agentLoopTimeoutMs: deps.agentLoopTimeoutMs,
       review: deps.review,
       ...(codeLoop ? { runAdmittedAgentLoop: codeLoop } : {}),
+      ...(deps.codingTrial ? { strictPublicationArtifact: true as const } : {}),
       ...(onPublicationReceipt ? { onPublicationReceipt } : {}),
       ...publicationGuard(deps, issue.id),
       ...(assertCodeAction ? {assertCanPublish:()=>{assertCodeAction();publicationGuard(deps,issue.id).assertCanPublish?.();}} : {}),

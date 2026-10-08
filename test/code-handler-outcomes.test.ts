@@ -43,6 +43,124 @@ function capturePublication() {
   return { receipts, head };
 }
 
+function strictPublication() {
+  const c=capturePublication();
+  f.deps.strictPublicationArtifact=true;
+  const artifact={headSha:RECEIPT_HEAD,baseSha:'c'.repeat(40),treeSha:'d'.repeat(40),branchSha:RECEIPT_HEAD,dirty:false};
+  c.head.mockImplementation(async()=>artifact.headSha);
+  f.gitCommand.mockImplementation(async args=>({stdout:args[0]==='rev-parse'
+    ? [artifact.headSha,artifact.treeSha,artifact.baseSha,artifact.branchSha].join('\n')+'\n'
+    : artifact.dirty?'?? unexpected.txt\n':'',stderr:'',exitCode:0}));
+  f.rebase.mockImplementation(async()=>({kind:'no_op',sha:artifact.headSha}));
+  return {...c,artifact};
+}
+
+describe('CODE strict canary publication artifact',()=>{
+  it('publishes only the clean artifact that passed the full check and independent approval',async()=>{
+    const c=strictPublication();
+    expect((await f.invoke({draftPr:true})).status).toBe('pr_opened');
+    expect(c.receipts[0]?.exactArtifact).toEqual({headSha:RECEIPT_HEAD,baseSha:'c'.repeat(40),treeSha:'d'.repeat(40),worktreeClean:true});
+    expect(f.push.mock.calls[0]?.[0].sourceCommit).toBe(RECEIPT_HEAD);
+    expect(f.run).toHaveBeenCalledTimes(1);expect(f.run.mock.calls[0]?.[0]).toBe('bun run check');
+    expect(f.review).toHaveBeenCalledTimes(1);expect(f.complete).toHaveBeenCalledTimes(2);
+    expect(f.push).toHaveBeenCalledTimes(1);expect(f.openPr).toHaveBeenCalledTimes(1);
+    expect(f.gitCommand.mock.calls.some(([args])=>args.join(' ')==='status --porcelain=v1 --untracked-files=all')).toBe(true);
+  });
+
+  for(const field of ['headSha','baseSha','treeSha','dirty'] as const) it('rejects '+field+' mutation during the full check before review',async()=>{
+    const c=strictPublication();
+    f.run.mockImplementation(async()=>{
+      if(field==='dirty')c.artifact.dirty=true;else c.artifact[field]='e'.repeat(40);
+      if(field==='headSha')c.artifact.branchSha=c.artifact.headSha;
+      return checkResult();
+    });
+    await expect(f.invoke()).rejects.toThrow('strict_publication_');
+    expect(f.review).not.toHaveBeenCalled();expect(f.complete).not.toHaveBeenCalled();
+    expect(f.push).not.toHaveBeenCalled();expect(f.openPr).not.toHaveBeenCalled();expect(c.receipts).toEqual([]);
+  });
+
+  it('rejects a timed-out full check even if the executor reports exit zero',async()=>{
+    strictPublication();f.run.mockResolvedValue({...checkResult(),timedOut:true});
+    await expect(f.invoke()).rejects.toThrow('strict_publication_check_unverified');
+    expect(f.review).not.toHaveBeenCalled();expect(f.push).not.toHaveBeenCalled();
+  });
+
+  for(const field of ['headSha','baseSha','treeSha','dirty'] as const) it('rejects '+field+' mutation during independent approval',async()=>{
+    const c=strictPublication();
+    f.review.mockImplementation(async()=>{
+      if(field==='dirty')c.artifact.dirty=true;else c.artifact[field]='e'.repeat(40);
+      if(field==='headSha')c.artifact.branchSha=c.artifact.headSha;
+      return reviewResult();
+    });
+    await expect(f.invoke()).rejects.toThrow('strict_publication_');
+    expect(f.rebase).not.toHaveBeenCalled();expect(f.complete).not.toHaveBeenCalled();
+    expect(f.push).not.toHaveBeenCalled();expect(f.openPr).not.toHaveBeenCalled();
+  });
+
+  for(const kind of ['clean','conflict'] as const) it('aborts a '+kind+' rebase before extra checks, PR text or publication',async()=>{
+    strictPublication();
+    f.rebase.mockResolvedValue(kind==='clean'?{kind,preRebaseSha:RECEIPT_HEAD,postRebaseSha:REBASED_HEAD}:{kind,preRebaseSha:RECEIPT_HEAD});
+    await expect(f.invoke()).rejects.toThrow('strict_publication_rebase_changed');
+    expect(f.run).toHaveBeenCalledTimes(1);expect(f.review).toHaveBeenCalledTimes(1);
+    expect(f.complete).not.toHaveBeenCalled();expect(f.push).not.toHaveBeenCalled();expect(f.openPr).not.toHaveBeenCalled();
+  });
+
+  it('a no-op rebase result cannot hide a changed base with the same HEAD and tree',async()=>{
+    const c=strictPublication();
+    f.rebase.mockImplementation(async()=>{c.artifact.baseSha='e'.repeat(40);return {kind:'no_op',sha:RECEIPT_HEAD};});
+    await expect(f.invoke()).rejects.toThrow('strict_publication_artifact_changed');
+    expect(f.complete).not.toHaveBeenCalled();expect(f.push).not.toHaveBeenCalled();
+  });
+
+  it('enforces the strict guard when readiness receipt capture is omitted',async()=>{
+    strictPublication();delete f.deps.onPublicationReceipt;
+    f.rebase.mockResolvedValue({kind:'clean',preRebaseSha:RECEIPT_HEAD,postRebaseSha:REBASED_HEAD});
+    await expect(f.invoke()).rejects.toThrow('strict_publication_rebase_changed');
+    expect(f.push).not.toHaveBeenCalled();expect(f.openPr).not.toHaveBeenCalled();
+  });
+
+  it('rechecks the approved artifact after PR text generation before push',async()=>{
+    const c=strictPublication();
+    f.complete.mockImplementation(async()=>{c.artifact.treeSha='e'.repeat(40);return 'offline metadata';});
+    await expect(f.invoke()).rejects.toThrow('strict_publication_artifact_changed');
+    expect(f.push).not.toHaveBeenCalled();expect(f.openPr).not.toHaveBeenCalled();expect(c.receipts).toEqual([]);
+  });
+
+  it('rechecks after push before creating a PR if a hook changed the local artifact',async()=>{
+    const c=strictPublication();f.push.mockImplementation(async()=>{c.artifact.dirty=true;});
+    await expect(f.invoke()).rejects.toThrow('strict_publication_artifact_unverified');
+    expect(f.push).toHaveBeenCalledTimes(1);expect(f.openPr).not.toHaveBeenCalled();
+    expect(f.db.query('SELECT * FROM prs').all()).toEqual([]);expect(c.receipts).toEqual([]);
+  });
+
+  for(const kind of ['unknown','different-branch','dirty','changing-observation'] as const) it('fails closed on '+kind+' initial artifact evidence',async()=>{
+    const c=strictPublication();
+    if(kind==='unknown')c.artifact.baseSha='unknown';
+    else if(kind==='different-branch')c.artifact.branchSha=REBASED_HEAD;
+    else if(kind==='dirty')c.artifact.dirty=true;
+    else {
+      let reads=0;
+      f.gitCommand.mockImplementation(async args=>({stdout:args[0]==='rev-parse'
+        ? [++reads===1?RECEIPT_HEAD:REBASED_HEAD,c.artifact.treeSha,c.artifact.baseSha,RECEIPT_HEAD].join('\n')+'\n':'',stderr:'',exitCode:0}));
+    }
+    await expect(f.invoke()).rejects.toThrow('strict_publication_artifact_unverified');
+    expect(f.run).not.toHaveBeenCalled();expect(f.review).not.toHaveBeenCalled();expect(f.complete).not.toHaveBeenCalled();expect(f.push).not.toHaveBeenCalled();
+  });
+
+  it('requires a new full check and independent approval after an existing bounded reviewer fixup',async()=>{
+    const c=strictPublication();let loops=0;
+    f.deps.runAdmittedAgentLoop=async()=>{
+      if(++loops===2){c.artifact.headSha=REBASED_HEAD;c.artifact.branchSha=REBASED_HEAD;c.artifact.treeSha='e'.repeat(40);f.pr.headSha=REBASED_HEAD;}
+      return loopResult('finished');
+    };
+    f.review.mockResolvedValueOnce(reviewResult('changes_needed')).mockResolvedValueOnce(reviewResult('approve'));
+    expect((await f.invoke()).status).toBe('pr_opened');
+    expect(loops).toBe(2);expect(f.run).toHaveBeenCalledTimes(2);expect(f.review).toHaveBeenCalledTimes(2);
+    expect(c.receipts[0]?.exactArtifact).toEqual({headSha:REBASED_HEAD,baseSha:'c'.repeat(40),treeSha:'e'.repeat(40),worktreeClean:true});
+    expect(f.push.mock.calls[0]?.[0].sourceCommit).toBe(REBASED_HEAD);
+  });
+});
+
 describe('CODE trusted publication receipts', () => {
   it('records the admitted check/review/publication evidence only after the actual PR receipt persists', async () => {
     const c = capturePublication();

@@ -28,14 +28,21 @@ export function createCanaryReadiness(options: CanaryReadinessOptions) {
       const native = options.activation.getHealthEvidence().find(e => e.actionId === actionId && e.ownerEpoch === ownerEpoch
         && e.ticketId === options.issueId && e.runtime === 'hermes' && e.terminalStatus === 'finished' && e.traceClosed);
       if (!native) return NOT_READY;
+      // Match the canonical admission fence: any newer action for this ticket
+      // supersedes the publication, including actions other than start_coding.
+      // Owner rows are immutable claims, not leases: close() only revokes an
+      // in-memory admission. An unfinished claimed action remains a conflict
+      // even after a crash; unrelated unclaimed legacy history is not a claim.
+      // Read all canonical action/owner fences in the same SQLite snapshot.
       const row = options.db.query<{ id: number; state_fingerprint: string; owner_epoch: string; provider: string; model: string }, [string, string]>(
         `SELECT a.id,a.state_fingerprint,a.provider,a.model,o.owner_epoch FROM actions a
          JOIN hermes_action_owners o ON o.action_id=a.id
          WHERE a.id=? AND a.ticket_linear_id=? AND a.action_type='start_coding'
-           AND a.completed_at IS NOT NULL AND a.success=1 AND a.outcome='pr_opened'`).get(actionId, options.issueId);
-      const latest = options.db.query<{ id: number }, [string]>("SELECT id FROM actions WHERE ticket_linear_id=? AND action_type='start_coding' ORDER BY id DESC LIMIT 1").get(options.issueId);
-      const active = options.db.query<{ n: number }, []>('SELECT count(*) AS n FROM actions WHERE completed_at IS NULL').get();
-      if (!row || row.state_fingerprint !== fingerprint || row.owner_epoch !== ownerEpoch || String(latest?.id) !== actionId || active?.n !== 0
+           AND a.completed_at IS NOT NULL AND a.success=1 AND a.outcome='pr_opened'
+           AND NOT EXISTS (SELECT 1 FROM actions newer WHERE newer.ticket_linear_id=a.ticket_linear_id AND newer.id>a.id)
+           AND NOT EXISTS (SELECT 1 FROM hermes_action_owners claimed LEFT JOIN actions pending ON pending.id=claimed.action_id
+             WHERE pending.id IS NULL OR pending.completed_at IS NULL OR length(trim(claimed.owner_epoch))=0 OR pending.action_type<>'start_coding')`).get(actionId, options.issueId);
+      if (!row || row.state_fingerprint !== fingerprint || row.owner_epoch !== ownerEpoch
           || row.provider !== 'deepseek' || row.model !== 'deepseek-v4-pro') return NOT_READY;
       const allocation = options.ledger.status(options.issueId);
       if (!allocation || allocation.state !== 'closed' || allocation.terminalReason !== 'pr_opened'

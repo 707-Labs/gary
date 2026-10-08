@@ -14,7 +14,7 @@ import { HERMES_CANARY_CHILD_IMAGE, HERMES_CANARY_WORKER_IMAGE, type HermesActiv
 import { bindCanonicalCodeAction } from '../src/hermes/canonical-admission.ts';
 import type { CodePublicationReceipt } from '../src/handlers/code.ts';
 import { openDb } from '../src/state/db.ts';
-import { recordActionEnd, recordActionStart, recordPr, upsertTicket } from '../src/state/queries.ts';
+import { recordActionEnd, recordPr, setClassification, upsertTicket } from '../src/state/queries.ts';
 import { SpendLedger } from '../src/spend.ts';
 import { createSlackTransport, type SlackSocket } from '../src/slack/transport.ts';
 import { GARY_SLACK, READY_DM_TEXT } from '../src/slack/service.ts';
@@ -79,7 +79,7 @@ async function fixture(){
       DOCKER_HOST:'unix:///Users/tanner/.colima/default/docker.sock',GARY_SLACK_ENABLED:'1',GARY_SLACK_CREDENTIALS_FILE:credentialsPath},
     fetch:(async(input:RequestInfo|URL,init?:RequestInit)=>{
       const request=new Request(input,init);expect(request.url).toBe('https://api.deepseek.com/anthropic/v1/messages');
-      const body=await request.json();expect(body.model).toBe('deepseek-v4-pro');modelCalls++;
+      const body=await request.json();expect(body.model).toBe('deepseek-v4-pro');expect(body.thinking).toEqual({type:'disabled'});modelCalls++;
       const steps=[['read_file',{path:'task.ts'}],['write_file',{path:'task.ts',content:'updated\n'}],['run_bash',{command:CHECK}],['finish',{summary:'Verified offline fixture'}]] as const;
       const step=steps[modelCalls-1]!;
       return Response.json({id:'reply-'+modelCalls,type:'message',role:'assistant',model:'deepseek-v4-pro',content:[{type:'tool_use',id:'tool-'+modelCalls,name:step[0],input:step[1]}],stop_reason:'tool_use',
@@ -113,7 +113,10 @@ for(const mode of modes)test('actual startup Slack readiness: '+mode,async()=>{
     noSend();expect(f.counts()).toEqual({modelCalls:0,launches:0,credentialLoads:1});
     mention(f.sockets[0]!,'Before');await flush();noSend();expect(f.sockets[0]!.sent).toHaveLength(1);
     args.spend!.createCampaign('offline',10);args.spend!.enrollTicket('offline',ISSUE,10,{draftPr:true});upsertTicket(args.db,{linearId:ISSUE,identifier:'ERT-1'});
-    const actionId=recordActionStart(args.db,{ticketLinearId:ISSUE,stateFingerprint:'fp',actionType:'start_coding',provider:'deepseek',model:'deepseek-v4-pro'});
+    const admitted={issueId:ISSUE,fingerprint:'fp',humanSignature:'fixture-human',provider:'deepseek',model:'deepseek-v4-pro',repo:REPO};
+    const classify=args.codingTrial!.admit({...admitted,actionType:'classify'});
+    setClassification(args.db,{linearId:ISSUE,classification:'CODE',confidence:.99,scope:'S'});classify.complete(true,'handled');
+    const trial=args.codingTrial!.admit({...admitted,actionType:'start_coding'}),actionId=trial.actionId;
     const binding=bindCanonicalCodeAction({db:args.db,ledger:args.spend!,actionId,fingerprint:'fp',issue:{id:ISSUE,identifier:'ERT-1',teamKey:'ERT',teamId:'fixture-team'} as AssignedIssue,
       repo:REPO,provider:'deepseek',model:'deepseek-v4-pro'});
     try{
@@ -142,9 +145,13 @@ for(const mode of modes)test('actual startup Slack readiness: '+mode,async()=>{
           body:JSON.stringify({model:'deepseek-v4-pro',max_tokens:128,messages:[{role:'user',content:'offline'}]})}))).rejects.toThrow('offline_ambiguous_request');
         expect(args.spend!.status(ISSUE)?.unknownAttempts).toBe(1);
       }
-      if(mode!=='incomplete-action')recordActionEnd(args.db,{id:actionId,success:true,outcome:'pr_opened'});
-      await refresh();noSend(); // Completed action and publication still require known closed spend.
-      if(mode!=='active-spend')args.spend!.markTerminal(ISSUE,'pr_opened');
+      if(mode==='ready')trial.complete(true,'pr_opened');
+      else {
+        // Deliberately split negative fixture state to exercise action and allocation gates independently.
+        if(mode!=='incomplete-action')recordActionEnd(args.db,{id:actionId,success:true,outcome:'pr_opened'});
+        await refresh();noSend(); // Completed action and publication still require known closed spend.
+        if(mode!=='active-spend')args.spend!.markTerminal(ISSUE,'pr_opened');
+      }
       await refresh();await refresh();await refresh();
       if(mode==='ready'){
         expect(f.posts).toEqual([{channel:GARY_SLACK.tannerId,text:READY_DM_TEXT,unfurl_links:false,unfurl_media:false}]);

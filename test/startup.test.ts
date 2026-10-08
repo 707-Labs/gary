@@ -10,7 +10,7 @@ import { HERMES_CANARY_WORKER_IMAGE, HERMES_CANARY_CHILD_IMAGE, type HermesActiv
 import { bindCanonicalCodeAction } from '../src/hermes/canonical-admission.ts';
 import { openDb } from '../src/state/db.ts';
 import { SpendLedger } from '../src/spend.ts';
-import { recordActionStart, upsertTicket } from '../src/state/queries.ts';
+import { setClassification, upsertTicket } from '../src/state/queries.ts';
 import { LocalExecutor } from '../src/executors/local.ts';
 import type { AssignedIssue, LinearAdapter } from '../src/adapters/linear.ts';
 import type { GitHubClient } from '../src/adapters/github.ts';
@@ -62,9 +62,15 @@ test('actual main selects the real Hermes factory and an injected failure never 
     runLoop:async args=>{
       polls++;expect([...args.allowedIssueIds!]).toEqual([issueId]);expect([...args.allowedActionTypes!]).toEqual(['classify','start_coding']);
       expect(typeof args.onCodePublication).toBe('function');
+      expect(args.review).toEqual({providerOrder:['deepseek'],maxRounds:1,iterationCap:6,timeoutMs:180_000});
+      expect(f.config.review.iterationCap).toBe(5); // Legacy config cannot widen or shrink the fixed trial review contract.
       args.spend!.createCampaign('fixture',10);args.spend!.enrollTicket('fixture',issueId,10,{draftPr:true});
       upsertTicket(args.db,{linearId:issueId,identifier:'ERT-1'});
-      const actionId=recordActionStart(args.db,{ticketLinearId:issueId,stateFingerprint:'fixture-fp',actionType:'start_coding',provider:'deepseek',model:'deepseek-v4-pro'});
+      expect(args.codingTrial).toBeDefined();
+      const admitted={issueId,fingerprint:'fixture-fp',humanSignature:'fixture-human',provider:'deepseek',model:'deepseek-v4-pro',repo:'fixture/repo'};
+      const classify=args.codingTrial!.admit({...admitted,actionType:'classify'});
+      setClassification(args.db,{linearId:issueId,classification:'CODE',confidence:.99,scope:'S'});classify.complete(true,'handled');
+      const trial=args.codingTrial!.admit({...admitted,actionType:'start_coding'}),actionId=trial.actionId;
       const issue={id:issueId,identifier:'ERT-1',teamId:'fixture-team',teamKey:'ERT'} as AssignedIssue;
       const binding=bindCanonicalCodeAction({db:args.db,ledger:args.spend!,actionId,fingerprint:'fixture-fp',issue,repo:'fixture/repo',provider:'deepseek',model:'deepseek-v4-pro'});
       try {
@@ -73,7 +79,7 @@ test('actual main selects the real Hermes factory and an injected failure never 
           maxIterations:50,maxTokensPerTurn:128,timeoutMs:30_000,deadlineMs:Date.now()+30_000,finishGateCommand:'bun run check',disableSubagent:true});
         expect(result.status).toBe('error');
         expect(args.spend!.status(issueId)?.attemptCount).toBe(0);
-      } finally {binding.close();}
+      } finally {trial.complete(false,'error');binding.close();}
     }});
   expect({launched,polls,network:f.networkCalls()}).toEqual({launched:1,polls:1,network:0});
   expect(process.listenerCount('SIGTERM')).toBe(beforeSignals);
@@ -81,8 +87,8 @@ test('actual main selects the real Hermes factory and an injected failure never 
 test('actual legacy main preserves the existing DeepSeek-only campaign and omits all canary hooks',async()=>{
   const f=fixture(); let polls=0;
   f.config.providers=[...f.config.providers,{name:'z.ai',apiKey:'fake-zai',baseUrl:'https://api.z.ai/api/anthropic',model:'glm-5.3',defaultBackoffMs:1000}];
-  await main({...f.deps,env:{},runLoop:async args=>{polls++;expect(args.createAdmittedCodeLoop).toBeUndefined();expect(args.allowedIssueIds).toBeUndefined();
-    expect(args.glm.chain.providers.map(p=>p.name)).toEqual(['deepseek']);}});
+  await main({...f.deps,env:{},runLoop:async args=>{polls++;expect(args.createAdmittedCodeLoop).toBeUndefined();expect(args.allowedIssueIds).toBeUndefined();expect(args.codingTrial).toBeUndefined();
+    expect(args.glm.chain.providers.map(p=>p.name)).toEqual(['deepseek']);expect(args.review).toEqual(f.config.review);}});
   expect(polls).toBe(1);expect(f.networkCalls()).toBe(0);
 });
 test('unsafe executor, missing activation and mismatched route stop before polling or network',async()=>{

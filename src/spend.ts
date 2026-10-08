@@ -20,6 +20,10 @@ type PricedProvider = keyof typeof POLICIES;
 type Policy = (typeof POLICIES)[PricedProvider];
 type TicketState = "active" | "exhausted" | "closed";
 
+/** The in-flight reservation is deliberately unknown during before_send. */
+export type PaidRequestGuardPhase = "before_request" | "before_send" | "after_response";
+export type PaidRequestGuard = (phase: PaidRequestGuardPhase) => void;
+
 export class SpendLimitError extends Error {
   constructor(readonly reason: string) {
     super(`spending guard stopped request: ${reason}`);
@@ -184,6 +188,7 @@ function receiptInput(body: unknown, policy: Policy, maxTokens: number): Receipt
 export class SpendLedger {
   private readonly db: Database;
   private readonly scope = new AsyncLocalStorage<string>();
+  private readonly paidRequestGuards = new AsyncLocalStorage<readonly PaidRequestGuard[]>();
 
   constructor(path: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
@@ -263,6 +268,28 @@ export class SpendLedger {
   }
   close(): void { this.db.close(); }
 
+  /** Optional trial admission layered around the existing ticket scope.
+   * Nested scopes compose with their outer guards and restore on completion.
+   * Await lazy SDK request objects inside fn, before leaving the guarded scope.
+   * Guards are synchronous: no await may open a gap before reservation/send. */
+  withPaidRequestGuard<T>(guard: PaidRequestGuard, fn: () => T): T {
+    if (typeof guard !== "function") throw new SpendLimitError("invalid paid request guard");
+    const guards = Object.freeze([...(this.paidRequestGuards.getStore() ?? []), guard]);
+    return this.paidRequestGuards.run(guards, fn);
+  }
+
+  private assertPaidRequestAllowed(phase: PaidRequestGuardPhase): void {
+    for (const guard of this.paidRequestGuards.getStore() ?? []) {
+      const result: unknown = guard(phase);
+      if (result !== undefined) {
+        // A mistakenly asynchronous guard must not authorize this request or
+        // leave an unhandled rejection behind after the synchronous rejection.
+        void Promise.resolve(result).catch(() => {});
+        throw new SpendLimitError("paid request guard must complete synchronously");
+      }
+    }
+  }
+
   guardedFetch(provider: string, inner: typeof fetch = globalThis.fetch): typeof fetch {
     return (async (input: RequestInfo | URL, init?: RequestInit) => {
       const ticketId = this.scope.getStore();
@@ -270,57 +297,71 @@ export class SpendLedger {
       let request: Request;
       try { request = new Request(input, { ...init, redirect: "manual" }); } catch { throw new SpendLimitError("invalid HTTP request"); }
       const { policy, maxTokens } = await validateRequest(provider, request);
+      this.assertPaidRequestAllowed("before_request");
       const attempt = this.reserve(ticketId, provider, policy, maxTokens);
-      let response: Response;
+      let response: Response | undefined;
       try {
-        response = await inner(request);
-      } catch (error) {
-        this.recordReceipt(attempt, "transport_error", policy);
-        this.unknown(attempt, null);
-        throw error;
-      }
-      this.assertResponseActive(ticketId, attempt, policy, response);
-      if (response.status >= 300 && response.status < 400) {
-        this.recordReceipt(attempt, "redirect", policy, response);
-        this.unknown(attempt, response.status);
-        throw new SpendLimitError("provider redirect rejected");
-      }
-      if (!response.ok) {
-        this.recordReceipt(attempt, "http_error", policy, response);
-        this.unknown(attempt, response.status);
-        return response;
-      }
-      let body: unknown;
-      try { body = await response.clone().json(); } catch {
-        this.recordReceipt(attempt, "invalid_json", policy, response);
-        this.unknown(attempt, response.status);
+        try {
+          this.assertPaidRequestAllowed("before_send");
+          response = await inner(request);
+        } catch (error) {
+          this.recordReceipt(attempt, "transport_error", policy);
+          this.unknown(attempt, null);
+          throw error;
+        }
         this.assertResponseActive(ticketId, attempt, policy, response);
+        if (response.status >= 300 && response.status < 400) {
+          this.recordReceipt(attempt, "redirect", policy, response);
+          this.unknown(attempt, response.status);
+          throw new SpendLimitError("provider redirect rejected");
+        }
+        if (!response.ok) {
+          this.recordReceipt(attempt, "http_error", policy, response);
+          this.unknown(attempt, response.status);
+          return response;
+        }
+        let body: unknown;
+        try { body = await response.clone().json(); } catch {
+          this.recordReceipt(attempt, "invalid_json", policy, response);
+          this.unknown(attempt, response.status);
+          this.assertResponseActive(ticketId, attempt, policy, response);
+          return response;
+        }
+        const receipt = receiptInput(body, policy, maxTokens);
+        const receiptResponse = response;
+        // A different connection may close/exhaust this ticket while we read the
+        // response. Take the writer lock before checking and keep it through the
+        // refund; a waiting receipt write must never refund a now-closed ticket.
+        const settlementError = this.db.transaction((): SpendLimitError | null => {
+          if (this.ticket(ticketId)?.state !== "active") {
+            this.recordReceipt(attempt, "ticket_closed", policy, receiptResponse, body);
+            this.unknown(attempt, receiptResponse.status);
+            return new SpendLimitError("ticket closed while request was in flight");
+          }
+          this.recordReceipt(attempt, receipt.reason, policy, receiptResponse, body);
+          if (receipt.reason === "token_bounds") {
+            this.unknown(attempt, receiptResponse.status);
+            this.markTerminal(ticketId, "receipt_exceeds_bounds");
+            return new SpendLimitError("receipt exceeds reserved token bounds");
+          }
+          if (receipt.reason !== "accepted") { this.unknown(attempt, receiptResponse.status); return null; }
+          // Always keep full output cost; compatibility usage may omit reasoning.
+          const charged = costMicros(policy, receipt.inputTokens, maxTokens);
+          this.db.query("UPDATE spend_attempts SET charged_micros=?, state='settled', input_tokens=?, http_status=?, settled_at=CURRENT_TIMESTAMP WHERE id=? AND state='reserved'").run(charged, receipt.inputTokens, receiptResponse.status, attempt);
+          return null;
+        }).immediate();
+        if (settlementError) throw settlementError;
         return response;
+      } finally {
+        // Every dispatched/error path records its known or conservative receipt
+        // before the outer trial policy decides whether any caller may continue.
+        try { this.assertPaidRequestAllowed("after_response"); }
+        catch (error) {
+          // A denied response never reaches the SDK; close its unused body.
+          try { await response?.body?.cancel(); } catch { /* Preserve the guard denial. */ }
+          throw error;
+        }
       }
-      const receipt = receiptInput(body, policy, maxTokens);
-      // A different connection may close/exhaust this ticket while we read the
-      // response. Take the writer lock before checking and keep it through the
-      // refund; a waiting receipt write must never refund a now-closed ticket.
-      const settlementError = this.db.transaction((): SpendLimitError | null => {
-        if (this.ticket(ticketId)?.state !== "active") {
-          this.recordReceipt(attempt, "ticket_closed", policy, response, body);
-          this.unknown(attempt, response.status);
-          return new SpendLimitError("ticket closed while request was in flight");
-        }
-        this.recordReceipt(attempt, receipt.reason, policy, response, body);
-        if (receipt.reason === "token_bounds") {
-          this.unknown(attempt, response.status);
-          this.markTerminal(ticketId, "receipt_exceeds_bounds");
-          return new SpendLimitError("receipt exceeds reserved token bounds");
-        }
-        if (receipt.reason !== "accepted") { this.unknown(attempt, response.status); return null; }
-        // Always keep full output cost; compatibility usage may omit reasoning.
-        const charged = costMicros(policy, receipt.inputTokens, maxTokens);
-        this.db.query("UPDATE spend_attempts SET charged_micros=?, state='settled', input_tokens=?, http_status=?, settled_at=CURRENT_TIMESTAMP WHERE id=? AND state='reserved'").run(charged, receipt.inputTokens, response.status, attempt);
-        return null;
-      }).immediate();
-      if (settlementError) throw settlementError;
-      return response;
     }) as typeof fetch;
   }
 

@@ -3,13 +3,18 @@ import { openDb } from '../../src/state/db.ts';
 import { recordActionEnd, recordActionStart, recordPr, upsertTicket } from '../../src/state/queries.ts';
 import { createCanaryReadiness } from '../../src/hermes/host-readiness.ts';
 import type { CodePublicationReceipt } from '../../src/handlers/code.ts';
-import type { CodeActionAdmission } from '../../src/hermes/canonical-admission.ts';
+import { bindCanonicalCodeAction, type CodeActionAdmission } from '../../src/hermes/canonical-admission.ts';
 import type { HermesActivationBinding, RuntimeHealthEvidence } from '../../src/hermes/activation.ts';
-import type { SpendLedger, SpendStatus } from '../../src/spend.ts';
+import { SpendLedger, type SpendStatus } from '../../src/spend.ts';
 
-function fixture() {
+function fixture(legacyActions=0) {
   const db = openDb(':memory:');
   const issueId = '10000000-0000-4000-8000-000000000001', repo = 'fixture/repo', head = 'a'.repeat(40);
+  for(let index=0;index<legacyActions;index++) {
+    const ticketLinearId='legacy-ticket-'+index;
+    upsertTicket(db,{linearId:ticketLinearId,identifier:'LEGACY-'+index});
+    recordActionStart(db,{ticketLinearId,stateFingerprint:'historical-'+index,actionType:index%2===0?'start_coding':'classify'});
+  }
   upsertTicket(db, { linearId: issueId, identifier: 'ERT-1' });
   const id = recordActionStart(db, { ticketLinearId: issueId, stateFingerprint: 'fp', actionType: 'start_coding', provider: 'deepseek', model: 'deepseek-v4-pro' });
   db.query('INSERT INTO hermes_action_owners(action_id,owner_epoch) VALUES(?,?)').run(id, 'owner');
@@ -75,4 +80,120 @@ test('stale action, in-flight action, altered owner and mismatched receipt fail 
     expect(f.monitor.check().ready).toBe(false);
     expect(()=>f.monitor.recordPublication(f.admission,{...f.receipt,repo:'other/repo'})).toThrow('publication_readiness_binding_mismatch');
   } finally { f.db.close(); }
+});
+
+test('21 unrelated unclaimed historical actions remain unchanged and do not block exact publication readiness',()=>{
+ const f=fixture(21);
+ try {
+  const historical=()=>f.db.query('SELECT * FROM actions WHERE id<>? ORDER BY id').all(f.id);
+  const before=JSON.stringify(historical());
+  expect(historical()).toHaveLength(21);
+  f.monitor.recordPublication(f.admission,f.receipt);
+  expect(f.monitor.check().ready).toBe(false);
+  f.complete();
+  const ready=f.monitor.check();
+  expect(ready).toMatchObject({ready:true,hermesCanarySucceeded:true});
+  expect(f.monitor.check()).toEqual(ready);
+  expect(JSON.stringify(historical())).toBe(before);
+  expect(f.db.query<{n:number},[]>('SELECT count(*) AS n FROM actions WHERE completed_at IS NULL').get()!.n).toBe(21);
+  expect(f.db.query('SELECT action_id,owner_epoch FROM hermes_action_owners').all()).toEqual([{action_id:f.id,owner_epoch:'owner'}]);
+ }finally{f.db.close();}
+});
+
+test('unfinished canonical owner claims block globally even for older unrelated actions',()=>{
+ const f=fixture(21);
+ try {
+  f.complete();f.monitor.recordPublication(f.admission,f.receipt);
+  expect(f.monitor.check().ready).toBe(true);
+  const before=f.db.query('SELECT * FROM actions WHERE id<>? ORDER BY id').all(f.id);
+  const oldId=f.db.query<{id:number},[]>('SELECT id FROM actions ORDER BY id LIMIT 1').get()!.id;
+  f.db.query('INSERT INTO hermes_action_owners(action_id,owner_epoch) VALUES(?,?)').run(oldId,'older-owner');
+  expect(f.monitor.check().ready).toBe(false);
+  expect(f.monitor.check().ready).toBe(false);
+  expect(f.db.query('SELECT * FROM actions WHERE id<>? ORDER BY id').all(f.id)).toEqual(before);
+ }finally{f.db.close();}
+});
+
+test('a separate currently claimed action blocks until canonical completion without deleting its owner',()=>{
+ const f=fixture();
+ try {
+  f.complete();f.monitor.recordPublication(f.admission,f.receipt);
+  upsertTicket(f.db,{linearId:'other-ticket',identifier:'OTHER-1'});
+  const current=recordActionStart(f.db,{ticketLinearId:'other-ticket',stateFingerprint:'other',actionType:'start_coding',provider:'deepseek',model:'deepseek-v4-pro'});
+  f.db.query('INSERT INTO hermes_action_owners(action_id,owner_epoch) VALUES(?,?)').run(current,'other-owner');
+  expect(f.monitor.check().ready).toBe(false);
+  recordActionEnd(f.db,{id:current,success:false,outcome:'error'});
+  expect(f.monitor.check().ready).toBe(true);
+  expect(f.db.query('SELECT owner_epoch FROM hermes_action_owners WHERE action_id=?').get(current)).toEqual({owner_epoch:'other-owner'});
+ }finally{f.db.close();}
+});
+
+test('closing a real admission in memory does not release an unfinished durable claim',()=>{
+ const f=fixture(),ledger=new SpendLedger(':memory:');
+ try {
+  f.complete();f.monitor.recordPublication(f.admission,f.receipt);
+  const issue:CodeActionAdmission['issue']={id:'active-ticket',identifier:'ACTIVE-1',title:'offline lifecycle',description:null,
+   url:'https://linear.invalid/ACTIVE-1',stateName:'Todo',stateType:'unstarted',createdAt:'2026-10-08T00:00:00Z',updatedAt:'2026-10-08T00:00:00Z',
+   creatorId:null,creatorName:null,teamId:'team',teamKey:'ERT',blockedBy:[]};
+  upsertTicket(f.db,{linearId:issue.id,identifier:issue.identifier});
+  ledger.createCampaign('offline',1);ledger.enrollTicket('offline',issue.id,1);
+  const actionId=recordActionStart(f.db,{ticketLinearId:issue.id,stateFingerprint:'active',actionType:'start_coding',provider:'deepseek',model:'deepseek-v4-pro'});
+  const binding=bindCanonicalCodeAction({db:f.db,ledger,actionId,fingerprint:'active',issue,provider:'deepseek',model:'deepseek-v4-pro',repo:'fixture/repo'});
+  expect(()=>binding.admission.assertActive()).not.toThrow();expect(f.monitor.check().ready).toBe(false);
+  binding.close();expect(()=>binding.admission.assertActive()).toThrow('canonical_action_inactive');
+  expect(f.monitor.check().ready).toBe(false);
+  recordActionEnd(f.db,{id:actionId,success:false,outcome:'error'});
+  expect(f.monitor.check().ready).toBe(true);
+  expect(f.db.query('SELECT owner_epoch FROM hermes_action_owners WHERE action_id=?').get(actionId)).toEqual({owner_epoch:binding.admission.ownerEpoch});
+ }finally{ledger.close();f.db.close();}
+});
+
+test('any newer same-ticket action supersedes publication even without an owner or after completion',()=>{
+ for(const actionType of ['start_coding','classify','review_pr']) {
+  const f=fixture(21);
+  try {
+   f.complete();f.monitor.recordPublication(f.admission,f.receipt);
+   const current=recordActionStart(f.db,{ticketLinearId:f.issueId,stateFingerprint:'newer',actionType});
+   expect(f.monitor.check().ready).toBe(false);
+   recordActionEnd(f.db,{id:current,success:true,outcome:'handled'});
+   expect(f.monitor.check().ready).toBe(false);
+  }finally{f.db.close();}
+ }
+});
+
+test('admitted identity, completion, and exact clean published head stay mandatory with historical rows',()=>{
+ for(const mutate of [
+  (f:ReturnType<typeof fixture>)=>{f.db.query('UPDATE actions SET completed_at=NULL WHERE id=?').run(f.id);},
+  (f:ReturnType<typeof fixture>)=>{f.db.query("UPDATE actions SET state_fingerprint='changed' WHERE id=?").run(f.id);},
+  (f:ReturnType<typeof fixture>)=>{f.db.query('DELETE FROM hermes_action_owners WHERE action_id=?').run(f.id);},
+  (f:ReturnType<typeof fixture>)=>{f.db.query("UPDATE hermes_action_owners SET owner_epoch='another' WHERE action_id=?").run(f.id);},
+  (f:ReturnType<typeof fixture>)=>{f.receipt.publication.beforePush.headSha='b'.repeat(40);},
+  (f:ReturnType<typeof fixture>)=>{f.receipt.publication.afterPush.worktreeClean=false;},
+  (f:ReturnType<typeof fixture>)=>{f.receipt.postRebaseCheck='incomplete';},
+  (f:ReturnType<typeof fixture>)=>{f.receipt.review.afterApproval.headSha='c'.repeat(40);},
+ ]) {
+  const f=fixture(21);
+  try{f.complete();mutate(f);f.monitor.recordPublication(f.admission,f.receipt);expect(f.monitor.check().ready).toBe(false);}
+  finally{f.db.close();}
+ }
+});
+
+test('dangling or malformed canonical owner claims fail closed instead of disappearing from the query',()=>{
+ for(const kind of ['dangling','empty-owner','wrong-action-type'] as const) {
+  const f=fixture();
+  try {
+   f.complete();f.monitor.recordPublication(f.admission,f.receipt);
+   expect(f.monitor.check().ready).toBe(true);
+   if(kind==='dangling') {
+    f.db.exec('PRAGMA foreign_keys=OFF');
+    f.db.query('INSERT INTO hermes_action_owners(action_id,owner_epoch) VALUES(?,?)').run(f.id+100,'dangling-owner');
+   }else{
+    upsertTicket(f.db,{linearId:'malformed-ticket',identifier:'MALFORMED-1'});
+    const current=recordActionStart(f.db,{ticketLinearId:'malformed-ticket',stateFingerprint:'malformed',actionType:kind==='empty-owner'?'start_coding':'classify'});
+    recordActionEnd(f.db,{id:current,success:true,outcome:'handled'});
+    f.db.query('INSERT INTO hermes_action_owners(action_id,owner_epoch) VALUES(?,?)').run(current,kind==='empty-owner'?' ':'wrong-type-owner');
+   }
+   expect(f.monitor.check().ready).toBe(false);
+  }finally{f.db.close();}
+ }
 });

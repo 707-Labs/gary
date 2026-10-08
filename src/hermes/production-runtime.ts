@@ -30,6 +30,8 @@ export interface ProductionTaskPolicy {
 export interface ProductionRuntimeOptions {
   /** Explicit already-approved route; must equal the dispatch action's provider/model. */
   route: Pick<SessionOptions, 'provider' | 'model' | 'providerApiKey' | 'fetch'>;
+  /** Host-selected DeepSeek policy; never inferred from agent arguments or native messages. */
+  thinking?: 'disabled';
   taskPolicy(admission: CodeActionAdmission, args: AgentLoopArgs): ProductionTaskPolicy | Promise<ProductionTaskPolicy>;
   /** Must create a fresh isolated worker for every invocation, including phases and children. */
   launch: GaryRuntimeLauncher;
@@ -61,6 +63,8 @@ const boundActions = new WeakSet<CodeActionAdmission>();
 
 /** Plug into LoopDeps.createAdmittedCodeLoop. This factory never polls or enrolls tickets. */
 export function createHermesCodeLoopFactory(options: ProductionRuntimeOptions): (action: CodeActionAdmission) => AdmittedCodeLoopRunner {
+  const thinking = options.thinking;
+  if (thinking !== undefined && (thinking !== 'disabled' || options.route.provider !== 'deepseek')) throw new Error('invalid_host_thinking_policy');
   options = {...options,route:Object.freeze({...options.route}),
     ...(options.readonlyChildren ? {readonlyChildren:Object.freeze({...options.readonlyChildren})} : {})};
   return action => {
@@ -171,7 +175,7 @@ export function createHermesCodeLoopFactory(options: ProductionRuntimeOptions): 
               };
               stage = "coordinator";
         const run = createGaryPhaseCoordinator({baseUrl:'http://127.0.0.1/',launch,prepareManifest:evidence!.prepareManifest,hostOptions:{
-                ...options.route,admission:childAdmission,capabilityToken:randomBytes(32).toString('hex'),ledger:action.ledger,
+                ...options.route,...(thinking === undefined ? {} : {thinking}),admission:childAdmission,capabilityToken:randomBytes(32).toString('hex'),ledger:action.ledger,
                 executor:child.executor,readOnly:true,integrations:childBindings,allowedTools:grantedTools(childBindings,true),
                 finishGateCommand:'',currentOwnerEpoch:()=>{active();return action.ownerEpoch;},assertAdmission,
                 trace:childTrace,progress:evidence!.progress,...(childSignal ? {signal:childSignal} : {}),
@@ -190,7 +194,7 @@ export function createHermesCodeLoopFactory(options: ProductionRuntimeOptions): 
             } finally {
               try {
                 if (childTrace && !handedOff && !childTrace.failed) { childTrace.append({kind:'terminal',status:'error',iteration:0,phase:'hermes',
-                  modelState:{provider:options.route.provider,model:options.route.model,thinking:'unknown',effort:'unknown'},errorCode:'native_runtime_error'});childTrace.close(); }
+                  modelState:{provider:options.route.provider,model:options.route.model,thinking:thinking ?? 'unknown',effort:'unknown'},errorCode:'native_runtime_error'});childTrace.close(); }
               } finally {
                 try { await child.close(); } catch { stopped=true;throw new Error('child_cleanup_failed'); }
               }
@@ -200,7 +204,7 @@ export function createHermesCodeLoopFactory(options: ProductionRuntimeOptions): 
         active();
         stage = "coordinator";
         const run = createGaryPhaseCoordinator({baseUrl:'http://127.0.0.1/',launch:options.launch,prepareManifest:evidence.prepareManifest,hostOptions:{
-          ...options.route,admission,capabilityToken:randomBytes(32).toString('hex'),ledger:action.ledger,
+          ...options.route,...(thinking === undefined ? {} : {thinking}),admission,capabilityToken:randomBytes(32).toString('hex'),ledger:action.ledger,
           assertFinishEvidence:async signal=>{
             const context=await evidence!.contextSnapshot(signal);active();
             if (!context.acceptance.scopeWithinAllowedFiles || context.acceptance.openBlockers.length
@@ -223,7 +227,7 @@ export function createHermesCodeLoopFactory(options: ProductionRuntimeOptions): 
         busy = false;
         if (trace && !traceHandedOff && !trace.failed) {
           try { trace.append({kind:'terminal',status:'error',iteration:0,phase:'hermes',modelState:{provider:options.route.provider,
-            model:options.route.model,thinking:'unknown',effort:'unknown'},errorCode:'native_runtime_error'});trace.close(); } catch { stopped = true; }
+            model:options.route.model,thinking:thinking ?? 'unknown',effort:'unknown'},errorCode:'native_runtime_error'});trace.close(); } catch { stopped = true; }
         }
       }
     };
