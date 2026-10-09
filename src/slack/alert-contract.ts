@@ -10,7 +10,7 @@ export const ALERT_INTAKE_POLICY = Object.freeze({
 } as const);
 const P = ALERT_INTAKE_POLICY;
 
-/** Both identities must come from reviewed raw producer evidence, never a display name. */
+/** Both identities must come from operator-reviewed bot metadata, never a display name. */
 export interface AlertProducerBinding { readonly botId: string; readonly appId: string }
 export interface AlertDecisionContext {
   readonly nowMs: number;
@@ -119,7 +119,10 @@ function inspectAlertEnvelope(envelope: unknown, context: Pick<AlertDecisionCont
       || authorizations[0].team_id !== P.teamId || authorizations[0].user_id !== P.botUserId || authorizations[0].is_bot !== true
       || (own(authorizations[0], 'enterprise_id') && authorizations[0].enterprise_id !== null)) return rejected('wrong_scope');
   }
-  if (event.bot_id !== producer.botId || event.app_id !== producer.appId || event.user === P.botUserId) return rejected('producer_rejected');
+  // Slack identifies integration messages by bot_id; inner app_id is optional.
+  // The configured pair is independently verified and immutable, not learned here.
+  if (event.bot_id !== producer.botId || (own(event, 'app_id') && event.app_id !== producer.appId)
+    || event.user === P.botUserId) return rejected('producer_rejected');
   if (own(event, 'bot_profile')) {
     const profile = event.bot_profile;
     if (!object(profile) || ['id', 'app_id', 'team_id'].some(key => own(profile, key)

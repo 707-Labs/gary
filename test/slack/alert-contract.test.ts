@@ -117,8 +117,8 @@ describe('producer, workspace and message boundary', () => {
     }
   });
 
-  test('requires both exact bot_id and app_id; display names do not authenticate', () => {
-    for (const key of ['bot_id', 'app_id']) {
+  test('requires exact bot_id and rejects conflicting app_id; display names do not authenticate', () => {
+    for (const key of ['bot_id']) {
       const value = fixture(); delete value.payload.event[key]; value.payload.event.username = 'Mulligan Labs Alerts';
       rejected(value, 'producer_rejected');
     }
@@ -128,6 +128,50 @@ describe('producer, workspace and message boundary', () => {
     }
     const value = fixture(); value.payload.event.bot_profile = { id: 'BFOREIGN1', app_id: 'A0AK0JCN5PF', team_id: P.teamId };
     rejected(value, 'producer_rejected');
+  });
+
+  test('absent inner app_id uses only the independently bound bot identity', () => {
+    const value = fixture(); delete value.payload.event.app_id;
+    const { nowMs, producer } = context();
+    expect(preflightAlertEnvelope(value, { nowMs, producer })).toEqual({ kind: 'candidate' });
+    expect(decide(value).kind).toBe('accepted');
+    value.payload.event.attachments = [{ title: 'Transport heartbeat' }];
+    expect(decide(value)).toEqual({ kind: 'suppressed', reason: 'no_eligible_observation' });
+    rejected(value, 'unbound_producer', { ...context(), producer: null });
+    rejected(value, 'unbound_producer', { ...context(), producer: { botId: 'B0AJNH6K4LF', appId: '' } });
+    value.payload.event.bot_id = 'BFOREIGN1'; rejected(value, 'producer_rejected');
+    delete value.payload.event.bot_id; rejected(value, 'producer_rejected');
+  });
+
+  test('absent inner app_id does not bypass workspace, recipient app or channel validation', () => {
+    for (const field of ['team_id', 'api_app_id']) {
+      const value = fixture(); delete value.payload.event.app_id; value.payload[field] = 'FOREIGN';
+      rejected(value, 'wrong_scope');
+    }
+    const value = fixture(); delete value.payload.event.app_id; value.payload.event.channel = 'COTHER123';
+    rejected(value, 'wrong_scope');
+    const local = fixture(); delete local.payload.event.app_id;
+    rejected(local, 'channel_rejected', { ...context(), channel: null });
+  });
+
+  test('present app_id must be an exact string; null, empty, wrong types and mismatches reject', () => {
+    for (const appId of [null, '', false, 123, [], {}, 'AFOREIGN1']) {
+      const value = fixture(); value.payload.event.app_id = appId;
+      rejected(value, 'producer_rejected');
+    }
+    const nonJson = fixture(); nonJson.payload.event.app_id = undefined;
+    rejected(nonJson, 'raw_size_rejected');
+  });
+
+  test('optional inner app_id cannot hide a conflicting bot_profile identity', () => {
+    for (const profile of [
+      { id: 'BFOREIGN1', app_id: 'A0AK0JCN5PF', team_id: P.teamId },
+      { id: 'B0AJNH6K4LF', app_id: 'AFOREIGN1', team_id: P.teamId },
+      { id: 'B0AJNH6K4LF', app_id: 'A0AK0JCN5PF', team_id: 'TFOREIGN1' },
+    ]) {
+      const value = fixture(); delete value.payload.event.app_id; value.payload.event.bot_profile = profile;
+      rejected(value, 'producer_rejected');
+    }
   });
 
   test('rejects foreign or external scope before content acceptance', () => {

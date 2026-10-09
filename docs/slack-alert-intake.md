@@ -40,10 +40,24 @@ limited to 32 KiB, 10 attachments, 24 fields per attachment, 64-byte field names
 Identity, shape, timestamps and bounds are checked before metadata lookup.
 The only runtime read is `conversations.info` for the exact channel. Fresh
 metadata must confirm current public/internal membership; external sharing or
-missing facts fail closed. Raw message contract currently requires root
-`bot_message`, producer `app_id`, `event_ts`, event time and explicit nonexternal
-wrapper status. Verify these against a real producer event before claiming live
-acceptance. Independently observed bot/app metadata alone is insufficient.
+missing facts fail closed. The producer bot/app pair must be verified by the
+operator through `bots.info` and pinned in the immutable configuration. Slack
+identifies integration messages by `bot_id`; its documented `bot_message` event
+can omit inner `app_id`. The handler therefore requires the exact configured
+`bot_id` and treats inner `app_id` as an optional consistency check: if present,
+it must exactly match the configured app. Null, empty, non-string or conflicting
+values reject, as do conflicting `bot_profile` identities. The outer
+`api_app_id` still must identify Gary's receiving app. No identity is learned
+from message text or display names, and no additional runtime API is introduced.
+See [Slack's bot message contract](https://docs.slack.dev/reference/events/message/bot_message/)
+and [bot metadata lookup](https://docs.slack.dev/reference/methods/bots.info/).
+
+The other raw message gates still require root `bot_message`, `event_ts`, event
+time and explicit nonexternal wrapper status. The one inspected history result
+omitted inner `app_id` and `bot_profile`; history is not evidence of the Socket
+Mode envelope or delivery. Independently verified bot metadata establishes the
+configured identity mapping, not successful live intake. Verify an actual
+producer event before claiming live acceptance.
 
 One durable owner runs at a time, with five accepted messages per rolling hour,
 a 60-second deadline, at most 15-minute-old timestamps and 60 seconds of future
