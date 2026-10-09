@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createSlackService, GARY_SLACK, READY_DM_TEXT, READONLY_READY_DM_TEXT, PRIVATE_DM_STATUS, type SlackHostHealth, type SlackService, type SlackServiceOptions } from '../../src/slack/service.ts';
-import type { SlackTransport } from '../../src/slack/transport.ts';
+import type { SlackTransport,SlackFrameInfo } from '../../src/slack/transport.ts';
 
 const cleanups:Array<()=>void|Promise<void>>=[];
 afterEach(async()=>{for(const cleanup of cleanups.splice(0).reverse())await cleanup();});
@@ -12,7 +12,7 @@ type SendArgs=Parameters<SlackTransport['sendMessage']>[0];
 const healthy:SlackHostHealth={ready:true,hermesCanarySucceeded:true,receiptId:'canary-action-123:deployment-456'};
 const readonlyHealthy:SlackHostHealth={kind:'readonly_runtime',ready:true,readonlyCanarySucceeded:true,receiptId:'readonly-canary-123:runtime-456'};
 function fakeTransport() {
-  const sends:SendArgs[]=[];let callback:((event:unknown)=>void|Promise<void>)|undefined;
+  const sends:SendArgs[]=[];let callback:((event:unknown,frame?:SlackFrameInfo)=>void|Promise<void>)|undefined;
   let connected=false,starts=0,stops=0;
   const identity={appId:GARY_SLACK.appId as string,teamId:GARY_SLACK.teamId as string,botUserId:GARY_SLACK.botUserId as string};
   let send:SlackTransport['sendMessage']=async args=>({ok:true,channel:args.channel.startsWith('U')?'D0FIXTURE1':args.channel,ts:'1791417600.000001'});
@@ -21,7 +21,7 @@ function fakeTransport() {
     async sendMessage(args,signal){sends.push({...args});return send(args,signal);},
     async start(handler){starts++;callback=handler;connected=true;},async stop(){stops++;connected=false;},
   };
-  return {transport,sends,identity,emit:(event:unknown)=>Promise.resolve(callback?.(event)),
+  return {transport,sends,identity,emit:(event:unknown,frame?:SlackFrameInfo)=>Promise.resolve(callback?.(event,frame)),
     set connected(value:boolean){connected=value;},set send(value:SlackTransport['sendMessage']){send=value;},
     get starts(){return starts;},get stops(){return stops;}};
 }
@@ -40,6 +40,35 @@ function rows(db:Database):any[]{return db.query('SELECT * FROM gary_slack_outbo
 function dm(overrides:Record<string,unknown>={},payloadOverrides:Record<string,unknown>={}) {
   return envelope({type:'message',channel_type:'im',channel:'D0FIXTURE1',text:'private inbound fixture',...overrides},payloadOverrides);
 }
+test('alert messages route separately, preserve trusted frame size, and never enter DM or shared responders',async()=>{
+  let alerts=0,dmCalls=0,shared=0,initialized=0;
+  const f=fixture({checkConversationHealth:()=>true,tannerDirectMessages:true,
+    conversation:{ready:()=>true,close:()=>({drained:true}),async respond(){dmCalls++;}},
+    sharedConversation:{ready:()=>true,close:()=>({drained:true}),async respond(){shared++;}},
+    alertIntake:{initialize(){initialized++;},ready:()=>true,close:()=>({drained:true}),drain:async()=>({drained:true}),
+      async handle(_envelope,signal,available,rawBytes){alerts++;expect(rawBytes).toBe(1234);expect(signal?.aborted).toBe(false);expect(available?.()).toBe(true);return{kind:'suppressed'};}}});
+  f.health={...healthy,ready:false};await f.service.start();expect(initialized).toBe(1);
+  const candidate=envelope({type:'message',channel_type:'channel',channel:'C0AKGTZM8KB',bot_id:'B0AJNH6K4LF',subtype:'bot_message'});
+  await f.fake.emit(candidate,{rawBytes:1234});expect(alerts).toBe(1);expect(dmCalls).toBe(0);expect(shared).toBe(0);expect(f.fake.sends).toEqual([]);
+  await f.fake.emit(envelope({type:'message',channel_type:'channel',channel:'C0OTHER123'}),{rawBytes:1234});
+  await f.fake.emit({...candidate,payload:{...candidate.payload,team_id:'T0FOREIGN'}},{rawBytes:1234});expect(alerts).toBe(1);
+  await f.fake.emit(envelope());expect(shared).toBe(1);
+  expect(f.db.query("SELECT name FROM sqlite_master WHERE name LIKE 'alert_%'").all()).toEqual([]);
+});
+test('latched alert store is detected before socket ingress opens',async()=>{
+  let handled=0;const f=fixture({alertIntake:{initialize(){},ready:()=>false,close:()=>({drained:true}),drain:async()=>({drained:true}),async handle(){handled++;return{kind:'halted'};}}});
+  await expect(f.service.start()).rejects.toThrow('alert_intake_not_ready');expect(f.fake.starts).toBe(0);expect(handled).toBe(0);
+});
+test('a normal alert arriving during startup health does not get mistaken for failed initialization',async()=>{
+  const db=new Database(':memory:',{strict:true});cleanups.push(()=>db.close());const fake=fakeTransport();let busy=false,readyChecks=0,release!:()=>void;
+  const work=new Promise<void>(resolve=>{release=resolve;});
+  const service=createSlackService({db,transport:fake.transport,checkConversationHealth:()=>true,
+    alertIntake:{initialize(){expect(fake.starts).toBe(0);},ready(){readyChecks++;return !busy;},close:()=>({drained:!busy}),drain:async()=>({drained:!busy}),
+      async handle(){busy=true;await work;busy=false;return{kind:'drafted'};}},
+    async checkHostHealth(){void fake.emit(envelope({type:'message',channel_type:'channel',channel:'C0AKGTZM8KB'}),{rawBytes:1000});return{...healthy,ready:false};}});
+  cleanups.push(()=>service.stop());await service.start();expect(busy).toBe(true);expect(readyChecks).toBe(1);expect(service.health.running).toBe(true);
+  release();await service.stop();
+});
 test('shared conversation uses independent trusted runtime health without claiming coding readiness or sending a ready DM',async()=>{
   let calls=0;const f=fixture({checkConversationHealth:()=>true,sharedConversation:{ready:()=>true,close:()=>({drained:true}),async respond(input,deliver,_signal,available){
     calls++;expect(input.requesterId).toBe('U0MEMBER11');expect(input.teamId).toBe(GARY_SLACK.teamId);expect(available?.()).toBe(true);expect(await deliver('Shared answer')).toBe('sent');

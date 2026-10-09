@@ -13,6 +13,8 @@ export interface HostStartupConfig {
   conversationRuntimeRelease?:string;
   projectAssistantConfigPath?:string;
   projectAssistantConfigSha256?:string;
+  slackAlertConfigPath?:string;
+  slackAlertConfigSha256?:string;
   slack?: { credentialsPath: string; approvedChannelIds: readonly string[]; tannerDirectMessages?:true };
 }
 
@@ -34,6 +36,8 @@ export function loadHostStartupConfig(env: Readonly<Record<string, string | unde
   const conversationRelease=env.GARY_CONVERSATION_RUNTIME_RELEASE;
   const combinedConversation=mode==='hermes-canary'&&enabled==='1'&&conversationRelease!==undefined;
   const projectConfig=env.GARY_PROJECT_ASSISTANT_CONFIG,projectSha=env.GARY_PROJECT_ASSISTANT_CONFIG_SHA256;
+  const alertConfig=env.GARY_SLACK_ALERT_CONFIG,alertSha=env.GARY_SLACK_ALERT_CONFIG_SHA256;
+  if((alertConfig!==undefined||alertSha!==undefined)&&(!combinedConversation||!alertConfig||!alertSha||!/^[a-f0-9]{64}$/.test(alertSha)))throw new Error('slack_alert_requires_pinned_runtime');
   if((projectConfig!==undefined||projectSha!==undefined)&&(!combinedConversation||!projectConfig||!projectSha||!/^[a-f0-9]{64}$/.test(projectSha)))throw new Error('project_assistant_requires_pinned_runtime');
   if(conversationRelease!==undefined&&(!combinedConversation||!/^[a-f0-9]{40}$/.test(conversationRelease)
       ||(!conversation&&!sharedConversation)||slackRelease!==undefined))throw new Error('invalid_conversation_runtime_release');
@@ -82,6 +86,7 @@ export function loadHostStartupConfig(env: Readonly<Record<string, string | unde
     ...(sharedConversation!==undefined?{slackSharedConversationConfigPath:path(sharedConversation)}:{}),
     ...(conversationRelease?{conversationRuntimeRelease:conversationRelease}:{}),
     ...(projectConfig?{projectAssistantConfigPath:path(projectConfig),projectAssistantConfigSha256:projectSha!}:{}),
+    ...(alertConfig?{slackAlertConfigPath:path(alertConfig),slackAlertConfigSha256:alertSha!}:{}),
     slack: Object.freeze({ credentialsPath: path(env.GARY_SLACK_CREDENTIALS_FILE), approvedChannelIds: Object.freeze(approvedChannelIds),
       ...(direct==='1'?{tannerDirectMessages:true as const}:{}) }) });
 }

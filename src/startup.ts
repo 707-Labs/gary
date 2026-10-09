@@ -1,6 +1,6 @@
 import { logSlackIngressDiagnostic } from './slack/ingress-diagnostics.ts';
 import { mkdirSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { resolve, join, dirname } from 'node:path';
 import { createExecutorJobJournal, reconcileDockerExecutorJobs, type ExecutorJobJournal } from './executors/index.ts';
 import { CloudflareClient } from './adapters/cloudflare.ts';
 import { GLMClient } from './adapters/glm.ts';
@@ -24,6 +24,8 @@ import { createSlackService, type SlackService } from './slack/service.ts';
 import { runReadonlyGaryHost, verifyReadonlyRelease, type ReadonlyStartupDependencies } from './readonly-startup.ts';
 import { createSlackConversation, loadSlackConversationConfig, fingerprintSlackConversationConfig, type SlackConversation } from './slack/conversation.ts';
 import { createSlackSharedConversation, loadSlackSharedConversationConfig, fingerprintSlackSharedConversationConfig, type SlackSharedConversation } from './slack/shared-conversation.ts';
+import { loadSlackAlertConfig,openSlackAlertDatabase } from './slack/alert-config.ts';
+import { createSlackAlertIntake,type SlackAlertIntake } from './slack/alert-intake.ts';
 import { createHermesDMResponder, createHermesSharedResponder } from './hermes/dm-conversation.ts';
 import { ProjectAssistant } from './hermes/project-assistant.ts';
 import { loadProjectRuntimeConfig } from './hermes/project-config.ts';
@@ -59,6 +61,8 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
   const conversationConfig=host.slackConversationConfigPath?loadSlackConversationConfig(host.slackConversationConfigPath):undefined;
   const sharedConfig=host.slackSharedConversationConfigPath?loadSlackSharedConversationConfig(host.slackSharedConversationConfigPath):undefined;
   const projectConfig=host.projectAssistantConfigPath?loadProjectRuntimeConfig(host.projectAssistantConfigPath,host.projectAssistantConfigSha256!):undefined;
+  const alertConfig=host.slackAlertConfigPath?loadSlackAlertConfig(host.slackAlertConfigPath,host.slackAlertConfigSha256!):undefined;
+  if(alertConfig&&[conversationConfig?.contextDirectory,sharedConfig?.contextDirectory,host.projectAssistantConfigPath?dirname(host.projectAssistantConfigPath):undefined].includes(alertConfig.directory))throw new Error('alert_context_must_be_separate');
   if(conversationConfig&&sharedConfig&&conversationConfig.contextDirectory===sharedConfig.contextDirectory)throw new Error('conversation_contexts_must_be_separate');
   const activationConfig = host.activationPath ? loadHermesActivationConfig(host.activationPath) : undefined;
   const cfg = (deps.config ?? loadConfig)();
@@ -73,6 +77,8 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
   let slack: SlackService | undefined;
   let conversation:SlackConversation|undefined;
   let sharedConversation:SlackSharedConversation|undefined;
+  let alertIntake:SlackAlertIntake|undefined;
+  let alertDb:ReturnType<typeof openSlackAlertDatabase>|undefined;
   let projects:ProjectAssistant|undefined;
   let executorJobJournal: ExecutorJobJournal | undefined;
   const controller = new AbortController();
@@ -128,12 +134,19 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
             metadata:{memberInfo:(id,signal)=>transport.memberInfo!(id,signal),channelInfo:(id,signal)=>transport.channelInfo!(id,signal)}});
         }catch{log.warn('shared conversation unavailable',{reason:'shared_runtime_initialization_rejected'});}
       }
+      if(alertConfig){
+        alertDb=openSlackAlertDatabase(alertConfig);
+        alertIntake=createSlackAlertIntake({db:alertDb,transport,producer:alertConfig.producer,mode:alertConfig.mode});
+      }
       slack = createSlackService({ db, transport, onIngressDiagnostic:logSlackIngressDiagnostic, checkHostHealth: readiness.check, approvedChannelIds: host.slack.approvedChannelIds,
         ...(conversation?{conversation,tannerDirectMessages:true as const}:{}),...(sharedConversation?{sharedConversation}:{}),
+        ...(alertIntake?{alertIntake}:{}),
         ...(host.conversationRuntimeRelease?{checkConversationHealth:()=>!controller.signal.aborted}: {}) });
       const health = await slack.start();
       if (controller.signal.aborted) return;
       if (!health.running || !health.identityVerified || !health.socketHealthy) throw new Error('slack_startup_health_failed');
+      if(alertConfig&&alertIntake){
+        log.info('alert runtime ready',{mode:alertConfig.mode,configFingerprint:alertConfig.fingerprint,release:host.conversationRuntimeRelease,modelCalls:false});}
       if(conversationConfig&&conversation){if(!conversation.ready())throw new Error('dm_conversation_not_ready');
         log.info('conversation runtime ready',{kind:'private_dm',runId:conversationConfig.runId,allocationId:conversationConfig.allocationId,
           configFingerprint:fingerprintSlackConversationConfig(conversationConfig),release:host.conversationRuntimeRelease,tools:projects?'project-assistant-v1':'none'});}
@@ -168,7 +181,14 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
       try {
         try{if(conversation)log.info('conversation runtime stopped',{kind:'private_dm',drained:conversation.close().drained});}
         finally{if(sharedConversation)log.info('conversation runtime stopped',{kind:'shared_channel',drained:sharedConversation.close().drained});}
-      } finally {try { projects?.close(); } finally {try { executorJobJournal?.close(); } finally { try { spend?.close(); } finally { db.close(); } }}}
+      } finally {try {
+        if(alertIntake){alertIntake.close();const drain=await alertIntake.drain();
+          log.info('alert runtime stopped',{drained:drain.drained});
+          // A timed out operation retains its durable stop. Do not close its
+          // handle underneath a late completion; process exit releases it.
+          if(drain.drained)alertDb?.close();
+        }else alertDb?.close();
+      } finally {try { projects?.close(); } finally {try { executorJobJournal?.close(); } finally { try { spend?.close(); } finally { db.close(); } }}}}
     }
   }
 }

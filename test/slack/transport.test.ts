@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { APPROVED_SLACK_IDENTITY, createSlackTransport, validateSlackSocketUrl,
-  type SlackFetch, type SlackSocket, type SlackTransport, type SlackTransportOptions } from "../../src/slack/transport.ts";
+  type SlackFetch, type SlackSocket, type SlackTransport, type SlackTransportOptions, type SlackFrameInfo } from "../../src/slack/transport.ts";
 
 const credentials = Object.freeze({ botToken: "xoxb-offline-fixture-not-a-real-token", appToken: "xapp-offline-fixture-not-a-real-token" });
 const socketUrl = "wss://wss-primary.slack.com/link/?ticket=offline-fixture-ticket";
@@ -63,6 +63,15 @@ function harness(options: Partial<SlackTransportOptions> = {}, authReply: unknow
 }
 
 describe("Slack transport, fake fetch and WebSocket only", () => {
+  test('passes actual UTF-8 wire size outside JSON while preserving existing frames above the alert limit',async()=>{
+    const h=harness();const received:Array<{value:unknown;frame:SlackFrameInfo|undefined}>=[];
+    const socket=await h.start((value:unknown,frame?:SlackFrameInfo)=>{received.push({value,frame});});
+    const value={...envelope,rawBytes:1,payload:{...envelope.payload,text:'🐌'.repeat(18_000)}};
+    const wire=' '.repeat(300)+JSON.stringify(value);expect(Buffer.byteLength(wire)).toBeGreaterThan(65_536);
+    socket.emit('message',{data:wire});await until(()=>received.length===1);
+    expect(received[0]!.value).toEqual(value);expect(received[0]!.frame).toEqual({rawBytes:Buffer.byteLength(wire,'utf8')});
+    expect(Object.isFrozen(received[0]!.frame)).toBe(true);expect(h.transport.socketHealthy()).toBe(true);
+  });
   test('shared metadata uses only exact bot-authenticated info routes, rejects foreign/pending facts, and discards profile text',async()=>{
     const calls:Array<{url:string;init:RequestInit;headers:Headers}>=[];let user:any={...memberMetadata},channel:any={...channelMetadata};
     const h=harness({fetch:async(url,init)=>{calls.push({url,init,headers:new Headers(init.headers)});

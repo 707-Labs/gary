@@ -3,9 +3,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { hasSlackUserMention } from './mentions.ts';
 import { createSlackIngressEmitter, slackEnvelopeShape, type SlackIngressObserver } from './ingress-diagnostics.ts';
 import type { DB } from '../state/db.ts';
-import type { SlackTransport } from './transport.ts';
+import type { SlackTransport, SlackFrameInfo } from './transport.ts';
 import type { SlackConversation } from './conversation.ts';
 import type { SlackSharedConversation } from './shared-conversation.ts';
+import type { SlackAlertIntake } from './alert-intake.ts';
 
 export const GARY_SLACK = Object.freeze({ appId:'A0C7QFW3PEG', teamId:'T0AA24R7VUZ', botUserId:'U0C7NPEUG1F',
   tannerId:'U0A9M5W16F8', benId:'U0A97PBGXE3', readyRequest:'Sentinel_ecc85c3dae948191965308b6414c1165' });
@@ -49,6 +50,8 @@ export interface SlackServiceOptions {
   tannerDirectMessages?:true;
   conversation?:SlackConversation;
   sharedConversation?:SlackSharedConversation;
+  /** Separate deterministic producer intake: no conversation, coding or spend authority. */
+  alertIntake?:SlackAlertIntake;
   /** Trusted exact-release/runtime composition proof; never coding/publication authority. */
   checkConversationHealth?():boolean;
 }
@@ -107,6 +110,10 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
       status TEXT NOT NULL CHECK(status IN ('unknown','sent','not_sent')),
       claimed_at TEXT NOT NULL, completed_at TEXT, slack_channel TEXT, slack_ts TEXT, error_code TEXT
     )`);
+    options.alertIntake?.initialize();
+    // Validate an idle store before opening ingress. Once connected, a valid
+    // event may already be active while start() is awaiting host health.
+    if(options.alertIntake&&!options.alertIntake.ready())throw new Error('alert_intake_not_ready');
     initialized=true;
   }
   function snapshot():SlackServiceHealth {
@@ -178,7 +185,7 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
     if(refreshPromise)return refreshPromise;
     refreshPromise=track(refresh()).finally(()=>{refreshPromise=undefined;});return refreshPromise;
   }
-  async function mention(envelope:unknown):Promise<void> {
+  async function mention(envelope:unknown,frame?:SlackFrameInfo):Promise<void> {
     observe('service_envelope',slackEnvelopeShape(envelope,GARY_SLACK));
     if(!live()||!object(envelope)||envelope.type!=='events_api'||!object(envelope.payload)){observe('service_envelope_rejected');return;}
     const payload=envelope.payload;
@@ -187,6 +194,18 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
     const event=payload.event;
     if(event.type!=='app_mention')observe('service_event_not_mention');
     if(event.type==='message') {
+      // Exact channel routing precedes the private message path. The intake
+      // validates its own producer/metadata and never receives a DM responder.
+      if(event.channel==='C0AKGTZM8KB') {
+        if(options.alertIntake&&conversationAvailable()) {
+          const result=await options.alertIntake.handle(envelope,cancellation.signal,conversationAvailable,frame?.rawBytes);
+          const stage=({ignored:'alert_ignored',unavailable:'alert_unavailable',rejected:'alert_rejected',suppressed:'alert_suppressed',
+            duplicate:'alert_duplicate',conflict:'alert_conflict',limited:'alert_limited',busy:'alert_busy',drafted:'alert_drafted',
+            sent:'alert_sent',not_sent:'alert_not_sent',halted:'alert_halted'} as const)[result.kind];
+          if(stage)observe(stage);
+        }
+        return;
+      }
       if(!options.tannerDirectMessages||event.channel_type!=='im'||event.user!==GARY_SLACK.tannerId
         ||event.bot_id!==undefined||event.subtype!==undefined||typeof event.channel!=='string'||!/^D[A-Z0-9]{5,32}$/.test(event.channel)
         ||typeof event.text!=='string'||!event.text.trim()||event.text.length>40_000
@@ -261,7 +280,7 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
     startPromise=(async()=>{
       initialize();
       try {
-        await options.transport.start(envelope=>track(mention(envelope)),cancellation.signal);
+        await options.transport.start((envelope,frame)=>track(mention(envelope,frame)),cancellation.signal);
         if(stopped)return snapshot();
         running=true;return await refreshHealth();
       } catch {

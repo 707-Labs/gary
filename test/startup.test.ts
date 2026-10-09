@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { Database } from 'bun:sqlite';
 import { main } from '../src/index.ts';
 import type { Config } from '../src/config.ts';
 import type { StartupDependencies } from '../src/startup.ts';
@@ -234,6 +235,34 @@ test('combined startup separates private and shared contexts from coding publica
     expect({verified,polls,ledgerClosed,network:f.networkCalls()}).toEqual({verified:1,polls:1,ledgerClosed:true,network:0});
     expect(f.stats()).toMatchObject({stopped:true,sends:0});
   }
+});
+
+test('actual startup drafts a producer alert in its own ledger with no conversation spend or publication',async()=>{
+ const f=slackFixture(),ledger=new SpendLedger(':memory:'),db=openDb(':memory:');
+ const sharedDir=join(f.root,'shared'),alertDir=join(f.root,'alerts');mkdirSync(sharedDir,{mode:0o700});mkdirSync(alertDir,{mode:0o700});
+ const sharedPath=join(sharedDir,'config.json'),alertPath=join(alertDir,'config.json');
+ writeFileSync(sharedPath,JSON.stringify({version:1,runId:'hermes-shared-20261008',campaignId:'hermes-shared-20261008',allocationId:'local:hermes-shared-20261008',teamId:'T0AA24R7VUZ',appId:'A0C7QFW3PEG',botUserId:'U0C7NPEUG1F',trigger:'explicit_mention'}),{mode:0o600});
+ const raw=JSON.stringify({version:1,mode:'draft',teamId:'T0AA24R7VUZ',channelId:'C0AKGTZM8KB',botId:'B0AJNH6K4LF',appId:'A0AK0JCN5PF'});writeFileSync(alertPath,raw,{mode:0o600});
+ ledger.createCampaign('hermes-shared-20261008',5);ledger.enrollTicket('hermes-shared-20261008','local:hermes-shared-20261008',5);
+ let receive:Parameters<SlackTransport['start']>[0]=()=>{};const originalStart=f.transport.start;
+ f.transport.start=async(handler,signal)=>{receive=handler;await originalStart(handler,signal);};
+ f.transport.memberInfo=async()=>{throw new Error('human_lookup_forbidden');};
+ f.transport.channelInfo=async channel=>{expect(channel).toBe('C0AKGTZM8KB');return{id:channel,teamId:'T0AA24R7VUZ',isMember:true,isArchived:false,isPrivate:false,isShared:false,isExtShared:false,isOrgShared:false,isPendingExtShared:false,observedAt:Date.now()};};
+ await main({...f.deps,env:{...f.env,GARY_CONVERSATION_RUNTIME_RELEASE:'c'.repeat(40),GARY_SLACK_SHARED_CONVERSATION_CONFIG:sharedPath,
+  GARY_SLACK_ALERT_CONFIG:alertPath,GARY_SLACK_ALERT_CONFIG_SHA256:createHash('sha256').update(raw).digest('hex')},verifyConversationRelease:()=>{},db:()=>db,ledger:()=>ledger,slackTransport:()=>f.transport,
+  runLoop:async()=>{
+   const seconds=Math.floor(Date.now()/1000),ts=`${seconds}.000001`;
+   const envelope={type:'events_api',envelope_id:'offline-alert-startup',payload:{type:'event_callback',api_app_id:'A0C7QFW3PEG',team_id:'T0AA24R7VUZ',event_id:'EvSTARTUP123',event_time:seconds,is_ext_shared_channel:false,
+    event:{type:'message',channel:'C0AKGTZM8KB',channel_type:'channel',subtype:'bot_message',bot_id:'B0AJNH6K4LF',app_id:'A0AK0JCN5PF',ts,event_ts:ts,attachments:[{title:'🚨 Error Alert',fields:[{title:'Event',value:'runtime_failure'},{title:'Worker',value:'frontend'},{title:'Error',value:'Workers runtime outcome: exceededCpu'}]}]}}};
+   await receive(envelope,{rawBytes:Buffer.byteLength(JSON.stringify(envelope))});
+   const proof=new Database(join(alertDir,'alerts.sqlite'),{readonly:true});try{
+    expect(proof.query('SELECT state FROM alert_messages').all()).toEqual([{state:'draft'}]);
+    expect(proof.query('SELECT count(*) n FROM alert_outbox').get()).toEqual({n:0});
+   }finally{proof.close();}
+   expect(ledger.status('local:hermes-shared-20261008')?.attemptCount).toBe(0);
+   expect(db.query("SELECT name FROM sqlite_master WHERE name LIKE 'alert_%'").all()).toEqual([]);
+  }});
+ expect(f.networkCalls()).toBe(0);expect(f.stats()).toMatchObject({stopped:true,sends:0});
 });
 
 test('actual startup routes an authenticated Slack question through canonical current-work tools',async()=>{

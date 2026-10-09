@@ -9,6 +9,8 @@ export const SLACK_INGRESS_STAGES=[
   'shared_duplicate','shared_health_rejected','shared_dispatch','shared_input_rejected',
   'shared_metadata_unavailable','shared_member_lookup_failed','shared_channel_lookup_failed','shared_member_rejected','shared_channel_rejected','shared_metadata_allowed',
   'shared_claimed','shared_admission_rejected','diagnostics_limited',
+  'alert_ignored','alert_unavailable','alert_rejected','alert_suppressed','alert_duplicate','alert_conflict',
+  'alert_limited','alert_busy','alert_drafted','alert_sent','alert_not_sent','alert_halted',
 ] as const;
 type Component='transport'|'service'|'shared';
 type Stage=typeof SLACK_INGRESS_STAGES[number];

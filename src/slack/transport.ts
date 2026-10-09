@@ -7,6 +7,8 @@ export type SlackSendResult = { ok: true; channel: string; ts: string }
   | { ok: false; outcome: "definitely_not_sent" | "unknown"; code: string };
 export interface SlackMemberMetadata { readonly id:string; readonly teamId:string; readonly deleted:boolean; readonly isBot:boolean; readonly isAppUser:boolean; readonly isRestricted:boolean; readonly isUltraRestricted:boolean; readonly isStranger:boolean; readonly observedAt:number }
 export interface SlackChannelMetadata { readonly id:string; readonly teamId:string; readonly isMember:boolean; readonly isArchived:boolean; readonly isPrivate:boolean; readonly isShared:boolean; readonly isExtShared:boolean; readonly isOrgShared:boolean; readonly isPendingExtShared:boolean; readonly observedAt:number }
+/** Measured by the host transport before parsing, never taken from event JSON. */
+export interface SlackFrameInfo { readonly rawBytes:number }
 export interface SlackTransport {
   /** Host-only metadata for explicit channel mentions; never history or profile text. */
   memberInfo?(userId:string,signal?:AbortSignal):Promise<SlackMemberMetadata>;
@@ -15,7 +17,7 @@ export interface SlackTransport {
   socketHealthy(): boolean;
   sendMessage(message: SlackMessage, signal?: AbortSignal): Promise<SlackSendResult>;
   /** Envelopes are untrusted; the service must validate identity, event and policy. */
-  start(onEnvelope: (envelope: unknown) => void | Promise<void>, signal?: AbortSignal): Promise<void>;
+  start(onEnvelope: (envelope: unknown, frame?:SlackFrameInfo) => void | Promise<void>, signal?: AbortSignal): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -194,7 +196,7 @@ export function createSlackTransport(options: SlackTransportOptions): SlackTrans
         || typeof value.bot_id !== "string" || !/^B[A-Z0-9]{2,63}$/.test(value.bot_id)) return fail("slack_identity_mismatch");
   }
 
-  async function connect(onEnvelope: (envelope: unknown) => void | Promise<void>, onReady: () => void): Promise<void> {
+  async function connect(onEnvelope: (envelope: unknown, frame?:SlackFrameInfo) => void | Promise<void>, onReady: () => void): Promise<void> {
     await auth(lifetime.signal);
     const value = await request("apps.connections.open", {}, lifetime.signal);
     if (value.ok !== true) return fail("slack_api_rejected");
@@ -226,6 +228,7 @@ export function createSlackTransport(options: SlackTransportOptions): SlackTrans
           // JSON text only, bounded before parsing; never log raw events/errors.
           const data = record(event) ? event.data : undefined;
           if (typeof data !== "string" || Buffer.byteLength(data, "utf8") > MAX_SOCKET_BYTES) return finish("slack_socket_protocol_rejected");
+          const frame=Object.freeze({rawBytes:Buffer.byteLength(data,'utf8')});
           const envelope: unknown = JSON.parse(data);
           observe('transport_envelope',slackEnvelopeShape(envelope,APPROVED_SLACK_IDENTITY));
           if (!record(envelope)) return finish("slack_socket_protocol_rejected");
@@ -253,7 +256,7 @@ export function createSlackTransport(options: SlackTransportOptions): SlackTrans
           // ACK before calling service code; async failures stay private. The
           // service owns durable deduplication and any user-visible response.
           Promise.resolve().then(() => {
-            if (!stopped) return onEnvelope(envelope);
+            if (!stopped) return onEnvelope(envelope,frame);
           }).catch(() => undefined).finally(() => { pendingHandlers--; });
         } catch { observe('transport_frame_rejected');finish("slack_socket_protocol_rejected"); }
       };

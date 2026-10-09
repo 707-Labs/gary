@@ -107,3 +107,10 @@ test('project tools require a separate exact configuration hash inside the revie
  expect(loadHostStartupConfig(env).projectAssistantConfigPath).toBe(env.GARY_PROJECT_ASSISTANT_CONFIG);
  for(const change of [{GARY_PROJECT_ASSISTANT_CONFIG:undefined},{GARY_PROJECT_ASSISTANT_CONFIG_SHA256:undefined},{GARY_PROJECT_ASSISTANT_CONFIG_SHA256:'main'},{GARY_PROJECT_ASSISTANT_CONFIG:'relative.json'},{GARY_CONVERSATION_RUNTIME_RELEASE:undefined},{GARY_RUNTIME_MODE:'legacy'}])expect(()=>loadHostStartupConfig({...env,...change})).toThrow();
 });
+
+test('alert intake needs its own exact configuration hash and pinned combined runtime',()=>{
+ const env={...canary,GARY_SLACK_ENABLED:'1',GARY_SLACK_CREDENTIALS_FILE:'/private/runtime/slack.env',GARY_SLACK_SHARED_CONVERSATION_CONFIG:'/private/shared/config.json',GARY_CONVERSATION_RUNTIME_RELEASE:'c'.repeat(40),GARY_SLACK_ALERT_CONFIG:'/private/alerts/config.json',GARY_SLACK_ALERT_CONFIG_SHA256:'d'.repeat(64)};
+ expect(loadHostStartupConfig(env)).toMatchObject({slackAlertConfigPath:env.GARY_SLACK_ALERT_CONFIG,slackAlertConfigSha256:env.GARY_SLACK_ALERT_CONFIG_SHA256});
+ for(const change of [{GARY_SLACK_ALERT_CONFIG:undefined},{GARY_SLACK_ALERT_CONFIG_SHA256:undefined},{GARY_SLACK_ALERT_CONFIG_SHA256:'main'},
+  {GARY_SLACK_ALERT_CONFIG:'relative.json'},{GARY_CONVERSATION_RUNTIME_RELEASE:undefined},{GARY_RUNTIME_MODE:'legacy'},{GARY_SLACK_ENABLED:'0'}])expect(()=>loadHostStartupConfig({...env,...change})).toThrow();
+});
