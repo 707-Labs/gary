@@ -5,7 +5,7 @@ import { createSlackIngressEmitter, slackEnvelopeShape, type SlackIngressObserve
 import type { DB } from '../state/db.ts';
 import type { SlackTransport, SlackFrameInfo } from './transport.ts';
 import type { SlackConversation } from './conversation.ts';
-import type { SlackSharedConversation } from './shared-conversation.ts';
+import type { SlackSharedConversation, DMDelivery } from './shared-conversation.ts';
 import type { SlackAlertIntake } from './alert-intake.ts';
 
 export const GARY_SLACK = Object.freeze({ appId:'A0C7QFW3PEG', teamId:'T0AA24R7VUZ', botUserId:'U0C7NPEUG1F',
@@ -158,6 +158,18 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
     options.db.query(`UPDATE ${table} SET status=?, completed_at=?, slack_channel=?, slack_ts=?, error_code=?
       WHERE delivery_key=? AND claim_id=? AND status='unknown'`).run(status,new Date().toISOString(),channel,ts,error,input.key,claim);
   }
+  /** Shared-channel delivery: one durable claim per event, then the row authenticates exactly what left. */
+  function sharedDelivery(key:string,eventId:string,user:string,channel:string,threadTs:string):DMDelivery {
+    return async (text,kind='answer')=>{
+      if(!conversationAvailable()||(kind!=='answer'&&kind!=='notice')||(kind==='answer'&&!options.sharedConversation!.ready()))return 'not_sent';
+      await sendOnce({key,kind:'shared',requestId:eventId,recipient:user,channel,threadTs,text});
+      const row=options.db.query<{status:OutboxRow['status'];content_sha256:string;recipient_id:string;target_channel:string;thread_ts:string},[string]>(
+        'SELECT status,content_sha256,recipient_id,target_channel,thread_ts FROM gary_slack_shared_outbox WHERE delivery_key=?').get(key);
+      if(!row)return 'not_sent';
+      if(row.content_sha256!==hash(text)||row.recipient_id!==user||row.target_channel!==channel||row.thread_ts!==threadTs)return 'unknown';
+      return row.status;
+    };
+  }
   async function refresh():Promise<SlackServiceHealth> {
     if(!live())return snapshot();
     hostReady=false;receiptId=null;readinessKind=null;
@@ -206,6 +218,29 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
         }
         return;
       }
+      if(options.sharedConversation&&typeof event.channel==='string'&&CHANNEL.test(event.channel)) {
+        // A threaded reply continues a conversation an explicit mention already opened. A message that
+        // mentions Gary also arrives as app_mention and is routed only there, so nothing is answered twice.
+        if(event.thread_ts===undefined||event.thread_ts===event.ts){observe('shared_thread_ignored');return;}
+        if(event.bot_id!==undefined||event.subtype!==undefined||event.user===GARY_SLACK.botUserId||event.user==='USLACKBOT'){observe('shared_bot_rejected');return;}
+        if(event.channel_type==='im'||event.channel_type==='mpim'||typeof event.user!=='string'||!/^[UW][A-Z0-9]{5,32}$/.test(event.user)
+          ||typeof event.text!=='string'||!event.text.trim()||event.text.length>40_000
+          ||typeof event.ts!=='string'||!TIMESTAMP.test(event.ts)||typeof event.thread_ts!=='string'||!TIMESTAMP.test(event.thread_ts)){observe('shared_thread_shape_rejected');return;}
+        if(hasSlackUserMention(event.text,GARY_SLACK.botUserId)){observe('shared_thread_mention_deferred');return;}
+        if((event.team!==undefined&&event.team!==GARY_SLACK.teamId)||(payload.context_team_id!==undefined&&payload.context_team_id!==GARY_SLACK.teamId)
+          ||(payload.is_ext_shared_channel!==undefined&&payload.is_ext_shared_channel!==false)){observe('shared_scope_rejected');return;}
+        const eventId=payload.event_id,channel=event.channel,user=event.user,ts=event.ts,threadTs=event.thread_ts;
+        // Threads Gary never joined cost nothing: no identity refresh, outbox read or metadata lookup.
+        if(!options.sharedConversation.joined(channel,threadTs)){observe('shared_thread_inactive');return;}
+        const key=`shared:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${eventId}`;
+        if(options.db.query('SELECT 1 FROM gary_slack_shared_outbox WHERE delivery_key=?').get(key)){observe('shared_duplicate');return;}
+        await refreshHealth();
+        if(!conversationAvailable()){observe('shared_health_rejected');return;}
+        observe('shared_thread_dispatch');
+        await options.sharedConversation.respond({type:'thread_reply',appId:GARY_SLACK.appId,teamId:GARY_SLACK.teamId,botUserId:GARY_SLACK.botUserId,
+          requesterId:user,eventId,channel,ts,threadTs,text:event.text},sharedDelivery(key,eventId,user,channel,threadTs),cancellation.signal,conversationAvailable);
+        return;
+      }
       if(!options.tannerDirectMessages||event.channel_type!=='im'||event.user!==GARY_SLACK.tannerId
         ||event.bot_id!==undefined||event.subtype!==undefined||typeof event.channel!=='string'||!/^D[A-Z0-9]{5,32}$/.test(event.channel)
         ||typeof event.text!=='string'||!event.text.trim()||event.text.length>40_000
@@ -235,7 +270,7 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
       return;
     }
     if(options.sharedConversation&&event.type==='app_mention') {
-      if(event.bot_id!==undefined||event.subtype!==undefined||event.user===GARY_SLACK.botUserId){observe('shared_bot_rejected');return;}
+      if(event.bot_id!==undefined||event.subtype!==undefined||event.user===GARY_SLACK.botUserId||event.user==='USLACKBOT'){observe('shared_bot_rejected');return;}
       if(typeof event.user!=='string'||!/^[UW][A-Z0-9]{5,32}$/.test(event.user)
         ||typeof event.channel!=='string'||!CHANNEL.test(event.channel)||typeof event.text!=='string'||!event.text.trim()
         ||event.text.length>40_000
@@ -251,15 +286,7 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
       if(!conversationAvailable()){observe('shared_health_rejected');return;}
       observe('shared_dispatch');
       await options.sharedConversation.respond({type:'app_mention',appId:GARY_SLACK.appId,teamId:GARY_SLACK.teamId,botUserId:GARY_SLACK.botUserId,
-        requesterId:user,eventId,channel,ts,threadTs,text:event.text},async (text,kind='answer')=>{
-        if(!conversationAvailable()||(kind!=='answer'&&kind!=='notice')||(kind==='answer'&&!options.sharedConversation!.ready()))return 'not_sent';
-        await sendOnce({key,kind:'shared',requestId:eventId,recipient:user,channel,threadTs,text});
-        const row=options.db.query<{status:OutboxRow['status'];content_sha256:string;recipient_id:string;target_channel:string;thread_ts:string},[string]>(
-          'SELECT status,content_sha256,recipient_id,target_channel,thread_ts FROM gary_slack_shared_outbox WHERE delivery_key=?').get(key);
-        if(!row)return 'not_sent';
-        if(row.content_sha256!==hash(text)||row.recipient_id!==user||row.target_channel!==channel||row.thread_ts!==threadTs)return 'unknown';
-        return row.status;
-      },cancellation.signal,conversationAvailable);
+        requesterId:user,eventId,channel,ts,threadTs,text:event.text},sharedDelivery(key,eventId,user,channel,threadTs),cancellation.signal,conversationAvailable);
       return;
     }
     if(event.type!=='app_mention'||event.bot_id!==undefined||event.subtype!==undefined||typeof event.user!=='string'

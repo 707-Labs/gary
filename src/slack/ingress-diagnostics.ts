@@ -7,6 +7,7 @@ export const SLACK_INGRESS_STAGES=[
   'service_envelope','service_envelope_rejected','service_payload_rejected','service_event_not_mention',
   'shared_bot_rejected','shared_shape_rejected','shared_mention_rejected','shared_scope_rejected',
   'shared_duplicate','shared_health_rejected','shared_dispatch','shared_input_rejected',
+  'shared_thread_ignored','shared_thread_shape_rejected','shared_thread_mention_deferred','shared_thread_inactive','shared_thread_dispatch',
   'shared_metadata_unavailable','shared_member_lookup_failed','shared_channel_lookup_failed','shared_member_rejected','shared_channel_rejected','shared_metadata_allowed',
   'shared_claimed','shared_admission_rejected','diagnostics_limited',
   'alert_ignored','alert_unavailable','alert_rejected','alert_suppressed','alert_duplicate','alert_conflict',

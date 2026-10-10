@@ -44,7 +44,7 @@ test('alert messages route separately, preserve trusted frame size, and never en
   let alerts=0,dmCalls=0,shared=0,initialized=0;
   const f=fixture({checkConversationHealth:()=>true,tannerDirectMessages:true,
     conversation:{ready:()=>true,close:()=>({drained:true}),async respond(){dmCalls++;}},
-    sharedConversation:{ready:()=>true,close:()=>({drained:true}),async respond(){shared++;}},
+    sharedConversation:{joined:()=>true,ready:()=>true,close:()=>({drained:true}),async respond(){shared++;}},
     alertIntake:{initialize(){initialized++;},ready:()=>true,close:()=>({drained:true}),drain:async()=>({drained:true}),
       async handle(_envelope,signal,available,rawBytes){alerts++;expect(rawBytes).toBe(1234);expect(signal?.aborted).toBe(false);expect(available?.()).toBe(true);return{kind:'suppressed'};}}});
   f.health={...healthy,ready:false};await f.service.start();expect(initialized).toBe(1);
@@ -70,22 +70,41 @@ test('a normal alert arriving during startup health does not get mistaken for fa
   release();await service.stop();
 });
 test('shared conversation uses independent trusted runtime health without claiming coding readiness or sending a ready DM',async()=>{
-  let calls=0;const f=fixture({checkConversationHealth:()=>true,sharedConversation:{ready:()=>true,close:()=>({drained:true}),async respond(input,deliver,_signal,available){
+  let calls=0;const f=fixture({checkConversationHealth:()=>true,sharedConversation:{joined:()=>true,ready:()=>true,close:()=>({drained:true}),async respond(input,deliver,_signal,available){
     calls++;expect(input.requesterId).toBe('U0MEMBER11');expect(input.teamId).toBe(GARY_SLACK.teamId);expect(available?.()).toBe(true);expect(await deliver('Shared answer')).toBe('sent');
   }}});f.health={...healthy,ready:false,hermesCanarySucceeded:false};await f.service.start();expect(f.fake.sends).toEqual([]);
   await f.fake.emit(envelope({user:'U0MEMBER11'}));expect(calls).toBe(1);expect(f.fake.sends).toEqual([{channel:'C0APPROVED',threadTs:'1791417600.000002',text:'Shared answer'}]);
   expect(f.service.health.hostReady).toBe(false);expect(f.service.health.readinessKind).toBe(null);expect(rows(f.db)).toEqual([]);
   await f.fake.emit(envelope({user:'U0MEMBER11'}));expect(calls).toBe(1);
 });
-test('shared route requires explicit mention each turn and rejects bots, DM, foreign workspace and SlackConnect envelope hints',async()=>{
-  let calls=0;const f=fixture({checkConversationHealth:()=>true,sharedConversation:{ready:()=>true,close:()=>({drained:true}),async respond(){calls++;}}});f.health={...healthy,ready:false};await f.service.start();
-  for(const event of [{type:'message',channel_type:'channel'},{user:GARY_SLACK.botUserId},{bot_id:'B0OTHER11'},{subtype:'bot_message'},{channel:'D0PRIVATE1'},{text:'no mention'},{team:'TFOREIGN'}])await f.fake.emit(envelope(event));
+test('plain replies in a joined thread reach the shared responder; roots, unjoined threads, bots, DMs and mentions are not routed from message events',async()=>{
+  const inputs:any[]=[],records:any[]=[];let joined=true;
+  const f=fixture({onIngressDiagnostic:r=>{records.push(r);},checkConversationHealth:()=>true,sharedConversation:{joined:(channel,threadTs)=>{inputs.push({joined:[channel,threadTs]});return joined;},ready:()=>true,close:()=>({drained:true}),
+    async respond(input,deliver){inputs.push(input);expect(await deliver('Thread answer')).toBe('sent');}}});
+  f.health={...healthy,ready:false};await f.service.start();const before=f.healthCalls;
+  const reply=(event:Record<string,unknown>={},payload:Record<string,unknown>={})=>envelope({type:'message',channel_type:'channel',thread_ts:'1791417500.000001',text:'what are you working on now?',...event},{event_id:'EvThread1',...payload});
+  for(const event of [{thread_ts:undefined},{thread_ts:'1791417600.000002'},{bot_id:'B0OTHER11'},{subtype:'message_changed'},{user:GARY_SLACK.botUserId},{user:'USLACKBOT'},{channel_type:'mpim'},{channel:'D0PRIVATE1'},
+    {user:'invalid'},{text:'   '},{ts:'bad'},{thread_ts:'bad'},{text:`<@${GARY_SLACK.botUserId}> hi`},{team:'TFOREIGN'}])await f.fake.emit(reply(event));
+  await f.fake.emit(reply({},{is_ext_shared_channel:true}));
+  expect(inputs).toEqual([]);expect(f.healthCalls).toBe(before);expect(f.fake.sends).toEqual([]);
+  joined=false;await f.fake.emit(reply());expect(inputs).toEqual([{joined:['C0APPROVED','1791417500.000001']}]);expect(f.healthCalls).toBe(before);expect(records.at(-1).stage).toBe('shared_thread_inactive');
+  joined=true;inputs.length=0;await f.fake.emit(reply());
+  expect(inputs).toEqual([{joined:['C0APPROVED','1791417500.000001']},{type:'thread_reply',appId:GARY_SLACK.appId,teamId:GARY_SLACK.teamId,botUserId:GARY_SLACK.botUserId,requesterId:GARY_SLACK.tannerId,
+    eventId:'EvThread1',channel:'C0APPROVED',ts:'1791417600.000002',threadTs:'1791417500.000001',text:'what are you working on now?'}]);
+  expect(f.fake.sends).toEqual([{channel:'C0APPROVED',threadTs:'1791417500.000001',text:'Thread answer'}]);expect(records.some(r=>r.stage==='shared_thread_dispatch')).toBe(true);
+  inputs.length=0;await f.fake.emit(reply());expect(inputs).toEqual([{joined:['C0APPROVED','1791417500.000001']}]);expect(records.at(-1).stage).toBe('shared_duplicate');
+  expect(f.db.query('SELECT kind,request_id,status,thread_ts FROM gary_slack_shared_outbox').all()).toEqual([{kind:'shared',request_id:'EvThread1',status:'sent',thread_ts:'1791417500.000001'}]);
+  expect(JSON.stringify(records)).not.toContain('what are you working on');
+});
+test('shared mention route rejects bots, DM, foreign workspace and SlackConnect envelope hints; unthreaded channel messages are ignored',async()=>{
+  let calls=0;const f=fixture({checkConversationHealth:()=>true,sharedConversation:{joined:()=>true,ready:()=>true,close:()=>({drained:true}),async respond(){calls++;}}});f.health={...healthy,ready:false};await f.service.start();
+  for(const event of [{type:'message',channel_type:'channel'},{user:GARY_SLACK.botUserId},{user:'USLACKBOT'},{bot_id:'B0OTHER11'},{subtype:'bot_message'},{channel:'D0PRIVATE1'},{text:'no mention'},{team:'TFOREIGN'}])await f.fake.emit(envelope(event));
   for(const payload of [{team_id:'TFOREIGN'},{api_app_id:'AFOREIGN'},{context_team_id:'TFOREIGN'},{is_ext_shared_channel:true}])await f.fake.emit(envelope({},payload));
   expect(calls).toBe(0);expect(f.fake.sends).toEqual([]);
   await f.fake.emit(envelope({thread_ts:'1791400000.000001'}));expect(calls).toBe(1);
 });
 test('shared readiness does not enable private DMs and revoked conversation health blocks post-await send',async()=>{
-  let allowed=true,sharedCalls=0;const f=fixture({checkConversationHealth:()=>allowed,sharedConversation:{ready:()=>true,close:()=>({drained:true}),async respond(_input,deliver,_signal,available){
+  let allowed=true,sharedCalls=0;const f=fixture({checkConversationHealth:()=>allowed,sharedConversation:{joined:()=>true,ready:()=>true,close:()=>({drained:true}),async respond(_input,deliver,_signal,available){
     sharedCalls++;allowed=false;expect(available?.()).toBe(false);expect(await deliver('must not leave')).toBe('not_sent');
   }}});f.health={...healthy,ready:false};await f.service.start();await f.fake.emit(dm());expect(sharedCalls).toBe(0);
   await f.fake.emit(envelope());expect(sharedCalls).toBe(1);expect(f.fake.sends).toEqual([]);
@@ -93,11 +112,11 @@ test('shared readiness does not enable private DMs and revoked conversation heal
 test('private DM trusted health can remain available independently of unavailable coding/shared readiness',async()=>{
   const initial=fixture({tannerDirectMessages:true});initial.health=readonlyHealthy;await initial.service.start();await initial.service.stop();let calls=0;
   const f=fixture({db:initial.db,tannerDirectMessages:true,checkConversationHealth:()=>true,conversation:{ready:()=>true,close:()=>({drained:true}),async respond(_i,deliver){calls++;expect(await deliver('Private answer')).toBe('sent');}},
-    sharedConversation:{ready:()=>false,close:()=>({drained:true}),async respond(){throw new Error('shared unavailable');}}});f.health={...healthy,ready:false};await f.service.start();
+    sharedConversation:{joined:()=>true,ready:()=>false,close:()=>({drained:true}),async respond(){throw new Error('shared unavailable');}}});f.health={...healthy,ready:false};await f.service.start();
   await f.fake.emit(dm());expect(calls).toBe(1);expect(f.fake.sends[0]?.text).toBe('Private answer');expect(f.service.health.hostReady).toBe(false);
 });
 test('an unready store may send a fixed typed notice but never a paid answer or repeat unknown delivery',async()=>{
-  let calls=0;const f=fixture({checkConversationHealth:()=>true,sharedConversation:{ready:()=>false,close:()=>({drained:false}),async respond(_input,deliver){
+  let calls=0;const f=fixture({checkConversationHealth:()=>true,sharedConversation:{joined:()=>true,ready:()=>false,close:()=>({drained:false}),async respond(_input,deliver){
     calls++;expect(await deliver('unready paid answer','answer')).toBe('not_sent');expect(await deliver('Fixed bounded stop notice','notice')).toBe('unknown');
   }}});f.health={...healthy,ready:false};await f.service.start();f.fake.send=async()=>({ok:false,outcome:'unknown',code:'fixture'});
   await f.fake.emit(envelope());await f.fake.emit(envelope());expect(calls).toBe(1);expect(f.fake.sends).toEqual([{channel:'C0APPROVED',threadTs:'1791417600.000002',text:'Fixed bounded stop notice'}]);
@@ -379,7 +398,7 @@ test('a stopped service cannot report its cached successful start as current rea
 test('ingress diagnostics distinguish gates without exposing fields; labeled mentions preserve exact authorization',async()=>{
   const records:any[]=[],calls:string[]=[];
   const f=fixture({onIngressDiagnostic:value=>{records.push(value);throw new Error('observer failure');},checkConversationHealth:()=>true,
-    sharedConversation:{ready:()=>true,close:()=>({drained:true}),async respond(input){calls.push(input.text);}}});
+    sharedConversation:{joined:()=>true,ready:()=>true,close:()=>({drained:true}),async respond(input){calls.push(input.text);}}});
   f.health={...healthy,ready:false};await f.service.start();
   await f.fake.emit(envelope({text:`<@${GARY_SLACK.botUserId}|Gary> synthetic-secret-body`}));
   await f.fake.emit(envelope({text:`<@${GARY_SLACK.botUserId}> synthetic-secret-body`}));

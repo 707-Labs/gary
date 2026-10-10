@@ -1,4 +1,4 @@
-/** Isolated context for explicitly mentioned shared-channel turns; no DM or coding authority. */
+/** Isolated context for shared-channel threads: an explicit mention opens one, plain replies continue it. No DM or coding authority. */
 import { Database } from 'bun:sqlite';
 import { hasSlackUserMention } from './mentions.ts';
 import { createSlackIngressEmitter, type SlackIngressObserver } from './ingress-diagnostics.ts';
@@ -37,7 +37,8 @@ export function fingerprintSlackSharedConversationConfig(config:SlackSharedConve
   return hash(JSON.stringify({version:config.version,runId:config.runId,campaignId:config.campaignId,allocationId:config.allocationId,
     contextDirectory:config.contextDirectory,appId:config.appId,teamId:config.teamId,botUserId:config.botUserId,trigger:config.trigger,policy:POLICY}));
 }
-export interface SlackSharedConversationInput { type:'app_mention'; appId:string;teamId:string;botUserId:string;requesterId:string;eventId:string;channel:string;ts:string;threadTs:string;text:string }
+/** app_mention opens or continues a thread; thread_reply only continues a thread an earlier mention opened. */
+export interface SlackSharedConversationInput { type:'app_mention'|'thread_reply'; appId:string;teamId:string;botUserId:string;requesterId:string;eventId:string;channel:string;ts:string;threadTs:string;text:string }
 export interface SlackSharedMetadata {
   memberInfo(userId:string,signal?:AbortSignal):Promise<SlackMemberMetadata>;
   channelInfo(channelId:string,signal?:AbortSignal):Promise<SlackChannelMetadata>;
@@ -58,6 +59,8 @@ export function sharedMetadataAllowed(input:SlackSharedConversationInput,member:
 export type DMDelivery=(text:string,kind?:'answer'|'notice')=>Promise<'sent'|'unknown'|'not_sent'>;
 export interface SlackSharedConversation {
   respond(input:SlackSharedConversationInput,deliver:DMDelivery,signal:AbortSignal,isAvailable?:()=>boolean):Promise<void>;
+  /** True only for a thread an explicit mention opened that can still take turns; a local read, no Slack call. */
+  joined(channel:string,threadTs:string):boolean;
   close():{drained:boolean};
   ready():boolean;
 }
@@ -143,24 +146,46 @@ export function createSlackSharedConversation(options:{config:SlackSharedConvers
       if(!signal.aborted&&isAvailable()&&await authorize(input,signal))try {await deliver("I couldn't complete that reply. This thread is paused, and I won't retry the message automatically.",'notice');}catch{/* No retry. */}
     }
   }
+  const ready=()=>!closed&&!blocked()&&allocationReady();
+  const activeSession=(sessionKey:string)=>{
+    const session=db.query<Session,[string]>('SELECT history,turns,blocked FROM sessions WHERE session_key=?').get(sessionKey);
+    return !!session&&!session.blocked&&session.turns<POLICY.maxTurns;
+  };
+  // All local reads: a thread counts as joined only while Gary could still take a turn in it.
+  function joined(channel:string,threadTs:string):boolean {
+    return ready()&&/^[CG][A-Z0-9]{5,32}$/.test(channel)&&/^\d{10,16}\.\d{6}$/.test(threadTs)&&activeSession(POLICY.appId+':'+POLICY.teamId+':'+channel+':'+threadTs);
+  }
   async function admit(input:SlackSharedConversationInput,deliver:DMDelivery,signal:AbortSignal,isAvailable:()=>boolean=()=>true):Promise<void> {
-    if(closed||!isAvailable()||signal.aborted||input.type!=='app_mention'||input.appId!==POLICY.appId||input.teamId!==POLICY.teamId||input.botUserId!==POLICY.botUserId
+    const reply=input.type==='thread_reply';
+    // A message that mentions Gary arrives as app_mention; a thread reply never carries one and is never
+    // a thread root, so the two kinds cannot answer the same message twice or open a thread by accident.
+    if(closed||!isAvailable()||signal.aborted||(input.type!=='app_mention'&&!reply)||input.appId!==POLICY.appId||input.teamId!==POLICY.teamId||input.botUserId!==POLICY.botUserId
       ||typeof input.requesterId!=='string'||! /^[UW][A-Z0-9]{5,32}$/.test(input.requesterId)||input.requesterId===POLICY.botUserId||input.requesterId==='USLACKBOT'
-      ||typeof input.text!=='string'||!input.text.trim()||!hasSlackUserMention(input.text,POLICY.botUserId)||!/^Ev[A-Za-z0-9]{1,80}$/.test(input.eventId)
-      ||!/^[CG][A-Z0-9]{5,32}$/.test(input.channel)||!/^\d{10,16}\.\d{6}$/.test(input.ts)||!/^\d{10,16}\.\d{6}$/.test(input.threadTs)){observe('shared_input_rejected');return Promise.resolve();}
+      ||typeof input.text!=='string'||!input.text.trim()||hasSlackUserMention(input.text,POLICY.botUserId)===reply||!/^Ev[A-Za-z0-9]{1,80}$/.test(input.eventId)
+      ||!/^[CG][A-Z0-9]{5,32}$/.test(input.channel)||!/^\d{10,16}\.\d{6}$/.test(input.ts)||!/^\d{10,16}\.\d{6}$/.test(input.threadTs)
+      ||(reply&&input.threadTs===input.ts)){observe('shared_input_rejected');return Promise.resolve();}
     const scope=POLICY.appId+':'+POLICY.teamId;
     const key=config.runId+':'+scope+':'+input.eventId,messageKey=scope+':'+input.channel+':'+input.ts,sessionKey=scope+':'+input.channel+':'+input.threadTs;
+    // A follow-up in a thread Gary never joined, or can no longer take turns in, costs nothing: no
+    // metadata lookup, claim or notice. Members talking among themselves are not addressing Gary.
+    if(reply&&!(ready()&&activeSession(sessionKey))){observe('shared_thread_inactive');return Promise.resolve();}
     const duplicate=()=>db.query('SELECT 1 FROM events WHERE event_key=? OR message_key=?').get(key,messageKey)
       ||db.query('SELECT 1 FROM notices WHERE event_key=? OR message_key=?').get(key,messageKey);
     const notice=(reason:string):Promise<void>=>{
       observe('shared_admission_rejected');
+      // Follow-ups stay silent at the limit; an explicit mention still receives the bounded notice.
+      if(reply)return Promise.resolve();
       const claimed=db.transaction(()=>{if(duplicate()||Number((db.query('SELECT count(*) AS n FROM notices').get() as any).n)>=POLICY.maxNotices)return false;
         db.query('INSERT INTO notices VALUES (?,?,?)').run(key,messageKey,reason);return true;}).immediate();
       return claimed?deliver("I can't answer this message within the current conversation limits. No model call was made.",'notice').then(()=>{},()=>{}):Promise.resolve();
     };
     if(duplicate()){observe('shared_duplicate');return Promise.resolve();}
+    const limited=()=>queued>=POLICY.maxQueued||blocked()||!allocationReady()||Buffer.byteLength(encodedText(input))>POLICY.maxInputBytes;
+    // A mention is authorized before its notice so only members ever hear from Gary. A reply never gets a
+    // notice, so its local limits run first and a limited reply (or its redelivery) costs no metadata lookup.
+    if(reply&&(limited()||Number((db.query('SELECT count(*) AS n FROM events').get() as any).n)>=POLICY.maxAcceptedEvents))return notice('shared_admission_limit');
     if(!await authorize(input,signal)||!isAvailable()||closed)return Promise.resolve();
-    if(queued>=POLICY.maxQueued||blocked()||!allocationReady()||Buffer.byteLength(encodedText(input))>POLICY.maxInputBytes)return notice('shared_admission_limit');
+    if(limited())return notice('shared_admission_limit');
     const accepted=db.transaction(()=>{
       if(duplicate()||db.query("SELECT 1 FROM events WHERE cleanup=0 AND owner<>?").get(owner)
         ||Number((db.query('SELECT count(*) AS n FROM events').get() as any).n)>=POLICY.maxAcceptedEvents)return false;
@@ -185,6 +210,6 @@ export function createSlackSharedConversation(options:{config:SlackSharedConvers
     if(closed||admitting>=POLICY.maxQueued)return Promise.resolve();
     admitting++;return admit(input,deliver,signal,isAvailable).finally(()=>{admitting--;});
   }
-  return {respond,ready:()=>!closed&&!blocked()&&allocationReady(),close(){if(closed)throw new Error('dm_context_already_closed');if(queued||admitting)throw new Error('dm_context_not_drained');
+  return {respond,joined,ready,close(){if(closed)throw new Error('dm_context_already_closed');if(queued||admitting)throw new Error('dm_context_not_drained');
     const drained=pending()===0;closed=true;db.close();return {drained};}};
 }

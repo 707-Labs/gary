@@ -58,11 +58,44 @@ test('Slack Connect, org sharing, pending sharing, foreign context team, nonmemb
     const db=new Database(join(f.dir,'shared-context.sqlite'));expect(db.query('SELECT * FROM events').all()).toEqual([]);db.close();
   }
 });
-test('every turn requires an explicit mention; malformed/foreign/DM/bot events cannot create state',async()=>{
+test('only a mention opens a thread; malformed/foreign/DM/bot events and replies outside a joined thread cannot create state',async()=>{
   const f=fixture();let reads=0,calls=0;f.metadata.memberInfo=async()=>{reads++;throw new Error('not called');};
   const shared=createSlackSharedConversation({...f,reply:async()=>{calls++;return 'forbidden';}});
   for(const bad of [{type:'message'},{appId:'AFOREIGN'},{teamId:'TFOREIGN'},{botUserId:'UFOREIGN'},{requesterId:POLICY.botUserId},{channel:'D0PRIVATE1'},{text:'plain followup'},{ts:'invalid'}])await shared.respond(mention(1,bad as any),sent,signal);
+  // A thread_reply is never a thread root, never carries a mention, and never finds a session nobody opened.
+  for(const bad of [{},{text:'plain followup'},{text:'plain followup',threadTs:'1791400000.000001'}])await shared.respond(mention(1,{type:'thread_reply',...bad}),sent,signal);
+  expect(shared.joined('C0CHANNEL1','1791400000.000001')).toBe(false);
   expect(reads).toBe(0);expect(calls).toBe(0);shared.close();
+  const db=new Database(join(f.dir,'shared-context.sqlite'));
+  expect(db.query('SELECT count(*) AS n FROM sessions').get()).toEqual({n:0});expect(db.query('SELECT count(*) AS n FROM notices').get()).toEqual({n:0});db.close();
+});
+test('plain replies continue a joined thread with history and member checks; limits stay silent for replies and notice only mentions',async()=>{
+  const f=fixture(),turns:DMTurn[]=[],notices:string[]=[];let guestReads=0,lookups=0;const member=f.metadata.memberInfo,channel=f.metadata.channelInfo;
+  f.metadata.channelInfo=async id=>{lookups++;return channel(id);};
+  const deliver=async(text:string,kind?:'answer'|'notice')=>{if(kind==='notice')notices.push(text);return 'sent' as const;};
+  const shared=createSlackSharedConversation({...f,reply:async turn=>{turns.push(turn);return 'reply '+turns.length;}});
+  const root=mention(1),follow=(n:number,overrides:Partial<SlackSharedConversationInput>={})=>mention(n,{type:'thread_reply',threadTs:root.threadTs,requesterId:'U0MEMBER22',text:'what are you working on now?',...overrides});
+  await shared.respond(follow(0),deliver,signal);expect(shared.joined(root.channel,root.threadTs)).toBe(false);expect(turns).toHaveLength(0);
+  await shared.respond(root,deliver,signal);expect(shared.joined(root.channel,root.threadTs)).toBe(true);
+  await shared.respond(follow(2),deliver,signal);
+  expect(turns).toHaveLength(2);expect(turns[1]!.history).toHaveLength(2);expect(JSON.parse(turns[1]!.text)).toEqual({senderId:'U0MEMBER22',text:'what are you working on now?'});
+  expect(turns[1]!.authority).toMatchObject({surface:'shared_channel',requesterId:'U0MEMBER22',channelId:root.channel,threadTs:root.threadTs});
+  // Replayed message, mention-bearing reply (routed as app_mention), other channel, guest sender: no turn, no notice.
+  await shared.respond(follow(2,{eventId:'EvReplay'}),deliver,signal);
+  await shared.respond(follow(3,{text:`<@${POLICY.botUserId}> mentioned replies arrive as app_mention`}),deliver,signal);
+  await shared.respond(follow(4,{channel:'C0CHANNEL2'}),deliver,signal);
+  f.metadata.memberInfo=async id=>{guestReads++;return {...await member(id),isRestricted:true};};await shared.respond(follow(5),deliver,signal);f.metadata.memberInfo=member;
+  expect(guestReads).toBe(1);expect(turns).toHaveLength(2);expect(notices).toEqual([]);
+  // A paused thread drops replies silently and without a metadata lookup; an explicit mention there still gets the bounded notice.
+  await shared.respond(follow(6),async()=> 'unknown',signal);expect(turns).toHaveLength(3);expect(shared.joined(root.channel,root.threadTs)).toBe(false);
+  let seen=lookups;await shared.respond(follow(7),deliver,signal);expect(notices).toEqual([]);expect(lookups).toBe(seen);
+  await shared.respond(mention(8,{threadTs:root.threadTs}),deliver,signal);expect(notices).toHaveLength(1);expect(turns).toHaveLength(3);expect(lookups).toBe(seen+1);
+  const other=mention(9);await shared.respond(other,deliver,signal);expect(turns).toHaveLength(4);expect(shared.joined(other.channel,other.threadTs)).toBe(true);
+  // An exhausted allocation is a local fact: every thread stops counting as joined and replies cost nothing.
+  f.ledger.markTerminal(f.config.allocationId,'operator_stop');expect(shared.joined(other.channel,other.threadTs)).toBe(false);
+  seen=lookups;await shared.respond(follow(10,{threadTs:other.threadTs}),deliver,signal);expect(notices).toHaveLength(1);expect(lookups).toBe(seen);
+  await shared.respond(mention(11,{threadTs:other.threadTs}),deliver,signal);expect(notices).toHaveLength(2);expect(turns).toHaveLength(4);expect(lookups).toBe(seen+1);
+  shared.close();
 });
 test('mention in an existing thread starts empty context and durable event/message dedupe survives restart',async()=>{
   const f=fixture(),turns:DMTurn[]=[];const reply=async(turn:DMTurn)=>{turns.push(turn);return 'answer';};let shared=createSlackSharedConversation({...f,reply});
