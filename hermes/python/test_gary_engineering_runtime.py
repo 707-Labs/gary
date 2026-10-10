@@ -45,6 +45,8 @@ class FixtureHost:
         self.frames = []
         self.observed = {}
         self.active = None
+        self.completed = {}
+        self.presented = set()
         self.processes = {}
         self.starts = []
         self.reject_begin = False
@@ -73,7 +75,18 @@ class FixtureHost:
             assert payload["toolCallId"] == self.active
             assert payload["admissionId"] == "admit-" + self.active
             assert isinstance(payload["operationReceipts"], list)
+            self.completed[self.active] = copy.deepcopy(payload)
             self.active = None
+            return result
+        if frame["kind"] == "tool.presentation":
+            assert self.active is None
+            assert set(payload) == {"toolCallId", "admissionId", "rawResultHash", "resultHash"}
+            call_id = payload["toolCallId"]
+            raw = self.completed[call_id]
+            assert call_id not in self.presented
+            assert payload["admissionId"] == raw["admissionId"]
+            assert payload["rawResultHash"] == raw["resultHash"]
+            self.presented.add(call_id)
             return result
         if frame["kind"] == "session.close":
             self.closed = True

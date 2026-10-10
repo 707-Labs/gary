@@ -45,9 +45,9 @@ def digest(value):
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def native_history(value):
-    """Drop pinned Hermes bookkeeping, retaining the original wire identities."""
-    from gary_runtime import _history
+def _native_messages(value):
+    """Normalize wire fields, also usable on an incomplete native batch."""
+    from gary_runtime import _message
     if not isinstance(value, list):
         raise EngineeringFault("invalid_native_history")
     messages = copy.deepcopy(value)
@@ -60,7 +60,16 @@ def native_history(value):
                     raise EngineeringFault("native_call_identity_changed")
                 call.pop("call_id", None)
                 call.pop("response_item_id", None)
-    return _history(messages, native=True)
+    # Match _history(native=True): native system rows are bookkeeping; the
+    # host separately pins the one system prompt actually sent to its model.
+    return [_message(message, native=True) for message in messages
+            if not (isinstance(message, dict) and message.get("role") == "system")]
+
+
+def native_history(value):
+    """Drop pinned Hermes bookkeeping and validate a complete wire history."""
+    from gary_runtime import _history
+    return _history(_native_messages(value), native=True)
 
 
 def _id(value, name):
@@ -262,7 +271,11 @@ class ScopedNativeContext:
 
 class EngineeringSession:
     def __init__(self, binding, rpc, *, max_turns=64, max_tool_calls=100,
-                 max_frames=20000, max_result_bytes=1_048_576):
+                 max_frames=20000, max_result_bytes=1_048_576, result_presentation="raw"):
+        if result_presentation not in ("raw", "native_batch"):
+            raise EngineeringFault("invalid_result_presentation")
+        self.result_presentation = result_presentation
+        self._native_batch = None
         self.binding = {name: _id(binding.get(name), name)
                         for name in ("taskId", "sessionId", "ownerEpoch")}
         self.scope_key = binding.get("scopeKey")
@@ -287,6 +300,7 @@ class EngineeringSession:
         self.native_context = None
         self._turn_iteration_limit = False
         self._turn_tool_counts = dict(toolCalls=0, toolFailures=0, toolBlocks=0, toolResultErrors=0)
+        self._turn_tool_error_details = []
 
     def _guard(self):
         if self._closed or self._fenced:
@@ -363,6 +377,7 @@ class EngineeringSession:
         token = None
         admission = None
         self._turn_tool_counts["toolCalls"] += 1
+        tool_ordinal = self._turn_tool_counts["toolCalls"]
         try:
             self._guard()
             if self.environment is not None and self.environment._fenced:
@@ -428,6 +443,16 @@ class EngineeringSession:
                     native_result = None
                 if isinstance(native_result, dict) and native_result.get("error"):
                     self._turn_tool_counts["toolResultErrors"] += 1
+                    if len(self._turn_tool_error_details) < 6:
+                        # Bounded attribution only. Native messages may contain
+                        # paths or private output; retain no error text and do
+                        # not infer a cause from message substrings. This is
+                        # the same canonical hash authenticated in tool.end.
+                        self._turn_tool_error_details.append({
+                            "toolOrdinal": tool_ordinal, "toolName": tool_name,
+                            "phase": "native_result", "category": "native_reported_error",
+                            "resultHash": digest(result),
+                        })
             except Exception:
                 self._turn_tool_counts["toolFailures"] += 1
                 status, result = "failed", json.dumps({"error": "native_tool_failed"})
@@ -437,6 +462,9 @@ class EngineeringSession:
                 "admissionId": admission["admissionId"], "status": status,
                 "resultHash": digest(result), "operationReceipts": list(admission["receipts"])})
             self.events.append({"event": "tool.end", "toolCallId": tool_call_id, "receiptId": end["receiptId"]})
+            if self._native_batch is not None:
+                self._native_batch.append({"toolCallId": tool_call_id,
+                    "admissionId": admission["admissionId"], "rawResultHash": digest(result)})
             return result
         except Exception:
             self._turn_tool_counts["toolBlocks"] += 1
@@ -570,6 +598,22 @@ class EngineeringSession:
         from run_agent import AIAgent
         session = self
         class BoundEngineeringAgent(AIAgent):
+            @staticmethod
+            def _uniquify_tool_call_ids(tool_calls):
+                # The host observed these exact IDs. Never repair an identity
+                # or silently drop a separately admitted repeated command.
+                ids = [getattr(call, "id", None) for call in tool_calls]
+                if (any(not isinstance(value, str) or not value for value in ids)
+                        or len(set(ids)) != len(ids) or any(value in session._calls for value in ids)):
+                    session._fenced = True
+                    raise EngineeringFault("native_call_identity_replayed")
+                return tool_calls
+
+            @staticmethod
+            def _deduplicate_tool_calls(tool_calls):
+                BoundEngineeringAgent._uniquify_tool_call_ids(tool_calls)
+                return tool_calls
+
             def _build_system_prompt(self, system_message=None):
                 return system_prompt
 
@@ -589,10 +633,47 @@ class EngineeringSession:
                 for call in message.tool_calls or []:
                     if call.function.name not in session.native_entries or not call.id:
                         raise EngineeringFault("unapproved_native_tool")
+                if session._native_batch is not None:
+                    raise EngineeringFault("native_batch_overlap")
+                prefix = _native_messages(messages)
+                start = len(messages)
+                ids = [call.id for call in message.tool_calls or []]
+                records = [] if session.result_presentation == "native_batch" else None
+                session._native_batch = records
                 self._executing_tools = True
                 try:
-                    return self._execute_tool_calls_sequential(message, messages, effective_task_id, api_call_count)
+                    result = self._execute_tool_calls_sequential(message, messages, effective_task_id, api_call_count)
+                    if records is not None:
+                        # Native warnings, result persistence, subdirectory
+                        # hints, model conversion and aggregate budgeting all
+                        # finish inside the native executor. Authenticate that
+                        # final presentation separately from each raw result.
+                        # This receipt grants no further environment authority.
+                        if _native_messages(messages[:start]) != prefix:
+                            raise EngineeringFault("native_batch_history_changed")
+                        rows = native_history(messages)[len(prefix):]
+                        if ([call.id for call in message.tool_calls or []] != ids
+                                or len(rows) != len(ids) or len(records) != len(ids)
+                                or any(row.get("role") != "tool" or row.get("tool_call_id") != call_id
+                                       or record["toolCallId"] != call_id
+                                       or not isinstance(row.get("content"), str)
+                                       for row, record, call_id in zip(rows, records, ids))):
+                            # Guardrail/interrupt-skipped calls have no admission;
+                            # they cannot acquire a fabricated result receipt.
+                            raise EngineeringFault("native_batch_result_mismatch")
+                        for record, row in zip(records, rows):
+                            if len(canonical_json(row["content"]).encode()) > session.max_result_bytes:
+                                raise EngineeringFault("native_presentation_limit")
+                            session._send("tool.presentation", dict(record, resultHash=digest(row["content"])))
+                    return result
+                except BaseException:
+                    # AIAgent catches ordinary executor exceptions. A failed
+                    # presentation/identity proof must also fence future model
+                    # requests rather than become an unauthenticated tool row.
+                    session._fenced = True
+                    raise
                 finally:
+                    session._native_batch = None
                     self._executing_tools = False
 
             def _build_api_kwargs(self, messages, tools_for_api=None):
@@ -635,6 +716,7 @@ class EngineeringSession:
             raise EngineeringFault("host_system_prompt_changed")
         self._turn_iteration_limit = False
         self._turn_tool_counts = dict(toolCalls=0, toolFailures=0, toolBlocks=0, toolResultErrors=0)
+        self._turn_tool_error_details = []
         result = agent.run_conversation(prompt, system_message=system_message,
             conversation_history=copy.deepcopy(history or []), task_id=self.binding["taskId"])
         self._guard()
@@ -650,6 +732,10 @@ class EngineeringSession:
             outcome="iteration_limit" if self._turn_iteration_limit else
                 "completed" if result.get("completed") is True else "incomplete",
             modelRequests=model_requests, **self._turn_tool_counts)
+        if self._turn_tool_counts["toolResultErrors"]:
+            result["diagnostics"].update(
+                toolErrorDetails=copy.deepcopy(self._turn_tool_error_details),
+                toolErrorDetailsTruncated=self._turn_tool_counts["toolResultErrors"] > 6)
         return result
 
     def close(self):
@@ -735,12 +821,13 @@ def main(*, input_stream=None, output_stream=None):
     session = None
     try:
         start = channel.read()
-        allowed = {"type", "binding", "nativeSource", "scopedHome", "model", "maxIterations", "maxTokens", "systemPrompt"}
+        allowed = {"type", "binding", "nativeSource", "scopedHome", "model", "maxIterations", "maxTokens", "systemPrompt", "resultPresentation"}
         if not isinstance(start, dict) or set(start) - allowed or start.get("type") != "engineering.start":
             raise EngineeringFault("invalid_engineering_start")
         if not isinstance(start.get("binding"), dict):
             raise EngineeringFault("invalid_engineering_binding")
-        session = EngineeringSession(start["binding"], lambda frame: channel.exchange("rpc", frame))
+        session = EngineeringSession(start["binding"], lambda frame: channel.exchange("rpc", frame),
+                                     result_presentation=start.get("resultPresentation", "raw"))
         channel.deadline_ms = session.deadline_ms
         iterations, tokens = start.get("maxIterations", 20), start.get("maxTokens", 4096)
         if type(iterations) is not int or not 1 <= iterations <= 50 or type(tokens) is not int or not 1 <= tokens <= 8192:

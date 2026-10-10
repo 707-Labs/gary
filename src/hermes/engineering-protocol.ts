@@ -25,6 +25,8 @@ export interface EngineeringProtocolOptions {
   now?: () => number;
   /** Trusted pinned-native normalization only. Default requires unchanged arguments. */
   normalizeArguments?: (name: string, args: Readonly<Record<string, unknown>>) => Record<string, unknown>;
+  /** Host-selected native postprocessing contract; raw remains compatible with older fixtures. */
+  resultPresentation?: 'native_batch';
 }
 export interface ObservedNativeToolCall { turnId: string; toolCallId: string; toolName: string; originalArgs: Record<string, unknown> }
 interface ActiveCall extends ObservedNativeToolCall { admissionId: string; operationReceipts: string[]; operations: Set<string> }
@@ -45,6 +47,7 @@ function snapshot<T>(value: T): T {
 
 export class EngineeringProtocol {
   readonly binding: Readonly<EngineeringProtocolBinding>;
+  readonly resultPresentation: 'raw' | 'native_batch';
   private readonly options: EngineeringProtocolOptions;
   private readonly observed = new Map<string, ObservedNativeToolCall>();
   private readonly consumed = new Set<string>();
@@ -58,9 +61,12 @@ export class EngineeringProtocol {
   private operationCount = 0;
   private readonly operationIds = new Set<string>();
   private readonly processOwners = new Map<string, string>();
+  private readonly presentations = new Map<string, { turnId: string; admissionId: string; rawResultHash: string }>();
   constructor(options: EngineeringProtocolOptions) {
     this.options = { ...options, allowedTools: Object.freeze([...options.allowedTools]) };
     this.binding = snapshot(options.binding);
+    if (options.resultPresentation !== undefined && options.resultPresentation !== 'native_batch') fail('configuration');
+    this.resultPresentation = options.resultPresentation ?? 'raw';
     for (const value of [this.binding.taskId, this.binding.sessionId, this.binding.ownerEpoch]) validId(value);
     if (!Number.isSafeInteger(this.binding.deadlineMs) || options.transportCapability.length < 32
         || !options.allowedTools.length || options.allowedTools.length > 64) fail('configuration');
@@ -80,7 +86,7 @@ export class EngineeringProtocol {
   /** Only the host model-response parser may call this. Worker protocol has no observe operation. */
   observeTurn(turnId: string): void {
     this.live(); validId(turnId);
-    if (this.busy || this.active || [...this.observed.keys()].some(k => !this.consumed.has(k))) fail('turn_incomplete');
+    if (this.busy || this.active || this.presentations.size || [...this.observed.keys()].some(k => !this.consumed.has(k))) fail('turn_incomplete');
     if (this.turns.has(turnId) || this.turns.size >= 64) fail('turn_replay');
     this.turns.add(turnId); this.turnId = turnId;
     this.record('turn', null, { turnId });
@@ -105,7 +111,7 @@ export class EngineeringProtocol {
       if (frame.protocol !== 'gary.engineering.v1' || frame.taskId !== this.binding.taskId || frame.sessionId !== this.binding.sessionId
           || frame.ownerEpoch !== this.binding.ownerEpoch || frame.turnId !== this.turnId || !this.turnId
           || frame.sequence !== this.sequence + 1 || !object(frame.payload)) fail('binding_or_sequence');
-      if (!['tool.begin', 'environment.operation', 'tool.end', 'session.close'].includes(String(frame.kind))) fail('kind');
+      if (!['tool.begin', 'environment.operation', 'tool.end', 'tool.presentation', 'session.close'].includes(String(frame.kind))) fail('kind');
       // Consume before any effect. Failed/uncertain operations are never implicitly replayed.
       this.sequence++;
       const p = frame.payload;
@@ -124,6 +130,19 @@ export class EngineeringProtocol {
         return { ok: true, cleanupConfirmed: true, receiptId };
       }
       this.live();
+      if (frame.kind === 'tool.presentation') {
+        only(p, ['toolCallId', 'admissionId', 'rawResultHash', 'resultHash']);
+        const expected = this.presentations.entries().next().value;
+        if (this.resultPresentation !== 'native_batch' || this.active || !expected
+            || p.toolCallId !== expected[0] || expected[1].turnId !== this.turnId
+            || p.admissionId !== expected[1].admissionId || p.rawResultHash !== expected[1].rawResultHash
+            || typeof p.resultHash !== 'string' || p.resultHash.length !== 64 || !/^[a-f0-9]{64}$/.test(p.resultHash)) fail('tool_presentation_binding');
+        // This receipt authenticates only the model-facing representation of an
+        // already completed call. It grants no execution or retry authority.
+        const receiptId = this.record('tool_presentation', expected[0], p);
+        this.presentations.delete(expected[0]);
+        return { ok: true, receiptId };
+      }
       if (frame.kind === 'tool.begin') {
         only(p, ['toolCallId', 'toolName', 'originalArgs', 'effectiveArgs']); validId(p.toolCallId);
         const call = this.observed.get(p.toolCallId);
@@ -175,6 +194,8 @@ export class EngineeringProtocol {
       if (!['completed', 'failed'].includes(String(p.status)) || typeof p.resultHash !== 'string' || !/^[a-f0-9]{64}$/.test(p.resultHash)
           || fingerprintJson(p.operationReceipts).sha256 !== fingerprintJson(call.operationReceipts).sha256) fail('tool_result_binding');
       const receiptId = this.record('tool_' + p.status, call.toolCallId, { resultHash: p.resultHash, operationReceipts: call.operationReceipts });
+      if (this.resultPresentation === 'native_batch') this.presentations.set(call.toolCallId,
+        { turnId: this.turnId, admissionId: call.admissionId, rawResultHash: p.resultHash });
       this.active = null;
       return { ok: true, receiptId };
     } catch (error) {

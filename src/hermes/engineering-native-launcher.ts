@@ -149,8 +149,14 @@ export function createEngineeringStdioLauncher(config: EngineeringStdioOptions):
             if (frame.body.kind === 'tool.end') {
               const p = frame.body.payload;
               if (!object(p) || typeof p.toolCallId !== 'string' || typeof p.resultHash !== 'string') fail('tool_result');
-              input.model.observeToolResult(p.toolCallId, p.resultHash);
+              if (input.protocol.resultPresentation === 'raw') input.model.observeToolResult(p.toolCallId, p.resultHash);
               hostObserved.toolEnds++; if (p.status === 'failed') hostObserved.toolFailures++;
+            }
+            if (frame.body.kind === 'tool.presentation') {
+              const p = frame.body.payload;
+              if (input.protocol.resultPresentation !== 'native_batch' || !object(p)
+                  || typeof p.toolCallId !== 'string' || typeof p.resultHash !== 'string') fail('tool_result');
+              input.model.observeToolResult(p.toolCallId, p.resultHash);
             }
           }
           guard(); await write({ type: 'engineering.response', id: frame.id, body: response });
@@ -173,7 +179,8 @@ export function createEngineeringStdioLauncher(config: EngineeringStdioOptions):
       input.append(Object.freeze({ kind: 'native_stdio_start', ...binding }));
       await write({ type: 'engineering.start', binding, systemPrompt,
         ...paths,
-        model: 'deepseek-v4-pro', maxIterations: 3, maxTokens: 8192 });
+        model: 'deepseek-v4-pro', maxIterations: 3, maxTokens: 8192,
+        resultPresentation: input.protocol.resultPresentation });
       const ready = await until('engineering.ready');
       if (!exact(ready, ['type','sessionId','tools','toolSchemas']) || ready.sessionId !== binding.sessionId
           || hash(ready.toolSchemas) !== hash(expectedTools)

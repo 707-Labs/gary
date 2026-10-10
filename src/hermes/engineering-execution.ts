@@ -76,7 +76,7 @@ export function createEngineeringExecution(options: EngineeringExecutionOptions)
   // The capability is deliberately distinct from all model/API credentials.
   // Construct protocol and launcher with one private token, never a model schema.
   const capability = randomBytes(32).toString('hex');
-  const protocol2 = new EngineeringProtocol({ binding, transportCapability: capability,
+  const protocol2 = new EngineeringProtocol({ binding, transportCapability: capability, resultPresentation: 'native_batch',
     allowedTools: options.tools.map(t => String((t.function as Json).name)), assertOwner,
     append: r => { append({ ...r }); }, execute: async (op, args) => ({ ...await operation(op, args) }),
     close: async () => ({ cleanupConfirmed: (await closeBuild()).cleanupConfirmed === true }), fence: options.fence });

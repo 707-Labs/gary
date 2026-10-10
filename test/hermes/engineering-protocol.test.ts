@@ -2,11 +2,12 @@ import { describe, expect, test } from 'bun:test';
 import { EngineeringProtocol, type EngineeringProtocolReceipt } from '../../src/hermes/engineering-protocol.ts';
 import { fingerprintJson } from '../../src/hermes/audit-trace.ts';
 const token = 'x'.repeat(48);
-function setup() {
+function setup(resultPresentation?: 'native_batch') {
   let owner = true, cleanup = true, writes = 0, failAppend = false, closes = 0, invalidResult = false;
   const calls: string[] = [], receipts: EngineeringProtocolReceipt[] = [], fences: string[] = [];
   const binding = { taskId: 'task', sessionId: 'session', ownerEpoch: 'owner', deadlineMs: 10_000 };
   const protocol = new EngineeringProtocol({ binding, transportCapability: token, allowedTools: ['terminal', 'read_file'],
+    ...(resultPresentation ? { resultPresentation } : {}),
     now: () => 1000, assertOwner: () => { if (!owner) throw new Error('revoked'); },
     append: r => { if (failAppend) throw new Error('disk full'); receipts.push(r); },
     fence: reason => fences.push(reason), close: async () => { closes++; return { cleanupConfirmed: cleanup }; },
@@ -82,4 +83,62 @@ test('receipt disk failure cannot prevent physical cleanup', async () => {
   const s = setup(); s.failAppend();
   expect(await s.accept('session.close', {})).toMatchObject({ ok: false });
   expect(s.closes()).toBe(1);
+});
+
+const rawResultHash = fingerprintJson('original native result').sha256;
+const displayedHash = fingerprintJson('original native result\n[Tool loop warning: synthetic fixture]').sha256;
+async function completed(s: ReturnType<typeof setup>, id = 'call') {
+  s.observed(id);
+  const admission = await s.accept('tool.begin', begin(id));
+  const call = { toolCallId: id, admissionId: admission.admissionId };
+  expect((await s.accept('tool.end', { ...call, status: 'completed', resultHash: rawResultHash, operationReceipts: [] })).ok).toBe(true);
+  return { ...call, rawResultHash, resultHash: displayedHash };
+}
+test('explicit native presentation binds postprocessed output to its completed original call without execution', async () => {
+  const s = setup('native_batch'), p = await completed(s);
+  expect(() => s.protocol.observeTurn('next')).toThrow('turn_incomplete');
+  expect(await s.accept('tool.presentation', p)).toMatchObject({ ok: true });
+  expect(s.receipts.at(-1)?.kind).toBe('tool_presentation');
+  expect(s.receipts.at(-1)?.digest).toBe(fingerprintJson(p).sha256);
+  expect(s.calls).toHaveLength(0);
+  expect(JSON.stringify(s.receipts)).not.toContain('original native result');
+  expect(await s.accept('tool.presentation', p)).toMatchObject({ ok: false, error: 'engineering_protocol:tool_presentation_binding' });
+  expect(() => s.protocol.observeTurn('next')).not.toThrow();
+});
+test('presentations reject unknown, incomplete, reordered, changed, foreign and replayed bindings', async () => {
+  const s = setup('native_batch');
+  const unbound = { toolCallId: 'call', admissionId: 'none', rawResultHash, resultHash: displayedHash };
+  expect((await s.accept('tool.presentation', unbound)).ok).toBe(false);
+  const first = await completed(s, 'first');
+  s.observed('second'); const admission = await s.accept('tool.begin', begin('second'));
+  expect((await s.accept('tool.presentation', first)).ok).toBe(false);
+  const second = { toolCallId: 'second', admissionId: admission.admissionId, rawResultHash, resultHash: displayedHash };
+  expect((await s.accept('tool.end', { toolCallId: 'second', admissionId: admission.admissionId,
+    status: 'completed', resultHash: rawResultHash, operationReceipts: [] })).ok).toBe(true);
+  expect((await s.accept('tool.presentation', second)).ok).toBe(false);
+  for (const patch of [{ toolCallId: 'unknown' }, { admissionId: second.admissionId }, { rawResultHash: 'a'.repeat(64) },
+    { resultHash: 'invalid' }, { resultHash: displayedHash + '\n' }, { command: 'unbound command' }]) {
+    expect((await s.accept('tool.presentation', { ...first, ...patch })).ok).toBe(false);
+  }
+  const frame = s.frame('tool.presentation', first);
+  expect((await s.protocol.accept({ ...frame, sessionId: 'foreign' }, token)).ok).toBe(false);
+  expect((await s.protocol.accept(frame, token)).ok).toBe(true);
+  expect((await s.accept('tool.presentation', second)).ok).toBe(true);
+  expect(s.calls).toHaveLength(0);
+});
+test('legacy raw mode cannot use presentation and selected mode is host configuration only', async () => {
+  const s = setup(), p = await completed(s);
+  expect(s.protocol.resultPresentation).toBe('raw');
+  expect((await s.accept('tool.presentation', p)).ok).toBe(false);
+  expect(() => s.protocol.observeTurn('next')).not.toThrow();
+});
+test('presentation receipt failure and revoked ownership still permit exact existing session cleanup', async () => {
+  for (const scenario of ['receipt', 'owner']) {
+    const s = setup('native_batch'), p = await completed(s);
+    if (scenario === 'receipt') s.failAppend(); else s.revoke();
+    expect((await s.accept('tool.presentation', p)).ok).toBe(false);
+    await s.accept('session.close', {});
+    expect(s.closes()).toBe(1);
+    expect(s.calls).toHaveLength(0);
+  }
 });

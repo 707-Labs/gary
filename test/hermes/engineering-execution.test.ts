@@ -217,6 +217,7 @@ function fixture(flags: Flags = {}) {
           expect(polled.ok).toBe(true); expect(polled.status).toBe('exited');
           const result = JSON.stringify({ output: polled.output, exitCode: polled.exitCode }), resultHash = fingerprintJson(result).sha256;
           expect((await rpc('tool.end', { ...common, status: 'completed', resultHash, operationReceipts: [start.receiptId, polled.receiptId] })).ok).toBe(true);
+          expect((await rpc('tool.presentation', { ...common, rawResultHash: resultHash, resultHash })).ok).toBe(true);
           input.model.observeToolResult(call.id, resultHash);
           history.push({ role: 'tool', tool_call_id: call.id, content: result });
         }

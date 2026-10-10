@@ -197,6 +197,7 @@ const SAFE_ERRORS = new Set([
   'engineering_protocol:shape',
   'engineering_protocol:tool_admission',
   'engineering_protocol:tool_result_binding',
+  'engineering_protocol:tool_presentation_binding',
   'engineering_protocol:turn_incomplete',
   'engineering_protocol:turn_replay',
   'engineering_protocol:unknown_process',
@@ -232,9 +233,19 @@ const SAFE_ERRORS = new Set([
   'engineering_repository:workspace',
   'engineering_worker:result_diagnostics',
 ]);
+export interface EngineeringToolErrorDetail {
+  toolOrdinal: number;
+  toolName: string;
+  phase: 'native_result';
+  category: 'native_reported_error';
+  resultHash: string;
+}
 export interface EngineeringWorkerReported {
   outcome: 'completed' | 'iteration_limit' | 'incomplete';
   modelRequests: number; toolCalls: number; toolFailures: number; toolBlocks: number; toolResultErrors: number;
+  /** Worker observations only; no result bodies, arguments or authority. Old reports remain readable. */
+  toolErrorDetails?: readonly EngineeringToolErrorDetail[];
+  toolErrorDetailsTruncated?: boolean;
 }
 export interface EngineeringHostObserved {
   modelRequestsReceived: number; toolBegins: number; toolEnds: number; toolFailures: number; environmentOperations: number;
@@ -248,10 +259,31 @@ export interface EngineeringDiagnosticBinding { taskId: string; requestId: strin
 const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const exact = (v: Record<string, unknown>, keys: readonly string[]) => Object.keys(v).length === keys.length && keys.every(k => Object.hasOwn(v, k));
 const count = (v: unknown) => Number.isSafeInteger(v) && (v as number) >= 0 && (v as number) <= 2048;
+const NATIVE_DIAGNOSTIC_TOOLS = new Set(['terminal', 'read_file', 'write_file', 'patch', 'search_files',
+  'process', 'todo', 'memory', 'session_search', 'skills_list', 'skill_view', 'skill_manage', 'delegate_task', 'execute_code']);
 export function parseEngineeringWorkerReported(v: unknown): EngineeringWorkerReported {
-  if (!object(v) || !exact(v, ['outcome','modelRequests','toolCalls','toolFailures','toolBlocks','toolResultErrors'])
+  const fields = ['outcome','modelRequests','toolCalls','toolFailures','toolBlocks','toolResultErrors'];
+  const detailed = object(v) && (Object.hasOwn(v, 'toolErrorDetails') || Object.hasOwn(v, 'toolErrorDetailsTruncated'));
+  if (!object(v) || !exact(v, detailed ? [...fields, 'toolErrorDetails', 'toolErrorDetailsTruncated'] : fields)
       || !['completed','iteration_limit','incomplete'].includes(String(v.outcome))
       || !['modelRequests','toolCalls','toolFailures','toolBlocks','toolResultErrors'].every(k => count(v[k]))) throw Error('engineering_worker:result_diagnostics');
+  if (detailed) {
+    const details = v.toolErrorDetails;
+    if (!Array.isArray(details) || details.length !== Math.min(v.toolResultErrors as number, 6)
+        || v.toolErrorDetailsTruncated !== ((v.toolResultErrors as number) > 6)
+        || (v.toolResultErrors as number) > (v.toolCalls as number)) throw Error('engineering_worker:result_diagnostics');
+    let previousOrdinal = 0;
+    for (const item of details) {
+      if (!object(item) || !exact(item, ['toolOrdinal','toolName','phase','category','resultHash'])
+          || !count(item.toolOrdinal) || (item.toolOrdinal as number) <= previousOrdinal
+          || (item.toolOrdinal as number) > (v.toolCalls as number)
+          || typeof item.toolName !== 'string' || !NATIVE_DIAGNOSTIC_TOOLS.has(item.toolName)
+          || item.phase !== 'native_result' || item.category !== 'native_reported_error'
+          || typeof item.resultHash !== 'string' || item.resultHash.length !== 64
+          || !/^[a-f0-9]{64}$/.test(item.resultHash)) throw Error('engineering_worker:result_diagnostics');
+      previousOrdinal = item.toolOrdinal as number;
+    }
+  }
   return structuredClone(v) as unknown as EngineeringWorkerReported;
 }
 export function engineeringFailure(phase: EngineeringPhase, error: unknown): EngineeringDiagnostic {
