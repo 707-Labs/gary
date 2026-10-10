@@ -8,6 +8,7 @@ import { constants, closeSync, existsSync, fstatSync, fsyncSync, lstatSync, open
 import { dirname, isAbsolute, join, resolve, relative, sep } from 'node:path';
 import { assertEngineeringBudgetAdmission, type EngineeringBudgetBinding } from './engineering-budget.ts';
 import { fingerprintJson } from './audit-trace.ts';
+import type { EngineeringLedgerRebootReference } from './engineering-budget-reboot.ts';
 
 export interface EngineeringContinuationConfig {
   version: 1;
@@ -15,6 +16,7 @@ export interface EngineeringContinuationConfig {
   predecessorJournalPath: string;
   predecessorTaskId: string;
   receiptPath: string;
+  ledgerRebootAttestation?: EngineeringLedgerRebootReference;
 }
 export interface EngineeringContinuationBinding extends EngineeringBudgetBinding {
   root: string;
@@ -130,11 +132,15 @@ function predecessor(o: EngineeringContinuationBinding, base: ReturnType<typeof 
   return { identity: file, logicalSha256: result };
 }
 function snapshot(o: EngineeringContinuationBinding, prospective = false) {
-  const ready = assertEngineeringBudgetAdmission(o.continuation.original);
+  const ready = originalAdmission(o);
   if (ready.status.capMicros !== CAP) fail('allocation_binding');
   const ledgerIdentity = identity(o.ledgerPath), journalIdentity = prospective ? null : identity(join(o.root, 'engineering.sqlite'), true);
   const base = withReadDb(o.ledgerPath, db => prefix(db, o.allocationId));
   return { baseline: base, ledgerIdentity, journalIdentity, predecessor: predecessor(o, base), holdId: ready.holdId };
+}
+function originalAdmission(o: EngineeringContinuationBinding) {
+  const reboot=o.continuation.ledgerRebootAttestation;
+  return assertEngineeringBudgetAdmission(o.continuation.original, reboot ? {ledgerRebootAttestation:reboot} : {});
 }
 function claimPath(o: EngineeringContinuationBinding) { return join(o.continuation.original.auditDir, o.continuation.original.runId + '.continuation-claim.json'); }
 function encode(value: unknown) { return Buffer.from(JSON.stringify(value, null, 2) + '\n'); }
@@ -142,7 +148,7 @@ function encode(value: unknown) { return Buffer.from(JSON.stringify(value, null,
  * It verifies all predecessor evidence but never asserts an uncreated identity. */
 export function previewEngineeringContinuation(input: EngineeringContinuationBinding) {
   const o = binding(input, true), evidence = snapshot(o, true);
-  const ready = assertEngineeringBudgetAdmission(o.continuation.original);
+  const ready = originalAdmission(o);
   if (ready.status.unknownAttempts !== 0 || ready.status.attemptCount !== BASE_COUNT || ready.status.chargedMicros !== BASE_CHARGED) fail('new_attempts_already_exist');
   if (existsSync(claimPath(o)) || existsSync(o.continuation.receiptPath)) fail('continuation_already_claimed');
   return Object.freeze({ applied:false,canRun:false,baselineAttemptCount:BASE_COUNT,baselineChargedMicros:BASE_CHARGED,
@@ -153,7 +159,7 @@ export function previewEngineeringContinuation(input: EngineeringContinuationBin
  * Both preview and apply reconcile the existing hold; neither enrolls or spends. */
 export function admitEngineeringContinuation(options: EngineeringContinuationBinding & { apply?: boolean; onClaimed?: () => void }) {
   const { apply, onClaimed, ...input } = options, o = binding(input), evidence = snapshot(o);
-  const ready = assertEngineeringBudgetAdmission(o.continuation.original);
+  const ready = originalAdmission(o);
   if (ready.status.unknownAttempts !== 0 || ready.status.attemptCount !== BASE_COUNT || ready.status.chargedMicros !== BASE_CHARGED) fail('new_attempts_already_exist');
   withReadDb(join(o.root, 'engineering.sqlite'), db => {
     for (const row of db.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[]) {
@@ -170,7 +176,7 @@ export function admitEngineeringContinuation(options: EngineeringContinuationBin
     writeNew(path, encode({ version: 1, kind: 'engineering_continuation_claim', receiptPath: o.continuation.receiptPath, receiptSha256,
       allocationId: o.allocationId, ledgerIdentity: evidence.ledgerIdentity, journalIdentity: evidence.journalIdentity }));
     onClaimed?.();
-    if (digest(snapshot(o)) !== digest(evidence) || assertEngineeringBudgetAdmission(o.continuation.original).status.attemptCount !== BASE_COUNT) fail('claim_state_changed');
+    if (digest(snapshot(o)) !== digest(evidence) || originalAdmission(o).status.attemptCount !== BASE_COUNT) fail('claim_state_changed');
     writeNew(o.continuation.receiptPath, bytes);
     assertEngineeringContinuationBudget(o, { requireUnused: true });
   }
@@ -192,7 +198,7 @@ export function assertEngineeringContinuationBudget(input: EngineeringContinuati
         || digest(snapshot(o)) !== digest(receipt.evidence)) fail('evidence_changed');
   };
   assertCurrent();
-  if (options.requireUnused && assertEngineeringBudgetAdmission(o.continuation.original).status.attemptCount !== BASE_COUNT) fail('continuation_already_used');
+  if (options.requireUnused && originalAdmission(o).status.attemptCount !== BASE_COUNT) fail('continuation_already_used');
   const baseline: EngineeringContinuationBaseline = Object.freeze({ allocationId:o.allocationId, campaignId:o.campaignId, baselineAttemptCount: 3, baselineChargedMicros: 114776, receiptSha256,
     assertCurrent,
     assertPrefix(db: Database) {

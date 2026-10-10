@@ -42,7 +42,8 @@ function overlaps(a: string, b: string): boolean {
 }
 function validateContinuation(value: Record<string, unknown>, budget: Record<string, unknown>): void {
   const continuation = budget.continuation;
-  if (!object(continuation) || !exact(continuation, ['version','original','predecessorJournalPath','predecessorTaskId','receiptPath'])
+  if (!object(continuation) || !exact(continuation, ['version','original','predecessorJournalPath','predecessorTaskId','receiptPath',
+      ...(Object.hasOwn(continuation,'ledgerRebootAttestation') ? ['ledgerRebootAttestation'] : [])])
       || continuation.version !== 1 || !object(continuation.original)) fail();
   const original = continuation.original;
   if (!exact(original, ['aggregatePath','ledgerPath','auditDir','runId','grantId','campaignId','allocationId','sourceRevision','runtimeConfigSha256','authoritySha256'])
@@ -59,6 +60,12 @@ function validateContinuation(value: Record<string, unknown>, budget: Record<str
       || continuation.predecessorTaskId !== 'engineering-1683fa3a-bde9-4d73-b000-f84f88d67b4a'
       || continuation.predecessorJournalPath !== join(dirname(original.auditDir), 'engineering.sqlite')
       || continuation.receiptPath !== join(budget.auditDir as string, 'continuation.json')) fail();
+  if (Object.hasOwn(continuation,'ledgerRebootAttestation')) {
+    const reboot = continuation.ledgerRebootAttestation;
+    if (!object(reboot) || !exact(reboot,['path','sha256']) || reboot.path !== join(original.auditDir as string, original.runId+'.ledger-reboot.json')
+        || typeof reboot.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(reboot.sha256)) fail();
+    Object.freeze(reboot);
+  }
   for (const root of [value.root, value.workspacesRoot] as string[]) {
     if (overlaps(root, dirname(original.auditDir)) || overlaps(root, original.ledgerPath)) fail();
   }

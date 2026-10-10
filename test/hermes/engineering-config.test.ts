@@ -78,6 +78,16 @@ test('continuation preserves the original allocation and immutable pins with sep
   expect(loaded.budget.continuation!.receiptPath).toBe(join(loaded.budget.auditDir, 'continuation.json'));
 });
 
+test('continuation accepts only the exact immutable original-ledger reboot reference',()=>{
+  const f=continuationFixture(),continuation=f.config.budget.continuation!;
+  continuation.ledgerRebootAttestation={path:join(continuation.original.auditDir,continuation.original.runId+'.ledger-reboot.json'),sha256:'a'.repeat(64)};
+  const loaded=f.load();expect(Object.isFrozen(loaded.budget.continuation!.ledgerRebootAttestation)).toBe(true);
+  const original=structuredClone(continuation.ledgerRebootAttestation);
+  for(const change of [(v:any)=>v.path+='.other',(v:any)=>v.sha256='invalid',(v:any)=>v.extra=true]) {
+    continuation.ledgerRebootAttestation=structuredClone(original);change(continuation.ledgerRebootAttestation);expect(()=>f.load()).toThrow();
+  }
+});
+
 test('continuation permits sibling engineering roots beneath the canonical ledger directory', () => {
   const f = continuationFixture(), state = f.root;
   const root = join(state, 'engineering-v2'), predecessorRoot = join(state, 'engineering-v1');

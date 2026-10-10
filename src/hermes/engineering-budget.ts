@@ -12,6 +12,8 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { Database } from 'bun:sqlite';
 import { openSpendLedger, type SpendStatus } from '../spend.ts';
+import { observeEngineeringLedgerBootIdentity, validateEngineeringLedgerRebootAttestation, type EngineeringLedgerMetadata,
+  type EngineeringLedgerRebootReference } from './engineering-budget-reboot.ts';
 
 class JsonNumber { constructor(readonly literal:string){} }
 type Json = null|boolean|string|JsonNumber|Json[]|{[key:string]:Json};
@@ -183,13 +185,13 @@ function assertLedgerBinding(prior:LedgerState,campaignId:string):asserts prior 
  * the approval and runtime config whose exact hashes are bound here. This never
  * creates an allocation, releases a hold, or authorizes a model request by itself.
  * requireUnused belongs at first task admission; ongoing health must allow usage. */
-export function assertEngineeringBudgetAdmission(binding:EngineeringBudgetBinding,options:{requireUnused?:boolean}={}) {
+export function assertEngineeringBudgetAdmission(binding:EngineeringBudgetBinding,options:{requireUnused?:boolean;ledgerRebootAttestation?:EngineeringLedgerRebootReference}={}) {
   const o={...binding};validateBinding(o);assertPrivateAuditDirectory(o.auditDir);
   const bound=admissionBinding(o),holdId='hermes-engineering-acceptance:'+o.runId,auditPath=join(o.auditDir,o.runId+'.intent.json');
   const current=safeFile(o.aggregatePath),budget=parseExact(current.bytes.toString());if(!record(budget))fail('aggregate_not_object');
   const sum=totals(budget),hold=(budget.runtimeAllocations as Json[]).find(a=>record(a)&&a.id===holdId);
   assertHold(hold,bound,auditPath);
-  const intent=parseExact(safeFile(auditPath).bytes.toString()),enrolled=parseExact(safeFile(join(o.auditDir,o.runId+'.enrolled.json')).bytes.toString());
+  const intentFile=safeFile(auditPath),intent=parseExact(intentFile.bytes.toString()),enrolled=parseExact(safeFile(join(o.auditDir,o.runId+'.enrolled.json')).bytes.toString());
   if(!record(intent)||!boundMatches(intent,bound)||intent.aggregatePath!==o.aggregatePath
     ||!(intent.schemaVersion instanceof JsonNumber)||intent.schemaVersion.literal!=='1'
     ||typeof intent.beforeSha256!=='string'||typeof intent.afterSha256!=='string'||typeof intent.priorLedgerRowsSha256!=='string'
@@ -203,7 +205,23 @@ export function assertEngineeringBudgetAdmission(binding:EngineeringBudgetBindin
     ||addEngineeringHold(old,bound,holdId,auditPath,before.hash,next.bookkeepingUpdatedAt)!==after.bytes.toString())fail('recovery_transition_mismatch');
   const auditedHold=(next.runtimeAllocations as Json[]).find(a=>record(a)&&a.id===holdId);
   if(!auditedHold||encode(auditedHold)!==encode(hold))fail('existing_hold_binding_mismatch');
-  const ledgerIdentity=safeFile(o.ledgerPath).stat;assertLedgerIdentity(intent,ledgerIdentity);
+  const ledgerIdentity=safeFile(o.ledgerPath).stat;
+  if(options.ledgerRebootAttestation) {
+    const ref=options.ledgerRebootAttestation;
+    if(Object.keys(ref).length!==2||ref.path!==join(o.auditDir,o.runId+'.ledger-reboot.json')||!/^[a-f0-9]{64}$/.test(ref.sha256))fail('reboot_attestation_rejected');
+    const attestation=safeFile(ref.path);
+    if(attestation.hash!==ref.sha256||(attestation.stat.mode&0o777)!==0o600)fail('reboot_attestation_rejected');
+    if(!record(intent.ledgerMetadata))fail('recovery_ledger_identity_changed');
+    const originalMetadata={} as EngineeringLedgerMetadata,currentMetadata={} as EngineeringLedgerMetadata;
+    for(const key of ['dev','ino','uid','gid','mode'] as const) {
+      const value=intent.ledgerMetadata[key];
+      if(!(value instanceof JsonNumber)||!/^\d+$/.test(value.literal)||!Number.isSafeInteger(Number(value.literal)))fail('recovery_ledger_identity_changed');
+      originalMetadata[key]=Number(value.literal);currentMetadata[key]=ledgerIdentity[key];
+    }
+    validateEngineeringLedgerRebootAttestation(JSON.parse(encode(parseExact(attestation.bytes.toString()))),
+      {ledgerPath:o.ledgerPath,originalIntentPath:auditPath,originalIntentSha256:intentFile.hash,campaignId:o.campaignId,allocationId:o.allocationId,originalMetadata,currentMetadata},
+      observeEngineeringLedgerBootIdentity(ledgerIdentity.dev));
+  } else assertLedgerIdentity(intent,ledgerIdentity);
   const state=ledgerState(o.ledgerPath,o.campaignId,o.allocationId);assertLedgerBinding(state,o.campaignId);
   if(options.requireUnused&&state.status.attemptCount!==0)fail('allocation_already_used');
   return Object.freeze({holdId,capMicros:ENGINEERING_ACCEPTANCE_CAP_MICROS,aggregateCurrentSha256:current.hash,

@@ -5,7 +5,8 @@ import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync,
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SpendLedger } from '../../src/spend.ts';
-import { admitEngineeringAcceptance, type EngineeringBudgetBinding } from '../../src/hermes/engineering-budget.ts';
+import { admitEngineeringAcceptance, assertEngineeringBudgetAdmission, type EngineeringBudgetBinding } from '../../src/hermes/engineering-budget.ts';
+import { observeEngineeringLedgerBootIdentity } from '../../src/hermes/engineering-budget-reboot.ts';
 import { admitEngineeringContinuation, previewEngineeringContinuation, assertEngineeringContinuationBudget, assertEngineeringContinuationBaseline, type EngineeringContinuationBinding } from '../../src/hermes/engineering-continuation-budget.ts';
 import { EngineeringTaskStore } from '../../src/hermes/engineering-task-store.ts';
 import { fingerprintJson } from '../../src/hermes/audit-trace.ts';
@@ -189,5 +190,55 @@ test('group/world writable ledger parents and nonprivate journal or receipt dire
     const path=dir==='old-journal'?join(s.root,'v1'):dir==='new-root'?s.o.root:dir==='old-audit'?s.o.continuation.original.auditDir:s.o.auditDir;
     chmodSync(path,0o755);
     expect(()=>baseline.assertCurrent()).toThrow();expect(()=>assertEngineeringContinuationBudget(s.o)).toThrow();
+  }
+});
+
+function rebootFixture() {
+  const s=fixture(true),original=s.o.continuation.original,intentPath=join(original.auditDir,original.runId+'.intent.json');
+  // Offline history fixture: simulate a prior boot's device number before
+  // recording evidence; production never edits that original intent.
+  const intent=JSON.parse(readFileSync(intentPath,'utf8'));intent.ledgerMetadata.dev--;
+  writeFileSync(intentPath,JSON.stringify(intent,null,2)+'\n');
+  const stat=lstatSync(original.ledgerPath),currentMetadata={dev:stat.dev,ino:stat.ino,uid:stat.uid,gid:stat.gid,mode:stat.mode};
+  const value={version:1,kind:'engineering_ledger_reboot_attestation',ledgerPath:original.ledgerPath,originalIntentPath:intentPath,
+    originalIntentSha256:hash(readFileSync(intentPath)),campaignId:original.campaignId,allocationId:original.allocationId,capMicros:5_650_000,
+    originalMetadata:intent.ledgerMetadata,currentMetadata,...observeEngineeringLedgerBootIdentity(stat.dev),
+    rebootObservationSha256:'b'.repeat(64),userMessageId:'Sentinel_f2a39cc8fb608191b26f1f7fd9769ab6'};
+  const path=join(original.auditDir,original.runId+'.ledger-reboot.json'),bytes=JSON.stringify(value,null,2)+'\n';
+  writeFileSync(path,bytes,{mode:0o600});s.o.continuation.ledgerRebootAttestation={path,sha256:hash(bytes)};
+  return {...s,intentPath,value,attestationPath:path};
+}
+const macTest=process.platform==='darwin'?test:test.skip;
+macTest('reboot continuation retains all original bytes, cap, hold, settled prefix and future usage accounting',async()=>{
+  const s=rebootFixture(),intent=readFileSync(s.intentPath),aggregate=readFileSync(s.o.aggregatePath),before=s.logical();
+  expect(()=>assertEngineeringBudgetAdmission(s.o.continuation.original)).toThrow('recovery_ledger_identity_changed');
+  expect(()=>admitEngineeringAcceptance({...s.o.continuation.original,expectedAggregateSha256:hash(aggregate),resumePartial:true})).toThrow('recovery_ledger_identity_changed');
+  expect(previewEngineeringContinuation(s.o).remainingMicros).toBe(5_535_224);
+  const m=model(s);expect(s.logical()).toBe(before);
+  m.adapter.beginTurn({turnId:'after-reboot',prompt:'Work.'});
+  expect((await m.adapter.handle(m.body(),new AbortController().signal)).status).toBe(200);
+  m.adapter.finishTurn(m.adapter.history());assertEngineeringContinuationBudget(s.o).assertCurrent();
+  expect(s.ledger.status(s.o.allocationId)!.capMicros).toBe(5_650_000);expect(s.ledger.status(s.o.allocationId)!.attemptCount).toBe(4);
+  expect(readFileSync(s.intentPath)).toEqual(intent);expect(readFileSync(s.o.aggregatePath)).toEqual(aggregate);
+});
+macTest('reboot references fail closed for wrong hash, path, metadata, boot, volume and unsafe or changed files',()=>{
+  for(const change of ['hash','path','inode','boot','volume','mode','duplicate-key','changed-after-admission']) {
+    const s=rebootFixture(),ref=s.o.continuation.ledgerRebootAttestation!;
+    if(change==='changed-after-admission') {
+      admitEngineeringContinuation({...s.o,apply:true});const baseline=assertEngineeringContinuationBudget(s.o);
+      writeFileSync(s.attestationPath,readFileSync(s.attestationPath,'utf8')+' ');
+      expect(()=>baseline.assertCurrent()).toThrow();expect(()=>assertEngineeringContinuationBudget(s.o)).toThrow();continue;
+    }
+    if(change==='hash')ref.sha256='a'.repeat(64);
+    else if(change==='path')ref.path+='.other';
+    else if(change==='mode')chmodSync(ref.path,0o644);
+    else {
+      if(change==='inode')s.value.currentMetadata.ino++;
+      else if(change==='boot')s.value.bootSessionUUID='12D97A38-83D2-457D-967F-A01481D5EEFC';
+      else if(change==='volume')s.value.apfsVolumeUUID='8CD7DC2C-1F22-4B7C-BB7A-525D8FF5B697';
+      let bytes=JSON.stringify(s.value);if(change==='duplicate-key')bytes=bytes.slice(0,-1)+',"version":1}';
+      writeFileSync(ref.path,bytes);ref.sha256=hash(bytes);
+    }
+    expect(()=>previewEngineeringContinuation(s.o)).toThrow();expect(()=>admitEngineeringContinuation({...s.o,apply:true})).toThrow();
   }
 });
