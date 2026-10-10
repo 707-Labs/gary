@@ -15,6 +15,10 @@ export interface HostStartupConfig {
   projectAssistantConfigSha256?:string;
   slackAlertConfigPath?:string;
   slackAlertConfigSha256?:string;
+  engineeringConfigPath?:string;
+  engineeringConfigSha256?:string;
+  engineeringAuthorityReceiptPath?:string;
+  engineeringAuthorityReceiptSha256?:string;
   slack?: { credentialsPath: string; approvedChannelIds: readonly string[]; tannerDirectMessages?:true };
 }
 
@@ -37,6 +41,12 @@ export function loadHostStartupConfig(env: Readonly<Record<string, string | unde
   const combinedConversation=mode==='hermes-canary'&&enabled==='1'&&conversationRelease!==undefined;
   const projectConfig=env.GARY_PROJECT_ASSISTANT_CONFIG,projectSha=env.GARY_PROJECT_ASSISTANT_CONFIG_SHA256;
   const alertConfig=env.GARY_SLACK_ALERT_CONFIG,alertSha=env.GARY_SLACK_ALERT_CONFIG_SHA256;
+  const engineeringConfig=env.GARY_ENGINEERING_CONFIG,engineeringSha=env.GARY_ENGINEERING_CONFIG_SHA256;
+  const engineeringAuthority=env.GARY_ENGINEERING_AUTHORITY_RECEIPT,engineeringAuthoritySha=env.GARY_ENGINEERING_AUTHORITY_RECEIPT_SHA256;
+  if([engineeringConfig,engineeringSha,engineeringAuthority,engineeringAuthoritySha].some(value=>value!==undefined)
+    &&(!combinedConversation||!conversation||direct!=='1'||!engineeringConfig||!engineeringSha||!engineeringAuthority||!engineeringAuthoritySha
+      ||!/^[a-f0-9]{64}$/.test(engineeringSha)||!/^[a-f0-9]{64}$/.test(engineeringAuthoritySha)))throw new Error('engineering_requires_pinned_owner_dm_runtime');
+  if(engineeringConfig&&engineeringAuthority===engineeringConfig)throw new Error('engineering_authority_must_be_separate');
   if((alertConfig!==undefined||alertSha!==undefined)&&(!combinedConversation||!alertConfig||!alertSha||!/^[a-f0-9]{64}$/.test(alertSha)))throw new Error('slack_alert_requires_pinned_runtime');
   if((projectConfig!==undefined||projectSha!==undefined)&&(!combinedConversation||!projectConfig||!projectSha||!/^[a-f0-9]{64}$/.test(projectSha)))throw new Error('project_assistant_requires_pinned_runtime');
   if(conversationRelease!==undefined&&(!combinedConversation||!/^[a-f0-9]{40}$/.test(conversationRelease)
@@ -87,6 +97,8 @@ export function loadHostStartupConfig(env: Readonly<Record<string, string | unde
     ...(conversationRelease?{conversationRuntimeRelease:conversationRelease}:{}),
     ...(projectConfig?{projectAssistantConfigPath:path(projectConfig),projectAssistantConfigSha256:projectSha!}:{}),
     ...(alertConfig?{slackAlertConfigPath:path(alertConfig),slackAlertConfigSha256:alertSha!}:{}),
+    ...(engineeringConfig?{engineeringConfigPath:path(engineeringConfig),engineeringConfigSha256:engineeringSha!,
+      engineeringAuthorityReceiptPath:path(engineeringAuthority),engineeringAuthorityReceiptSha256:engineeringAuthoritySha!}:{}),
     slack: Object.freeze({ credentialsPath: path(env.GARY_SLACK_CREDENTIALS_FILE), approvedChannelIds: Object.freeze(approvedChannelIds),
       ...(direct==='1'?{tannerDirectMessages:true as const}:{}) }) });
 }

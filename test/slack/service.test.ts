@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { renderSlackReplyParts, renderSlackReply, SLACK_REPLY_TRUNCATED } from '../../src/slack/render.ts';
-import { createSlackService, GARY_SLACK, READY_DM_TEXT, READONLY_READY_DM_TEXT, PRIVATE_DM_STATUS, type SlackHostHealth, type SlackService, type SlackServiceOptions } from '../../src/slack/service.ts';
+import { createSlackService, GARY_SLACK, READY_DM_TEXT, READONLY_READY_DM_TEXT, PRIVATE_DM_STATUS, type EngineeringIngressRequest, type EngineeringReceipt, type EngineeringIngress, type SlackHostHealth, type SlackService, type SlackServiceOptions } from '../../src/slack/service.ts';
 import type { SlackTransport,SlackFrameInfo } from '../../src/slack/transport.ts';
 
 const cleanups:Array<()=>void|Promise<void>>=[];
@@ -505,4 +505,193 @@ test('shared delivery without a trusted physical-send authorization callback fai
     sharedConversation:{joined:()=>true,ready:()=>true,close:()=>({drained:true}),async respond(_input,deliver){expect(await deliver('No authorization callback')).toBe('not_sent');}}});
   cleanups.push(()=>service.stop());await service.start();await fake.emit(envelope());expect(fake.sends).toEqual([]);
   expect(db.query('SELECT * FROM gary_slack_shared_outbox').all()).toEqual([]);expect(db.query('SELECT * FROM gary_slack_conversation_parts').all()).toEqual([]);
+});
+
+function engineeringFixture(extra:Partial<SlackServiceOptions>={},override?:EngineeringIngress['admit']) {
+  const requests:EngineeringIngressRequest[]=[],receipts=new Set<string>();let chats=0,enabled=true;
+  const issue=(request:EngineeringIngressRequest,phase:'admitted'|'final'='admitted',changes:Partial<EngineeringReceipt>={}):EngineeringReceipt=>{
+    const receipt:EngineeringReceipt={requestId:request.requestId,taskId:'engineering-offline-fixture',receiptId:'receipt:'+phase,phase,
+      status:phase==='admitted'?'queued':'completed',text:phase==='admitted'?'Engineering request accepted.':'Engineering task completed.',...changes};
+    receipts.add(JSON.stringify(receipt));return receipt;
+  };
+  const ingress:EngineeringIngress={async admit(request,signal,available){requests.push(request);expect(signal.aborted).toBe(false);expect(available()).toBe(true);
+    return override?override(request,signal,available):issue(request);},verifyReceipt:receipt=>receipts.has(JSON.stringify(receipt)),
+    readReceipt:input=>[...receipts].map(raw=>JSON.parse(raw) as EngineeringReceipt).filter(receipt=>receipt.requestId===input.requestId&&receipt.taskId===input.taskId).at(-1)??null};
+  const f=fixture({tannerDirectMessages:true,checkConversationHealth:()=>true,checkEngineeringHealth:()=>enabled,engineeringIngress:ingress,
+    conversation:{ready:()=>false,close:()=>({drained:true}),async respond(){chats++;}},...extra});
+  return {...f,requests,issue,ingress,receipts,get chats(){return chats;},get enabled(){return enabled;},set enabled(value:boolean){enabled=value;}};
+}
+const engineeringMessage=(event:Record<string,unknown>={},payload:Record<string,unknown>={})=>dm({text:'!engineer 707-Labs/gary fix the fixture\nRun the offline checks.',...event},payload);
+
+test('engineering claims the authenticated message before admission, dedupes events/messages, and skips chat budget',async()=>{
+  let release!:()=>void,entered!:()=>void;const gate=new Promise<void>(r=>release=r),started=new Promise<void>(r=>entered=r);
+  let f:ReturnType<typeof engineeringFixture>;f=engineeringFixture({},async request=>{entered();await gate;return f.issue(request);});
+  await f.service.start();const first=f.fake.emit(engineeringMessage({thread_ts:'1791417500.000001'}));await started;
+  await Promise.all([f.fake.emit(engineeringMessage({thread_ts:'1791417500.000001'})),
+    f.fake.emit(engineeringMessage({thread_ts:'1791417500.000001'},{event_id:'EvRedelivered'})),
+    f.fake.emit(engineeringMessage({ts:'1791417600.000003',text:'!engineer 707-Labs/other conflicting message'}))]);
+  expect(f.requests).toHaveLength(1);expect(f.chats).toBe(0);expect(f.fake.sends).toHaveLength(1);
+  const request=f.requests[0]!;expect(request).toMatchObject({eventId:'EvFixture1',repository:'707-Labs/gary',task:'fix the fixture\nRun the offline checks.',
+    authority:{authenticated:true,requesterId:GARY_SLACK.tannerId,teamId:GARY_SLACK.teamId,surface:'private_dm',channelId:'D0FIXTURE1',threadTs:'1791417500.000001'}});
+  expect(Object.isFrozen(request)).toBe(true);expect(Object.isFrozen(request.authority)).toBe(true);
+  expect(request.requestId).toBe('slack-engineering-'+createHash('sha256').update(request.messageKey).digest('hex'));
+  expect(f.db.query('SELECT state,task_id FROM gary_slack_engineering_ingress').get()).toEqual({state:'pending',task_id:null});
+  expect(JSON.stringify(f.db.query('SELECT * FROM gary_slack_engineering_ingress').all())).not.toContain('fix the fixture');
+  release();await first;expect(f.fake.sends[1]).toEqual({channel:'D0FIXTURE1',threadTs:'1791417500.000001',text:'Engineering request accepted.'});
+  expect(f.db.query('SELECT state,task_id FROM gary_slack_engineering_ingress').get()).toEqual({state:'bound',task_id:'engineering-offline-fixture'});
+  const final=f.issue(request,'final');expect(await f.service.deliverEngineeringReceipt(final)).toBe('sent');
+  expect(f.fake.sends[2]?.threadTs).toBe('1791417500.000001');expect(f.chats).toBe(0);
+  expect(f.db.query('SELECT status FROM gary_slack_dm_outbox ORDER BY rowid').all()).toEqual([{status:'sent'},{status:'sent'}]);
+});
+
+test('engineering rejects nonowner/nonprivate/foreign/slash envelopes before admission or chat',async()=>{
+  const f=engineeringFixture();await f.service.start();
+  for(const event of [{user:GARY_SLACK.benId},{channel:'D0FOREIGN'},{channel:'C0APPROVED'},{channel_type:'mpim'},{bot_id:'B0BOT123'},{subtype:'message_changed'},
+    {team:'T0FOREIGN'},{ts:'invalid'},{thread_ts:'invalid'},{type:'app_mention'}])await f.fake.emit(engineeringMessage(event));
+  for(const payload of [{team_id:'T0FOREIGN'},{api_app_id:'A0FOREIGN'},{context_team_id:'T0FOREIGN'},{is_ext_shared_channel:true}])await f.fake.emit(engineeringMessage({},payload));
+  await f.fake.emit({type:'slash_commands',payload:{...engineeringMessage().payload,command:'/engineer'}});
+  expect(f.requests).toEqual([]);expect(f.chats).toBe(0);expect(f.fake.sends).toHaveLength(1);
+  expect(f.db.query('SELECT * FROM gary_slack_engineering_ingress').all()).toEqual([]);
+});
+
+test('malformed, disabled, and unavailable explicit engineering commands never fall through into a paid chat',async()=>{
+  const f=engineeringFixture();await f.service.start();let index=0;
+  for(const text of ['!engineer','!engineer other-org/repo task','!engineer 707-Labs/gary','!engineer 707-Labs/gary bad\0task','!engineer 707-Labs/gary '+ 'x'.repeat(16_001)]) {
+    index++;await f.fake.emit(engineeringMessage({text,ts:'1791417600.'+String(index).padStart(6,'0')},{event_id:'EvMalformed'+index}));
+  }
+  expect(f.requests).toHaveLength(0);expect(f.chats).toBe(0);expect(f.fake.sends.slice(1).every(s=>s.text.startsWith('Use !engineer'))).toBe(true);
+  f.enabled=false;await f.fake.emit(engineeringMessage({ts:'1791417600.000009'},{event_id:'EvUnavailable'}));
+  expect(f.requests).toHaveLength(0);expect(f.fake.sends.at(-1)?.text).toContain('unavailable');
+  let chats=0;const disabled=fixture({tannerDirectMessages:true,checkConversationHealth:()=>true,conversation:{ready:()=>true,close:()=>({drained:true}),async respond(){chats++;}}});
+  await disabled.service.start();await disabled.fake.emit(engineeringMessage());expect(chats).toBe(0);expect(disabled.fake.sends.at(-1)?.text).toContain('unavailable');
+  expect(disabled.db.query("SELECT name FROM sqlite_master WHERE name='gary_slack_engineering_ingress'").all()).toEqual([]);
+});
+
+test('bounded admission rejection needs no fabricated task and preserves the dedupe fence',async()=>{
+  const f=engineeringFixture({},async()=>({kind:'rejected',code:'budget_unavailable'}));await f.service.start();await f.fake.emit(engineeringMessage());
+  expect(f.db.query('SELECT state,task_id FROM gary_slack_engineering_ingress').get()).toEqual({state:'rejected',task_id:null});
+  expect(f.fake.sends.at(-1)?.text).toContain('approved budget is unavailable');expect(f.chats).toBe(0);
+  await f.fake.emit(engineeringMessage({},{event_id:'EvAnotherEvent'}));expect(f.requests).toHaveLength(1);
+});
+
+test('unknown admission survives restart and unverified or cross-request receipts never gain delivery authority',async()=>{
+  for(const failure of ['throws','unverified','cross_request'] as const){
+    let f:ReturnType<typeof engineeringFixture>;f=engineeringFixture({},async request=>{
+      if(failure==='throws')throw new Error('offline admission outcome uncertain');
+      const receipt=f.issue(request);if(failure==='unverified')f.receipts.clear();
+      return failure==='cross_request'?{...receipt,requestId:'slack-engineering-'+'a'.repeat(64)}:receipt;
+    });await f.service.start();await f.fake.emit(engineeringMessage());
+    expect(f.db.query('SELECT state,task_id FROM gary_slack_engineering_ingress').get()).toEqual({state:'unknown',task_id:null});
+    expect(f.fake.sends.at(-1)?.text).toContain("couldn't confirm");const final=f.issue(f.requests[0]!,'final');
+    expect(await f.service.deliverEngineeringReceipt(final)).toBe('not_sent');await f.service.stop();
+    const restarted=engineeringFixture({db:f.db});await restarted.service.start();await restarted.fake.emit(engineeringMessage({},{event_id:'EvAfterRestart'}));
+    expect(restarted.requests).toEqual([]);expect(restarted.fake.sends).toEqual([]);
+  }
+});
+
+test('unknown acknowledgement does not block verified final; identical receipts dedupe and changed receipts never send',async()=>{
+  const f=engineeringFixture();await f.service.start();f.fake.send=async()=>({ok:false,outcome:'unknown',code:'offline_timeout'});
+  await f.fake.emit(engineeringMessage());expect(f.db.query('SELECT state FROM gary_slack_engineering_ingress').get()).toEqual({state:'bound'});
+  const request=f.requests[0]!,ack=f.issue(request);expect(await f.service.deliverEngineeringReceipt(ack)).toBe('unknown');expect(f.fake.sends).toHaveLength(2);
+  f.fake.send=async args=>({ok:true,channel:args.channel,ts:'1791417600.000010'});
+  const final=f.issue(request,'final');expect(await f.service.deliverEngineeringReceipt(final)).toBe('sent');expect(await f.service.deliverEngineeringReceipt(final)).toBe('sent');
+  const changed=f.issue(request,'final',{text:'different final body'});expect(await f.service.deliverEngineeringReceipt(changed)).toBe('unknown');
+  expect(await f.service.deliverEngineeringReceipt({...final,taskId:'engineering-foreign'})).toBe('not_sent');
+  expect(await f.service.deliverEngineeringReceipt({...final,requestId:'slack-engineering-'+'c'.repeat(64)})).toBe('not_sent');
+  expect(f.fake.sends).toHaveLength(3);expect(f.db.query('SELECT status FROM gary_slack_dm_outbox ORDER BY rowid').all()).toEqual([{status:'unknown'},{status:'sent'}]);
+});
+
+test('final cannot precede durable admission and delivery serialization keeps acknowledgement before final',async()=>{
+  let f:ReturnType<typeof engineeringFixture>;f=engineeringFixture({},async request=>{
+    expect(await f.service.deliverEngineeringReceipt(f.issue(request,'final'))).toBe('not_sent');return f.issue(request);
+  });await f.service.start();let entered!:()=>void,release!:()=>void;const started=new Promise<void>(r=>entered=r),gate=new Promise<void>(r=>release=r);
+  f.fake.send=async args=>{if(args.text==='Engineering request accepted.'){entered();await gate;}return{ok:true,channel:args.channel,ts:'1791417600.000011'};};
+  const incoming=f.fake.emit(engineeringMessage());await started;const final=f.service.deliverEngineeringReceipt(f.issue(f.requests[0]!,'final'));
+  await Promise.resolve();expect(f.fake.sends).toHaveLength(2);release();await incoming;expect(await final).toBe('sent');
+  expect(f.fake.sends.slice(1).map(s=>s.text)).toEqual(['Engineering request accepted.','Engineering task completed.']);
+});
+
+test('runner wakes once only after verified durable binding and may immediately queue final delivery',async()=>{
+  const f=engineeringFixture();let starts=0,final:Promise<string>|undefined;
+  f.ingress.start=receipt=>{
+    starts++;expect(f.db.query('SELECT state,task_id FROM gary_slack_engineering_ingress').get()).toEqual({state:'bound',task_id:receipt.taskId});
+    expect(f.fake.sends).toHaveLength(1);final=f.service.deliverEngineeringReceipt(f.issue(f.requests[0]!,'final'));
+  };
+  await f.service.start();await f.fake.emit(engineeringMessage());expect(await final).toBe('sent');
+  expect(f.fake.sends.slice(1).map(s=>s.text)).toEqual(['Engineering request accepted.','Engineering task completed.']);
+  expect(await f.service.deliverEngineeringReceipt(f.issue(f.requests[0]!))).toBe('sent');expect(starts).toBe(1);
+  await f.fake.emit(engineeringMessage({},{event_id:'EvDuplicateWake'}));expect(starts).toBe(1);
+});
+
+test('engineering verification cannot lend authority after runtime revocation or move receipt delivery to another destination',async()=>{
+  const f=engineeringFixture();await f.service.start();await f.fake.emit(engineeringMessage());const final=f.issue(f.requests[0]!,'final');
+  expect(await f.service.deliverEngineeringReceipt({...final,channel:'D0FOREIGN'} as EngineeringReceipt)).toBe('not_sent');
+  f.ingress.verifyReceipt=async()=>{f.enabled=false;return true;};
+  expect(await f.service.deliverEngineeringReceipt(final)).toBe('not_sent');expect(f.fake.sends).toHaveLength(2);
+  expect(f.db.query('SELECT final_sha256 FROM gary_slack_engineering_ingress').get()).toEqual({final_sha256:null});
+});
+
+test('engineering rechecks authority before each physical send and stop drains retained final delivery callbacks',async()=>{
+  const f=engineeringFixture();await f.service.start();await f.fake.emit(engineeringMessage());const request=f.requests[0]!;
+  const final=f.issue(request,'final',{text:'& fixture '.repeat(3000)});expect(renderSlackReplyParts(final.text).length).toBeGreaterThan(1);
+  f.fake.send=async args=>{f.enabled=false;return{ok:true,channel:args.channel,ts:'1791417600.000012'};};
+  expect(await f.service.deliverEngineeringReceipt(final)).toBe('unknown');expect(f.fake.sends).toHaveLength(3);
+  expect(f.db.query("SELECT status,error_code FROM gary_slack_dm_outbox WHERE delivery_key LIKE '%:final'").get()).toEqual({status:'unknown',error_code:'engineering_authority_unavailable'});
+  const g=engineeringFixture();await g.service.start();await g.fake.emit(engineeringMessage());let entered!:()=>void,release!:()=>void;
+  const started=new Promise<void>(r=>entered=r),gate=new Promise<void>(r=>release=r);
+  g.fake.send=async args=>{entered();await gate;return{ok:true,channel:args.channel,ts:'1791417600.000013'};};
+  const gFinal=g.issue(g.requests[0]!,'final'),sending=g.service.deliverEngineeringReceipt(gFinal);await started;
+  let stopped=false;const stopping=g.service.stop().then(()=>stopped=true);await Promise.resolve();expect(stopped).toBe(false);
+  release();await Promise.all([sending,stopping]);expect(stopped).toBe(true);g.db.close();
+  expect(await g.service.deliverEngineeringReceipt(gFinal)).toBe('not_sent');
+});
+
+test('engineering injection requires explicit owner DM and separate trusted runtime health before schema changes',()=>{
+  const f=fixture();const engineeringIngress:EngineeringIngress={async admit(){return{kind:'rejected',code:'unavailable'};},verifyReceipt:()=>false};
+  for(const extra of [{},{tannerDirectMessages:true as const},{tannerDirectMessages:true as const,checkConversationHealth:()=>true},
+    {tannerDirectMessages:true as const,checkConversationHealth:()=>true,checkEngineeringHealth:()=>true,approvedChannelIds:['C0APPROVED']}])
+    expect(()=>createSlackService({db:f.db,transport:f.fake.transport,checkHostHealth:()=>healthy,engineeringIngress,...extra})).toThrow('engineering_ingress_boundary_rejected');
+  expect(f.db.query("SELECT name FROM sqlite_master WHERE name='gary_slack_engineering_ingress'").all()).toEqual([]);
+});
+
+test('ordinary chat admission pauses independently while engineering ack and final remain deliverable',async()=>{
+  let allowChat=false;
+  const f=engineeringFixture({checkConversationAdmission:()=>allowChat});await f.service.start();
+  await f.fake.emit(dm({text:'Ordinary question'}, {event_id:'EvChatBefore'}));expect(f.chats).toBe(0);
+  await f.fake.emit(engineeringMessage());expect(f.requests).toHaveLength(1);expect(f.fake.sends).toHaveLength(2);
+  expect(await f.service.deliverEngineeringReceipt(f.issue(f.requests[0]!,'final'))).toBe('sent');
+  allowChat=true;await f.fake.emit(dm({text:'Another question',ts:'1791417600.000004'},{event_id:'EvChatAfter'}));expect(f.chats).toBe(1);
+});
+
+test('engineering status reads only exact bound private thread, remains available while busy and dedupes',async()=>{
+  const f=engineeringFixture({checkConversationAdmission:()=>false});await f.service.start();
+  const thread='1791417600.000001';await f.fake.emit(engineeringMessage({ts:thread}));const request=f.requests[0]!;
+  const status=engineeringMessage({text:'!engineer status',ts:'1791417600.000002',thread_ts:thread},{event_id:'EvStatus1'});
+  const before=f.fake.sends.length;await f.fake.emit(status);await f.fake.emit(status);
+  expect(f.fake.sends).toHaveLength(before+1);expect(f.fake.sends.at(-1)?.text).toContain('Recorded engineering status: queued.');
+  expect(f.fake.sends.at(-1)?.text).toContain('does not confirm current worker activity');
+  expect(f.requests).toHaveLength(1);expect(f.chats).toBe(0);
+  f.issue(request,'final',{status:'cleanup_unknown'});
+  await f.fake.emit(engineeringMessage({text:'!engineer status',ts:'1791417600.000003',thread_ts:thread},{event_id:'EvStatus2'}));
+  expect(f.fake.sends.at(-1)?.text).toContain('Recorded engineering status: cleanup_unknown.');
+  await f.fake.emit(engineeringMessage({text:'!engineer status',ts:'1791417600.000004'},{event_id:'EvStatusOtherThread'}));
+  expect(f.fake.sends.at(-1)?.text).toBe('No engineering task is recorded for this DM thread.');
+  const count=f.fake.sends.length;
+  await f.fake.emit(engineeringMessage({text:'!engineer status',user:GARY_SLACK.benId,ts:'1791417600.000005',thread_ts:thread},{event_id:'EvStatusOtherUser'}));
+  await f.fake.emit(engineeringMessage({text:'!engineer status',channel:'D0OTHER999',ts:'1791417600.000006',thread_ts:thread},{event_id:'EvStatusOtherDm'}));
+  expect(f.fake.sends).toHaveLength(count);expect(f.requests).toHaveLength(1);expect(f.chats).toBe(0);
+});
+
+test('engineering status rejects forged, cross-task and changed binding receipts without exposing text',async()=>{
+  for(const mode of ['forged','cross_task','binding_changed'] as const){
+    const f=engineeringFixture();await f.service.start();await f.fake.emit(engineeringMessage({ts:'1791417600.000001'}));
+    const receipt=f.issue(f.requests[0]!,'final');
+    f.ingress.readReceipt=()=>{
+      if(mode==='binding_changed')f.db.query("UPDATE gary_slack_engineering_ingress SET thread_ts='1791417000.000001'").run();
+      return{...receipt,...(mode==='cross_task'?{taskId:'foreign-task'}:{}),...(mode==='forged'?{text:'secret unverified details'}:{})};
+    };
+    await f.fake.emit(engineeringMessage({text:'!engineer status',ts:'1791417600.000009',thread_ts:'1791417600.000001'},{event_id:'EvStatusInvalid'}));
+    expect(f.fake.sends.at(-1)?.text).toBe('The engineering status record could not be verified.');
+    expect(f.fake.sends.at(-1)?.text).not.toContain('secret');expect(f.requests).toHaveLength(1);expect(f.chats).toBe(0);
+  }
 });

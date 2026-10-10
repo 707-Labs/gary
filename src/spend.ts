@@ -273,6 +273,13 @@ export class SpendLedger {
     return { ticketId, campaignId: row.campaign_id, state: row.state, terminalReason: row.terminal_reason, draftPr: row.draft_pr === 1, capMicros: row.cap_micros, chargedMicros: row.charged, remainingMicros: row.cap_micros - row.charged, attemptCount: row.attempts, unknownAttempts: row.unknowns, campaignCapMicros: row.campaign_cap, campaignChargedMicros: row.campaign_charged };
   }
 
+  /** Bounded ownership evidence, not spending authority. Two rows distinguish a sole request from competing unresolved work. */
+  unresolvedAttempts(ticketId: string): readonly { id: number; state: 'reserved' | 'unknown' }[] {
+    return this.db.query<{ id: number; state: 'reserved' | 'unknown' }, [string]>(
+      "SELECT id,state FROM spend_attempts WHERE ticket_id=? AND state!='settled' ORDER BY id LIMIT 2",
+    ).all(ticketId);
+  }
+
   canDispatch(ticketId: string): boolean {
     const status = this.status(ticketId);
     // This is a cheap admission check only; the transaction reserves the exact

@@ -70,6 +70,9 @@ export interface LoopDeps {
   db: DB;
   /** Trusted host lifetime; omission preserves legacy standalone calls. */
   signal?: AbortSignal;
+  /** Synchronous host dispatch lease. Null refuses new work; release follows
+   * the complete handler lifetime, including failed admission and exceptions. */
+  beginDispatch?: () => (() => void) | null;
   /** Production intake requires a funded, explicitly enrolled ticket. */
   spend?: SpendLedger;
   /** Durable one-issue classify/code admission, enabled only by the explicit Hermes activation. */
@@ -348,6 +351,21 @@ export async function tick(deps: LoopDeps): Promise<TickResult> {
  * by the caller's allSettled aggregation.
  */
 async function runOne(
+  deps: LoopDeps,
+  action: CandidateAction,
+  glm: GLMClient,
+  slot: number,
+): Promise<string | null> {
+  let release: (() => void) | undefined;
+  if (deps.beginDispatch) {
+    try { release = deps.beginDispatch() ?? undefined; } catch { return null; }
+    if (!release) return null;
+  }
+  try { return await runOneAdmitted(deps, action, glm, slot); }
+  finally { release?.(); }
+}
+
+async function runOneAdmitted(
   deps: LoopDeps,
   action: CandidateAction,
   glm: GLMClient,

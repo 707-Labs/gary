@@ -1,0 +1,82 @@
+/** Operator-reviewed, hash-pinned configuration for the first engineering acceptance. */
+import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { dirname, isAbsolute, join, normalize, relative, sep } from 'node:path';
+import { isSafeGitBranch } from '../git.ts';
+import { ENGINEERING_ACCEPTANCE_POLICY } from './engineering-policy.ts';
+export interface EngineeringRuntimeConfig {
+  version: 1; grantId: string; allocationId: string; campaignId: string; root: string; workspacesRoot: string;
+  repository: string; baseBranch: string; baseCommit: string; allowedFiles: readonly string[]; requiredCommands: readonly string[];
+  deadlineMs: number; workerImage: string; executorImage: string; bunCacheVolume: string;
+  dockerExecutable: '/usr/local/bin/docker'; dockerSocketPath: '/Users/tanner/.colima/default/docker.sock';
+  runtimeFiles: readonly { path: string; sha256: string }[];
+  sourceRevision: string; publication: 'patch_only'; capMicros: 5650000;
+  budget: Readonly<{ aggregatePath: string; auditDir: string; runId: string }>;
+}
+export interface EngineeringAuthorityReceipt {
+  version: 1; grantId: string; sourceThreadId: string; assistantMessageId: string; userMessageId: string;
+  userApproval: 'yes approve go ahead'; requesterId: 'U0A9M5W16F8'; teamId: 'T0AA24R7VUZ';
+  capMicros: 5650000; scope: '707-Labs-existing-app-isolated-engineering'; mergeAllowed: false; deploymentAllowed: false;
+}
+function fail(): never { throw new Error('engineering_config_rejected'); }
+function privateJson(path: string, expectedSha: string): unknown {
+  if (!isAbsolute(path) || normalize(path) !== path || realpathSync(path) !== path || !/^[a-f0-9]{64}$/.test(expectedSha)) fail();
+  const parent = lstatSync(dirname(path)), before = lstatSync(path);
+  if (!parent.isDirectory() || parent.uid !== process.getuid?.() || (parent.mode & 0o777) !== 0o700
+      || !before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.uid !== process.getuid?.()
+      || (before.mode & 0o777) !== 0o600 || before.size > 65_536) fail();
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW); let bytes: Buffer;
+  try { const st = fstatSync(fd); if (st.dev !== before.dev || st.ino !== before.ino || st.size !== before.size) fail(); bytes = readFileSync(fd); }
+  finally { closeSync(fd); }
+  if (createHash('sha256').update(bytes).digest('hex') !== expectedSha) fail();
+  return JSON.parse(bytes.toString('utf8'));
+}
+function object(v: unknown): v is Record<string, unknown> { return !!v && typeof v === 'object' && !Array.isArray(v); }
+function exact(v: Record<string, unknown>, keys: readonly string[]): boolean { return Object.keys(v).length === keys.length && keys.every(k => Object.hasOwn(v, k)); }
+function safePath(value: unknown): value is string { return typeof value === 'string' && isAbsolute(value) && normalize(value) === value && !/[\0\r\n,]/.test(value); }
+function list(value: unknown, max: number): value is string[] { return Array.isArray(value) && value.length > 0 && value.length <= max && value.every(x => typeof x === 'string' && x.length > 0 && x.length < 1024) && new Set(value).size === value.length; }
+function overlaps(a: string, b: string): boolean {
+  const inside = (base: string, path: string) => { const r = relative(base, path); return !isAbsolute(r) && r !== '..' && !r.startsWith('..' + sep); };
+  return inside(a, b) || inside(b, a);
+}
+export function loadEngineeringRuntimeConfig(path: string, sha: string, authorityPath: string, authoritySha: string): Readonly<EngineeringRuntimeConfig> {
+  const value = privateJson(path, sha), authority = privateJson(authorityPath, authoritySha);
+  if (!object(authority) || !exact(authority, ['version','grantId','sourceThreadId','assistantMessageId','userMessageId','userApproval','requesterId','teamId','capMicros','scope','mergeAllowed','deploymentAllowed'])
+      || authority.version !== 1 || authority.sourceThreadId !== '01a0fa90-833c-71cc-907b-0b3fc0e1b02d'
+      || authority.assistantMessageId !== 'Sentinel_668b96adaca8819199844e4bbb4f2971'
+      || authority.userMessageId !== 'Sentinel_c0289b9b991c81918b40e3a04e870894'
+      || authority.userApproval !== 'yes approve go ahead' || authority.requesterId !== 'U0A9M5W16F8' || authority.teamId !== 'T0AA24R7VUZ'
+      || authority.capMicros !== ENGINEERING_ACCEPTANCE_POLICY.capMicros || authority.scope !== '707-Labs-existing-app-isolated-engineering'
+      || authority.mergeAllowed !== false || authority.deploymentAllowed !== false) fail();
+  if (!object(value) || !exact(value, ['version','grantId','allocationId','campaignId','root','workspacesRoot','repository','baseBranch','baseCommit','allowedFiles','requiredCommands','deadlineMs',
+    'workerImage','executorImage','bunCacheVolume','dockerExecutable','dockerSocketPath','runtimeFiles','sourceRevision','publication','capMicros','budget'])
+      || value.version !== 1 || value.grantId !== authority.grantId || !['grantId','allocationId','campaignId'].every(k => typeof value[k] === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value[k] as string))
+      || !safePath(value.root) || dirname(path) !== value.root || authorityPath !== join(value.root, 'authority.json')
+      || !safePath(value.workspacesRoot) || overlaps(value.root, value.workspacesRoot)
+      || value.repository === undefined || typeof value.repository !== 'string' || !/^707-Labs\/[A-Za-z0-9._-]+$/.test(value.repository)
+      || typeof value.baseBranch !== 'string' || !isSafeGitBranch(value.baseBranch)
+      || typeof value.baseCommit !== 'string' || !/^[a-f0-9]{40}$/.test(value.baseCommit)
+      || typeof value.sourceRevision !== 'string' || !/^[a-f0-9]{40}$/.test(value.sourceRevision)
+      || !list(value.allowedFiles, 128) || value.allowedFiles.some(p => p.startsWith('/') || /[\\\x00-\x1f*?\[\]{}:]/.test(p)
+        || p.split('/').some(s => !s || s === '.' || s === '..' || /^(?:\.git|\.beads|\.env(?:\..*)?|\.aws|\.ssh)$/i.test(s)))
+      || !list(value.requiredCommands, 16) || value.requiredCommands.some(c => c.trim() !== c || /[\x00-\x1f]/.test(c))
+      || value.deadlineMs !== 30 * 60_000 || value.publication !== 'patch_only' || value.capMicros !== ENGINEERING_ACCEPTANCE_POLICY.capMicros
+      || value.workerImage !== 'sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab'
+      || value.executorImage !== 'sha256:0efb49a8f21794948395f7bec2c15557a78473acd760207613fe7714e7c47f8c'
+      || value.bunCacheVolume !== 'gary-bun-cache-20261010-mulligan-4bb2fdde-v2'
+      || value.dockerExecutable !== '/usr/local/bin/docker' || value.dockerSocketPath !== '/Users/tanner/.colima/default/docker.sock'
+      || !object(value.budget) || !exact(value.budget, ['aggregatePath','auditDir','runId']) || !safePath(value.budget.aggregatePath)
+      || value.budget.auditDir !== join(value.root, 'budget-admission') || value.budget.runId !== value.grantId
+      || !Array.isArray(value.runtimeFiles) || value.runtimeFiles.length < 2 || value.runtimeFiles.length > 8) fail();
+  const workspaces = lstatSync(value.workspacesRoot);
+  if (!workspaces.isDirectory() || workspaces.isSymbolicLink() || workspaces.uid !== process.getuid?.()
+      || (workspaces.mode & 0o777) !== 0o700 || realpathSync(value.workspacesRoot) !== value.workspacesRoot) fail();
+  const seen = new Set<string>();
+  for (const f of value.runtimeFiles) {
+    if (!object(f) || !exact(f, ['path','sha256']) || !safePath(f.path) || typeof f.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(f.sha256)
+      || seen.has(f.path) || realpathSync(f.path) !== f.path || createHash('sha256').update(readFileSync(f.path)).digest('hex') !== f.sha256) fail();
+    seen.add(f.path); Object.freeze(f);
+  }
+  Object.freeze(value.runtimeFiles); Object.freeze(value.allowedFiles); Object.freeze(value.requiredCommands); Object.freeze(value.budget);
+  return Object.freeze(value) as unknown as Readonly<EngineeringRuntimeConfig>;
+}

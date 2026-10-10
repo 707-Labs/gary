@@ -5,8 +5,9 @@ import { createSlackIngressEmitter, type SlackIngressObserver } from './ingress-
 import { constants, openSync, closeSync, fstatSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, normalize } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { LEGACY_DM_CONVERSATION_POLICY, DM_CONVERSATION_POLICY, DMReplyError, exactDMAllocation, type DMTurn, type DMText } from '../hermes/dm-conversation.ts';
+import { LEGACY_DM_CONVERSATION_POLICY, DM_CONVERSATION_POLICY, DMReplyError, type DMTurn, type DMText } from '../hermes/dm-conversation.ts';
 import { conversationFailureMessage } from './conversation-error.ts';
+import { createConversationQueueBudget } from './conversation.ts';
 import { boundedHistory, replacedHistoryPrefix, recordHistoryCompaction, migrateContextPolicy, rollbackContextPolicy, type ContextMigrationReceipt } from './context-policy.ts';
 import type { SlackMemberMetadata, SlackChannelMetadata } from './transport.ts';
 import type { SpendLedger } from '../spend.ts';
@@ -109,7 +110,7 @@ export function createSlackSharedConversation(options:{config:SlackSharedConvers
   const blocked=()=>Boolean((db.query('SELECT blocked FROM control WHERE id=1').get() as any).blocked);
   // A prior owner may have left a native process or model dispatch in flight. Never take it over.
   if(pending())db.query('UPDATE control SET blocked=1 WHERE id=1').run();
-  const allocationReady=()=>{const s=ledger.status(config.allocationId);return exactDMAllocation(s,config.allocationId,config.campaignId)&&s.unknownAttempts===0;};
+  const budget=createConversationQueueBudget(ledger,config),allocationReady=budget.ready;
   if(!allocationReady()){db.close();throw new Error('dm_budget_unavailable');}
   async function authorize(input:SlackSharedConversationInput,signal:AbortSignal):Promise<boolean> {
     try {const [member,channel]=await Promise.all([
@@ -130,7 +131,7 @@ export function createSlackSharedConversation(options:{config:SlackSharedConvers
     let cleanup=true,errorCode:string|null=null,reply:string|undefined;
     try {
       const session=db.query<Session,[string]>('SELECT history,turns,blocked FROM sessions WHERE session_key=?').get(sessionKey)!;
-      if(!isAvailable()||signal.aborted||blocked()||session.blocked||!allocationReady()||!await authorize(input,signal)||!isAvailable())throw new DMReplyError('dm_turn_unavailable');
+      if(!isAvailable()||signal.aborted||blocked()||session.blocked||!budget.canStart()||!await authorize(input,signal)||!isAvailable()||!budget.canStart())throw new DMReplyError('dm_turn_unavailable');
       const history=JSON.parse(session.history) as DMText[],text=encodedText(input);
       if(session.turns>=POLICY.maxTurns||Buffer.byteLength(JSON.stringify(history))>POLICY.maxContextBytes)throw new DMReplyError('dm_context_limit');
       let candidateHistory=history;
@@ -141,17 +142,18 @@ export function createSlackSharedConversation(options:{config:SlackSharedConvers
         candidateHistory=checked.history;
       };
       db.query("UPDATE events SET state='running' WHERE event_key=? AND owner=? AND state='queued'").run(key,owner);
-      reply=await options.reply({requestId:randomUUID(),ownerId:owner,allocationId:config.allocationId,campaignId:config.campaignId,
+      const assertActive=()=>{
+        const event=db.query<{state:string;owner:string;cleanup:number},[string]>('SELECT state,owner,cleanup FROM events WHERE event_key=?').get(key);
+        if(closed||!isAvailable()||blocked()||signal.aborted||event?.owner!==owner||event.state!=='running'||event.cleanup!==0)throw new DMReplyError('dm_owner_changed');
+      };
+      reply=await budget.run(assertActive,()=>options.reply({requestId:randomUUID(),ownerId:owner,allocationId:config.allocationId,campaignId:config.campaignId,
         authority:Object.freeze({surface:'shared_channel',requesterId:input.requesterId,teamId:input.teamId,channelId:input.channel,threadTs:input.threadTs}),
         history,text,signal,compactHistory,
-        assertActive:()=>{
-          if(closed||!isAvailable()||blocked()||signal.aborted||(db.query('SELECT state,owner FROM events WHERE event_key=?').get(key) as any)?.owner!==owner
-            ||(db.query('SELECT state FROM events WHERE event_key=?').get(key) as any)?.state!=='running')throw new DMReplyError('dm_owner_changed');
-        },
+        assertActive,
         recordWorker:name=>{if(!/^gary-hermes-worker-[a-f0-9-]{36}$/.test(name))throw new DMReplyError('dm_worker_binding_rejected');
           const result=db.query("UPDATE events SET worker_name=? WHERE event_key=? AND owner=? AND state='running' AND worker_name IS NULL").run(name,key,owner);
           if(result.changes!==1)throw new DMReplyError('dm_worker_binding_rejected');}
-      });
+      }));
       if(!isAvailable()||signal.aborted||blocked()||!allocationReady()||!await authorize(input,signal)||!isAvailable())throw new DMReplyError('dm_turn_unavailable');
       if(typeof reply!=='string'||!reply.trim()||Buffer.byteLength(reply)>POLICY.maxReplyBytes)throw new DMReplyError('dm_reply_rejected');
       const compacted=boundedHistory(candidateHistory,text,POLICY.maxContextBytes,Buffer.byteLength(JSON.stringify(reply))+64);
@@ -180,13 +182,14 @@ export function createSlackSharedConversation(options:{config:SlackSharedConvers
     }
   }
   const ready=()=>!closed&&!blocked()&&allocationReady();
+  const queueReady=()=>!closed&&!blocked()&&budget.canQueue();
   const activeSession=(sessionKey:string)=>{
     const session=db.query<Session,[string]>('SELECT history,turns,blocked FROM sessions WHERE session_key=?').get(sessionKey);
     return !!session&&!session.blocked&&session.turns<POLICY.maxTurns;
   };
   // All local reads: a thread counts as joined only while Gary could still take a turn in it.
   function joined(channel:string,threadTs:string):boolean {
-    return ready()&&/^[CG][A-Z0-9]{5,32}$/.test(channel)&&/^\d{10,16}\.\d{6}$/.test(threadTs)&&activeSession(POLICY.appId+':'+POLICY.teamId+':'+channel+':'+threadTs);
+    return queueReady()&&/^[CG][A-Z0-9]{5,32}$/.test(channel)&&/^\d{10,16}\.\d{6}$/.test(threadTs)&&activeSession(POLICY.appId+':'+POLICY.teamId+':'+channel+':'+threadTs);
   }
   async function admit(input:SlackSharedConversationInput,deliver:DMDelivery,signal:AbortSignal,isAvailable:()=>boolean=()=>true):Promise<void> {
     const reply=input.type==='thread_reply';
@@ -201,7 +204,7 @@ export function createSlackSharedConversation(options:{config:SlackSharedConvers
     const key=config.runId+':'+scope+':'+input.eventId,messageKey=scope+':'+input.channel+':'+input.ts,sessionKey=scope+':'+input.channel+':'+input.threadTs;
     // A follow-up in a thread Gary never joined, or can no longer take turns in, costs nothing: no
     // metadata lookup, claim or notice. Members talking among themselves are not addressing Gary.
-    if(reply&&!(ready()&&activeSession(sessionKey))){observe('shared_thread_inactive');return Promise.resolve();}
+    if(reply&&!(queueReady()&&activeSession(sessionKey))){observe('shared_thread_inactive');return Promise.resolve();}
     const duplicate=()=>db.query('SELECT 1 FROM events WHERE event_key=? OR message_key=?').get(key,messageKey)
       ||db.query('SELECT 1 FROM notices WHERE event_key=? OR message_key=?').get(key,messageKey);
     const notice=(reason:string):Promise<void>=>{
@@ -213,7 +216,7 @@ export function createSlackSharedConversation(options:{config:SlackSharedConvers
       return claimed?deliver("I can't answer this message within the current conversation limits. No model call was made.",'notice',deliveryAuthorization(input,signal,isAvailable)).then(()=>{},()=>{}):Promise.resolve();
     };
     if(duplicate()){observe('shared_duplicate');return Promise.resolve();}
-    const limited=()=>queued>=POLICY.maxQueued||blocked()||!allocationReady()||Buffer.byteLength(encodedText(input))>POLICY.maxInputBytes;
+    const limited=()=>queued>=POLICY.maxQueued||blocked()||!budget.canQueue()||Buffer.byteLength(encodedText(input))>POLICY.maxInputBytes;
     // A mention is authorized before its notice so only members ever hear from Gary. A reply never gets a
     // notice, so its local limits run first and a limited reply (or its redelivery) costs no metadata lookup.
     if(reply&&(limited()||Number((db.query('SELECT count(*) AS n FROM events').get() as any).n)>=POLICY.maxAcceptedEvents))return notice('shared_admission_limit');

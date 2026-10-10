@@ -1,0 +1,384 @@
+/** Explicit opt-in native engineering worker; no live service import or default activation. */
+import { execFile, spawn } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import { constants, closeSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync,
+  realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join } from 'node:path';
+import { EngineeringProtocol, type EngineeringProtocolBinding } from './engineering-protocol.ts';
+import type { EngineeringModelAdapter } from './engineering-model.ts';
+import { fingerprintJson } from './audit-trace.ts';
+import type { ConversationMessage } from './conversation.ts';
+import { createEngineeringSessionGuardianFactory, type EngineeringSessionGuardian,
+  type EngineeringSessionGuardianFactory } from '../executors/engineering-session-guardian.ts';
+
+export const ENGINEERING_WORKER_IMAGE = 'sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab';
+const RUNTIME = '/opt/gary-hermes-runtime', OVERLAY = '/opt/gary-engineering';
+const FILES = ['gary_engineering_environment.py', 'gary_engineering_runtime.py'];
+const MAX_FRAME = 2 * 1024 * 1024;
+type Json = Record<string, unknown>;
+const object = (v: unknown): v is Json => !!v && typeof v === 'object' && !Array.isArray(v);
+const exact = (v: Json, keys: string[]) => Object.keys(v).length === keys.length && keys.every(k => Object.hasOwn(v, k));
+function fail(reason: string): never { throw new Error('engineering_worker:' + reason); }
+const hash = (v: unknown) => fingerprintJson(v).sha256;
+export interface EngineeringNativeInput {
+  binding: EngineeringProtocolBinding;
+  systemPrompt: string;
+  tools: readonly Json[];
+  model: EngineeringModelAdapter;
+  protocol: EngineeringProtocol;
+  transportCapability: string;
+  assertOwner(): void;
+  fence(reason: string): void;
+  /** Durable host evidence; append completes before launching any worker. */
+  append(receipt: Readonly<Json>): void;
+}
+export interface EngineeringNativeTurn {
+  turnId: string;
+  messages: readonly ConversationMessage[];
+  finalResponse: string;
+  /** Worker report only. Tests/review/publication remain separate host decisions. */
+  nativeCompleted: boolean;
+}
+export interface EngineeringNativeSession {
+  turn(input: { turnId: string; prompt: string }): Promise<EngineeringNativeTurn>;
+  close(): Promise<{ cleanupConfirmed: true }>;
+}
+export type EngineeringNativeLauncher = (input: EngineeringNativeInput, signal: AbortSignal) => Promise<EngineeringNativeSession>;
+export interface EngineeringStdioOptions {
+  command: readonly string[]; cwd: string; env: Readonly<Record<string, string>>;
+  /** Trusted offline fixture paths only. The Docker composition never supplies this seam. */
+  fixturePaths?: { nativeSource: string; scopedHome: string };
+  /** Must prove exact worker absence, even if its attached CLI already exited. */
+  cleanup(): Promise<void>;
+}
+
+/** Trusted process fixture seam. This function itself does not establish isolation. */
+export function createEngineeringStdioLauncher(config: EngineeringStdioOptions): EngineeringNativeLauncher {
+  const command = [...config.command], env = { ...config.env }, cwd = config.cwd;
+  const paths = { nativeSource: RUNTIME + '/vendor/hermes', scopedHome: '/tmp/gary-engineering-scope', ...config.fixturePaths };
+  if (!command[0]?.startsWith('/') || command.some(s => !s || s.includes('\0')) || !isAbsolute(cwd)) fail('configuration');
+  if (!isAbsolute(paths.nativeSource) || !isAbsolute(paths.scopedHome)) fail('configuration');
+  return async (input, signal) => {
+    const binding = Object.freeze({ ...input.binding }), systemPrompt = input.systemPrompt;
+    const expectedTools = structuredClone(input.tools);
+    if (hash(binding) !== hash(input.protocol.binding) || input.transportCapability.length < 32) fail('binding');
+    input.assertOwner(); signal.throwIfAborted();
+    if (Date.now() >= binding.deadlineMs) fail('expired');
+    let cleanupPromise: Promise<void> | undefined;
+    const cleanup = () => cleanupPromise ??= Promise.resolve().then(config.cleanup);
+    const cancellation = new AbortController(), active = AbortSignal.any([signal, cancellation.signal]);
+    let child: ReturnType<typeof spawn>;
+    try { child = spawn(command[0]!, command.slice(1), { cwd, env, shell: false,
+      detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'ignore'] }); }
+    catch { await cleanup(); fail('spawn_failed'); }
+    const stdin = child.stdin!, stdout = child.stdout!;
+    let ended = false, exitCode: number | null = null, busy = false, closing = false, stopped = false, operationPending = false;
+    let cleanupConfirmed = false;
+    const completion = new Promise<void>(resolve => {
+      child.once('error', () => { cancellation.abort(); ended = true; resolve(); });
+      child.once('exit', () => { if (operationPending) cancellation.abort(); });
+      child.once('close', code => { exitCode = code; ended = true; resolve(); });
+    });
+    const stop = () => {
+      if (stopped) return; stopped = true;
+      if (child.pid && !ended) {
+        try { process.platform === 'win32' ? child.kill('SIGKILL') : process.kill(-child.pid, 'SIGKILL'); }
+        catch { try { child.kill('SIGKILL'); } catch { /* Exact container cleanup remains authoritative. */ } }
+      }
+      stdin.destroy(); stdout.destroy(); void cleanup().catch(() => {});
+    };
+    active.addEventListener('abort', stop, { once: true });
+    stdin.on('error', () => cancellation.abort());
+    const timer = setTimeout(() => cancellation.abort(), Math.max(1, Math.min(2_147_483_647, binding.deadlineMs - Date.now())));
+    if (active.aborted) stop();
+    const guard = () => { active.throwIfAborted(); if (!closing) input.assertOwner(); if (Date.now() >= binding.deadlineMs) fail('expired'); };
+    async function write(value: unknown) {
+      guard(); const raw = Buffer.from(JSON.stringify(value) + '\n');
+      if (raw.length > MAX_FRAME || stdin.destroyed) fail('write_failed');
+      await new Promise<void>((resolve, reject) => stdin.write(raw, e => e ? reject(new Error('engineering_worker:write_failed')) : resolve()));
+      guard();
+    }
+    async function* frames(): AsyncGenerator<Json> {
+      let pending = Buffer.alloc(0);
+      for await (const bytes of stdout) {
+        guard(); pending = Buffer.concat([pending, Buffer.from(bytes)]);
+        if (pending.length > MAX_FRAME) fail('frame_limit');
+        for (;;) {
+          const at = pending.indexOf(10); if (at < 0) break;
+          const raw = pending.subarray(0, at); pending = pending.subarray(at + 1);
+          const value: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw));
+          if (!object(value) || fingerprintJson(value).bytes > MAX_FRAME) fail('frame_shape');
+          yield value;
+        }
+      }
+      if (pending.length) fail('partial_frame');
+    }
+    const reader = frames(); let nextRequest = 1;
+    async function until(type: string): Promise<Json> {
+      for (;;) {
+        guard(); const item = await reader.next(); guard();
+        if (item.done) fail('unexpected_exit');
+        const frame = item.value;
+        if (frame.type === type) return frame;
+        if (!exact(frame, ['type','id','kind','body']) || frame.type !== 'engineering.request'
+            || frame.id !== nextRequest || nextRequest > 2048 || !['rpc','model'].includes(String(frame.kind))
+            || !object(frame.body)) fail('request_shape');
+        nextRequest++; operationPending = true;
+        let response: Json;
+        try {
+          if (frame.kind === 'model') {
+            if (closing) fail('model_during_close');
+            response = await input.model.handle(frame.body, active);
+          } else {
+            response = await input.protocol.accept(frame.body, input.transportCapability);
+            if (response.ok !== true) fail('rpc_rejected');
+            if (frame.body.kind === 'tool.end') {
+              const p = frame.body.payload;
+              if (!object(p) || typeof p.toolCallId !== 'string' || typeof p.resultHash !== 'string') fail('tool_result');
+              input.model.observeToolResult(p.toolCallId, p.resultHash);
+            }
+          }
+          guard(); await write({ type: 'engineering.response', id: frame.id, body: response });
+        } finally { operationPending = false; }
+      }
+    }
+    const dispose = async (reason?: string) => {
+      clearTimeout(timer); active.removeEventListener('abort', stop);
+      if (!ended) stop();
+      await completion; stdin.destroy(); stdout.destroy();
+      try { await cleanup(); }
+      catch { input.fence('native_cleanup_unknown'); fail('cleanup_unknown'); }
+      if (!cleanupConfirmed) {
+        input.append(Object.freeze({ kind: 'native_cleanup_confirmed', ...binding }));
+        cleanupConfirmed = true;
+      }
+      if (reason) input.fence(reason);
+    };
+    try {
+      input.append(Object.freeze({ kind: 'native_stdio_start', ...binding }));
+      await write({ type: 'engineering.start', binding, systemPrompt,
+        ...paths,
+        model: 'deepseek-v4-pro', maxIterations: 3, maxTokens: 8192 });
+      const ready = await until('engineering.ready');
+      if (!exact(ready, ['type','sessionId','tools','toolSchemas']) || ready.sessionId !== binding.sessionId
+          || hash(ready.toolSchemas) !== hash(expectedTools)
+          || hash(ready.tools) !== hash(expectedTools.map(t => (t.function as Json).name).sort())) fail('native_schema_changed');
+      input.append(Object.freeze({ kind: 'native_ready', ...binding, schemasHash: hash(expectedTools) }));
+    } catch { await dispose('native_start_failed'); fail('startup_failed'); }
+    let closed = false;
+    return {
+      async turn(turn) {
+        if (closed || closing || busy) fail('turn_not_available');
+        busy = true;
+        try {
+          guard(); const history = input.model.history(); input.model.beginTurn(turn);
+          await write({ type: 'engineering.turn', turnId: turn.turnId, prompt: turn.prompt, history });
+          const frame = await until('engineering.result');
+          if (!exact(frame, ['type','turnId','result']) || frame.turnId !== turn.turnId || !object(frame.result)
+              || !Array.isArray(frame.result.messages)) fail('result_binding');
+          const messages = input.model.finishTurn(frame.result.messages);
+          const last = messages.at(-1);
+          input.append(Object.freeze({ kind: 'native_turn_result', ...binding, turnId: turn.turnId, historyHash: hash(messages) }));
+          return { turnId: turn.turnId, messages, finalResponse: last?.role === 'assistant' ? String(last.content ?? '') : '',
+            nativeCompleted: frame.result.completed === true };
+        } catch { closed = true; await dispose('native_turn_failed'); fail('turn_failed'); }
+        finally { busy = false; }
+      },
+      async close() {
+        if (cleanupConfirmed) return { cleanupConfirmed: true };
+        if (busy || closed || closing) fail('close_not_available');
+        closing = true;
+        try {
+          await write({ type: 'engineering.close' });
+          const frame = await until('engineering.closed');
+          if (!exact(frame, ['type','cleanupConfirmed']) || frame.cleanupConfirmed !== true) fail('close_receipt');
+          stdin.end();
+          const extra = await reader.next();
+          if (!extra.done) fail('trailing_frame');
+          await completion;
+          if (exitCode !== 0) fail('exit_failed');
+          await dispose(); closed = true;
+          return { cleanupConfirmed: true };
+        } catch {
+          // Execution authority can expire before cooperative close. Physical
+          // cleanup remains mandatory and its verified absence is sufficient.
+          closed = true; await dispose('native_close_failed');
+          return { cleanupConfirmed: true };
+        }
+      },
+    };
+  };
+}
+
+export interface EngineeringRuntimeFile { path: string; sha256: string }
+export interface EngineeringDockerOptions {
+  /** Exact reviewed source bytes, overlaid individually on the immutable image. */
+  runtimeFiles: readonly EngineeringRuntimeFile[];
+  /** Existing host-private directory for read-only per-worker source snapshots. */
+  snapshotDirectory: string;
+  /** Private durable guardian journals survive host/worker loss. Must be outside snapshots. */
+  guardianDirectory: string;
+  /** Host-only reservation profile, independently bounded by the worker ceiling. */
+  resources: { cpus: number; memoryMiB: number };
+  dockerExecutable: '/usr/local/bin/docker';
+  dockerHost: 'unix:///Users/tanner/.colima/default/docker.sock';
+}
+export type EngineeringDockerRunner = (command: readonly string[], env: Readonly<Record<string, string>>,
+  timeoutMs: number, signal?: AbortSignal) => Promise<{ exitCode: number; stdout: string }>;
+const runDocker: EngineeringDockerRunner = (command, env, timeout, signal) => new Promise((resolve, reject) => {
+  execFile(command[0]!, command.slice(1), { cwd: '/', env: { ...env }, timeout, encoding: 'utf8', maxBuffer: 1_048_576,
+    killSignal: 'SIGKILL', ...(signal ? { signal } : {}) }, (e, stdout) => {
+    if (e && (typeof e.code !== 'number' || e.killed)) reject(new Error('engineering_worker:docker_failed'));
+    else resolve({ exitCode: e?.code as number ?? 0, stdout });
+  });
+});
+function source(file: EngineeringRuntimeFile): Buffer {
+  if (!isAbsolute(file.path) || realpathSync(file.path) !== file.path || !/^[a-f0-9]{64}$/.test(file.sha256)) fail('source_path');
+  const before = lstatSync(file.path), fd = openSync(file.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const s = fstatSync(fd);
+    if (!s.isFile() || s.nlink !== 1 || s.uid !== process.getuid?.() || s.mode & 0o022 || s.size > 262_144
+        || s.dev !== before.dev || s.ino !== before.ino) fail('source_identity');
+    const raw = readFileSync(fd), after = fstatSync(fd);
+    if (after.mtimeMs !== s.mtimeMs || after.size !== s.size || createHash('sha256').update(raw).digest('hex') !== file.sha256) fail('source_changed');
+    return raw;
+  } finally { closeSync(fd); }
+}
+
+/** Construction is inert. Production execution uses immutable image, clean environment,
+ * no network/socket/home mounts, and only two reviewed read-only Python overlays. */
+export function createEngineeringNativeLauncher(options: EngineeringDockerOptions, dependencies: {
+  run?: EngineeringDockerRunner; stdio?: typeof createEngineeringStdioLauncher;
+  guardian?: EngineeringSessionGuardianFactory;
+} = {}): EngineeringNativeLauncher {
+  const pinned = structuredClone(options);
+  if (pinned.dockerExecutable !== '/usr/local/bin/docker' || pinned.dockerHost !== 'unix:///Users/tanner/.colima/default/docker.sock'
+      || hash(pinned.runtimeFiles.map(f => basename(f.path)).sort()) !== hash(FILES) || !isAbsolute(pinned.snapshotDirectory)
+      || !isAbsolute(pinned.guardianDirectory) || /[,\x00-\x1f]/.test(pinned.snapshotDirectory)
+      || !pinned.resources || !Number.isFinite(pinned.resources.cpus) || pinned.resources.cpus < 0.25 || pinned.resources.cpus > 2
+      || !Number.isSafeInteger(pinned.resources.memoryMiB) || pinned.resources.memoryMiB < 256 || pinned.resources.memoryMiB > 4096) fail('docker_configuration');
+  const run = dependencies.run ?? runDocker, stdio = dependencies.stdio ?? createEngineeringStdioLauncher;
+  const guardians = dependencies.guardian ?? createEngineeringSessionGuardianFactory({ directory: pinned.guardianDirectory });
+  return async (input, signal) => {
+    let files: {name: string; raw: Buffer; sha256: string}[], snapshot: string;
+    try {
+      input.assertOwner(); signal.throwIfAborted();
+      const parent = lstatSync(pinned.snapshotDirectory);
+      if (!parent.isDirectory() || parent.uid !== process.getuid?.() || parent.mode & 0o077
+          || realpathSync(pinned.snapshotDirectory) !== pinned.snapshotDirectory) fail('snapshot_directory');
+      files = pinned.runtimeFiles.map(f => ({ name: basename(f.path), raw: source(f), sha256: f.sha256 }));
+      snapshot = mkdtempSync(join(pinned.snapshotDirectory, 'native-'));
+    } catch (error) {
+      input.append(Object.freeze({ kind: 'native_cleanup_confirmed', ...input.binding, noContainerAttempted: true }));
+      throw error;
+    }
+    const name = 'gary-longjob-' + randomUUID(), admissionId = randomUUID();
+    const env = Object.freeze({ PATH: '/usr/bin:/bin', DOCKER_HOST: pinned.dockerHost,
+      DOCKER_CONFIG: join(snapshot, 'docker-config'), HOME: snapshot });
+    let creationAttempted = false, containerId: string | null = null, guardian: EngineeringSessionGuardian | undefined;
+    let cleanupPromise: Promise<void> | undefined;
+    const verifyDaemon = async () => {
+      if (!guardian) fail('guardian_missing');
+      const found = await run([pinned.dockerExecutable, 'info', '--format', '{{.ID}}'], env, 10_000);
+      if (found.exitCode !== 0 || found.stdout.trim() !== guardian.daemonId) fail('daemon_changed');
+    };
+    const ids = async (filter: string) => {
+      const found = await run([pinned.dockerExecutable, 'container', 'ls', '--all', '--no-trunc', '--quiet', '--filter', filter], env, 10_000);
+      const values = found.stdout.trim() ? found.stdout.trim().split(/\s+/) : [];
+      if (found.exitCode !== 0 || values.length > 1 || values.some(id => !/^[a-f0-9]{64}$/.test(id))) fail('container_identity_unknown');
+      return values;
+    };
+    const verifyContainer = async (id: string) => {
+      const found = await run([pinned.dockerExecutable, 'container', 'inspect', '--format', '{{json .}}', id], env, 10_000);
+      const item: unknown = JSON.parse(found.stdout);
+      if (found.exitCode !== 0 || !object(item) || item.Id !== id || !object(item.Config) || !object(item.Config.Labels)) fail('container_identity_unknown');
+      const labels = item.Config.Labels;
+      if (labels['gary.task'] !== input.binding.taskId || labels['gary.session'] !== input.binding.sessionId
+          || labels['gary.owner'] !== input.binding.ownerEpoch || labels['gary.admission'] !== admissionId
+          || labels['dev.gary.executor-job'] !== guardian?.reference.invocationId
+          || labels['dev.gary.executor-journal'] !== guardian?.reference.journalId) fail('container_owner_changed');
+    };
+    const cleanup = () => cleanupPromise ??= (async () => {
+      // Drain the independent remover before fallback; never race a live guardian.
+      if (guardian) {
+        try {
+          const proof = await guardian.complete();
+          if (proof.absenceVerified !== true || containerId !== null && proof.containerId !== containerId) fail('guardian_receipt_mismatch');
+          containerId = proof.containerId;
+        } catch { /* Exact-ID host fallback below preserves unrelated containers. */ }
+      }
+      if (creationAttempted) {
+        await verifyDaemon();
+        if (containerId === null) fail('unbound_creation');
+        const existing = await ids(`id=${containerId}`);
+        if (existing.some(id => id !== containerId)) fail('container_identity_unknown');
+        if (existing.length) {
+          await verifyContainer(containerId);
+          const removed = await run([pinned.dockerExecutable, 'container', 'rm', '--force', containerId], env, 10_000);
+          if (removed.exitCode !== 0) fail('container_removal_failed');
+        }
+        if ((await ids(`id=${containerId}`)).length) fail('container_absence_unknown');
+        // A foreign replacement at the old name is never removed or adopted.
+        const named = await ids(`name=^/${name}$`);
+        if (named.includes(containerId)) fail('container_absence_unknown');
+        input.append(Object.freeze({ kind: 'native_container_cleanup_confirmed', ...input.binding,
+          containerName: name, containerId, daemonId: guardian!.daemonId, foreignNamePresent: named.length > 0 }));
+      }
+      rmSync(snapshot, { recursive: true });
+      input.append(Object.freeze({ kind: 'native_cleanup_confirmed', ...input.binding,
+        ...(creationAttempted ? { containerId, daemonId: guardian!.daemonId } : { noContainerAttempted: true }) }));
+    })();
+    try {
+      mkdirSync(env.DOCKER_CONFIG, { mode: 0o700 });
+      for (const file of files) writeFileSync(join(snapshot, file.name), file.raw, { flag: 'wx', mode: 0o444 });
+      const inspected = await run([pinned.dockerExecutable, 'image', 'inspect', ENGINEERING_WORKER_IMAGE], env, 10_000, signal);
+      const images: unknown = JSON.parse(inspected.stdout);
+      if (inspected.exitCode !== 0 || !Array.isArray(images) || images.length !== 1 || !object(images[0])) fail('image_unverified');
+      const image = images[0], config = image.Config;
+      if (image.Id !== ENGINEERING_WORKER_IMAGE || image.Os !== 'linux' || image.Architecture !== 'arm64' || !object(config)
+          || config.User !== '65532:65532' || config.WorkingDir !== RUNTIME
+          || (config.Volumes !== null && config.Volumes !== undefined && (!object(config.Volumes) || Object.keys(config.Volumes).length))
+          || config.Healthcheck !== undefined && config.Healthcheck !== null) fail('image_unverified');
+      input.assertOwner(); signal.throwIfAborted();
+      guardian = await guardians.arm({ binding: { ...input.binding, admissionId }, containerName: name,
+        deadlineMs: input.binding.deadlineMs, workspaceRoot: snapshot, image: ENGINEERING_WORKER_IMAGE,
+        dockerBinary: pinned.dockerExecutable, dockerHost: pinned.dockerHost, runner: {
+          run: async invocation => { const r = await run(invocation.argv, invocation.env, invocation.timeoutMs);
+            return { output: r.stdout, exitCode: r.exitCode, timedOut: false, outputTruncated: Buffer.byteLength(r.stdout) > invocation.maxOutputBytes }; },
+          start: async () => fail('guardian_command_start_forbidden'),
+        } });
+      input.append(Object.freeze({ kind: 'native_guardian_armed', ...input.binding, containerName: name,
+        admissionId, daemonId: guardian.daemonId, dockerHost: pinned.dockerHost, guardian: guardian.reference }));
+      const command = [pinned.dockerExecutable, 'container', 'create', '--rm', '--interactive', '--init', '--name', name,
+        '--pull', 'never', '--restart', 'no', '--network', 'none', '--read-only', '--user', '65532:65532',
+        '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges=true', '--pids-limit', '128', '--memory', `${pinned.resources.memoryMiB}m`,
+        '--memory-swap', `${pinned.resources.memoryMiB}m`, '--cpus', String(pinned.resources.cpus), '--ulimit', 'nofile=256:256', '--stop-timeout', '5', '--no-healthcheck',
+        '--log-driver', 'none', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=268435456,mode=1777',
+        '--label', `gary.task=${input.binding.taskId}`, '--label', `gary.session=${input.binding.sessionId}`,
+        '--label', `gary.owner=${input.binding.ownerEpoch}`, '--label', `gary.admission=${admissionId}`,
+        '--label', `dev.gary.executor-job=${guardian.reference.invocationId}`,
+        '--label', `dev.gary.executor-journal=${guardian.reference.journalId}`,
+        ...files.flatMap(f => ['--mount', `type=bind,source=${join(snapshot, f.name)},target=${OVERLAY}/${f.name},readonly`]),
+        '--workdir', RUNTIME, '--entrypoint', '/usr/bin/env', ENGINEERING_WORKER_IMAGE, '-i',
+        'PATH=/usr/local/bin:/usr/bin:/bin', 'HOME=/tmp', 'PYTHONNOUSERSITE=1', 'PYTHONDONTWRITEBYTECODE=1',
+        'python', '-I', '-B', '-c', `import sys,runpy;sys.path[:0]=['${OVERLAY}','${RUNTIME}/python'];runpy.run_path('${OVERLAY}/gary_engineering_runtime.py',run_name='__main__')`];
+      input.append(Object.freeze({ kind: 'native_container_intent', ...input.binding, containerName: name,
+        imageDigest: ENGINEERING_WORKER_IMAGE, resources: pinned.resources,
+        sourceFiles: files.map(f => ({ name: f.name, sha256: f.sha256 })) }));
+      await verifyDaemon(); input.assertOwner(); signal.throwIfAborted(); guardian.signal.throwIfAborted();
+      creationAttempted = true;
+      const created = await run(command, env, 10_000, signal), id = created.stdout.trim();
+      if (created.exitCode !== 0 || !/^[a-f0-9]{64}$/.test(id)) fail('container_creation_unknown');
+      containerId = id;
+      input.append(Object.freeze({ kind: 'native_container_created', ...input.binding, containerName: name,
+        containerId, daemonId: guardian.daemonId, admissionId }));
+      await verifyContainer(id); await guardian.bind(id);
+      input.assertOwner(); signal.throwIfAborted(); guardian.signal.throwIfAborted();
+      return await stdio({ command: [pinned.dockerExecutable, 'container', 'start', '--attach', '--interactive', id],
+        cwd: '/', env, cleanup })(input, AbortSignal.any([signal, guardian.signal]));
+    } catch {
+      try { await cleanup(); } catch { input.fence('native_cleanup_unknown'); fail('cleanup_unknown'); }
+      fail('launch_failed');
+    }
+  };
+}

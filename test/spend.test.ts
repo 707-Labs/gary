@@ -42,6 +42,18 @@ function scoped(ledger: SpendLedger, transport: typeof fetch, req = request()) {
 }
 
 describe("durable spending allocation", () => {
+  it('exposes bounded exact unresolved identities without treating unknown attempts as healthy reservations', async () => {
+    const path=join(directory(),'spend.sqlite'),ledger=ledgerAt(path,5);
+    let release!:()=>void,entered!:()=>void,count=0;
+    const gate=new Promise<void>(r=>release=r),started=new Promise<void>(r=>entered=r);
+    const transport=ledger.guardedFetch('deepseek',fakeFetch(async()=>{if(++count===3)entered();await gate;return receipt();}));
+    const jobs=[1,2,3].map(()=>scoped(ledger,transport));await started;
+    const db=new Database(path);db.query("UPDATE spend_attempts SET state='unknown' WHERE id=1").run();
+    const before=ledger.status('ERT-3189');expect(ledger.unresolvedAttempts('ERT-3189')).toEqual([{id:1,state:'unknown'},{id:2,state:'reserved'}]);
+    expect(ledger.unresolvedAttempts('missing')).toEqual([]);expect(ledger.status('ERT-3189')).toEqual(before);
+    release();await Promise.all(jobs);expect(ledger.unresolvedAttempts('ERT-3189')).toEqual([{id:1,state:'unknown'}]);db.close();
+  });
+
   it("reserves full input context at uncached peak price and full capped output", () => {
     expect(spendReservationMicros("deepseek")).toBe(1_416_561);
     expect(spendReservationMicros("z.ai")).toBe(1_504_052);

@@ -1,4 +1,4 @@
-/** Host Slack service; optional tightly scoped Tanner DM conversation, no coding dispatch. */
+/** Host Slack service; optional Tanner DM conversation and explicitly injected engineering admission. */
 import { createHash, randomUUID } from 'node:crypto';
 import { hasSlackUserMention } from './mentions.ts';
 import { renderSlackReply, renderSlackReplyParts } from './render.ts';
@@ -8,6 +8,7 @@ import type { SlackTransport, SlackFrameInfo } from './transport.ts';
 import type { SlackConversation } from './conversation.ts';
 import type { SlackSharedConversation, DMDelivery } from './shared-conversation.ts';
 import type { SlackAlertIntake } from './alert-intake.ts';
+import type { EngineeringHostAuthority } from '../hermes/engineering-policy.ts';
 
 export const GARY_SLACK = Object.freeze({ appId:'A0C7QFW3PEG', teamId:'T0AA24R7VUZ', botUserId:'U0C7NPEUG1F',
   tannerId:'U0A9M5W16F8', benId:'U0A97PBGXE3', readyRequest:'Sentinel_ecc85c3dae948191965308b6414c1165' });
@@ -21,6 +22,52 @@ const TIMESTAMP = /^\d{10,16}\.\d{6}$/;
 const RECEIPT = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
 const hash = (value:string) => createHash('sha256').update(value).digest('hex');
 const object = (value:unknown):value is Record<string,unknown> => value !== null && typeof value==='object' && !Array.isArray(value);
+const ENGINEERING_HELP='Use !engineer 707-Labs/repository followed by the task you want Gary to perform.';
+const ENGINEERING_UNAVAILABLE='Engineering admission is unavailable. No engineering task was admitted from this message.';
+const ENGINEERING_UNCONFIRMED="I couldn't confirm engineering admission for this message. Its request remains fenced for review; I won't retry it automatically.";
+const ENGINEERING_REJECTIONS=Object.freeze({
+  unavailable:ENGINEERING_UNAVAILABLE,
+  unauthorized:'Engineering admission was declined because this request is outside the current approval. No engineering task was admitted.',
+  repository_unavailable:'Engineering admission was declined because the repository could not be verified. No engineering task was admitted.',
+  budget_unavailable:'Engineering admission was declined because the approved budget is unavailable. No engineering task was admitted.',
+  busy:'Engineering admission was declined because another engineering request needs to finish or be reviewed. No engineering task was admitted.',
+  invalid_request:ENGINEERING_HELP,
+});
+
+export interface EngineeringIngressRequest {
+  readonly requestId:string;
+  readonly eventId:string;
+  readonly eventKey:string;
+  readonly messageKey:string;
+  readonly authority:Readonly<EngineeringHostAuthority>;
+  readonly repository:string;
+  readonly task:string;
+}
+export interface EngineeringReceipt {
+  readonly requestId:string;
+  readonly taskId:string;
+  readonly receiptId:string;
+  readonly phase:'admitted'|'final';
+  readonly status:'queued'|'running'|'paused'|'completed'|'blocked'|'cleanup_unknown';
+  readonly text:string;
+}
+export type EngineeringAdmissionRejection={readonly kind:'rejected';readonly code:'unavailable'|'unauthorized'|'repository_unavailable'|'budget_unavailable'|'busy'|'invalid_request'};
+/** Trusted host adapter: no model chooses authority, destinations, allocation or task identity. */
+export interface EngineeringIngress {
+  admit(request:EngineeringIngressRequest,signal:AbortSignal,isAvailable:()=>boolean):Promise<EngineeringReceipt|EngineeringAdmissionRejection>;
+  /** Must authenticate every field against durable task/receipt evidence, not model prose. */
+  verifyReceipt(receipt:EngineeringReceipt):boolean|Promise<boolean>;
+  /** Read one already-bound task's latest immutable receipt; never claim or resume it. */
+  readReceipt?(input:Readonly<{requestId:string;taskId:string}>):EngineeringReceipt|null|Promise<EngineeringReceipt|null>;
+  /** Optional idempotent runner wake, invoked once after a newly verified durable task/destination binding. */
+  start?(receipt:EngineeringReceipt):void;
+}
+interface EngineeringIngressRow {
+  request_id:string;event_key:string;event_id:string;message_key:string;command_sha256:string;
+  requester_id:string;team_id:string;channel_id:string;thread_ts:string;
+  state:'pending'|'bound'|'rejected'|'unknown';task_id:string|null;
+  admitted_receipt_id:string|null;admitted_sha256:string|null;final_receipt_id:string|null;final_sha256:string|null;
+}
 
 export type SlackReadinessKind = 'coding_publication'|'readonly_runtime';
 export type SlackHostHealth = {
@@ -53,8 +100,14 @@ export interface SlackServiceOptions {
   sharedConversation?:SlackSharedConversation;
   /** Separate deterministic producer intake: no conversation, coding or spend authority. */
   alertIntake?:SlackAlertIntake;
+  /** Dormant unless an exact reviewed host composition explicitly supplies both dependencies. */
+  engineeringIngress?:EngineeringIngress;
+  checkEngineeringHealth?():boolean;
   /** Trusted exact-release/runtime composition proof; never coding/publication authority. */
   checkConversationHealth?():boolean;
+  /** New ordinary conversations may be paused while engineering owns resources.
+   * Existing authenticated receipt delivery remains independently available. */
+  checkConversationAdmission?():boolean;
 }
 export interface SlackServiceHealth {
   running:boolean; identityVerified:boolean; socketHealthy:boolean; hostReady:boolean;
@@ -66,6 +119,8 @@ export interface SlackService {
   start():Promise<SlackServiceHealth>;
   stop():Promise<void>;
   refreshHealth():Promise<SlackServiceHealth>;
+  /** Private destination comes only from the durable authenticated ingress binding. */
+  deliverEngineeringReceipt(receipt:EngineeringReceipt):Promise<'sent'|'unknown'|'not_sent'>;
   readonly health:SlackServiceHealth;
 }
 interface OutboxRow { status:'sent'|'unknown'|'not_sent'; }
@@ -74,12 +129,15 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
   if(options.tannerDirectMessages!==undefined&&options.tannerDirectMessages!==true)throw new Error('invalid_slack_dm_switch');
   if(options.conversation&&(!options.tannerDirectMessages||options.approvedChannelIds?.length))throw new Error('dm_conversation_boundary_rejected');
   if(options.sharedConversation&&options.approvedChannelIds?.length)throw new Error('shared_conversation_boundary_rejected');
+  if(options.engineeringIngress&&(!options.tannerDirectMessages||options.approvedChannelIds?.length
+    ||typeof options.checkEngineeringHealth!=='function'||typeof options.checkConversationHealth!=='function'))throw new Error('engineering_ingress_boundary_rejected');
   const observe=createSlackIngressEmitter('service',options.onIngressDiagnostic);
   const channels=[...(options.approvedChannelIds??[])], users=[...(options.allowedUserIds??[GARY_SLACK.tannerId])];
   if (channels.length>64 || new Set(channels).size!==channels.length || channels.some(id=>!CHANNEL.test(id))) throw new Error('invalid_slack_channel_allowlist');
   if (new Set(users).size!==users.length || users.some(id=>id!==GARY_SLACK.tannerId && id!==GARY_SLACK.benId)) throw new Error('invalid_slack_user_allowlist');
   const channelSet=new Set(channels), userSet=new Set(users);
   const cancellation=new AbortController(), pending=new Set<Promise<unknown>>();
+  const engineeringDeliveries=new Map<string,Promise<OutboxRow['status']>>();
   const readyKey=`ready:${GARY_SLACK.readyRequest}:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${GARY_SLACK.tannerId}`;
   let running=false, stopped=false, initialized=false, identityVerified=false, hostReady=false, receiptId:string|null=null;
   let readinessKind:SlackReadinessKind|null=null;
@@ -88,6 +146,13 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
   const conversationAvailable=()=>{
     if(!live()||!identityVerified||!options.transport.socketHealthy())return false;
     try{return options.checkConversationHealth?options.checkConversationHealth()===true:hostReady&&readinessKind==='readonly_runtime';}catch{return false;}
+  };
+  const engineeringAvailable=()=>{
+    if(!options.engineeringIngress||!conversationAvailable())return false;
+    try{return options.checkEngineeringHealth?.()===true;}catch{return false;}
+  };
+  const conversationAdmission=()=>{
+    try{return conversationAvailable()&&(!options.checkConversationAdmission||options.checkConversationAdmission()===true);}catch{return false;}
   };
   function track<T>(promise:Promise<T>):Promise<T> {
     pending.add(promise);void promise.then(()=>pending.delete(promise),()=>pending.delete(promise));return promise;
@@ -111,11 +176,16 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
       status TEXT NOT NULL CHECK(status IN ('unknown','sent','not_sent')),
       claimed_at TEXT NOT NULL, completed_at TEXT, slack_channel TEXT, slack_ts TEXT, error_code TEXT
     )`);
-    if(options.conversation||options.sharedConversation)options.db.exec(`CREATE TABLE IF NOT EXISTS gary_slack_conversation_parts (
+    if(options.conversation||options.sharedConversation||options.engineeringIngress)options.db.exec(`CREATE TABLE IF NOT EXISTS gary_slack_conversation_parts (
       delivery_key TEXT NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('dm','shared')),part_index INTEGER NOT NULL,part_count INTEGER NOT NULL,
       content_sha256 TEXT NOT NULL,claim_id TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('planned','unknown','sent','not_sent')),
       claimed_at TEXT NOT NULL,completed_at TEXT,slack_channel TEXT,slack_ts TEXT,error_code TEXT,
       PRIMARY KEY(kind,delivery_key,part_index))`);
+    if(options.engineeringIngress)options.db.exec(`CREATE TABLE IF NOT EXISTS gary_slack_engineering_ingress (
+      request_id TEXT PRIMARY KEY,event_key TEXT NOT NULL UNIQUE,event_id TEXT NOT NULL,message_key TEXT NOT NULL UNIQUE,command_sha256 TEXT NOT NULL,
+      requester_id TEXT NOT NULL,team_id TEXT NOT NULL,channel_id TEXT NOT NULL,thread_ts TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('pending','bound','rejected','unknown')),task_id TEXT,
+      admitted_receipt_id TEXT,admitted_sha256 TEXT,final_receipt_id TEXT,final_sha256 TEXT)`);
     options.alertIntake?.initialize();
     // Validate an idle store before opening ingress. Once connected, a valid
     // event may already be active while start() is awaiting host health.
@@ -196,10 +266,10 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
     let finalChannel:string|null=null,finalTs:string|null=null;
     for(let index=0;index<parts.length;index++){
       if(!conversationAvailable()) {status=confirmed?'unknown':'not_sent';error='service_stopped_before_send';break;}
-      if(input.kind==='shared'){
+      if(input.authorizeBeforePhysicalSend){
         let authorized=false;
         try{authorized=await input.authorizeBeforePhysicalSend!()===true;}catch{/* A failed refresh grants no authority. */}
-        if(!authorized){status=confirmed?'unknown':'not_sent';error='shared_authority_unavailable';break;}
+        if(!authorized){status=confirmed?'unknown':'not_sent';error=input.kind==='shared'?'shared_authority_unavailable':'engineering_authority_unavailable';break;}
         if(!conversationAvailable()){status=confirmed?'unknown':'not_sent';error='service_stopped_before_send';break;}
       }
       const dispatched=options.db.query(`UPDATE gary_slack_conversation_parts SET status='unknown'
@@ -225,6 +295,129 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
     options.db.query(`UPDATE ${table} SET status=?,completed_at=?,slack_channel=?,slack_ts=?,error_code=?
       WHERE delivery_key=? AND claim_id=? AND status='unknown'`).run(status,new Date().toISOString(),finalChannel,finalTs,error,input.key,claim);
     return prior()?.status??'unknown';
+  }
+  function receiptSnapshot(value:EngineeringReceipt):Readonly<EngineeringReceipt>|null {
+    try {
+      if(!object(value)||Object.keys(value).sort().join(',')!=='phase,receiptId,requestId,status,taskId,text'
+        ||!/^slack-engineering-[a-f0-9]{64}$/.test(value.requestId)||!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(value.taskId)
+        ||!RECEIPT.test(value.receiptId)||typeof value.text!=='string'||!value.text.trim()||Buffer.byteLength(value.text)>64_000
+        ||!(value.phase==='admitted'?['queued','running','blocked'].includes(value.status)
+          :value.phase==='final'&&['paused','completed','blocked','cleanup_unknown'].includes(value.status)))return null;
+      return Object.freeze({requestId:value.requestId,taskId:value.taskId,receiptId:value.receiptId,phase:value.phase,status:value.status,text:value.text});
+    }catch{return null;}
+  }
+  async function sendEngineeringReceipt(receipt:Readonly<EngineeringReceipt>):Promise<OutboxRow['status']> {
+    if(!engineeringAvailable())return 'not_sent';
+    const lookup=()=>options.db.query<EngineeringIngressRow,[string]>('SELECT * FROM gary_slack_engineering_ingress WHERE request_id=?').get(receipt.requestId);
+    const before=lookup();
+    if(!before||!['pending','bound'].includes(before.state)||before.requester_id!==GARY_SLACK.tannerId||before.team_id!==GARY_SLACK.teamId)return 'not_sent';
+    if(receipt.phase==='final'&&(before.state!=='bound'||before.task_id!==receipt.taskId||!before.admitted_sha256))return 'not_sent';
+    let verified=false;
+    try{verified=await options.engineeringIngress!.verifyReceipt(receipt)===true;}catch{/* Verification failure is not delivery authority. */}
+    if(!verified||!engineeringAvailable())return 'not_sent';
+    const digest=hash(JSON.stringify(receipt));let newlyBound=false;
+    const bound=options.db.transaction(()=>{
+      const row=lookup();
+      if(!row||row.command_sha256!==before.command_sha256||row.event_key!==before.event_key||row.message_key!==before.message_key
+        ||row.channel_id!==before.channel_id||row.thread_ts!==before.thread_ts||row.requester_id!==before.requester_id||row.team_id!==before.team_id)return false;
+      if(receipt.phase==='admitted') {
+        if(row.state==='bound')return row.task_id===receipt.taskId&&row.admitted_receipt_id===receipt.receiptId&&row.admitted_sha256===digest;
+        if(row.state!=='pending'||row.task_id!==null)return false;
+        newlyBound=options.db.query("UPDATE gary_slack_engineering_ingress SET state='bound',task_id=?,admitted_receipt_id=?,admitted_sha256=? WHERE request_id=? AND state='pending' AND task_id IS NULL")
+          .run(receipt.taskId,receipt.receiptId,digest,receipt.requestId).changes===1;
+        return newlyBound;
+      }
+      if(row.state!=='bound'||row.task_id!==receipt.taskId||!row.admitted_sha256)return false;
+      if(row.final_sha256!==null)return row.final_receipt_id===receipt.receiptId&&row.final_sha256===digest;
+      return options.db.query('UPDATE gary_slack_engineering_ingress SET final_receipt_id=?,final_sha256=? WHERE request_id=? AND task_id=? AND final_sha256 IS NULL')
+        .run(receipt.receiptId,digest,receipt.requestId,receipt.taskId).changes===1;
+    }).immediate();
+    if(!bound)return 'unknown';
+    if(!engineeringAvailable())return 'not_sent';
+    if(newlyBound)try{options.engineeringIngress!.start?.(receipt);}catch{/* Admission remains durable; a failed wake never authorizes a retry. */}
+    return sendConversation({key:receipt.phase==='admitted'?before.event_key:receipt.requestId+':final',kind:'dm',requestId:receipt.requestId,
+      recipient:before.requester_id,channel:before.channel_id,threadTs:before.thread_ts,text:receipt.text,authorizeBeforePhysicalSend:async()=>engineeringAvailable()});
+  }
+  function deliverEngineeringReceipt(value:EngineeringReceipt):Promise<OutboxRow['status']> {
+    // Retained callbacks after shutdown must not even read a closed database.
+    if(!engineeringAvailable())return Promise.resolve('not_sent');
+    const receipt=receiptSnapshot(value);if(!receipt)return Promise.resolve('not_sent');
+    const prior=engineeringDeliveries.get(receipt.requestId);
+    const delivery=track((prior?prior.then(()=>sendEngineeringReceipt(receipt)):sendEngineeringReceipt(receipt)).catch(()=> 'unknown' as const));
+    engineeringDeliveries.set(receipt.requestId,delivery);
+    void delivery.finally(()=>{if(engineeringDeliveries.get(receipt.requestId)===delivery)engineeringDeliveries.delete(receipt.requestId);});
+    return delivery;
+  }
+  async function engineeringCommand(input:{eventId:string;key:string;user:string;channel:string;ts:string;threadTs:string;text:string}):Promise<boolean> {
+    if(!/^!engineer(?:\s|$)/i.test(input.text.trim()))return false;
+    if(!conversationAvailable())return true;
+    if(options.db.query('SELECT 1 FROM gary_slack_dm_outbox WHERE delivery_key=?').get(input.key))return true;
+    const notice=async(text:string)=>{await sendOnce({key:input.key,kind:'dm',requestId:input.eventId,recipient:input.user,channel:input.channel,threadTs:input.threadTs,text});};
+    if(!options.engineeringIngress){await notice(ENGINEERING_UNAVAILABLE);return true;}
+    if(/^!engineer\s+status\s*$/i.test(input.text.trim())) {
+      if(!engineeringAvailable())return true;
+      const rows=options.db.query<EngineeringIngressRow,[string,string,string,string]>(`SELECT * FROM gary_slack_engineering_ingress
+        WHERE state='bound' AND task_id IS NOT NULL AND requester_id=? AND team_id=? AND channel_id=? AND thread_ts=? LIMIT 2`)
+        .all(input.user,GARY_SLACK.teamId,input.channel,input.threadTs);
+      const sendStatus=(text:string,authorizeBeforePhysicalSend:()=>Promise<boolean>)=>sendConversation({key:input.key,kind:'dm',requestId:input.eventId,
+        recipient:input.user,channel:input.channel,threadTs:input.threadTs,text,authorizeBeforePhysicalSend});
+      if(rows.length!==1||!options.engineeringIngress.readReceipt){
+        await sendStatus(rows.length===0?'No engineering task is recorded for this DM thread.':'The engineering status record could not be verified.',async()=>engineeringAvailable());return true;
+      }
+      const bound=rows[0]!;let saved:Readonly<EngineeringReceipt>|null=null;
+      try {const value=await options.engineeringIngress.readReceipt({requestId:bound.request_id,taskId:bound.task_id!});saved=value?receiptSnapshot(value):null;}catch{/* No task history is inferred from a failed read. */}
+      const authorized=async()=>{
+        if(!engineeringAvailable()||!saved||saved.requestId!==bound.request_id||saved.taskId!==bound.task_id)return false;
+        const current=options.db.query<EngineeringIngressRow,[string]>('SELECT * FROM gary_slack_engineering_ingress WHERE request_id=?').get(bound.request_id);
+        return current?.state==='bound'&&current.task_id===bound.task_id&&current.requester_id===input.user&&current.team_id===GARY_SLACK.teamId
+          &&current.channel_id===input.channel&&current.thread_ts===input.threadTs&&await options.engineeringIngress!.verifyReceipt(saved)===true;
+      };
+      let verified=false;try{verified=await authorized();}catch{/* Failed verification grants no status authority. */}
+      if(!verified){await sendStatus('The engineering status record could not be verified.',async()=>engineeringAvailable());return true;}
+      await sendStatus(`Recorded engineering status: ${saved!.status}.\nTask: ${saved!.taskId}.\nThis saved record does not confirm current worker activity.`,authorized);
+      return true;
+    }
+    const messageKey=[GARY_SLACK.appId,GARY_SLACK.teamId,input.channel,input.ts].join(':');
+    const requestId='slack-engineering-'+hash(messageKey);
+    // Persist before any asynchronous resolver/admission. Crash or unknown admission never authorizes retry.
+    const claimed=options.db.transaction(()=>{
+      if(options.db.query('SELECT 1 FROM gary_slack_engineering_ingress WHERE request_id=? OR event_key=? OR message_key=?').get(requestId,input.key,messageKey))return false;
+      options.db.query(`INSERT INTO gary_slack_engineering_ingress
+        (request_id,event_key,event_id,message_key,command_sha256,requester_id,team_id,channel_id,thread_ts,state) VALUES(?,?,?,?,?,?,?,?,?,'pending')`)
+        .run(requestId,input.key,input.eventId,messageKey,hash(input.text),input.user,GARY_SLACK.teamId,input.channel,input.threadTs);
+      return true;
+    }).immediate();
+    if(!claimed)return true;
+    const match=/^!engineer\s+(707-Labs\/[A-Za-z0-9][A-Za-z0-9._-]{0,99})\s+([\s\S]+)$/i.exec(input.text.trim());
+    const task=match?.[2]?.trim();
+    if(!match||!task||Buffer.byteLength(task)>16_000||/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(task)) {
+      options.db.query("UPDATE gary_slack_engineering_ingress SET state='rejected' WHERE request_id=? AND state='pending'").run(requestId);
+      await notice(ENGINEERING_HELP);return true;
+    }
+    if(!engineeringAvailable()) {
+      options.db.query("UPDATE gary_slack_engineering_ingress SET state='rejected' WHERE request_id=? AND state='pending'").run(requestId);
+      await notice(ENGINEERING_UNAVAILABLE);return true;
+    }
+    const authority=Object.freeze({authenticated:true as const,requesterId:input.user,teamId:GARY_SLACK.teamId,surface:'private_dm' as const,channelId:input.channel,threadTs:input.threadTs});
+    const request=Object.freeze({requestId,eventId:input.eventId,eventKey:input.key,messageKey,authority,repository:'707-Labs/'+match[1]!.split('/')[1],task});
+    try {
+      const result=await options.engineeringIngress.admit(request,cancellation.signal,engineeringAvailable);
+      if(!live())return true;
+      if(object(result)&&result.kind==='rejected'&&['unavailable','unauthorized','repository_unavailable','budget_unavailable','busy','invalid_request'].includes(result.code as string)) {
+        options.db.query("UPDATE gary_slack_engineering_ingress SET state='rejected' WHERE request_id=? AND state='pending'").run(requestId);
+        await notice(ENGINEERING_REJECTIONS[result.code as EngineeringAdmissionRejection['code']]);
+        return true;
+      }
+      const receipt=receiptSnapshot(result as EngineeringReceipt);
+      if(!receipt||receipt.requestId!==requestId||receipt.phase!=='admitted')throw new Error('engineering_admission_receipt_rejected');
+      await deliverEngineeringReceipt(receipt);
+      const row=options.db.query<{state:string},[string]>('SELECT state FROM gary_slack_engineering_ingress WHERE request_id=?').get(requestId);
+      if(row?.state!=='bound')throw new Error('engineering_admission_unconfirmed');
+    }catch{
+      options.db.query("UPDATE gary_slack_engineering_ingress SET state='unknown' WHERE request_id=? AND state='pending'").run(requestId);
+      if(conversationAvailable())await notice(ENGINEERING_UNCONFIRMED);
+    }
+    return true;
   }
   function sharedDelivery(key:string,eventId:string,user:string,channel:string,threadTs:string):DMDelivery {
     return async (text,kind='answer',authorizeBeforePhysicalSend)=>{
@@ -297,7 +490,7 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
         const key=`shared:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${eventId}`;
         if(options.db.query('SELECT 1 FROM gary_slack_shared_outbox WHERE delivery_key=?').get(key)){observe('shared_duplicate');return;}
         await refreshHealth();
-        if(!conversationAvailable()){observe('shared_health_rejected');return;}
+        if(!conversationAdmission()){observe('shared_health_rejected');return;}
         observe('shared_thread_dispatch');
         await options.sharedConversation.respond({type:'thread_reply',appId:GARY_SLACK.appId,teamId:GARY_SLACK.teamId,botUserId:GARY_SLACK.botUserId,
           requesterId:user,eventId,channel,ts,threadTs,text:event.text},sharedDelivery(key,eventId,user,channel,threadTs),cancellation.signal,conversationAvailable);
@@ -307,7 +500,9 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
         ||event.bot_id!==undefined||event.subtype!==undefined||typeof event.channel!=='string'||!/^D[A-Z0-9]{5,32}$/.test(event.channel)
         ||typeof event.text!=='string'||!event.text.trim()||event.text.length>40_000
         ||typeof event.ts!=='string'||!TIMESTAMP.test(event.ts)
-        ||(event.thread_ts!==undefined&&(typeof event.thread_ts!=='string'||!TIMESTAMP.test(event.thread_ts))))return;
+        ||(event.thread_ts!==undefined&&(typeof event.thread_ts!=='string'||!TIMESTAMP.test(event.thread_ts)))
+        ||(event.team!==undefined&&event.team!==GARY_SLACK.teamId)||(payload.context_team_id!==undefined&&payload.context_team_id!==GARY_SLACK.teamId)
+        ||(payload.is_ext_shared_channel!==undefined&&payload.is_ext_shared_channel!==false))return;
       // The existing verified ready delivery binds this exact private conversation.
       // No conversations.history/info lookup, shared channels, or other users.
       const ready=options.db.query<{slack_channel:string},[string]>("SELECT slack_channel FROM gary_slack_outbox WHERE delivery_key=? AND status='sent'").get(readyKey);
@@ -316,8 +511,9 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
       if(!live()||!identityVerified||!options.transport.socketHealthy())return;
       const eventId=payload.event_id,channel=event.channel,ts=event.ts,user=event.user,threadTs=(event.thread_ts??event.ts) as string;
       const key=`dm:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${eventId}`;
+      if(await engineeringCommand({eventId,key,user,channel,ts,threadTs,text:event.text}))return;
       if(options.conversation) {
-        if(!conversationAvailable()||options.db.query('SELECT 1 FROM gary_slack_dm_outbox WHERE delivery_key=?').get(key))return;
+        if(!conversationAdmission()||options.db.query('SELECT 1 FROM gary_slack_dm_outbox WHERE delivery_key=?').get(key))return;
         // Incoming text is passed only after every existing identity/channel/health gate.
         await options.conversation.respond({eventId,channel,ts,threadTs,text:event.text},async (text,kind='answer')=>{
           if(!conversationAvailable()||(kind!=='answer'&&kind!=='notice')||(kind==='answer'&&!options.conversation!.ready()))return 'not_sent';
@@ -341,7 +537,7 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
       if(options.db.query('SELECT 1 FROM gary_slack_shared_outbox WHERE delivery_key=?').get(key)
         ||options.db.query('SELECT 1 FROM gary_slack_outbox WHERE delivery_key=?').get(oldKey)){observe('shared_duplicate');return;}
       await refreshHealth();
-      if(!conversationAvailable()){observe('shared_health_rejected');return;}
+      if(!conversationAdmission()){observe('shared_health_rejected');return;}
       observe('shared_dispatch');
       await options.sharedConversation.respond({type:'app_mention',appId:GARY_SLACK.appId,teamId:GARY_SLACK.teamId,botUserId:GARY_SLACK.botUserId,
         requesterId:user,eventId,channel,ts,threadTs,text:event.text},sharedDelivery(key,eventId,user,channel,threadTs),cancellation.signal,conversationAvailable);
@@ -388,5 +584,5 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
       if(transportFailed)throw new Error('slack_service_stop_failed');
     })();return stopPromise;
   }
-  return {start,stop,refreshHealth,get health(){return snapshot();}};
+  return {start,stop,refreshHealth,deliverEngineeringReceipt,get health(){return snapshot();}};
 }

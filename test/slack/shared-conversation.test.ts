@@ -26,6 +26,44 @@ function fixture(){
 }
 const mention=(n:number,overrides:Partial<SlackSharedConversationInput>={}):SlackSharedConversationInput=>({type:'app_mention',appId:POLICY.appId,teamId:POLICY.teamId,botUserId:POLICY.botUserId,
   requesterId:'U0MEMBER11',eventId:'EvShared'+n,channel:'C0CHANNEL1',ts:'1791417600.'+String(n).padStart(6,'0'),threadTs:'1791417600.'+String(n).padStart(6,'0'),text:`<@${POLICY.botUserId}> fabricated channel phrase`,...overrides});
+test('known owned reservation preserves joined-thread routing and queues mentions/replies until actual settlement',async()=>{
+  const f=fixture(),turns:DMTurn[]=[],messages:string[]=[];let release!:()=>void,entered!:()=>void;
+  const gate=new Promise<void>(r=>release=r),started=new Promise<void>(r=>entered=r);
+  const transport=f.ledger.guardedFetch('deepseek',(async(_request:RequestInfo|URL,_init?:RequestInit)=>{
+    if(turns.length===1){entered();await gate;}
+    return Response.json({id:'msg_shared_queue',type:'message',role:'assistant',model:'deepseek-v4-pro',content:[{type:'text',text:'fixture'}],stop_reason:'end_turn',
+      usage:{input_tokens:30,output_tokens:5,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+  }) as typeof fetch);
+  const shared=createSlackSharedConversation({...f,reply:async turn=>{
+    turns.push(turn);await f.ledger.withSpendScope(f.config.allocationId,()=>transport(new Request('https://api.deepseek.com/anthropic/v1/messages',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer offline-fixture'},
+      body:JSON.stringify({model:'deepseek-v4-pro',max_tokens:4096,messages:[{role:'user',content:'synthetic shared fixture'}]})})));return 'answer '+turns.length;
+  }});
+  const deliver=async(text:string,kind?:'answer'|'notice')=>{messages.push(kind+':'+text);return 'sent' as const;};
+  const root=mention(1),first=shared.respond(root,deliver,signal);await started;
+  expect(shared.ready()).toBe(false);expect(shared.joined(root.channel,root.ts)).toBe(true);expect(shared.joined('C0CHANNEL2',root.ts)).toBe(false);
+  const second=shared.respond(mention(2,{threadTs:root.ts}),deliver,signal);
+  const third=shared.respond(mention(3,{type:'thread_reply',threadTs:root.ts,text:'a plain authorized follow-up'}),deliver,signal);
+  await new Promise(resolve=>setImmediate(resolve));
+  const db=new Database(join(f.dir,'shared-context.sqlite'));
+  expect(db.query('SELECT state FROM events ORDER BY rowid').all()).toEqual([{state:'running'},{state:'queued'},{state:'queued'}]);expect(messages).toEqual([]);expect(turns).toHaveLength(1);
+  release();await Promise.all([first,second,third]);expect(turns).toHaveLength(3);expect(turns[1]!.history).toHaveLength(2);expect(turns[2]!.history).toHaveLength(4);
+  expect(messages.map(text=>text.split(':')[0])).toEqual(['answer','answer','answer']);expect(f.ledger.status(f.config.allocationId)?.attemptCount).toBe(3);expect(f.ledger.unresolvedAttempts(f.config.allocationId)).toEqual([]);
+  expect(shared.ready()).toBe(true);db.close();expect(shared.close()).toEqual({drained:true});
+});
+
+test('unowned shared reserved/unknown attempts do not mark existing threads joined or admit more paid work',async()=>{
+  const f=fixture();let calls=0,release!:()=>void,entered!:()=>void;
+  const gate=new Promise<void>(r=>release=r),started=new Promise<void>(r=>entered=r);
+  const shared=createSlackSharedConversation({...f,reply:async()=>{calls++;return 'confirmed';}});
+  const root=mention(1);await shared.respond(root,sent,signal);
+  const transport=f.ledger.guardedFetch('deepseek',(async(_request:RequestInfo|URL,_init?:RequestInit):Promise<Response>=>{entered();await gate;throw new Error('synthetic uncertain foreign request');}) as typeof fetch);
+  const foreign=f.ledger.withSpendScope(f.config.allocationId,()=>transport(new Request('https://api.deepseek.com/anthropic/v1/messages',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer offline-fixture'},
+    body:JSON.stringify({model:'deepseek-v4-pro',max_tokens:4096,messages:[{role:'user',content:'synthetic foreign fixture'}]})}))).catch(()=>{});
+  await started;expect(shared.joined(root.channel,root.ts)).toBe(false);
+  await shared.respond(mention(2,{threadTs:root.ts}),sent,signal);expect(calls).toBe(1);
+  release();await foreign;expect(f.ledger.unresolvedAttempts(f.config.allocationId)[0]?.state).toBe('unknown');expect(shared.joined(root.channel,root.ts)).toBe(false);
+  await shared.respond(mention(3,{type:'thread_reply',threadTs:root.ts,text:'plain follow-up'}),sent,signal);expect(calls).toBe(1);shared.close();
+});
 test('strict config binds exact workspace/app/bot/trigger and private file independently of DM config',()=>{
   const f=fixture();expect(fingerprintSlackSharedConversationConfig(f.config)).toMatch(/^[a-f0-9]{64}$/);
   for(const value of [{...f.raw,teamId:'TFOREIGN'},{...f.raw,trigger:'ambient'},{...f.raw,dmContext:'/private/dm'}, {...f.raw,allocationId:'local:hermes-dm-20261008-tanner'}]){
