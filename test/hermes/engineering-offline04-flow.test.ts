@@ -18,6 +18,8 @@ import { createEngineeringStdioLauncher } from '../../src/hermes/engineering-nat
 import type { EngineeringCommandRunner } from '../../src/executors/engineering-session.ts';
 import { createSqliteEngineeringSessionJournal } from '../../src/executors/engineering-session-journal.ts';
 import { admitFixtureCommand, startOwnedFixtureCommand } from './fixtures/offline04-command-runner.ts';
+import { createEngineeringContinuation04Fixture } from './fixtures/engineering-continuation04.ts';
+import { admitEngineeringContinuation, assertEngineeringContinuationBudget } from '../../src/hermes/engineering-continuation-budget.ts';
 import { readEngineeringDiagnostics } from '../../src/hermes/engineering-diagnostics.ts';
 
 const NATIVE = '/Users/tanner/Documents/Codex/2026-10-07/task-4/gary-hermes-runtime/vendor/hermes';
@@ -44,7 +46,7 @@ function provider(content: Json[], reason = 'tool_use') {
   return { id: 'offline-fixture-response', type: 'message', role: 'assistant', model: 'deepseek-v4-pro', content, stop_reason: reason,
     usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } };
 }
-type ReplayMode = 'no-edit' | 'corrected' | 'repeated-read' | 'same-batch';
+type ReplayMode = 'no-edit' | 'corrected' | 'repeated-read' | 'same-batch' | 'practical-policy';
 function harness(mode: ReplayMode) {
   expect(sha(BASE_SOURCE)).toBe('4eaf107ec9675930c385f5a9ee853bb3c50a30cee70d101956e88bc84fca1b3c');
   // All paths are beneath the checked-out test tree, never any live Gary root.
@@ -70,8 +72,14 @@ function harness(mode: ReplayMode) {
   git(author,['add','.']); git(author,['commit','-qm','synthetic baseline with exact admitted parser bytes']);
   const base = git(author,['rev-parse','HEAD']);
   git(author,['bundle','create',path('baseline.bundle'),'HEAD']);
-  const ledger = new SpendLedger(path('spend.sqlite')); ledger.createCampaign('fixture',5.65); ledger.enrollTicket('fixture','allocation',5.65);
-  const spendDb = new Database(path('spend.sqlite'),{readonly:true}), db = new Database(path('engineering.sqlite'));
+  const continuation = mode === 'practical-policy' ? createEngineeringContinuation04Fixture() : undefined;
+  if (continuation) admitEngineeringContinuation({ ...continuation.o, apply:true });
+  const baseline = continuation ? assertEngineeringContinuationBudget(continuation.o) : undefined;
+  const ledger = continuation?.ledger ?? new SpendLedger(path('spend.sqlite'));
+  if (!continuation) { ledger.createCampaign('fixture',5.65); ledger.enrollTicket('fixture','allocation',5.65); }
+  const allocationId = continuation?.o.allocationId ?? 'allocation', campaignId = continuation?.o.campaignId ?? 'fixture';
+  const spendDb = continuation?.spend ?? new Database(path('spend.sqlite'),{readonly:true}), db = new Database(continuation?.journalPath ?? path('engineering.sqlite'));
+  const previousPrefix = JSON.stringify(spendDb.query('SELECT * FROM spend_attempts WHERE id <= 152 ORDER BY id').all());
   const journal = createSqliteEngineeringSessionJournal(db), requests: Json[] = [], commands: Json[] = [], events:string[] = [], fences:string[] = [];
   const containers = new Map<string,{root:string; live:boolean; labels:Json}>();
   const owned = new Map<string, Array<ReturnType<typeof startOwnedFixtureCommand>>>();
@@ -113,11 +121,11 @@ function harness(mode: ReplayMode) {
   };
   const authority={authenticated:true as const,requesterId:'U0A9M5W16F8',teamId:'T0AA24R7VUZ',surface:'private_dm' as const,channelId:'D123456789',threadTs:'1234567890.000001'};
   const repo=resolveEngineeringRepository('fixture',authority,[{repositoryId:1,installationId:2,fullName:'707-Labs/fixture',appAccessible:true,contents:'write',pullRequests:'write',archived:false,disabled:false,sharedChannelIds:[]}]);
-  const policy=createEngineeringTaskPolicy({taskId:'offline04',repository:repo,baseCommit:base,allowedFiles:[TEST,PARSER],requiredCommands:[CHECK],publication:'patch_only'});
-  const task:EngineeringTaskView={taskId:'offline04',spec:{taskId:'offline04',requestId:'request',grantId:'grant',scope:{teamId:authority.teamId,surface:'private_dm',audienceId:authority.requesterId,projectId:'707-labs:fixture'},repositoryId:'1',repository:repo.repo,baseCommit:base,policyHash:policy.fingerprint,allocationId:'allocation',deadlineMs:Date.now()+90000},scopeKey:'fixture',state:'running',ownerEpoch:'owner',sessionId:'session',cleanupConfirmed:false,updatedAtMs:Date.now(),workerState:'not_observed'};
-  const config:EngineeringRuntimeConfig={version:1,grantId:'grant',allocationId:'allocation',campaignId:'fixture',root:state,workspacesRoot:root,repository:repo.repo,baseBranch:'main',baseCommit:base,allowedFiles:[TEST,PARSER],requiredCommands:[CHECK],deadlineMs:1800000,workerImage:'sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab',executorImage:'sha256:0efb49a8f21794948395f7bec2c15557a78473acd760207613fe7714e7c47f8c',bunCacheVolume:'unused-fixture',dockerExecutable:'/usr/local/bin/docker',dockerSocketPath:'/Users/tanner/.colima/default/docker.sock',runtimeFiles:[],sourceRevision:'b'.repeat(40),publication:'patch_only',capMicros:5650000,budget:{aggregatePath:path('aggregate.json'),auditDir:path('audit'),runId:'grant'},resourceLock:{path:'/private/tmp/apple-release-xcode.lock',dev:1,ino:2,uid:501,mode:0o644,nlink:1,bootSessionUUID:'02D97A38-83D2-457D-967F-A01481D5EEFC',apfsVolumeUUID:'7CD7DC2C-1F22-4B7C-BB7A-525D8FF5B697'}};
+  const policy=createEngineeringTaskPolicy({taskId:'offline04',repository:repo,baseCommit:base,allowedFiles:[TEST,PARSER],requiredCommands:[CHECK],publication:'patch_only', ...(mode==='practical-policy'?{acceptancePolicyVersion:2 as const}:{})});
+  const task:EngineeringTaskView={taskId:'offline04',spec:{taskId:'offline04',requestId:'request',grantId:'grant',scope:{teamId:authority.teamId,surface:'private_dm',audienceId:authority.requesterId,projectId:'707-labs:fixture'},repositoryId:'1',repository:repo.repo,baseCommit:base,policyHash:policy.fingerprint,allocationId,deadlineMs:Date.now()+90000},scopeKey:'fixture',state:'running',ownerEpoch:'owner',sessionId:'session',cleanupConfirmed:false,updatedAtMs:Date.now(),workerState:'not_observed'};
+  const config:EngineeringRuntimeConfig={version:1,grantId:'grant',allocationId,campaignId,root:state,workspacesRoot:root,repository:repo.repo,baseBranch:'main',baseCommit:base,allowedFiles:[TEST,PARSER],requiredCommands:[CHECK],deadlineMs:1800000,workerImage:'sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab',executorImage:'sha256:0efb49a8f21794948395f7bec2c15557a78473acd760207613fe7714e7c47f8c',bunCacheVolume:'unused-fixture',dockerExecutable:'/usr/local/bin/docker',dockerSocketPath:'/Users/tanner/.colima/default/docker.sock',runtimeFiles:[],sourceRevision:'b'.repeat(40),publication:'patch_only',capMicros:5650000,budget:{aggregatePath:path('aggregate.json'),auditDir:path('audit'),runId:'grant'},resourceLock:{path:'/private/tmp/apple-release-xcode.lock',dev:1,ino:2,uid:501,mode:0o644,nlink:1,bootSessionUUID:'02D97A38-83D2-457D-967F-A01481D5EEFC',apfsVolumeUUID:'7CD7DC2C-1F22-4B7C-BB7A-525D8FF5B697'}};
   const options:EngineeringExecutionOptions={task,config,policy,workspaceRoot:author,artifactsRoot:artifacts,snapshotDirectory:path('snapshots'),journalDb:db,spendDb,ledger,
-    tools:JSON.parse(readFileSync(resolve('hermes/engineering-tools.json'),'utf8')),providerApiKey:'offline-fixture-no-secret',session:{image:config.executorImage,runner,journal,resourceProfile:{cpus:2,memoryMiB:4096}},
+    tools:JSON.parse(readFileSync(resolve('hermes/engineering-tools.json'),'utf8')),providerApiKey:'offline-fixture-no-secret',...(baseline?{continuationBaseline:baseline}:{}),session:{image:config.executorImage,runner,journal,resourceProfile:{cpus:2,memoryMiB:4096}},
     assertOwner(){},fence(reason){fences.push(reason);},
     async acquireLease(){leaseHeld=true;return {signal:new AbortController().signal,assertHeld(){expect(leaseHeld).toBe(true);},async release(){expect(nativeClosed).toBe(true);expect([...containers.values()].some(c=>c.live)).toBe(false);leaseHeld=false;events.push('lease-released');}};},
     async prepareVerifier(){expect(nativeClosed).toBe(true);expect([...containers.values()].some(c=>c.live)).toBe(false);
@@ -129,8 +137,12 @@ function harness(mode: ReplayMode) {
       if(body.max_tokens===4090){review++;expect(nativeClosed).toBe(true);expect([...containers.values()].some(c=>c.live)).toBe(false);
         const evidence=JSON.parse(body.messages[0].content[0].text);expect(evidence.patch).toContain("parsed.hostname !== 'scryfall.com'");expect(evidence.tests).toHaveLength(1);expect(evidence.tests[0].exitCode).toBe(0);
         return Response.json(provider([{type:'text',text:JSON.stringify({verdict:'approved',blockingFindings:[]})}],'end_turn'));}
-      work++; expect(work).toBeLessThanOrEqual(3);
-      const batches: Array<Array<[string,Json]>> = (mode==='corrected'||mode==='same-batch') ? [
+      work++; expect(work).toBeLessThanOrEqual(policy.acceptance.work.maxRequests);
+      const batches: Array<Array<[string,Json]>> = mode==='practical-policy' ? [
+        [['read_file',{path:'CLAUDE.md'}]], [['read_file',{path:PARSER}]], [['read_file',{path:TEST}]],
+        [['write_file',{path:TEST,content:TEST_SOURCE}]], [['terminal',{command:CHECK}]],
+        [['patch',{mode:'patch',patch:PATCH}]], [['terminal',{command:CHECK}]], [],
+      ] : (mode==='corrected'||mode==='same-batch') ? [
         [['read_file',{path:'CLAUDE.md'}],['read_file',{path:PARSER}]],
         [['write_file',{path:TEST,content:TEST_SOURCE}],['terminal',{command:CHECK}],['patch',{mode:'patch',patch:PATCH}],...(mode==='same-batch'?[['terminal',{command:CHECK}] as [string,Json]]:[])],
         mode==='same-batch'?[]:[['terminal',{command:CHECK}]],
@@ -148,7 +160,7 @@ function harness(mode: ReplayMode) {
   const execution=createEngineeringExecution(options);
   const wire=()=>readFileSync(path('native-wire.jsonl'),'utf8').trim().split('\n').map(line=>JSON.parse(line) as Json);
   return {root,author,verifier,artifacts,requests,commands,events,fences,ledger,db,execution,wire,
-    counts:()=>({work,review}),async cleanup(){
+    allocationId,policy,baseline,counts:()=>({work,review}),async cleanup(){
       const evidence:Json={synthetic:true,historicalAcceptanceReplay:false,baseCommit:base,parserBaselineSha256:sha(BASE_SOURCE)};
       try {
         Object.assign(evidence,{wire:existsSync(path('native-wire.jsonl'))?readFileSync(path('native-wire.jsonl'),'utf8'):null,requests,commands,
@@ -158,7 +170,8 @@ function harness(mode: ReplayMode) {
       } finally {
         await execution.cleanup();expect(leaseHeld).toBe(false);
         expect(nativeClosed).toBe(true);expect([...containers.values()].some(c=>c.live)).toBe(false);
-        db.close();spendDb.close();ledger.close();rmSync(root,{recursive:true,force:true});
+        if(continuation)expect(JSON.stringify(spendDb.query('SELECT * FROM spend_attempts WHERE id <= 152 ORDER BY id').all())).toBe(previousPrefix);
+        db.close();if(continuation)continuation.dispose();else{spendDb.close();ledger.close();}rmSync(root,{recursive:true,force:true});
         evidence.cleanup={nativeClosed,syntheticContainersAbsent:true,syntheticLeaseReleased:!leaseHeld,temporaryFilesRemoved:!existsSync(root)};
         if(CAPTURE_DIR)writeFileSync(join(CAPTURE_DIR,'offline04-'+mode+'-capture.json'),JSON.stringify(evidence,null,2),{mode:0o600,flag:'wx'});
       }
@@ -183,10 +196,16 @@ for (const mode of ['no-edit','repeated-read'] as const) test.skipIf(!available)
     }
   }finally{await f.cleanup();}
 },100000);
-for (const mode of ['corrected','same-batch'] as const) test.skipIf(!available)(`offline04 ${mode}: actual native writes/red/patch/green reach fresh-verifier artifact and separately settled review`,async()=>{
+for (const mode of ['corrected','same-batch','practical-policy'] as const) test.skipIf(!available)(`offline04 ${mode}: actual native writes/red/patch/green reach fresh-verifier artifact and separately settled review`,async()=>{
   const f=harness(mode);try{
     const result=await f.execution.run('Offline fixture: repair hostname boundary.',new AbortController().signal);expect(result.completed).toBe(true);
-    expect(f.counts()).toEqual({work:3,review:1});
+    const workCount=mode==='practical-policy'?8:3;
+    expect(f.counts()).toEqual({work:workCount,review:1});
+    if(mode==='practical-policy'){
+      expect(f.policy.acceptance.version).toBe(2);expect(f.policy.acceptance.work.maxRequests).toBe(12);
+      expect(f.baseline).toMatchObject({baselineAttemptCount:6,baselineChargedMicros:232012});
+      expect(f.requests.filter(r=>r.max_tokens===8192)).toHaveLength(8);
+    }
     const checks=f.commands.filter(c=>c.command.includes(CHECK));
     expect(checks.map(c=>[c.phase,c.exitCode])).toEqual([['author',1],['author',0],['verifier',0]]);
     expect(checks[0]!.output).toContain('rejects prefixed attacker hostname');
@@ -195,12 +214,12 @@ for (const mode of ['corrected','same-batch'] as const) test.skipIf(!available)(
       expect(begins).toHaveLength(6);expect(begins.filter(x=>x.toolName==='terminal').map(x=>[x.toolCallId,x.originalArgs.command])).toEqual([['call-2-1',CHECK],['call-2-3',CHECK]]);
     }
     const artifact=JSON.parse(readFileSync(join(f.artifacts,'artifact.json'),'utf8'));
-    expect(artifact.changedFiles).toEqual([TEST,PARSER]);expect(artifact.nativeReportedCompleted).toBe(mode==='same-batch');expect(artifact.publication).toBe('disabled');
+    expect(artifact.changedFiles).toEqual([TEST,PARSER]);expect(artifact.nativeReportedCompleted).toBe(mode!=='corrected');expect(artifact.publication).toBe('disabled');
     expect(artifact.tests).toHaveLength(1);expect(artifact.review).toEqual({verdict:'approved',blockingFindings:[]});
-    expect(artifact.requests.map((r:Json)=>[r.role,r.state])).toEqual([['work','settled'],['work','settled'],['work','settled'],['review','settled']]);
+    expect(artifact.requests.map((r:Json)=>[r.role,r.state])).toEqual([...Array.from({length:workCount},()=>['work','settled']),['review','settled']]);
     expect(sha(readFileSync(join(f.artifacts,'patch.diff')))).toBe(artifact.patchSha256);
     const captured=JSON.parse(readFileSync(join(f.artifacts,'source-files.json'),'utf8'));expect(captured.hash).toBe(artifact.capturedFilesHash);
     for(const file of captured.files){expect(file.kind).toBe('file');expect(sha(Buffer.from(file.base64,'base64'))).toBe(file.sha256);expect(readFileSync(join(f.verifier,file.path),'base64')).toBe(file.base64);}
-    expect(f.fences).toEqual([]);expect(f.ledger.status('allocation')?.attemptCount).toBe(4);
+    expect(f.fences).toEqual([]);expect(f.ledger.status(f.allocationId)?.attemptCount).toBe(workCount+1+(mode==='practical-policy'?6:0));
   }finally{await f.cleanup();}
 },100000);

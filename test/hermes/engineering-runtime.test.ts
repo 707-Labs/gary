@@ -13,7 +13,9 @@ import { SpendLedger } from '../../src/spend.ts';
 import { createEngineeringRuntime, type EngineeringRuntimeOptions } from '../../src/hermes/engineering-runtime.ts';
 import type { EngineeringRuntimeConfig } from '../../src/hermes/engineering-config.ts';
 import type { EngineeringExecutionOptions } from '../../src/hermes/engineering-execution.ts';
-import type { EngineeringContinuationBaseline, EngineeringContinuationConfig } from '../../src/hermes/engineering-continuation-budget.ts';
+import { admitEngineeringContinuation, assertEngineeringContinuationBaseline, assertEngineeringContinuationBudget, type EngineeringContinuationBaseline, type EngineeringContinuationConfig } from '../../src/hermes/engineering-continuation-budget.ts';
+import { ENGINEERING_ACCEPTANCE_POLICY, ENGINEERING_ACCEPTANCE_POLICY_V2, engineeringAcceptancePolicySha256, assertEngineeringRequestAllowed } from '../../src/hermes/engineering-policy.ts';
+import { createEngineeringContinuation04Fixture } from './fixtures/engineering-continuation04.ts';
 import type { EngineeringIngressRequest, EngineeringReceipt } from '../../src/slack/service.ts';
 const CURRENT_RESOURCE_LOCK = Object.freeze({ path: '/private/tmp/apple-release-xcode.lock', dev: 16777232, ino: 176033673, uid: 501, mode: 0o644, nlink: 1,
   bootSessionUUID: '02D97A38-83D2-457D-967F-A01481D5EEFC', apfsVolumeUUID: '7CD7DC2C-1F22-4B7C-BB7A-525D8FF5B697' });
@@ -22,15 +24,16 @@ afterEach(() => cleanups.splice(0).reverse().forEach(fn => fn()));
 const request: EngineeringIngressRequest = { requestId: 'request', eventId: 'event', eventKey: 'event-key', messageKey: 'message',
   authority: { authenticated: true, requesterId: 'U0A9M5W16F8', teamId: 'T0AA24R7VUZ', surface: 'private_dm', channelId: 'D0C7EJELQJX', threadTs: '1234.1234' },
   repository: '707-Labs/fixture', task: 'Make the scoped edit and test it.' };
-function fixture() {
-  const fixtureRoot = realpathSync(mkdtempSync(join(tmpdir(), 'engineering-runtime-'))); chmodSync(fixtureRoot, 0o700);
-  const root=join(fixtureRoot,'state'),workspacesRoot=join(fixtureRoot,'workspaces');mkdirSync(root,{mode:0o700});mkdirSync(workspacesRoot,{mode:0o700});
-  const journalPath = join(root, 'engineering.sqlite'); writeFileSync(journalPath, '', { mode: 0o600 });
+function fixture(continuation?: ReturnType<typeof createEngineeringContinuation04Fixture>) {
+  const fixtureRoot = continuation?.root ?? realpathSync(mkdtempSync(join(tmpdir(), 'engineering-runtime-'))); chmodSync(fixtureRoot, 0o700);
+  const root=continuation?.o.root??join(fixtureRoot,'state'),workspacesRoot=continuation?.o.workspacesRoot??join(fixtureRoot,'workspaces');
+  if(!continuation){mkdirSync(root,{mode:0o700});mkdirSync(workspacesRoot,{mode:0o700});}
+  const journalPath = join(root, 'engineering.sqlite'); if(!continuation)writeFileSync(journalPath, '', { mode: 0o600 });
   const db = new Database(journalPath); db.exec('PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;');
-  const ledger = new SpendLedger(join(root, 'spend.sqlite'));
-  ledger.createCampaign('campaign', 5.65); ledger.enrollTicket('campaign', 'allocation', 5.65);
-  const spendDb = new Database(join(root, 'spend.sqlite'), { readonly: true });
-  cleanups.push(() => { db.close(); spendDb.close(); ledger.close(); rmSync(fixtureRoot, { recursive: true, force: true }); });
+  const ledger = continuation?.ledger??new SpendLedger(join(root, 'spend.sqlite'));
+  if(!continuation){ledger.createCampaign('campaign', 5.65);ledger.enrollTicket('campaign', 'allocation', 5.65);}
+  const spendDb = continuation?.spend??new Database(join(root, 'spend.sqlite'), { readonly: true });
+  cleanups.push(() => { db.close();if(continuation)continuation.dispose();else{spendDb.close();ledger.close();rmSync(fixtureRoot,{recursive:true,force:true});} });
   let resourceObserved: EngineeringResourceLockBinding = { ...CURRENT_RESOURCE_LOCK };
   let resourceBoot: { bootSessionUUID: string; apfsVolumeUUID: string } = { bootSessionUUID: CURRENT_RESOURCE_LOCK.bootSessionUUID, apfsVolumeUUID: CURRENT_RESOURCE_LOCK.apfsVolumeUUID };
   let resourceObservations = 0, providerCalls = 0;
@@ -38,13 +41,15 @@ function fixture() {
     lstat(path) { expect(path).toBe(CURRENT_RESOURCE_LOCK.path); resourceObservations++; return { ...resourceObserved, isFile: () => true, isSymbolicLink: () => false }; },
     realpath(path) { expect(path).toBe(CURRENT_RESOURCE_LOCK.path); return path; },
   };
-  const config: EngineeringRuntimeConfig = { resourceLock: { ...CURRENT_RESOURCE_LOCK }, version: 1, grantId: 'grant', allocationId: 'allocation', campaignId: 'campaign', root, workspacesRoot,
+  const config: EngineeringRuntimeConfig = { resourceLock: { ...CURRENT_RESOURCE_LOCK }, version: 1, grantId: continuation?.o.grantId??'grant', allocationId: continuation?.o.allocationId??'allocation', campaignId: continuation?.o.campaignId??'campaign', root, workspacesRoot,
     repository: request.repository, baseBranch: 'main', baseCommit: 'a'.repeat(40), allowedFiles: ['src/fixture.ts'], requiredCommands: ['bun test test/fixture.test.ts'],
     deadlineMs: 1800000, workerImage: 'sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab',
     executorImage: 'sha256:0efb49a8f21794948395f7bec2c15557a78473acd760207613fe7714e7c47f8c', bunCacheVolume: 'gary-bun-cache-20261010-mulligan-4bb2fdde-v2',
     dockerExecutable: '/usr/local/bin/docker', dockerSocketPath: '/Users/tanner/.colima/default/docker.sock', runtimeFiles: [],
     sourceRevision: 'b'.repeat(40), publication: 'patch_only', capMicros: 5650000,
-    budget: { aggregatePath: join(root, 'aggregate.json'), auditDir: join(root, 'budget-admission'), runId: 'grant' } };
+    budget: continuation?{aggregatePath:continuation.o.aggregatePath,auditDir:continuation.o.auditDir,runId:continuation.o.runId,continuation:continuation.o.continuation}
+      :{ aggregatePath: join(root, 'aggregate.json'), auditDir: join(root, 'budget-admission'), runId: 'grant' },
+    ...(continuation?{acceptancePolicyVersion:2 as const}:{}) };
   const gitCalls: { cwd: string; args: readonly string[]; authenticated: boolean }[] = [];
   const delivered: EngineeringReceipt[] = [], executions: EngineeringExecutionOptions[] = [];
   let deliveredResolve!: () => void; const finished = new Promise<void>(resolve => { deliveredResolve = resolve; });
@@ -59,7 +64,7 @@ function fixture() {
     }, async getCredential() { return { kind: 'app', appId: 1, installationId: 2, accountLogin: '707-Labs', token: 'host-only-fake-token-'.replaceAll('-', '_').repeat(3), issuedAtMs: now(), expiresAtMs: now() + 60000, permissions: { contents: 'write', pullRequests: 'write' } }; } },
     providerApiKey: 'fake-model-secret', async fetch() { providerCalls++; throw Error('unexpected paid request'); },
     assertGrant() { if (revoked) throw Error('revoked'); }, assertRuntime() {},
-    assertBudget() { const s = ledger.status('allocation'); if (s?.attemptCount !== 0 || s.capMicros !== 5650000) throw Error('budget unavailable'); },
+    assertBudget() { const s = ledger.status(config.allocationId); if (s?.attemptCount !== (continuation?6:0) || s.capMicros !== 5650000 || (continuation&&s.chargedMicros!==232012)) throw Error('budget unavailable'); },
     async deliver(value) { delivered.push(value); deliveredResolve(); },
     dependencies: {
       resourceBinding: { inspection, observeBoot() { return { ...resourceBoot }; } },
@@ -127,6 +132,7 @@ test('exact standalone author and verifier clones, durable ack then bounded exec
   const e = f.executions[0]!;
   expect(e.policy.allowedFiles).toEqual(f.config.allowedFiles); expect(e.policy.requiredCommands).toEqual(f.config.requiredCommands);
   expect(e.policy.publication).toBe('patch_only'); expect(e.task.spec.policyHash).toBe(e.policy.fingerprint);
+  expect(e.policy.acceptance).toBe(ENGINEERING_ACCEPTANCE_POLICY);expect(e.policy.acceptance).toMatchObject({version:1,maxPhysicalRequests:4,work:{maxRequests:3,maxTokens:8192},review:{maxRequests:1,maxTokens:4090}});
   expect(e.session.resourceProfile).toEqual({ cpus: 2, memoryMiB: 4096 });
   expect(e.session.guardian).toBeDefined(); expect(e.session.journal).toBeDefined();
   expect(e.config.sourceRevision).toBe(f.config.sourceRevision); expect(Object.isFrozen(e.tools)).toBe(true);
@@ -221,6 +227,43 @@ test('continuation baseline is required with its configuration and passed unchan
   runtime.ingress.start!(ack); await f.finished;
   expect(f.executions).toHaveLength(1); expect(f.executions[0]!.continuationBaseline).toBe(baseline);
   expect(f.ledger.status('allocation')?.attemptCount).toBe(0); await runtime.stop();
+});
+
+/** Runtime and ingress are real. Execution and OS dependencies remain controlled
+ * here; native/model/reservation integration is covered by separate fixtures. */
+test('explicit v2 reaches admitted task and execution with a genuine six-row continuation baseline',async()=>{
+  const chain=createEngineeringContinuation04Fixture(),f=fixture(chain),before=chain.logical();
+  admitEngineeringContinuation({...chain.o,apply:true});
+  const baseline=assertEngineeringContinuationBudget(chain.o,{requireUnused:true});
+  f.options.continuationBaseline=baseline;
+  const runtime=createEngineeringRuntime(f.options);
+  const ack=await runtime.ingress.admit(request,signal(),()=>true) as EngineeringReceipt;
+  expect(ack.phase).toBe('admitted');expect(runtime.ingress.verifyReceipt(ack)).toBe(true);
+  expect(f.executions).toHaveLength(0);
+  const prepared=f.db.query('SELECT policy_hash,launch_state FROM engineering_runtime_runs').get() as {policy_hash:string;launch_state:string};
+  expect(prepared.launch_state).toBe('prepared');
+  runtime.ingress.start!(ack);await f.finished;
+  expect(f.executions).toHaveLength(1);expect(f.delivered[0]?.status).toBe('completed');
+  const e=f.executions[0]!;
+  expect(()=>assertEngineeringRequestAllowed(e.policy,{requestId:'synthetic-eligibility',role:'work',maxTokens:8192},{attempts:[],allocationActive:true,taskRemainingMicros:5417988,campaignRemainingMicros:5417988,unresolvedAttempts:0})).not.toThrow();
+  expect(e.policy.acceptance).toBe(ENGINEERING_ACCEPTANCE_POLICY_V2);
+  expect(e.policy.acceptance).toMatchObject({version:2,maxPhysicalRequests:13,work:{maxRequests:12,maxTokens:8192},review:{maxRequests:1,maxTokens:4090}});
+  expect(e.policy.fingerprint).toBe(prepared.policy_hash);expect(e.task.spec.policyHash).toBe(e.policy.fingerprint);
+  expect(e.task.spec.grantId).toBe(chain.o.grantId);expect(e.task.spec.allocationId).toBe(chain.o.allocationId);
+  expect(e.config.acceptancePolicyVersion).toBe(2);expect(e.policy.allowedFiles).toEqual(f.config.allowedFiles);
+  expect(e.policy.requiredCommands).toEqual(f.config.requiredCommands);expect(e.policy.publication).toBe('patch_only');
+  expect(e.continuationBaseline).toBe(baseline);expect(baseline.budgetPolicySha256).toBe(engineeringAcceptancePolicySha256(2));
+  assertEngineeringContinuationBaseline(baseline,e.spendDb,e.journalDb,chain.o.allocationId);
+  expect(e.ledger).toBe(chain.ledger);expect(e.spendDb).toBe(chain.spend);expect(e.journalDb.filename).toBe(chain.journalPath);
+  expect(chain.ledger.status(chain.o.allocationId)).toMatchObject({attemptCount:6,chargedMicros:232012,remainingMicros:5417988,unknownAttempts:0});
+  expect(chain.logical()).toBe(before);expect(f.providerCalls()).toBe(0);
+  expect(f.counts()).toMatchObject({leaseCount:1,releaseCount:1,cleanupCount:1});
+  expect(f.db.query('SELECT launch_state FROM engineering_runtime_runs').get()).toEqual({launch_state:'closed'});
+  await runtime.stop();
+  chain.close();chain.close();
+  const retained=new Database(chain.o.ledgerPath,{readonly:true});
+  try{expect(retained.query('SELECT count(*) n FROM spend_attempts').get()).toEqual({n:6});}finally{retained.close();}
+  expect(readFileSync(chain.o.continuation.receiptPath,'utf8')).toContain('engineering_budget_continuation');
 });
 
 /** Only the holder process boundary is controlled: runtime composition, binding

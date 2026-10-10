@@ -59,6 +59,61 @@ test('schema mismatch cleans up before reporting failure', async () => {
   expect(cleaned).toBe(1); expect(s.requests).toHaveLength(0); expect(s.fences).toContain('native_start_failed');
 });
 
+test('native startup copies versioned limits from the guarded model adapter without granting a model call', async () => {
+  for (const policyVersion of [1, 2] as const) {
+    const s = modelFixture(); let cleaned = 0;
+    const limits = Object.freeze({ policyVersion, model: 'deepseek-v4-pro' as const,
+      maxIterations: policyVersion === 1 ? 3 : 12, maxTokens: 8192 });
+    const file = join(s.root, 'policy-limits.mjs');
+    // This tests only the trusted serialization seam. The synthetic v2 adapter
+    // cannot admit requests through its v1 host policy, and none are attempted.
+    writeFileSync(file, fixtureScript.replace('const binding=start.binding;',
+      `if(start.model!==${JSON.stringify(limits.model)}||start.maxIterations!==${limits.maxIterations}||start.maxTokens!==${limits.maxTokens})throw Error('limits mismatch'); const binding=start.binding;`));
+    const input = nativeInput(s), receipts: any[] = [];
+    input.model = { ...s.model, nativeLimits: limits };
+    input.append = receipt => receipts.push(receipt);
+    const session = await createEngineeringStdioLauncher({ command: [process.execPath, file], cwd: s.root,
+      env: { PATH: '/usr/bin:/bin' }, cleanup: async () => { cleaned++; } })(input, new AbortController().signal);
+    const started = receipts.find(receipt => receipt.kind === 'native_stdio_start');
+    expect(started.modelLimits).toEqual(limits);
+    expect(Number.isSafeInteger(started.processId)).toBe(true); expect(started.processId).toBeGreaterThan(1);
+    if (process.platform !== 'win32') {
+      expect(started.processGroupId).toBe(started.processId);
+      expect(started.processBirth).toMatch(/^[A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/);
+    }
+    expect(await session.close()).toEqual({ cleanupConfirmed: true });
+    expect(cleaned).toBe(1); expect(s.requests).toHaveLength(0); expect(s.model.attempts()).toHaveLength(0);
+  }
+});
+
+test('failed spawn with no owned child PID never fabricates process identity', async () => {
+  const s = modelFixture(), input = nativeInput(s), receipts: any[] = []; let cleaned = 0;
+  input.append = receipt => receipts.push(receipt);
+  const launch = createEngineeringStdioLauncher({ command: [join(s.root, 'nonexistent-executable')], cwd: s.root,
+    env: {}, cleanup: async () => { cleaned++; } });
+  await expect(launch(input, new AbortController().signal)).rejects.toThrow('startup_failed');
+  expect(receipts.some(receipt => receipt.kind === 'native_stdio_start')).toBe(false);
+  expect(receipts.some(receipt => receipt.kind === 'native_diagnostic')).toBe(true);
+  expect(cleaned).toBe(1); expect(s.requests).toHaveLength(0);
+});
+
+test('invalid or mismatched legacy native limits fail before subprocess creation', async () => {
+  const s = modelFixture(), file = join(s.root, 'must-not-start.mjs'), marker = join(s.root, 'started');
+  writeFileSync(file, `import{writeFileSync}from'node:fs';writeFileSync(${JSON.stringify(marker)},'unexpected');`);
+  let cleaned = 0;
+  const launch = createEngineeringStdioLauncher({ command: [process.execPath, file], cwd: s.root,
+    env: {}, cleanup: async () => { cleaned++; } });
+  const valid = { policyVersion: 1, model: 'deepseek-v4-pro', maxIterations: 3, maxTokens: 8192 };
+  for (const delta of [{ policyVersion: 3 }, { model: 'other' }, { maxIterations: 8 }, { maxTokens: 4096 },
+    { policyVersion: 2, maxIterations: 51 }, { policyVersion: 2, maxIterations: 0 },
+    { policyVersion: 2, maxTokens: 8193 }, { policyVersion: 2, maxTokens: 1.5 }, { extra: true }]) {
+    const input = nativeInput(s);
+    input.model = { ...s.model, nativeLimits: { ...valid, ...delta } as any };
+    await expect(launch(input, new AbortController().signal)).rejects.toThrow('model_limits');
+  }
+  expect(existsSync(marker)).toBe(false); expect(cleaned).toBe(0); expect(s.requests).toHaveLength(0);
+});
+
 test('replayed model frame is rejected and cleaned without a second physical call', async () => {
   const s = modelFixture(); let cleaned = 0;
   const file = join(s.root, 'replay.mjs');

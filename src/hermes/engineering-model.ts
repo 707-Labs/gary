@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import type { Database } from 'bun:sqlite';
 import { SpendLedger, spendReservationMicros } from '../spend.ts';
 import { createModelTransport } from './model-transport.ts';
-import { ENGINEERING_ACCEPTANCE_POLICY as LIMITS, assertEngineeringRequestAllowed,
+import { assertEngineeringRequestAllowed, engineeringAcceptancePolicySha256,
   type EngineeringTaskPolicy, type EngineeringRequestAttempt, type EngineeringRequestRole } from './engineering-policy.ts';
 import { EngineeringProtocol, type EngineeringProtocolBinding } from './engineering-protocol.ts';
 import { fingerprintJson } from './audit-trace.ts';
@@ -37,6 +37,8 @@ export interface EngineeringModelOptions {
   fence(reason: string): void;
 }
 export interface EngineeringModelAdapter {
+  /** Host-derived launcher limits; worker arguments never select a policy. */
+  readonly nativeLimits: Readonly<{ policyVersion: 1 | 2; model: 'deepseek-v4-pro'; maxIterations: number; maxTokens: number }>;
   beginTurn(turn: { turnId: string; prompt: string; history?: readonly ConversationMessage[] }): void;
   handle(body: unknown, signal: AbortSignal): Promise<{ status: number; body: Json }>;
   /** Called only AFTER EngineeringProtocol accepted the corresponding tool.end frame. */
@@ -55,6 +57,7 @@ const copy = <T>(v: T): T => { fingerprintJson(v); return structuredClone(v); };
 export function createEngineeringModelAdapter(input: EngineeringModelOptions): EngineeringModelAdapter {
   const options = { ...input, binding: Object.freeze({ ...input.binding }), tools: copy(input.tools) };
   const { binding, ledger, journalDb: db, spendDb, policy, allocationId } = options;
+  const LIMITS = policy.acceptance;
   if (!(ledger instanceof SpendLedger) || ledger.databasePath !== spendDb.filename || policy.taskId !== binding.taskId
       || hash(options.protocol.binding) !== hash(binding) || !options.systemPrompt.trim()
       || Buffer.byteLength(options.systemPrompt) > 262_144 || options.tools.length > 64) fail('configuration');
@@ -64,6 +67,12 @@ export function createEngineeringModelAdapter(input: EngineeringModelOptions): E
     return tool.function.name;
   });
   if (new Set(names).size !== names.length) fail('tool_schema');
+  const baseline = options.continuationBaseline;
+  if (LIMITS.version === 2 ? (!baseline || baseline.baselineAttemptCount !== 6
+      || baseline.baselineChargedMicros !== 232_012
+      || baseline.budgetPolicySha256 !== engineeringAcceptancePolicySha256(2))
+    : (baseline && (baseline.baselineAttemptCount !== 3 || baseline.budgetPolicySha256 !== undefined))) fail('policy_baseline_binding');
+  if (baseline) assertEngineeringContinuationBaseline(baseline, spendDb, db, allocationId);
   const ownerToken = randomUUID();
   db.exec(`PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
     CREATE TABLE IF NOT EXISTS engineering_model_owners (
@@ -74,8 +83,6 @@ export function createEngineeringModelAdapter(input: EngineeringModelOptions): E
       max_tokens INTEGER NOT NULL, state TEXT NOT NULL, request_hash TEXT NOT NULL,
       ledger_attempt INTEGER UNIQUE, receipt_hash TEXT, response_hash TEXT);`);
   if ((db.query('PRAGMA synchronous').get() as { synchronous: number }).synchronous !== 2) fail('journal_not_durable');
-  const baseline = options.continuationBaseline;
-  if (baseline) assertEngineeringContinuationBaseline(baseline, spendDb, db, allocationId);
   const baselineCount = baseline?.baselineAttemptCount ?? 0;
   const baselineCharged = baseline?.baselineChargedMicros ?? 0;
   if (baseline) db.exec('CREATE TABLE IF NOT EXISTS engineering_model_baselines(allocation_id TEXT PRIMARY KEY,receipt_hash TEXT NOT NULL,attempt_count INTEGER NOT NULL,charged_micros INTEGER NOT NULL)');
@@ -222,6 +229,8 @@ export function createEngineeringModelAdapter(input: EngineeringModelOptions): E
     pending.clear(); transcript = actual; return actual;
   }
   return {
+    nativeLimits: Object.freeze({ policyVersion: policy.acceptance.version, model: policy.acceptance.model,
+      maxIterations: policy.acceptance.work.maxRequests, maxTokens: policy.acceptance.work.maxTokens }),
     beginTurn(turn) {
       guard();
       if (busy || !completedTurn || pending.size || !turn.prompt.trim() || Buffer.byteLength(turn.prompt) > 262_144) fail('turn_not_ready');

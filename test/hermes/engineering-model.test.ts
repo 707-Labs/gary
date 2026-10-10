@@ -8,6 +8,8 @@ import { createEngineeringModelAdapter, type EngineeringModelOptions } from '../
 import { EngineeringProtocol, type EngineeringProtocolOptions } from '../../src/hermes/engineering-protocol.ts';
 import { createEngineeringTaskPolicy, resolveEngineeringRepository } from '../../src/hermes/engineering-policy.ts';
 import { fingerprintJson } from '../../src/hermes/audit-trace.ts';
+import { createEngineeringContinuation04Fixture } from './fixtures/engineering-continuation04.ts';
+import { admitEngineeringContinuation, assertEngineeringContinuationBudget } from '../../src/hermes/engineering-continuation-budget.ts';
 
 export const TOOL = { type: 'function', function: { name: 'terminal', description: 'Run foreground command.',
   parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } };
@@ -18,13 +20,20 @@ export function provider(content: unknown[] = [{ type: 'text', text: 'Done.' }],
 const cleanup: (() => void)[] = [];
 afterEach(() => { for (const fn of cleanup.splice(0)) fn(); });
 export function modelFixture(fetch?: EngineeringModelOptions['fetch'], fixture: {
-  tools?: Record<string, unknown>[]; execute?: EngineeringProtocolOptions['execute']; deadlineMs?: number;
+  tools?: Record<string, unknown>[]; execute?: EngineeringProtocolOptions['execute']; deadlineMs?: number; acceptancePolicyVersion?: 2;
 } = {}) {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'engineering-model-')));
-  const ledger = new SpendLedger(join(root, 'spend.sqlite'));
-  ledger.createCampaign('engineering-test', 5.65); ledger.enrollTicket('engineering-test', 'engineering-allocation', 5.65, { draftPr: true });
-  const spendDb = new Database(join(root, 'spend.sqlite'), { readonly: true }), journalDb = new Database(join(root, 'engineering.sqlite'));
-  cleanup.push(() => { spendDb.close(); journalDb.close(); ledger.close(); rmSync(root, { recursive: true }); });
+  const continuation = fixture.acceptancePolicyVersion === 2 ? createEngineeringContinuation04Fixture() : null;
+  const root = continuation?.root ?? realpathSync(mkdtempSync(join(tmpdir(), 'engineering-model-')));
+  const ledger = continuation?.ledger ?? new SpendLedger(join(root, 'spend.sqlite'));
+  if (!continuation) {
+    ledger.createCampaign('engineering-test', 5.65); ledger.enrollTicket('engineering-test', 'engineering-allocation', 5.65, { draftPr: true });
+  }
+  if (continuation) admitEngineeringContinuation({...continuation.o, apply:true});
+  const continuationBaseline = continuation ? assertEngineeringContinuationBudget(continuation.o) : undefined;
+  const spendDb = new Database(continuation?.o.ledgerPath ?? join(root, 'spend.sqlite'), { readonly: true }),
+    journalDb = new Database(continuation?.journalPath ?? join(root, 'engineering.sqlite'));
+  cleanup.push(() => { spendDb.close(); journalDb.close(); if(continuation) continuation.dispose();
+    else {ledger.close(); rmSync(root, { recursive: true });} });
   const binding = { taskId: 'task', sessionId: 'session', ownerEpoch: 'owner', deadlineMs: fixture.deadlineMs ?? Date.now() + 30_000 };
   const authority = { authenticated: true as const, requesterId: 'U0A9M5W16F8', teamId: 'T0AA24R7VUZ',
     surface: 'private_dm' as const, channelId: 'D123456789', threadTs: '1234567890.000001' };
@@ -32,7 +41,8 @@ export function modelFixture(fetch?: EngineeringModelOptions['fetch'], fixture: 
     fullName: '707-Labs/fixture', appAccessible: true, contents: 'write', pullRequests: 'write',
     archived: false, disabled: false, sharedChannelIds: [] }]);
   const policy = createEngineeringTaskPolicy({ taskId: 'task', repository, baseCommit: 'a'.repeat(40),
-    allowedFiles: ['file.ts'], requiredCommands: ['bun test'], publication: 'draft_pr' });
+    allowedFiles: ['file.ts'], requiredCommands: ['bun test'], publication: continuation ? 'patch_only' : 'draft_pr',
+    ...(fixture.acceptancePolicyVersion === 2 ? {acceptancePolicyVersion:2 as const} : {}) });
   const fences: string[] = [], requests: Request[] = [], protocolReceipts: unknown[] = [];
   let owner = true;
   const assertOwner = () => { if (!owner) throw new Error('revoked'); };
@@ -41,7 +51,8 @@ export function modelFixture(fetch?: EngineeringModelOptions['fetch'], fixture: 
   const protocol = new EngineeringProtocol({ binding, transportCapability: token, allowedTools: tools.map(t => (t.function as any).name),
     assertOwner, append: r => protocolReceipts.push(r), fence: r => fences.push(r),
     execute: fixture.execute ?? (async () => ({ processId: 'process', stdout: 'ok', returncode: 0 })), close: async () => ({ cleanupConfirmed: true }) });
-  const options: EngineeringModelOptions = { binding, policy, allocationId: 'engineering-allocation', ledger,
+  const options: EngineeringModelOptions = { binding, policy, allocationId: continuation?.o.allocationId ?? 'engineering-allocation', ledger,
+    ...(continuationBaseline ? {continuationBaseline} : {}),
     journalDb, spendDb, protocol, tools, systemPrompt: 'Host engineering instructions.',
     providerApiKey: 'fake-host-only-key', assertOwner, fence: r => fences.push(r), fetch: async request => {
       requests.push(request);
@@ -153,4 +164,62 @@ test('simultaneous worker model requests cannot acquire a second physical reques
   await expect(s.model.handle(s.body(), new AbortController().signal)).rejects.toThrow('concurrent_or_inactive_turn');
   release(); await first;
   expect(s.requests).toHaveLength(1); expect(s.model.attempts()).toHaveLength(1);
+});
+
+
+test('v2 twelve physical work calls and protected review settle against genuine six-row continuation without rewriting history', async () => {
+  const s=modelFixture(undefined,{acceptancePolicyVersion:2}), allocation=s.options.allocationId;
+  const prefix=s.options.spendDb.query('SELECT a.*,r.reason,r.details_json FROM spend_attempts a LEFT JOIN spend_receipts r ON r.attempt_id=a.id ORDER BY a.id').all();
+  const schema=s.options.spendDb.query("SELECT name,sql FROM sqlite_master WHERE name IN ('spend_attempts','spend_receipts') ORDER BY name").all();
+  expect(prefix).toHaveLength(6);expect(s.ledger.status(allocation)!.chargedMicros).toBe(232012);
+  expect(s.model.nativeLimits).toEqual({policyVersion:2,model:'deepseek-v4-pro',maxIterations:12,maxTokens:8192});
+  expect(Object.isFrozen(s.model.nativeLimits)).toBe(true);
+  for(let i=0;i<12;i++) {
+    s.model.beginTurn({turnId:'v2-'+i,prompt:'Work '+i});
+    expect((await s.model.handle(s.body(),new AbortController().signal)).status).toBe(200);
+    s.model.finishTurn(s.model.history());
+    const latest=s.options.spendDb.query('SELECT reserved_micros,charged_micros,state FROM spend_attempts ORDER BY id DESC LIMIT 1').get();
+    expect(latest).toEqual({reserved_micros:1416561,charged_micros:32454,state:'settled'});
+    expect(s.ledger.status(allocation)!.remainingMicros).toBeGreaterThan(1400317);
+  }
+  await s.model.review({prompt:'Review exact result.',systemPrompt:'Independent.',signal:new AbortController().signal});
+  expect(s.requests).toHaveLength(13);expect(s.model.attempts()).toHaveLength(13);
+  const final=s.ledger.status(allocation)!;
+  expect(final.attemptCount).toBe(19);expect(final.chargedMicros).toBe(232012+12*32454+16210);
+  expect(final.unknownAttempts).toBe(0);
+  expect(s.options.spendDb.query('SELECT a.*,r.reason,r.details_json FROM spend_attempts a LEFT JOIN spend_receipts r ON r.attempt_id=a.id WHERE a.id<=152 ORDER BY a.id').all()).toEqual(prefix);
+  expect(s.options.spendDb.query("SELECT name,sql FROM sqlite_master WHERE name IN ('spend_attempts','spend_receipts') ORDER BY name").all()).toEqual(schema);
+  await expect(s.model.review({prompt:'Replay',systemPrompt:'Independent.',signal:new AbortController().signal})).rejects.toThrow('review_already_completed');
+  expect(s.requests).toHaveLength(13);
+});
+
+test('v2 adapter rejects missing, copied, mismatched and legacy continuation baselines before claiming ownership', () => {
+  const legacy=modelFixture(), v2=createEngineeringTaskPolicy({taskId:legacy.options.policy.taskId,
+    repository:legacy.options.policy.repository,baseCommit:legacy.options.policy.baseCommit,
+    allowedFiles:legacy.options.policy.allowedFiles,requiredCommands:legacy.options.policy.requiredCommands,
+    publication:legacy.options.policy.publication,acceptancePolicyVersion:2});
+  expect(() => createEngineeringModelAdapter({...legacy.options,policy:v2})).toThrow('policy_baseline_binding');
+  const s=modelFixture(undefined,{acceptancePolicyVersion:2}),base=s.options.continuationBaseline!;
+  for(const change of [{baselineAttemptCount:3},{baselineChargedMicros:0},{budgetPolicySha256:'0'.repeat(64)}])
+    expect(() => createEngineeringModelAdapter({...s.options,continuationBaseline:{...base,...change} as any})).toThrow('policy_baseline_binding');
+  expect(() => createEngineeringModelAdapter({...s.options,continuationBaseline:{...base}})).toThrow('untrusted_baseline');
+  expect(() => createEngineeringModelAdapter({...s.options,policy:legacy.options.policy})).toThrow('policy_baseline_binding');
+});
+
+test('v2 worst-case physical receipts exhaust work headroom after two and unknown usage never releases a reservation', async () => {
+  const s=modelFixture(async()=>Response.json({...provider(),usage:{input_tokens:1048576,output_tokens:1,
+    cache_read_input_tokens:0,cache_creation_input_tokens:0}}),{acceptancePolicyVersion:2});
+  for(let i=0;i<2;i++) {s.model.beginTurn({turnId:'max-'+i,prompt:'Work.'});
+    await s.model.handle(s.body(),new AbortController().signal);s.model.finishTurn(s.model.history());}
+  expect(s.ledger.status(s.options.allocationId)!.remainingMicros).toBe(2584866);
+  s.model.beginTurn({turnId:'max-third',prompt:'Work.'});
+  await expect(s.model.handle(s.body(),new AbortController().signal)).rejects.toThrow('headroom');
+  expect(s.requests).toHaveLength(2);expect(s.model.attempts()).toHaveLength(2);
+  const unknown=modelFixture(async()=>Response.json({...provider(),usage:{input_tokens:10}}),{acceptancePolicyVersion:2});
+  unknown.model.beginTurn({turnId:'unknown',prompt:'Work.'});
+  await expect(unknown.model.handle(unknown.body(),new AbortController().signal)).rejects.toThrow();
+  expect(unknown.ledger.status(unknown.options.allocationId)!.chargedMicros).toBe(232012+1416561);
+  expect(unknown.ledger.status(unknown.options.allocationId)!.unknownAttempts).toBe(1);
+  await expect(unknown.model.handle(unknown.body(),new AbortController().signal)).rejects.toThrow('inactive');
+  expect(unknown.requests).toHaveLength(1);
 });

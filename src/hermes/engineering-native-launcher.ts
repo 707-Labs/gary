@@ -21,6 +21,21 @@ const object = (v: unknown): v is Json => !!v && typeof v === 'object' && !Array
 const exact = (v: Json, keys: string[]) => Object.keys(v).length === keys.length && keys.every(k => Object.hasOwn(v, k));
 function fail(reason: string): never { throw new Error('engineering_worker:' + reason); }
 const hash = (v: unknown) => fingerprintJson(v).sha256;
+async function nativeProcessIdentity(pid: number | undefined): Promise<{ processId: number; processGroupId: number | null; processBirth: string | null }> {
+  if (!Number.isSafeInteger(pid) || pid! <= 1) fail('spawn_failed');
+  // Windows has no detached POSIX process group. Production here is macOS;
+  // never imply that a Windows PID establishes a process-group identity.
+  if (process.platform === 'win32') return { processId: pid!, processGroupId: null, processBirth: null };
+  const observed = await new Promise<string>((resolve, reject) => {
+    execFile('/bin/ps', ['-p', String(pid), '-o', 'lstart=,pgid='], {
+      cwd: '/', env: { PATH: '/usr/bin:/bin', LC_ALL: 'C', TZ: 'UTC' }, timeout: 2000,
+      encoding: 'utf8', maxBuffer: 1024, killSignal: 'SIGKILL',
+    }, (error, stdout) => error ? reject(new Error('engineering_worker:spawn_failed')) : resolve(stdout.trim()));
+  });
+  const match = /^([A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2} \d{4})\s+(\d+)$/.exec(observed);
+  if (!match || Number(match[2]) !== pid) fail('spawn_failed');
+  return { processId: pid!, processGroupId: pid!, processBirth: match[1]! };
+}
 export interface EngineeringNativeInput {
   binding: EngineeringProtocolBinding;
   systemPrompt: string;
@@ -63,6 +78,14 @@ export function createEngineeringStdioLauncher(config: EngineeringStdioOptions):
   return async (input, signal) => {
     const binding = Object.freeze({ ...input.binding }), systemPrompt = input.systemPrompt;
     const expectedTools = structuredClone(input.tools);
+    // One trusted model policy supplies both paid-route admission and native
+    // iteration/output limits. The worker never chooses a second allowance.
+    const limits = Object.freeze({ ...input.model.nativeLimits });
+    if (!exact(limits, ['policyVersion','model','maxIterations','maxTokens'])
+        || ![1, 2].includes(limits.policyVersion) || limits.model !== 'deepseek-v4-pro'
+        || !Number.isSafeInteger(limits.maxIterations) || limits.maxIterations < 1 || limits.maxIterations > 50
+        || !Number.isSafeInteger(limits.maxTokens) || limits.maxTokens < 1 || limits.maxTokens > 8192
+        || (limits.policyVersion === 1 && (limits.maxIterations !== 3 || limits.maxTokens !== 8192))) fail('model_limits');
     if (hash(binding) !== hash(input.protocol.binding) || input.transportCapability.length < 32) fail('binding');
     input.assertOwner(); signal.throwIfAborted();
     if (Date.now() >= binding.deadlineMs) fail('expired');
@@ -176,10 +199,12 @@ export function createEngineeringStdioLauncher(config: EngineeringStdioOptions):
       if (reason) input.fence(reason);
     };
     try {
-      input.append(Object.freeze({ kind: 'native_stdio_start', ...binding }));
+      const ownedProcess = await nativeProcessIdentity(child.pid);
+      if (ended) fail('spawn_failed');
+      input.append(Object.freeze({ kind: 'native_stdio_start', ...binding, modelLimits: limits, ...ownedProcess }));
       await write({ type: 'engineering.start', binding, systemPrompt,
         ...paths,
-        model: 'deepseek-v4-pro', maxIterations: 3, maxTokens: 8192,
+        model: limits.model, maxIterations: limits.maxIterations, maxTokens: limits.maxTokens,
         resultPresentation: input.protocol.resultPresentation });
       const ready = await until('engineering.ready');
       if (!exact(ready, ['type','sessionId','tools','toolSchemas']) || ready.sessionId !== binding.sessionId

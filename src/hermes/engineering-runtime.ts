@@ -123,7 +123,8 @@ export function createEngineeringRuntime(options: EngineeringRuntimeOptions) {
         { binding: options.repository.binding, observer: options.repository.observer, audienceGrants: () => [], now });
       guard(); signal.throwIfAborted();
       const policy = createEngineeringTaskPolicy({ taskId, repository: resolution.repository, baseCommit: config.baseCommit,
-        allowedFiles: config.allowedFiles, requiredCommands: config.requiredCommands, publication: config.publication });
+        allowedFiles: config.allowedFiles, requiredCommands: config.requiredCommands, publication: config.publication,
+        ...(config.acceptancePolicyVersion === 2 ? { acceptancePolicyVersion: 2 as const } : {}) });
       const stateTaskRoot = join(tasksRoot, taskId); privateDirectory(stateTaskRoot, true, true);
       const taskRoot = join(config.workspacesRoot, taskId); privateDirectory(taskRoot, true, true);
       const runtime: PreparedRuntime = { taskId, prompt: request.task, policy, resolution, taskRoot,

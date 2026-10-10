@@ -17,6 +17,24 @@ export const ENGINEERING_ACCEPTANCE_POLICY = Object.freeze({
   deploymentAllowed: false,
 } as const);
 
+/** Explicit host opt-in. Twelve is a request ceiling, not a promise that twelve
+ * full-context calls fit. Each next call must retain the complete review reserve;
+ * only canonical settled charges, never nominal/average costs, release headroom. */
+export const ENGINEERING_ACCEPTANCE_POLICY_V2 = Object.freeze({
+  ...ENGINEERING_ACCEPTANCE_POLICY,
+  version: 2,
+  accounting: 'canonical_settlement_with_review_floor',
+  inputReservationTokens: 1_048_576,
+  maxPhysicalRequests: 13,
+  work: Object.freeze({ ...ENGINEERING_ACCEPTANCE_POLICY.work, maxRequests: 12 }),
+} as const);
+export type EngineeringAcceptancePolicy = typeof ENGINEERING_ACCEPTANCE_POLICY | typeof ENGINEERING_ACCEPTANCE_POLICY_V2;
+export function engineeringAcceptancePolicySha256(version: 1 | 2): string {
+  if (version !== 1 && version !== 2) throw new Error('engineering_policy_rejected:policy_version');
+  return createHash('sha256').update(JSON.stringify(version === 1
+    ? ENGINEERING_ACCEPTANCE_POLICY : ENGINEERING_ACCEPTANCE_POLICY_V2)).digest('hex');
+}
+
 export interface EngineeringHostAuthority {
   /** Set only by authenticated host ingress, never copied from message/tool arguments. */
   readonly authenticated: true;
@@ -55,7 +73,7 @@ export interface EngineeringTaskPolicy {
   readonly allowedFiles: readonly string[];
   readonly requiredCommands: readonly string[];
   readonly publication: 'patch_only' | 'draft_pr';
-  readonly acceptance: typeof ENGINEERING_ACCEPTANCE_POLICY;
+  readonly acceptance: EngineeringAcceptancePolicy;
   readonly fingerprint: string;
 }
 export type EngineeringRequestRole = 'work' | 'review' | 'classification' | 'repair' | 'retry' | 'summary'
@@ -199,8 +217,13 @@ export function resolveEngineeringRepository(requestedRepo: string, host: Engine
 export function createEngineeringTaskPolicy(input: {
   taskId: string; repository: ResolvedEngineeringRepository; baseCommit: string;
   allowedFiles: readonly string[]; requiredCommands: readonly string[]; publication: 'patch_only' | 'draft_pr';
+  /** Trusted host selector; absent preserves the exact v1 policy and fingerprint. */
+  acceptancePolicyVersion?: 2;
 }): EngineeringTaskPolicy {
-  const value = data(input, ['taskId', 'repository', 'baseCommit', 'allowedFiles', 'requiredCommands', 'publication'], 'task');
+  const selectedV2 = Object.hasOwn(input, 'acceptancePolicyVersion');
+  const value = data(input, ['taskId', 'repository', 'baseCommit', 'allowedFiles', 'requiredCommands', 'publication',
+    ...(selectedV2 ? ['acceptancePolicyVersion'] : [])], 'task');
+  if (selectedV2 && value.acceptancePolicyVersion !== 2) fail('policy_version');
   const taskId = identifier(value.taskId, 'task');
   if (!value.repository || !resolved.has(value.repository as object)) fail('repository_binding');
   const repository = value.repository as ResolvedEngineeringRepository;
@@ -214,7 +237,8 @@ export function createEngineeringTaskPolicy(input: {
     return command;
   }), 'test_commands');
   const policy = { version: 1 as const, taskId, repository, baseCommit: value.baseCommit, allowedFiles, requiredCommands,
-    publication: value.publication as 'patch_only' | 'draft_pr', acceptance: ENGINEERING_ACCEPTANCE_POLICY };
+    publication: value.publication as 'patch_only' | 'draft_pr',
+    acceptance: selectedV2 ? ENGINEERING_ACCEPTANCE_POLICY_V2 : ENGINEERING_ACCEPTANCE_POLICY };
   const result = Object.freeze({ ...policy, fingerprint: 'sha256:' + createHash('sha256').update(JSON.stringify(policy)).digest('hex') });
   policies.add(result); return result;
 }
@@ -222,8 +246,8 @@ export function createEngineeringTaskPolicy(input: {
 function known(policy: EngineeringTaskPolicy): void {
   if (!policy || !policies.has(policy)) fail('task_policy_untrusted');
 }
-function attempts(raw: readonly EngineeringRequestAttempt[]) {
-  const values = list(raw, ENGINEERING_ACCEPTANCE_POLICY.maxPhysicalRequests, 'request_limit');
+function attempts(raw: readonly EngineeringRequestAttempt[], limits: EngineeringAcceptancePolicy) {
+  const values = list(raw, limits.maxPhysicalRequests, 'request_limit');
   const ids = new Set<string>(); let work = 0, review = 0, reservedMicros = 0;
   const records = values.map(value => {
     const a = data(value, ['requestId', 'role', 'maxTokens', 'state'], 'request_history');
@@ -231,14 +255,14 @@ function attempts(raw: readonly EngineeringRequestAttempt[]) {
     if (ids.has(requestId) || typeof a.role !== 'string' || !ROLES.has(a.role)
         || !['settled', 'in_flight', 'unknown'].includes(String(a.state))) fail('request_history');
     ids.add(requestId);
-    const cap = a.role === 'review' ? ENGINEERING_ACCEPTANCE_POLICY.review : ENGINEERING_ACCEPTANCE_POLICY.work;
+    const cap = a.role === 'review' ? limits.review : limits.work;
     if (integer(a.maxTokens, 'token_limit', 1) > cap.maxTokens) fail('token_limit');
     if (a.role === 'review') review++; else work++;
     reservedMicros += cap.reservationMicros;
     return a as unknown as EngineeringRequestAttempt;
   });
-  if (work > ENGINEERING_ACCEPTANCE_POLICY.work.maxRequests || review > ENGINEERING_ACCEPTANCE_POLICY.review.maxRequests
-      || reservedMicros > ENGINEERING_ACCEPTANCE_POLICY.capMicros) fail('request_limit');
+  if (work > limits.work.maxRequests || review > limits.review.maxRequests
+      || (limits.version === 1 && reservedMicros > limits.capMicros)) fail('request_limit');
   return { records, work, review, reservedMicros };
 }
 
@@ -249,11 +273,12 @@ export function assertEngineeringRequestAllowed(policy: EngineeringTaskPolicy,
   const r = data(request, ['requestId', 'role', 'maxTokens'], 'request');
   const u = data(usage, ['attempts', 'allocationActive', 'taskRemainingMicros', 'campaignRemainingMicros', 'unresolvedAttempts'], 'usage');
   if (u.allocationActive !== true || integer(u.unresolvedAttempts, 'usage') !== 0) fail('allocation_unavailable');
-  const history = attempts(u.attempts as readonly EngineeringRequestAttempt[]);
+  const history = attempts(u.attempts as readonly EngineeringRequestAttempt[], policy.acceptance);
   if (history.records.some(a => a.state !== 'settled')) fail('request_unresolved');
-  const next = attempts([...history.records, { ...r, state: 'in_flight' } as unknown as EngineeringRequestAttempt]);
-  const cap = r.role === 'review' ? ENGINEERING_ACCEPTANCE_POLICY.review : ENGINEERING_ACCEPTANCE_POLICY.work;
-  const preserveReviewMicros = r.role !== 'review' && history.review === 0 ? ENGINEERING_ACCEPTANCE_POLICY.review.reservationMicros : 0;
+  if (policy.acceptance.version === 2 && history.review !== 0) fail('review_already_completed');
+  const next = attempts([...history.records, { ...r, state: 'in_flight' } as unknown as EngineeringRequestAttempt], policy.acceptance);
+  const cap = r.role === 'review' ? policy.acceptance.review : policy.acceptance.work;
+  const preserveReviewMicros = r.role !== 'review' && history.review === 0 ? policy.acceptance.review.reservationMicros : 0;
   const requiredHeadroomMicros = cap.reservationMicros + preserveReviewMicros;
   if (integer(u.taskRemainingMicros, 'usage') < requiredHeadroomMicros
       || integer(u.campaignRemainingMicros, 'usage') < requiredHeadroomMicros) fail('headroom');
@@ -286,7 +311,7 @@ export function assertEngineeringPublicationAllowed(policy: EngineeringTaskPolic
       || integer(e.unresolvedAttempts, 'publication_evidence') !== 0) fail('publication_stopped');
   const changed = distinct(list(e.changedFiles, 128, 'file_scope').map(path), 'file_scope');
   if (changed.some(file => !policy.allowedFiles.includes(file))) fail('file_scope');
-  const history = attempts(e.requests as readonly EngineeringRequestAttempt[]);
+  const history = attempts(e.requests as readonly EngineeringRequestAttempt[], policy.acceptance);
   if (!history.work || history.review !== 1 || history.records.some(a => a.state !== 'settled')) fail('review_request_missing');
   const tests = list(e.tests, 16, 'test_evidence').map(raw => {
     const test = data(raw, ['taskId', 'policyFingerprint', 'artifact', 'command', 'completed', 'timedOut', 'exitCode'], 'test_evidence');

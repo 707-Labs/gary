@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { spendReservationMicros } from '../../src/spend.ts';
 import {
-  ENGINEERING_ACCEPTANCE_POLICY as LIMITS,
+  ENGINEERING_ACCEPTANCE_POLICY as LIMITS, ENGINEERING_ACCEPTANCE_POLICY_V2, engineeringAcceptancePolicySha256,
   resolveEngineeringRepository, createEngineeringTaskPolicy,
   assertEngineeringRequestAllowed, assertEngineeringPublicationAllowed,
   type EngineeringHostAuthority, type EngineeringRepositoryAccess, type EngineeringTaskPolicy,
@@ -15,10 +15,11 @@ const repository = (fullName = '707-Labs/new-service'): EngineeringRepositoryAcc
   repositoryId: 42, installationId: 7, fullName, appAccessible: true, contents: 'write',
   pullRequests: 'write', archived: false, disabled: false, sharedChannelIds: ['C123456789'],
 });
-const policy = (publication: 'patch_only' | 'draft_pr' = 'draft_pr') => createEngineeringTaskPolicy({
+const policy = (publication: 'patch_only' | 'draft_pr' = 'draft_pr', acceptancePolicyVersion?: 2) => createEngineeringTaskPolicy({
   taskId: 'engineering-fixture', repository: resolveEngineeringRepository('new-service', authority(), [repository()]),
   baseCommit: 'a'.repeat(40), allowedFiles: ['src/feature.ts', 'test/feature.test.ts'],
   requiredCommands: ['bun test test/feature.test.ts', 'bun run check'], publication,
+  ...(acceptancePolicyVersion === 2 ? { acceptancePolicyVersion } : {}),
 });
 const attempt = (requestId: string, role: EngineeringRequestRole = 'work'): EngineeringRequestAttempt => ({
   requestId, role, maxTokens: role === 'review' ? 4090 : 8192, state: 'settled',
@@ -189,4 +190,76 @@ test('publication cannot bypass scope/tests/review when finish was skipped or an
     { requests: [attempt('work-1'), { ...attempt('review-1', 'review'), state: 'unknown' }] },
   ];
   for (const mutation of mutations) expect(() => assertEngineeringPublicationAllowed(p, { ...e, ...mutation })).toThrow();
+});
+
+
+test('v2 is an explicit immutable host selection and preserves exact v1 default fingerprints', () => {
+  const v1 = policy(), v2 = policy('draft_pr', 2);
+  expect(v1.acceptance).toBe(LIMITS); expect(v2.acceptance).toBe(ENGINEERING_ACCEPTANCE_POLICY_V2);
+  expect(v2.acceptance.work.maxRequests).toBe(12); expect(v2.acceptance.maxPhysicalRequests).toBe(13);
+  expect(v1.fingerprint).not.toBe(v2.fingerprint);
+  expect(engineeringAcceptancePolicySha256(1)).not.toBe(engineeringAcceptancePolicySha256(2));
+  expect(engineeringAcceptancePolicySha256(2)).toMatch(/^[a-f0-9]{64}$/);
+  expect(Object.isFrozen(v2.acceptance)).toBe(true); expect(Object.isFrozen(v2.acceptance.work)).toBe(true);
+  expect(v2.acceptance.capMicros).toBe(5_650_000);
+  expect(spendReservationMicros('deepseek',8192)).toBe(v2.acceptance.work.reservationMicros);
+  expect(spendReservationMicros('deepseek',4090)).toBe(v2.acceptance.review.reservationMicros);
+  const input = {taskId:v1.taskId,repository:v1.repository,baseCommit:v1.baseCommit,
+    allowedFiles:v1.allowedFiles,requiredCommands:v1.requiredCommands,publication:v1.publication};
+  for (const version of [undefined, 1, 3, '2', null])
+    expect(() => createEngineeringTaskPolicy({...input,acceptancePolicyVersion:version} as any)).toThrow('policy_version');
+  let invoked = false;
+  expect(() => createEngineeringTaskPolicy(Object.defineProperty({...input},'acceptancePolicyVersion',
+    {enumerable:true,get(){invoked=true;return 2;}}))).toThrow('task');
+  expect(invoked).toBe(false);
+});
+
+test('v2 admits twelve cheap settled work calls plus review while v1 still rejects the fourth', () => {
+  const v2 = policy('draft_pr', 2), history: EngineeringRequestAttempt[] = [];
+  let remaining = 5_417_988;
+  for (let i=0; i<12; i++) {
+    const request = {requestId:'v2-work-'+i,role:'work' as const,maxTokens:8192};
+    const allowed = assertEngineeringRequestAllowed(v2,request,{...usage(history),
+      taskRemainingMicros:remaining,campaignRemainingMicros:remaining});
+    expect(allowed.reservationMicros).toBe(1_416_561); expect(allowed.preserveReviewMicros).toBe(1_400_317);
+    expect(allowed.physicalRequests).toBe(i+1); history.push({...request,state:'settled'});
+    remaining -= 32_454; // 10 billed input tokens + full 8192 output allowance, rounded up.
+  }
+  expect(() => assertEngineeringRequestAllowed(v2,{requestId:'v2-work-13',role:'work',maxTokens:8192},usage(history))).toThrow('request_limit');
+  const review=assertEngineeringRequestAllowed(v2,{requestId:'v2-review',role:'review',maxTokens:4090},
+    {...usage(history),taskRemainingMicros:remaining,campaignRemainingMicros:remaining});
+  expect(review.physicalRequests).toBe(13); expect(review.preserveReviewMicros).toBe(0);
+  expect(review.reservedEnvelopeMicros).toBeGreaterThan(v2.acceptance.capMicros); // Informational historical nominal sum only.
+  expect(() => assertEngineeringRequestAllowed(policy(),{requestId:'legacy-fourth',role:'work',maxTokens:8192},
+    usage(history.slice(0,3)))).toThrow('request_limit');
+  const e=evidence(v2); // Publication uses the selected history ceiling too.
+  expect(assertEngineeringPublicationAllowed(v2,{...e,requests:[...history,attempt('review-1','review')]}).executionAuthorized).toBe(false);
+});
+
+test('v2 full-context funding is conditional: two maximum charges fit, third protects review and rejects', () => {
+  const p=policy('draft_pr',2), history: EngineeringRequestAttempt[]=[];
+  let remaining=5_417_988;
+  for(let i=0;i<2;i++) {
+    const request={requestId:'maximum-'+i,role:'work' as const,maxTokens:8192};
+    expect(assertEngineeringRequestAllowed(p,request,{...usage(history),taskRemainingMicros:remaining,
+      campaignRemainingMicros:remaining}).reservationMicros).toBe(1_416_561);
+    history.push({...request,state:'settled'});remaining-=1_416_561;
+  }
+  expect(remaining).toBe(2_584_866);
+  const request={requestId:'third',role:'work' as const,maxTokens:8192};
+  expect(() => assertEngineeringRequestAllowed(p,request,{...usage(history),taskRemainingMicros:remaining,
+    campaignRemainingMicros:remaining})).toThrow('headroom');
+  expect(assertEngineeringRequestAllowed(p,{requestId:'review',role:'review',maxTokens:4090},
+    {...usage(history),taskRemainingMicros:remaining,campaignRemainingMicros:remaining}).reservationMicros).toBe(1_400_317);
+  for (const patch of [{taskRemainingMicros:2_816_877},{campaignRemainingMicros:2_816_877},
+    {unresolvedAttempts:1},{attempts:[{...attempt('unknown'),state:'unknown' as const}]}])
+    expect(() => assertEngineeringRequestAllowed(p,request,{...usage(),...patch})).toThrow();
+});
+
+
+test('v2 review permanently closes work and auxiliary admission without releasing a request slot', () => {
+  const p=policy('draft_pr',2);
+  for(const role of ['work','repair','summary','retry','review'] as const)
+    expect(() => assertEngineeringRequestAllowed(p,{requestId:'after-review',role,maxTokens:role==='review'?4090:8192},
+      usage([attempt('work'),attempt('review','review')]))).toThrow('review_already_completed');
 });

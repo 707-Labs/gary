@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { loadEngineeringRuntimeConfig, type EngineeringRuntimeConfig, type EngineeringAuthorityReceipt } from '../../src/hermes/engineering-config.ts';
+import { engineeringAcceptancePolicySha256 } from '../../src/hermes/engineering-policy.ts';
 const roots: string[] = []; afterEach(() => roots.splice(0).forEach(p => rmSync(p, { recursive: true, force: true })));
 const hash = (s: string) => createHash('sha256').update(s).digest('hex');
 function fixture() {
@@ -184,4 +185,76 @@ test('grant03 requires the exact new delegation and immutable zero-spend predece
   }
   writeFileSync(decisionPath,Buffer.from(decision.toString().replace('5535224','5535225')),{mode:0o600});
   expect(()=>load()).toThrow('engineering_config_rejected');
+});
+
+function continuation04ConfigFixture() {
+  const f=continuationFixture(),grantId='gary-native-engineering-20261010-04';
+  const previous=f.config.budget.continuation!, original=previous.original;
+  const policySha=engineeringAcceptancePolicySha256(2), decisionPath=join(f.root,'continuation-authority.json');
+  const config:EngineeringRuntimeConfig={...f.config,grantId,acceptancePolicyVersion:2,
+    budget:{...f.config.budget,runId:grantId,continuation:{...previous,version:2,budgetPolicySha256:policySha,
+      ledgerRebootAttestation:{path:join(original.auditDir,original.runId+'.ledger-reboot.json'),sha256:'a'.repeat(64)},
+      afterSettledContinuation:{receiptPath:join(dirname(dirname(original.auditDir)),'engineering-v3/budget-admission/continuation.json'),
+        receiptSha256:'8ecfd58c1f3f478138bb2acaa802f0930616628366de656f41426dbc27de7023',
+        claimSha256:'6d2c204804bca2a876d38eedb7cf1976657af2f11cf7ca704cab0c53b52652d0',
+        preservationSha256:'06aa0522a8174b34650526add2ab8a10b162ed81f1362ac016df9caf5faec429',
+        taskId:'engineering-eebc7874-e224-45f8-8e8b-9c01aed15ef9'}}}};
+  // Synthetic later activation, deliberately different from the real offline-only
+  // preparation delegation. Production preparation never creates this receipt.
+  const decision={version:1,kind:'trusted_delegated_continuation_04_activation',sourceThreadId:f.authority.sourceThreadId,
+    continuationGrantId:grantId,originalGrantId:original.runId,consumedContinuationGrantId:'gary-native-engineering-20261010-03',
+    campaignId:config.campaignId,allocationId:config.allocationId,cumulativeCapMicros:5650000,priorSettledSpendMicros:232012,
+    newAggregateHold:false,preserveUnknownHolds:true,replayConsumedPhases:false,publication:'patch_only',
+    originalApprovalSha256:original.authoritySha256,activationAllowed:true,paidAcceptanceAllowed:true,
+    budgetPolicySha256:policySha,runtimeConfigSha256:hash(JSON.stringify(config))};
+  const load=(c=config,d:Record<string,unknown>=decision) => {
+    const body=JSON.stringify(d);writeFileSync(decisionPath,body,{mode:0o600});
+    const authority:EngineeringAuthorityReceipt={...f.authority,grantId,continuationDecision:{path:decisionPath,sha256:hash(body)}};
+    const raw=JSON.stringify(c),ap=join(f.root,'authority.json'),cp=join(f.root,'config.json'),a=JSON.stringify(authority);
+    writeFileSync(cp,raw,{mode:0o600});writeFileSync(ap,a,{mode:0o600});
+    return loadEngineeringRuntimeConfig(cp,hash(raw),ap,hash(a));
+  };
+  return {...f,config,decision,load};
+}
+
+test('grant04 binds explicit dynamic policy, six-row predecessor and separately approved exact config',()=>{
+  const f=continuation04ConfigFixture(),loaded=f.load();
+  expect(loaded.acceptancePolicyVersion).toBe(2);
+  expect(Object.isFrozen(loaded.budget.continuation!.afterSettledContinuation)).toBe(true);
+  expect(loaded.budget.continuation!.budgetPolicySha256).toBe(engineeringAcceptancePolicySha256(2));
+  for(const change of [
+    (v:any)=>{delete v.acceptancePolicyVersion;},(v:any)=>{v.acceptancePolicyVersion=1;},
+    (v:any)=>{v.budget.continuation.version=1;},(v:any)=>{delete v.budget.continuation;},
+    (v:any)=>{delete v.budget.continuation.afterSettledContinuation;},
+    (v:any)=>{delete v.budget.continuation.ledgerRebootAttestation;},
+    (v:any)=>{v.budget.continuation.afterSettledContinuation.receiptSha256='a'.repeat(64);},
+    (v:any)=>{v.budget.continuation.afterSettledContinuation.claimSha256='a'.repeat(64);},
+    (v:any)=>{v.budget.continuation.afterSettledContinuation.preservationSha256='a'.repeat(64);},
+    (v:any)=>{v.budget.continuation.afterSettledContinuation.taskId='other';},
+    (v:any)=>{v.budget.continuation.afterSettledContinuation.receiptPath+='.other';},
+    (v:any)=>{v.budget.continuation.afterBlockedContinuation={};},
+    (v:any)=>{v.budget.continuation.budgetPolicySha256=engineeringAcceptancePolicySha256(1);},
+    (v:any)=>{v.repository='707-Labs/different';},(v:any)=>{v.sourceRevision='c'.repeat(40);},
+    (v:any)=>{v.allowedFiles.push('another.ts');},(v:any)=>{v.requiredCommands=['bun test different'];},
+  ]){const candidate=structuredClone(f.config);change(candidate);expect(()=>f.load(candidate)).toThrow('engineering_config_rejected');}
+});
+
+test('offline preparation, stale spend, widened scope or an unbound decision cannot activate grant04',()=>{
+  const f=continuation04ConfigFixture();
+  for(const change of [
+    (v:any)=>{v.kind='trusted_delegated_offline04_preparation_only';},
+    (v:any)=>{v.activationAllowed=false;},(v:any)=>{v.paidAcceptanceAllowed=false;},
+    (v:any)=>{v.activationAllowed='true';},(v:any)=>{delete v.paidAcceptanceAllowed;},
+    (v:any)=>{v.priorSettledSpendMicros=114776;},(v:any)=>{v.cumulativeCapMicros=6000000;},
+    (v:any)=>{v.newAggregateHold=true;},(v:any)=>{v.preserveUnknownHolds=false;},
+    (v:any)=>{v.replayConsumedPhases=true;},(v:any)=>{v.publication='draft_pr';},
+    (v:any)=>{v.originalApprovalSha256='a'.repeat(64);},(v:any)=>{v.sourceThreadId='other';},
+    (v:any)=>{v.budgetPolicySha256=engineeringAcceptancePolicySha256(1);},
+    (v:any)=>{v.runtimeConfigSha256='b'.repeat(64);},(v:any)=>{v.extra=true;},
+  ]){const decision=structuredClone(f.decision);change(decision);expect(()=>f.load(f.config,decision)).toThrow('engineering_config_rejected');}
+});
+
+test('dynamic request policy cannot be enabled for an original or three-row grant',()=>{
+  const f=fixture();expect(()=>f.load({...f.config,acceptancePolicyVersion:2})).toThrow('engineering_config_rejected');
+  const old=continuationFixture();expect(()=>old.load({...old.config,acceptancePolicyVersion:2})).toThrow('engineering_config_rejected');
 });
