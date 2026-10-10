@@ -16,8 +16,8 @@ bun run start        # run gary locally (will act on real tickets — see "don't
 bun run dev          # watch mode
 bun run typecheck    # tsc --noEmit
 bun test             # all unit tests
-bun run deploy       # ssh mini → git pull → install → typecheck → reload launchd
-bun run logs         # tail gary's stdout on the mini
+bun run deploy       # local: clean tree → install → typecheck → test → render plist with HEAD pin → restart launchd
+bun run logs         # tail gary's stdout log
 ```
 
 Probe scripts have different effects. Some below perform paid inference or real writes;
@@ -124,11 +124,11 @@ Files: `src/review/{precheck.ts, tools.ts, prompts.ts, runner.ts}`,
 
 ## Deploy / service
 
-Gary runs on the Mac mini as `com.707labs.gary` LaunchAgent. Plist in `scripts/com.707labs.gary.plist`. Logs at `~/Library/Logs/gary/{stdout,stderr}.log` on the mini. State at `~/.gary/` on the mini.
+Gary runs on this Mac (the development machine; there is no remote host) as the user LaunchAgent `com.707labs.gary`. `scripts/com.707labs.gary.plist` is the template for `~/Library/LaunchAgents/com.707labs.gary.plist`: it carries the whole runtime environment (Hermes executor pins, Slack config paths and content hashes) and a `__GARY_RELEASE__` placeholder for `GARY_CONVERSATION_RUNTIME_RELEASE`. Logs at `~/Library/Logs/gary/{stdout,stderr}.log`. State at `~/.gary/`.
 
-`bun run deploy` is the historical legacy deployment script. A pinned Hermes deployment uses its reviewed source/configuration transition and drain procedure; do not replace that procedure with an unreviewed pull/reload or edit consumed receipts.
+`bun run deploy` (`scripts/deploy.sh`) refuses a tree with modified tracked files, runs install/typecheck/tests, renders the plist with HEAD as the pin, restarts the agent (SIGTERM drains the conversation runtimes first) and fails unless `gary booted` appears without `shared conversation unavailable`. `src/readonly-startup.ts` rejects any start where HEAD or the tracked tree differs from the pin, so editing files and kickstarting the agent crash-loops with `readonly_release_mismatch`. Commit, deploy, verify, then push. Paths and hashes in the template are the reviewed deployment; change them only with a review, and never edit consumed receipts.
 
-Auth on the mini is a read-only deploy key (`mini-deploy` on `707-Labs/gary`) used via SSH config alias `Host github.com-gary`.
+Runtime configs and the Slack credentials file are referenced by absolute path from the plist. Several still live under `~/Documents/Codex/2026-10-07/...` where the sessions that produced them wrote them. Loaders require a canonical absolute path, 0700 parent, 0600 single-link regular file and no symlinks; the DM config must move together with its sibling `context.sqlite`, and the project config with its `project-memory.sqlite`.
 
 ## Runtime boundaries
 
@@ -142,6 +142,6 @@ New capabilities must preserve the existing authorization, canonical owners and 
 
 ## When something breaks
 
-1. Check `~/Library/Logs/gary/stderr.log` on the mini (`bun run logs` shows stdout).
+1. Check `~/Library/Logs/gary/stderr.log` (`bun run logs` tails stdout). Slack ingress lines (`slack ingress`, stage names in `src/slack/ingress-diagnostics.ts`) show why a message was or wasn't answered; the emitter goes quiet after 256 lines per process.
 2. Check SQLite: `sqlite3 ~/.gary/state/gary.db 'SELECT * FROM events ORDER BY id DESC LIMIT 20;'`
 3. Use the reviewed task lifecycle to stop or escalate work. Preserve closed trials, action owners, spend holds and receipts; never reset a latched stop by changing SQL state.

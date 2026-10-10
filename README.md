@@ -23,37 +23,41 @@ via `GARY_HOME`, `GARY_STATE_DIR`, `GARY_REPOS_DIR`, `GARY_WORKSPACES_DIR`.
 - `bun run dev` — start gary with file watching
 - `bun run typecheck` — `tsc --noEmit`
 - `bun test` — run unit tests
-- `bun run deploy` — push latest to the mini and reload the launchd service
-- `bun run logs` — tail gary's stdout on the mini
+- `bun run deploy` — install, typecheck, test, pin HEAD as the release and restart the launchd service
+- `bun run logs` — tail gary's stdout log
 
-## deploy path (mac mini)
+## deploy path (this mac)
 
-gary runs as a user-level launchagent on the mini at
-`~/Library/LaunchAgents/com.707labs.gary.plist`. logs land in
-`~/Library/Logs/gary/{stdout,stderr}.log`. state at `~/.gary/`.
+gary runs on the development mac as the user-level launchagent
+`com.707labs.gary` (`~/Library/LaunchAgents/com.707labs.gary.plist`); there is
+no remote host. logs land in `~/Library/Logs/gary/{stdout,stderr}.log`. state at
+`~/.gary/`.
+
+the installed plist is rendered from `scripts/com.707labs.gary.plist`, which
+carries the full runtime environment (Hermes executor pins, Slack config paths
+and content hashes). `__GARY_RELEASE__` becomes the current HEAD. startup
+(`src/readonly-startup.ts`) refuses to run unless HEAD equals that pin and no
+tracked file is modified, so edits without a commit and redeploy crash-loop with
+`readonly_release_mismatch`.
 
 to ship changes:
 
 ```sh
-git push                 # push to 707-Labs/gary
-bun run deploy           # ssh mini → git pull → bun install → typecheck → reload launchd
+git commit …             # the pin is HEAD; the tree must be clean
+bun run deploy           # install → typecheck → bun test → render plist → bootout/bootstrap → wait for "gary booted"
+git push origin main     # after the deploy verified
 ```
 
-the deploy script is idempotent. it uses `git pull --ff-only`, so it
-refuses to advance if the mini's working tree has local changes.
-
-to follow logs:
-
-```sh
-bun run logs
-```
+`bun run deploy -- --skip-tests` skips the suite. the script exits non-zero if
+the agent does not log `gary booted`, or logs `shared conversation unavailable`
+(config fingerprint or budget problem).
 
 manual launchctl ops:
 
 ```sh
-ssh mini 'launchctl bootout gui/$(id -u)/com.707labs.gary'
-ssh mini 'launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.707labs.gary.plist'
-ssh mini 'launchctl print gui/$(id -u)/com.707labs.gary | head'
+launchctl bootout gui/$(id -u)/com.707labs.gary
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.707labs.gary.plist
+launchctl print gui/$(id -u)/com.707labs.gary | head
 ```
 
 ## security
