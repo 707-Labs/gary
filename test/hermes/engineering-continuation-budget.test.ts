@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SpendLedger } from '../../src/spend.ts';
@@ -15,11 +15,12 @@ import { createEngineeringTaskPolicy, resolveEngineeringRepository } from '../..
 const roots: string[] = [], close: (() => void)[] = [];
 afterEach(() => { for (const f of close.splice(0).reverse()) f(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const hash = (v: string | Buffer) => createHash('sha256').update(v).digest('hex');
-function fixture() {
-  const root = mkdtempSync(join(realpathSync(tmpdir()), 'engineering-continuation-')); roots.push(root); chmodSync(root, 0o700);
+function fixture(productionLedgerMetadata = false) {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'engineering-continuation-')); roots.push(root); chmodSync(root, productionLedgerMetadata ? 0o755 : 0o700);
   const oldRoot = join(root, 'v1'), nextRoot = join(root, 'v2'), workspaces = join(root, 'workspaces-v2');
   for (const dir of [oldRoot, nextRoot, workspaces, join(nextRoot,'budget-admission')]) mkdirSync(dir, { mode: 0o700 });
   const ledgerPath = join(root,'spend.db'), aggregatePath = join(root,'aggregate.json'), ledger = new SpendLedger(ledgerPath); close.push(() => ledger.close());
+  if (productionLedgerMetadata) chmodSync(ledgerPath,0o644);
   writeFileSync(aggregatePath, JSON.stringify({ schemaVersion:2,totalCeilingUsd:100,runtimePoolUsd:60,other90HoldUsd:30,bufferHoldUsd:10,
     runtimeCommittedOrHeldUsd:50.302993006,runtimeUnallocatedUsd:9.697006994,totalCommittedOrHeldUsd:90.302993006,
     runtimeUnknownHoldsUsd:4.44446835,runtimeAuthorizationRetiredUsd:0,
@@ -165,4 +166,28 @@ test('baseline cannot authorize another allocation or another canonical writer',
   const other=new SpendLedger(join(s.root,'other-ledger.sqlite'));close.push(()=>other.close());
   other.createCampaign('other',5.65);other.enrollTicket('other',s.o.allocationId,5.65,{draftPr:false});
   expect(()=>createEngineeringModelAdapter({...m.options,ledger:other})).toThrow('configuration');expect(other.status(s.o.allocationId)!.attemptCount).toBe(0);
+});
+
+test('owned 0755 ledger parent and 0644 canonical ledger permit continuation while private roots remain 0700',()=>{
+  const s=fixture(true), before=s.logical(), aggregate=readFileSync(s.o.aggregatePath);
+  expect(lstatSync(s.root).mode & 0o777).toBe(0o755);expect(lstatSync(s.o.ledgerPath).mode & 0o777).toBe(0o644);
+  expect(previewEngineeringContinuation(s.o).canRun).toBe(false);
+  expect(admitEngineeringContinuation({...s.o,apply:true}).canRun).toBe(true);
+  const baseline=assertEngineeringContinuationBudget(s.o,{requireUnused:true});baseline.assertCurrent();
+  const journal=new Database(s.journalPath);close.push(()=>journal.close());assertEngineeringContinuationBaseline(baseline,s.spend,journal,s.o.allocationId);
+  expect(s.logical()).toBe(before);expect(readFileSync(s.o.aggregatePath)).toEqual(aggregate);
+  for(const dir of [s.o.root,s.o.auditDir,s.o.continuation.original.auditDir,s.o.workspacesRoot])expect(lstatSync(dir).mode & 0o777).toBe(0o700);
+  expect(lstatSync(s.root).mode & 0o777).toBe(0o755);expect(lstatSync(s.o.ledgerPath).mode & 0o777).toBe(0o644);
+});
+test('group/world writable ledger parents and nonprivate journal or receipt directories remain denied',()=>{
+  for(const mode of [0o775,0o777]){
+    const s=fixture(true);chmodSync(s.root,mode);
+    expect(()=>previewEngineeringContinuation(s.o)).toThrow();expect(()=>admitEngineeringContinuation({...s.o,apply:true})).toThrow();
+  }
+  for(const dir of ['old-journal','new-root','old-audit','new-audit']){
+    const s=fixture(true);admitEngineeringContinuation({...s.o,apply:true});const baseline=assertEngineeringContinuationBudget(s.o);
+    const path=dir==='old-journal'?join(s.root,'v1'):dir==='new-root'?s.o.root:dir==='old-audit'?s.o.continuation.original.auditDir:s.o.auditDir;
+    chmodSync(path,0o755);
+    expect(()=>baseline.assertCurrent()).toThrow();expect(()=>assertEngineeringContinuationBudget(s.o)).toThrow();
+  }
 });

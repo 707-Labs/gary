@@ -39,13 +39,15 @@ const CAP = 5_650_000, BASE_CHARGED = 114_776, BASE_COUNT = 3;
 const sha = (v: string | Buffer) => createHash('sha256').update(v).digest('hex');
 const digest = (v: unknown) => sha(JSON.stringify(v));
 function fail(code: string): never { throw new Error('engineering_continuation:' + code); }
-function canonical(path: string): void {
+function canonical(path: string, privateParent = true): void {
   if (!isAbsolute(path) || resolve(path) !== path || realpathSync(dirname(path)) !== dirname(path)) fail('path');
   const s = lstatSync(dirname(path));
-  if (!s.isDirectory() || s.uid !== process.getuid?.() || (s.mode & 0o077) !== 0) fail('parent_metadata');
+  if (!s.isDirectory() || s.uid !== process.getuid?.() || (s.mode & (privateParent ? 0o077 : 0o022)) !== 0) fail('parent_metadata');
 }
 function identity(path: string, privateFile = false) {
-  canonical(path); const s = lstatSync(path);
+  // The existing canonical ledger is readable (0644/0755), while journals and
+  // sidecars retain their private parent requirement. Never relax write paths.
+  canonical(path, privateFile); const s = lstatSync(path);
   if (!s.isFile() || s.isSymbolicLink() || s.nlink !== 1 || s.uid !== process.getuid?.() || (s.mode & 0o022)
       || (privateFile && (s.mode & 0o777) !== 0o600) || realpathSync(path) !== path) fail('file_metadata');
   return { dev: s.dev, ino: s.ino, uid: s.uid, gid: s.gid, mode: s.mode, nlink: s.nlink };
