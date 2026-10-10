@@ -3,7 +3,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { chmodSync, lstatSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { acquireEngineeringResourceLease, ENGINEERING_RESOURCE_LOCK, ENGINEERING_RESOURCE_REQUIREMENTS,
+import { acquireEngineeringResourceLease, ENGINEERING_RESOURCE_REQUIREMENTS,
   type EngineeringResourceLease, type EngineeringResourceLeaseOptions, type EngineeringResourceLockPin,
   type EngineeringResourceRequirements } from '../../src/executors/engineering-resource-lease.ts';
 
@@ -34,9 +34,13 @@ async function aborted(signal: AbortSignal): Promise<void> {
 }
 
 describe('isolated engineering resource lease', () => {
-  it('exports the reviewed production pin without opening or acquiring it', () => {
-    expect(ENGINEERING_RESOURCE_LOCK).toEqual({ path: '/private/tmp/apple-release-xcode.lock', dev: 16777229,
-      ino: 171769508, uid: 501, mode: 0o644, nlink: 1 });
+  it('requires an explicit lock pin before observation or spawning; no historical default exists', async () => {
+    let observations = 0, spawns = 0;
+    await expect(acquireEngineeringResourceLease({ binding, preflight,
+      inspection: { lstat() { observations++; throw Error('must not observe'); }, realpath() { observations++; throw Error('must not observe'); } },
+      spawn: (() => { spawns++; throw Error('must not spawn'); }) as typeof spawn,
+    } as unknown as EngineeringResourceLeaseOptions)).rejects.toThrow('engineering_resource_invalid_pin');
+    expect(observations).toBe(0); expect(spawns).toBe(0);
     expect(ENGINEERING_RESOURCE_REQUIREMENTS).toEqual({ cpus: 6, memoryBytes: 17179869184 });
   });
 

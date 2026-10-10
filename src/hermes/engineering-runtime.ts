@@ -11,6 +11,7 @@ import { createBunEngineeringCommandRunner } from '../executors/engineering-sess
 import { createSqliteEngineeringSessionJournal } from '../executors/engineering-session-journal.ts';
 import { createEngineeringSessionGuardianFactory } from '../executors/engineering-session-guardian.ts';
 import { acquireEngineeringResourceLease, type EngineeringResourceLeaseOptions } from '../executors/engineering-resource-lease.ts';
+import { createEngineeringResourceBindingGuard, type EngineeringResourceBindingDependencies } from '../executors/engineering-resource-binding.ts';
 import type { EngineeringRuntimeConfig } from './engineering-config.ts';
 import type { EngineeringContinuationBaseline } from './engineering-continuation-budget.ts';
 import { createEngineeringExecution, type EngineeringExecutionOptions } from './engineering-execution.ts';
@@ -41,6 +42,8 @@ export interface EngineeringRuntimeOptions {
     git?: EngineeringRepositoryGitRunner;
     createExecution?: typeof createEngineeringExecution;
     acquireLease?: (options: EngineeringResourceLeaseOptions) => ReturnType<typeof acquireEngineeringResourceLease>;
+    resourceBinding?: EngineeringResourceBindingDependencies;
+    resourceLease?: Pick<EngineeringResourceLeaseOptions, 'inspection' | 'spawn'>;
     readHeadroom?: ReturnType<typeof createEngineeringHeadroomReader>;
   };
 }
@@ -88,6 +91,8 @@ export function createEngineeringRuntime(options: EngineeringRuntimeOptions) {
   const { config, journalDb: db } = options, now = options.now ?? Date.now;
   if (!!config.budget.continuation !== !!options.continuationBaseline) fail('continuation_binding');
   options.assertRuntime(); options.assertGrant();
+  const assertResourceBinding = createEngineeringResourceBindingGuard(config.resourceLock, options.dependencies?.resourceBinding);
+  assertResourceBinding();
   privateDirectory(config.root); privateDirectory(config.workspacesRoot); privateJournal(db, config.root);
   const contains = (base: string, path: string) => { const rel = relative(base, path); return !isAbsolute(rel) && rel !== '..' && !rel.startsWith('..' + sep); };
   if (contains(config.root, config.workspacesRoot) || contains(config.workspacesRoot, config.root)) fail('workspace_state_overlap');
@@ -107,7 +112,7 @@ export function createEngineeringRuntime(options: EngineeringRuntimeOptions) {
   const headroom = options.dependencies?.readHeadroom ?? createEngineeringHeadroomReader({ root: config.root });
   const prepared = new Map<string, PreparedRuntime>();
   let stopped = false, fenced = false;
-  const guard = () => { if (stopped || fenced) fail('unavailable'); options.assertRuntime(); options.assertGrant(); };
+  const guard = () => { if (stopped || fenced) fail('unavailable'); options.assertRuntime(); options.assertGrant(); assertResourceBinding(); };
   const host = createEngineeringHost({ db, grantId: config.grantId, allocationId: config.allocationId, now,
     assertGrant: guard, assertBudget: options.assertBudget, deliver: options.deliver,
     async prepare(request, taskId, signal) {
@@ -158,7 +163,11 @@ export function createEngineeringRuntime(options: EngineeringRuntimeOptions) {
           dockerSocketPath: config.dockerSocketPath, bunCacheVolume: config.bunCacheVolume, resourceProfile: EXECUTOR_RESOURCES, now },
         async acquireLease() {
           assertOwner();
-          const lease = await acquireLease({ binding, requirements: RESOURCES, preflight: headroom, signal });
+          const lockPin = assertResourceBinding();
+          const lease = await acquireLease({
+            ...(options.dependencies?.resourceLease?.inspection ? { inspection: options.dependencies.resourceLease.inspection } : {}),
+            ...(options.dependencies?.resourceLease?.spawn ? { spawn: options.dependencies.resourceLease.spawn } : {}),
+            binding, lockPin, requirements: RESOURCES, preflight: headroom, signal });
           try {
             const reference = structuredClone(lease.reference);
             if (fingerprintJson(reference.binding).sha256 !== fingerprintJson(binding).sha256) fail('lease_binding');

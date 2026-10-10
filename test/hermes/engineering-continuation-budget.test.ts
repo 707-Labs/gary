@@ -16,9 +16,10 @@ import { createEngineeringTaskPolicy, resolveEngineeringRepository } from '../..
 const roots: string[] = [], close: (() => void)[] = [];
 afterEach(() => { for (const f of close.splice(0).reverse()) f(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const hash = (v: string | Buffer) => createHash('sha256').update(v).digest('hex');
-function fixture(productionLedgerMetadata = false) {
+function fixture(productionLedgerMetadata = false, knownChain = false) {
   const root = mkdtempSync(join(realpathSync(tmpdir()), 'engineering-continuation-')); roots.push(root); chmodSync(root, productionLedgerMetadata ? 0o755 : 0o700);
-  const oldRoot = join(root, 'v1'), nextRoot = join(root, 'v2'), workspaces = join(root, 'workspaces-v2');
+  if(knownChain)mkdirSync(join(root,'workspaces'),{mode:0o700});
+  const oldRoot = join(root, knownChain?'engineering-v1':'v1'), nextRoot = join(root, knownChain?'engineering-v2':'v2'), workspaces = join(root, knownChain?'workspaces/engineering-v2':'workspaces-v2');
   for (const dir of [oldRoot, nextRoot, workspaces, join(nextRoot,'budget-admission')]) mkdirSync(dir, { mode: 0o700 });
   const ledgerPath = join(root,'spend.db'), aggregatePath = join(root,'aggregate.json'), ledger = new SpendLedger(ledgerPath); close.push(() => ledger.close());
   if (productionLedgerMetadata) chmodSync(ledgerPath,0o644);
@@ -27,7 +28,8 @@ function fixture(productionLedgerMetadata = false) {
     runtimeUnknownHoldsUsd:4.44446835,runtimeAuthorizationRetiredUsd:0,
     runtimeAllocations:[{id:'historical',amountUsd:50.302993006,state:'retained',retainedAmountUsd:50.302993006,
       retainedUnknownCostsUsd:4.44446835,retiredUnusedAuthorizationUsd:0,admission:{kind:'classifier_canary',commonfieldEarmarkMicros:3000000}}] }), { mode:0o600 });
-  const original: EngineeringBudgetBinding = { aggregatePath,ledgerPath,auditDir:join(oldRoot,'budget-admission'),runId:'grant-one',grantId:'grant-one',
+  const originalRun=knownChain?'gary-native-engineering-20261010-01':'grant-one';
+  const original: EngineeringBudgetBinding = { aggregatePath,ledgerPath,auditDir:join(oldRoot,'budget-admission'),runId:originalRun,grantId:originalRun,
     campaignId:'original-campaign',allocationId:'original-allocation',sourceRevision:'a'.repeat(40),runtimeConfigSha256:'b'.repeat(64),authoritySha256:'c'.repeat(64) };
   admitEngineeringAcceptance({...original, expectedAggregateSha256:hash(readFileSync(aggregatePath)),apply:true});
   const spend = new Database(ledgerPath); close.push(() => spend.close());
@@ -50,7 +52,8 @@ function fixture(productionLedgerMetadata = false) {
     oldDb.query("INSERT INTO engineering_model_requests VALUES(?,?,?,'work',8192,'settled',?,?,?,?)").run('old-'+id,original.allocationId,'old-turn','hash',id,fingerprintJson(receipt).sha256,'f'.repeat(64));
   }
   const journalPath = join(nextRoot,'engineering.sqlite'); writeFileSync(journalPath,'',{mode:0o600});
-  const o: EngineeringContinuationBinding = {...original,root:nextRoot,workspacesRoot:workspaces,auditDir:join(nextRoot,'budget-admission'),runId:'grant-two',grantId:'grant-two',sourceRevision:'d'.repeat(40),runtimeConfigSha256:'e'.repeat(64),authoritySha256:'f'.repeat(64),
+  const secondRun=knownChain?'gary-native-engineering-20261010-02':'grant-two';
+  const o: EngineeringContinuationBinding = {...original,root:nextRoot,workspacesRoot:workspaces,auditDir:join(nextRoot,'budget-admission'),runId:secondRun,grantId:secondRun,sourceRevision:'d'.repeat(40),runtimeConfigSha256:'e'.repeat(64),authoritySha256:'f'.repeat(64),
     continuation:{version:1,original,predecessorJournalPath:oldPath,predecessorTaskId:spec.taskId,receiptPath:join(nextRoot,'budget-admission','continuation.json')} };
   const logical = () => JSON.stringify(['spend_campaigns','spend_tickets','spend_attempts','spend_receipts','spend_coding_policies'].map(t=>spend.query('SELECT * FROM '+t+' ORDER BY 1').all()));
   return {root,o,ledger,spend,oldDb,journalPath,attemptIds,logical};
@@ -241,4 +244,123 @@ macTest('reboot references fail closed for wrong hash, path, metadata, boot, vol
     }
     expect(()=>previewEngineeringContinuation(s.o)).toThrow();expect(()=>admitEngineeringContinuation({...s.o,apply:true})).toThrow();
   }
+});
+
+function afterBlockedFixture() {
+  const s=fixture(false,true),second=structuredClone(s.o);
+  const secondBase='09e0a6f361a7f6b79e18d7b782fcb8723d6f613b';
+  const config={grantId:second.grantId,allocationId:second.allocationId,campaignId:second.campaignId,sourceRevision:second.sourceRevision,
+    root:second.root,workspacesRoot:second.workspacesRoot,repository:'707-Labs/fixture',baseCommit:secondBase};
+  const configBytes=JSON.stringify(config);writeFileSync(join(second.root,'config.json'),configBytes,{mode:0o600});second.runtimeConfigSha256=hash(configBytes);
+  const admission=admitEngineeringContinuation({...second,apply:true});
+  const secondDb=new Database(s.journalPath);close.push(()=>secondDb.close());
+  const taskId='engineering-438c8176-7f19-495d-9a8b-4056a141e1c8';
+  const previous=s.oldDb.query('SELECT spec_json FROM engineering_tasks').get() as {spec_json:string};
+  const spec={...JSON.parse(previous.spec_json),taskId,requestId:'second-request',grantId:second.grantId,baseCommit:secondBase,deadlineMs:Date.now()+60_000};
+  const tasks=new EngineeringTaskStore(secondDb);tasks.admit(spec,()=>{});const task=tasks.claim(taskId,()=>{});
+  tasks.finish(taskId,task.ownerEpoch!,'blocked',()=>({receiptId:'second-cleanup',taskId,sessionId:task.sessionId!,ownerEpoch:task.ownerEpoch!,absent:true}));
+  secondDb.exec(`CREATE TABLE engineering_runtime_runs(task_id TEXT PRIMARY KEY,policy_hash TEXT NOT NULL,launch_state TEXT NOT NULL);
+    CREATE TABLE engineering_runtime_leases(task_id TEXT PRIMARY KEY,session_id TEXT,owner_epoch TEXT,reference_json TEXT,reference_hash TEXT);
+    CREATE TABLE engineering_ingress_requests(request_id TEXT PRIMARY KEY,task_id TEXT,allocation_id TEXT,stage TEXT,final_json TEXT);`);
+  secondDb.query('INSERT INTO engineering_runtime_runs VALUES(?,?,?)').run(taskId,spec.policyHash,'closed');
+  secondDb.query('INSERT INTO engineering_ingress_requests VALUES(?,?,?,?,?)').run(spec.requestId,taskId,s.o.allocationId,'blocked',
+    JSON.stringify({requestId:spec.requestId,taskId,phase:'final',status:'blocked',receiptId:'final-receipt'}));
+  const root=join(s.root,'engineering-v3'),workspacesRoot=join(s.root,'workspaces','engineering-v3'),auditDir=join(root,'budget-admission');
+  for(const path of [root,workspacesRoot,auditDir])mkdirSync(path,{mode:0o700});
+  const journalPath=join(root,'engineering.sqlite');writeFileSync(journalPath,'',{mode:0o600});
+  const o:EngineeringContinuationBinding={...second,root,workspacesRoot,auditDir,runId:'gary-native-engineering-20261010-03',grantId:'gary-native-engineering-20261010-03',
+    sourceRevision:'1'.repeat(40),runtimeConfigSha256:'2'.repeat(64),authoritySha256:'3'.repeat(64),continuation:{...second.continuation,
+      receiptPath:join(auditDir,'continuation.json'),afterBlockedContinuation:{receiptPath:second.continuation.receiptPath,
+        receiptSha256:admission.receiptSha256,claimSha256:hash(readFileSync(admission.claimPath)),taskId}}};
+  return {...s,o,journalPath,second,secondDb,secondClaim:admission.claimPath,secondSpec:spec};
+}
+
+test('explicit 03 continuation preserves both closed predecessors and only adds a new claim under 02',()=>{
+  const s=afterBlockedFixture(),before=s.logical(),aggregate=readFileSync(s.o.aggregatePath),claim=readFileSync(s.secondClaim),receipt=readFileSync(s.second.continuation.receiptPath);
+  const preview=previewEngineeringContinuation(s.o);expect(preview.remainingMicros).toBe(5_535_224);expect(preview.blockedContinuationSha256).toMatch(/^[a-f0-9]{64}$/);
+  expect(preview.claimPath).toBe(join(s.second.auditDir,s.second.runId+'.continuation-claim.json'));
+  expect(s.secondSpec.baseCommit).toBe('09e0a6f361a7f6b79e18d7b782fcb8723d6f613b');
+  expect(JSON.parse((s.oldDb.query('SELECT spec_json FROM engineering_tasks').get() as {spec_json:string}).spec_json).baseCommit).not.toBe(s.secondSpec.baseCommit);
+  expect(admitEngineeringContinuation({...s.o,apply:true}).canRun).toBe(true);assertEngineeringContinuationBudget(s.o,{requireUnused:true}).assertCurrent();
+  expect(readFileSync(s.secondClaim)).toEqual(claim);expect(readFileSync(s.second.continuation.receiptPath)).toEqual(receipt);
+  expect(readFileSync(s.o.aggregatePath)).toEqual(aggregate);expect(s.logical()).toBe(before);
+  expect(s.secondDb.query('SELECT state,cleanup_confirmed FROM engineering_tasks').get()).toEqual({state:'blocked',cleanup_confirmed:1});
+  expect(()=>admitEngineeringContinuation({...s.o,apply:true})).toThrow('already_claimed');
+});
+
+test('03 partial new claim is consumed without changing 01/02 receipts or retrying',()=>{
+  const s=afterBlockedFixture(),old=readFileSync(s.secondClaim),receipt=readFileSync(s.second.continuation.receiptPath),before=s.logical();
+  expect(()=>admitEngineeringContinuation({...s.o,apply:true,onClaimed:()=>{throw new Error('injected');}})).toThrow('injected');
+  expect(()=>admitEngineeringContinuation({...s.o,apply:true})).toThrow('already_claimed');expect(()=>assertEngineeringContinuationBudget(s.o)).toThrow();
+  expect(readFileSync(s.secondClaim)).toEqual(old);expect(readFileSync(s.second.continuation.receiptPath)).toEqual(receipt);expect(s.logical()).toBe(before);
+});
+
+for(const change of ['receipt','claim','config','journal-replaced','task-state','cleanup','model-table','lease','runtime','ingress','scope','base','extra-task','history'] as const)
+  test('03 readiness and existing guard reject changed second '+change,()=>{
+    const s=afterBlockedFixture();admitEngineeringContinuation({...s.o,apply:true});const baseline=assertEngineeringContinuationBudget(s.o);
+    if(change==='receipt')writeFileSync(s.second.continuation.receiptPath,readFileSync(s.second.continuation.receiptPath,'utf8')+' ');
+    else if(change==='claim')writeFileSync(s.secondClaim,readFileSync(s.secondClaim,'utf8')+' ');
+    else if(change==='config')writeFileSync(join(s.second.root,'config.json'),readFileSync(join(s.second.root,'config.json'),'utf8')+' ');
+    else if(change==='journal-replaced'){const p=join(s.second.root,'engineering.sqlite');copyFileSync(p,p+'.new');chmodSync(p+'.new',0o600);renameSync(p+'.new',p);}
+    else if(change==='task-state')s.secondDb.exec("UPDATE engineering_tasks SET state='cleanup_unknown',cleanup_confirmed=0");
+    else if(change==='cleanup')s.secondDb.exec('DELETE FROM engineering_cleanup_proofs');
+    else if(change==='model-table')s.secondDb.exec('CREATE TABLE engineering_model_requests(request_id TEXT)');
+    else if(change==='lease')s.secondDb.exec("INSERT INTO engineering_runtime_leases VALUES('task','session','owner','{}','hash')");
+    else if(change==='runtime')s.secondDb.exec("UPDATE engineering_runtime_runs SET launch_state='running'");
+    else if(change==='ingress')s.secondDb.exec("UPDATE engineering_ingress_requests SET stage='preparing'");
+    else if(change==='scope'||change==='base'){
+      const spec={...s.secondSpec,baseCommit:change==='base'?'b'.repeat(40):s.secondSpec.baseCommit,
+        scope:{...s.secondSpec.scope,audienceId:change==='scope'?'another-user':s.secondSpec.scope.audienceId}};
+      s.secondDb.query('UPDATE engineering_tasks SET spec_json=?,spec_hash=?,scope_key=?').run(JSON.stringify(spec),fingerprintJson(spec).sha256,
+        fingerprintJson([spec.scope.teamId,spec.scope.surface,spec.scope.audienceId,spec.scope.projectId]).sha256);
+    } else if(change==='extra-task')s.secondDb.exec("INSERT INTO engineering_tasks SELECT 'other','other-request',spec_json,spec_hash,scope_key,state,owner_epoch,session_id,cleanup_confirmed,updated_ms FROM engineering_tasks");
+    else s.secondDb.exec("UPDATE engineering_task_receipts SET evidence_hash='changed'");
+    expect(()=>baseline.assertCurrent()).toThrow();expect(()=>assertEngineeringContinuationBudget(s.o)).toThrow();
+  });
+
+test('03 admission rejects paid/unresolved second attempts and pre-admission nonzero-model or unknown cleanup',()=>{
+  for(const change of ['new-settled','new-unknown','model-table','cleanup-unknown','bad-cleanup']){
+    const s=afterBlockedFixture();
+    if(change.startsWith('new-'))s.spend.query('INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES(?,?,?,?,?,?,?)')
+      .run(s.o.allocationId,'deepseek','deepseek-v4-pro',8192,1416561,0,change==='new-settled'?'settled':'unknown');
+    else if(change==='model-table')s.secondDb.exec('CREATE TABLE engineering_model_owners(allocation_id TEXT)');
+    else if(change==='cleanup-unknown')s.secondDb.exec("UPDATE engineering_tasks SET state='cleanup_unknown',cleanup_confirmed=0");
+    else s.secondDb.exec("UPDATE engineering_cleanup_proofs SET session_id='other'");
+    expect(()=>previewEngineeringContinuation(s.o)).toThrow();expect(()=>admitEngineeringContinuation({...s.o,apply:true})).toThrow();
+  }
+});
+
+test('03 rejects wrong chain, recursive rollover, changed receipt pins and overlapping roots',()=>{
+  for(const change of ['no-chain','grant-four','other-task','receipt-path','claim-hash','old-original','recursive','overlap','reboot-reference']){
+    const s=afterBlockedFixture(),after=s.o.continuation.afterBlockedContinuation!;
+    if(change==='no-chain')delete s.o.continuation.afterBlockedContinuation;
+    else if(change==='grant-four')s.o.runId=s.o.grantId='gary-native-engineering-20261010-04';
+    else if(change==='other-task')after.taskId='another-task';
+    else if(change==='receipt-path')after.receiptPath=s.o.continuation.receiptPath;
+    else if(change==='claim-hash')after.claimSha256='a'.repeat(64);
+    else if(change==='overlap')s.o.workspacesRoot=s.second.workspacesRoot;
+    else if(change==='reboot-reference')s.o.continuation.ledgerRebootAttestation={path:'/wrong',sha256:'a'.repeat(64)};
+    else {
+      const receipt=JSON.parse(readFileSync(after.receiptPath,'utf8'));
+      if(change==='old-original')receipt.binding.continuation.original.authoritySha256='a'.repeat(64);
+      else receipt.binding.continuation.afterBlockedContinuation={...after};
+      const bytes=JSON.stringify(receipt);writeFileSync(after.receiptPath,bytes);after.receiptSha256=hash(bytes);
+    }
+    expect(()=>previewEngineeringContinuation(s.o)).toThrow();expect(()=>admitEngineeringContinuation({...s.o,apply:true})).toThrow();
+  }
+});
+
+test('03 future work and review remain inside original cap and permit new settled rows without weakening predecessor guards',async()=>{
+  const s=afterBlockedFixture(),prefix=s.spend.query('SELECT * FROM spend_attempts').all(),m=model(s),signal=new AbortController().signal;
+  for(let i=0;i<3;i++){
+    m.adapter.beginTurn({turnId:'third-attempt-'+i,prompt:'Work.'});expect((await m.adapter.handle(m.body(),signal)).status).toBe(200);m.adapter.finishTurn(m.adapter.history());
+    assertEngineeringContinuationBudget(s.o).assertCurrent();
+  }
+  expect((await m.adapter.review({prompt:'Independent review.',systemPrompt:'Independent.',signal})).status).toBe(200);
+  expect(m.calls()).toBe(4);expect(s.ledger.status(s.o.allocationId)!.attemptCount).toBe(7);
+  expect(s.ledger.status(s.o.allocationId)!.capMicros).toBe(5_650_000);expect(s.ledger.status(s.o.allocationId)!.chargedMicros).toBeLessThan(5_650_000);
+  expect(s.spend.query('SELECT * FROM spend_attempts ORDER BY id LIMIT 3').all()).toEqual(prefix);
+  expect(()=>assertEngineeringContinuationBudget(s.o,{requireUnused:true})).toThrow('already_used');
+  await expect(m.adapter.review({prompt:'Replay.',systemPrompt:'Independent.',signal})).rejects.toThrow();expect(m.calls()).toBe(4);
+  s.secondDb.exec("UPDATE engineering_task_receipts SET evidence_hash='changed'");expect(()=>assertEngineeringContinuationBudget(s.o)).toThrow();
 });

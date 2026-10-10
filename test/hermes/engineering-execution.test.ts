@@ -74,7 +74,7 @@ function fixture(flags: Flags = {}) {
     repositoryId: '1', repository: repository.repo, baseCommit: BASE, policyHash: policy.fingerprint, allocationId: 'allocation', deadlineMs },
     scopeKey: 'fixture', state: 'running', ownerEpoch: 'owner', sessionId: 'session', cleanupConfirmed: false,
     updatedAtMs: Date.now(), workerState: 'not_observed' };
-  const config: EngineeringRuntimeConfig = { version: 1, grantId: 'grant', allocationId: 'allocation', campaignId: 'campaign', root: stateRoot, workspacesRoot,
+  const config: EngineeringRuntimeConfig = {resourceLock: { path:'/private/tmp/apple-release-xcode.lock',dev:16777232,ino:176033673,uid:501,mode:0o644,nlink:1,bootSessionUUID:'02D97A38-83D2-457D-967F-A01481D5EEFC',apfsVolumeUUID:'7CD7DC2C-1F22-4B7C-BB7A-525D8FF5B697' },  version: 1, grantId: 'grant', allocationId: 'allocation', campaignId: 'campaign', root: stateRoot, workspacesRoot,
     repository: repository.repo, baseBranch: 'main', baseCommit: BASE, allowedFiles: [FILE], requiredCommands: [REQUIRED], deadlineMs: 1800000,
     workerImage: 'sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab',
     executorImage: 'sha256:0efb49a8f21794948395f7bec2c15557a78473acd760207613fe7714e7c47f8c', bunCacheVolume: 'fixture-cache',

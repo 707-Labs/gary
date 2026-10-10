@@ -17,6 +17,9 @@ export interface EngineeringContinuationConfig {
   predecessorTaskId: string;
   receiptPath: string;
   ledgerRebootAttestation?: EngineeringLedgerRebootReference;
+  /** Exactly one further task after the known second task blocked before model
+   * setup. This does not reopen that task or recursively roll over grants. */
+  afterBlockedContinuation?: { receiptPath: string; receiptSha256: string; claimSha256: string; taskId: string };
 }
 export interface EngineeringContinuationBinding extends EngineeringBudgetBinding {
   root: string;
@@ -38,6 +41,7 @@ export interface EngineeringContinuationBaseline {
 }
 const minted = new WeakSet<object>();
 const CAP = 5_650_000, BASE_CHARGED = 114_776, BASE_COUNT = 3;
+const RUN_ONE='gary-native-engineering-20261010-01', RUN_TWO='gary-native-engineering-20261010-02', RUN_THREE='gary-native-engineering-20261010-03';
 const sha = (v: string | Buffer) => createHash('sha256').update(v).digest('hex');
 const digest = (v: unknown) => sha(JSON.stringify(v));
 function fail(code: string): never { throw new Error('engineering_continuation:' + code); }
@@ -84,6 +88,14 @@ function binding(input: EngineeringContinuationBinding, prospective = false): En
       || o.auditDir !== join(o.root, 'budget-admission') || o.continuation.receiptPath !== join(o.auditDir, 'continuation.json')
       || o.continuation.predecessorJournalPath !== join(dirname(p.auditDir), 'engineering.sqlite')
       || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(o.continuation.predecessorTaskId)) fail('binding');
+  const after=o.continuation.afterBlockedContinuation;
+  if (after && (Object.keys(after).length!==4 || !['receiptPath','receiptSha256','claimSha256','taskId'].every(k=>Object.hasOwn(after,k))
+      || p.runId!==RUN_ONE || p.grantId!==RUN_ONE || o.runId!==RUN_THREE
+      || o.root!==join(dirname(dirname(p.auditDir)),'engineering-v3')
+      || after.receiptPath!==join(dirname(dirname(p.auditDir)),'engineering-v2','budget-admission','continuation.json')
+      || ![after.receiptSha256,after.claimSha256].every(h=>/^[a-f0-9]{64}$/.test(h))
+      || after.taskId!=='engineering-438c8176-7f19-495d-9a8b-4056a141e1c8')) fail('blocked_continuation_binding');
+  if (o.runId===RUN_THREE && !after) fail('blocked_continuation_required');
   for (const dir of [o.root, o.auditDir, o.workspacesRoot, p.auditDir]) {
     if (prospective && dir !== p.auditDir && !existsSync(dir)) {
       if (!isAbsolute(dir) || resolve(dir) !== dir) fail('path');
@@ -112,6 +124,11 @@ function withReadDb<T>(path: string, fn: (db: Database) => T): T {
   identity(path); const db = new Database(path, { readonly: true, strict: true, create: false });
   try { return db.transaction(() => fn(db))(); } finally { db.close(); }
 }
+function journalDigest(db: Database): string {
+  const schema=db.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all() as {type:string;name:string}[];
+  const rows=schema.filter(s=>s.type==='table').map(s=>[s.name,db.query('SELECT * FROM "'+s.name.replaceAll('"','""')+'"').all().map(r=>JSON.stringify(r)).sort()]);
+  return digest({schema,rows});
+}
 function predecessor(o: EngineeringContinuationBinding, base: ReturnType<typeof prefix>) {
   const path = o.continuation.predecessorJournalPath, file = identity(path, true);
   const result = withReadDb(path, db => {
@@ -124,25 +141,93 @@ function predecessor(o: EngineeringContinuationBinding, base: ReturnType<typeof 
     if (!owner || owner.task_id !== task.task_id || owner.session_id !== task.session_id || owner.owner_epoch !== task.owner_epoch || owner.policy_hash !== spec.policyHash) fail('predecessor_model_owner');
     const requests = db.query('SELECT * FROM engineering_model_requests WHERE allocation_id=? ORDER BY rowid').all(o.allocationId) as Record<string, unknown>[];
     if (requests.length !== BASE_COUNT || requests.some((r, i) => r.state !== 'settled' || r.role !== 'work' || r.max_tokens !== 8192 || r.ledger_attempt !== base.attempts[i]!.id || r.receipt_hash !== fingerprintJson({...base.attempts[i]!, reason:base.receipts[i]!.reason, details_json:base.receipts[i]!.details_json}).sha256 || typeof r.response_hash !== 'string' || !/^[a-f0-9]{64}$/.test(r.response_hash))) fail('predecessor_model_requests');
-    const schema = db.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all() as { type: string; name: string }[];
-    const rows = schema.filter(s => s.type === 'table').map(s => [s.name, db.query('SELECT * FROM "' + s.name.replaceAll('"', '""') + '"').all().map(r => JSON.stringify(r)).sort()]);
-    return digest({ schema, rows });
+    return journalDigest(db);
   });
   if (digest(identity(path, true)) !== digest(file)) fail('predecessor_replaced');
   return { identity: file, logicalSha256: result };
+}
+function blockedContinuation(o: EngineeringContinuationBinding) {
+  const after=o.continuation.afterBlockedContinuation!;
+  const receiptBytes=read(after.receiptPath),oldClaimPath=join(o.continuation.original.auditDir,RUN_ONE+'.continuation-claim.json'),claimBytes=read(oldClaimPath);
+  if (sha(receiptBytes)!==after.receiptSha256 || sha(claimBytes)!==after.claimSha256) fail('blocked_continuation_receipts');
+  const receipt=JSON.parse(receiptBytes.toString()),previous=receipt.binding as EngineeringContinuationBinding;
+  if (!previous || previous.continuation?.afterBlockedContinuation || previous.runId!==RUN_TWO || previous.grantId!==RUN_TWO
+      || previous.root!==dirname(dirname(after.receiptPath)) || previous.auditDir!==dirname(after.receiptPath)
+      || previous.continuation.receiptPath!==after.receiptPath
+      || fingerprintJson(previous.continuation.original).sha256!==fingerprintJson(o.continuation.original).sha256
+      || previous.continuation.predecessorJournalPath!==o.continuation.predecessorJournalPath
+      || previous.continuation.predecessorTaskId!==o.continuation.predecessorTaskId
+      || fingerprintJson(previous.continuation.ledgerRebootAttestation??null).sha256!==fingerprintJson(o.continuation.ledgerRebootAttestation??null).sha256
+      || previous.ledgerPath!==o.ledgerPath || previous.aggregatePath!==o.aggregatePath
+      || previous.campaignId!==o.campaignId || previous.allocationId!==o.allocationId
+      || o.workspacesRoot!==join(dirname(previous.workspacesRoot),'engineering-v3')) fail('blocked_continuation_chain');
+  for (const root of [o.root,o.workspacesRoot]) for (const old of [previous.root,previous.workspacesRoot]) {
+    if (inside(root,old)||inside(old,root)) fail('blocked_continuation_overlap');
+  }
+  // Its receipt remains valid after later usage by 03; requireUnused is solely
+  // a fresh-admission gate, never an ongoing cumulative-budget health check.
+  assertEngineeringContinuationBudget(previous).assertCurrent();
+  // A reviewed second rollout may advance the repository base. Its own pinned
+  // config is the authority for that base; never infer it from attempt 01.
+  const configBytes=read(join(previous.root,'config.json'));
+  if (sha(configBytes)!==previous.runtimeConfigSha256) fail('blocked_continuation_config');
+  const config=JSON.parse(configBytes.toString());
+  if (config.grantId!==previous.grantId || config.allocationId!==o.allocationId || config.campaignId!==o.campaignId
+      || config.sourceRevision!==previous.sourceRevision || config.root!==previous.root || config.workspacesRoot!==previous.workspacesRoot
+      || typeof config.repository!=='string' || !/^707-Labs\/[A-Za-z0-9._-]+$/.test(config.repository)
+      || typeof config.baseCommit!=='string' || !/^[a-f0-9]{40}$/.test(config.baseCommit)) fail('blocked_continuation_config');
+  const path=join(previous.root,'engineering.sqlite'),file=identity(path,true);
+  const originalSpec=withReadDb(o.continuation.predecessorJournalPath,db=> {
+    const row=db.query('SELECT spec_json FROM engineering_tasks WHERE task_id=?').get(o.continuation.predecessorTaskId) as {spec_json:string};
+    return JSON.parse(row.spec_json);
+  });
+  const logicalSha256=withReadDb(path,db=>{
+    if (db.query("SELECT 1 FROM sqlite_master WHERE name LIKE 'engineering_model_%' LIMIT 1").get()) fail('blocked_continuation_model_state');
+    const tasks=db.query('SELECT * FROM engineering_tasks').all() as Record<string,unknown>[];
+    const task=tasks[0];
+    if (tasks.length!==1 || !task || task.task_id!==after.taskId || task.state!=='blocked' || task.cleanup_confirmed!==1
+        || typeof task.owner_epoch!=='string' || typeof task.session_id!=='string') fail('blocked_continuation_task');
+    const spec=JSON.parse(task.spec_json as string);
+    if (fingerprintJson(spec).sha256!==task.spec_hash || spec.taskId!==task.task_id || spec.requestId!==task.request_id
+        || spec.grantId!==RUN_TWO || spec.allocationId!==o.allocationId
+        || ['repository','repositoryId'].some(k=>spec[k]!==originalSpec[k])
+        || spec.repository!==config.repository || spec.baseCommit!==config.baseCommit
+        || fingerprintJson(spec.scope).sha256!==fingerprintJson(originalSpec.scope).sha256
+        || task.scope_key!==fingerprintJson([spec.scope.teamId,spec.scope.surface,spec.scope.audienceId,spec.scope.projectId]).sha256) fail('blocked_continuation_spec');
+    const cleanup=db.query('SELECT * FROM engineering_cleanup_proofs').all() as Record<string,unknown>[];
+    if (cleanup.length!==1 || cleanup[0]!.task_id!==task.task_id || cleanup[0]!.session_id!==task.session_id
+        || cleanup[0]!.owner_epoch!==task.owner_epoch) fail('blocked_continuation_cleanup');
+    const runs=db.query('SELECT * FROM engineering_runtime_runs').all() as Record<string,unknown>[];
+    if (runs.length!==1 || runs[0]!.task_id!==task.task_id || runs[0]!.policy_hash!==spec.policyHash || runs[0]!.launch_state!=='closed'
+        || db.query('SELECT 1 FROM engineering_runtime_leases LIMIT 1').get()) fail('blocked_continuation_runtime');
+    const ingress=db.query('SELECT * FROM engineering_ingress_requests').all() as Record<string,unknown>[];
+    if (ingress.length!==1 || ingress[0]!.task_id!==task.task_id || ingress[0]!.request_id!==task.request_id
+        || ingress[0]!.allocation_id!==o.allocationId || ingress[0]!.stage!=='blocked') fail('blocked_continuation_ingress');
+    const final=JSON.parse(ingress[0]!.final_json as string);
+    if (final.taskId!==task.task_id || final.requestId!==task.request_id || final.phase!=='final' || final.status!=='blocked') fail('blocked_continuation_ingress');
+    return journalDigest(db);
+  });
+  if (digest(identity(path,true))!==digest(file) || !read(after.receiptPath).equals(receiptBytes) || !read(oldClaimPath).equals(claimBytes)
+      || !read(join(previous.root,'config.json')).equals(configBytes)) fail('blocked_continuation_changed');
+  return {receiptSha256:after.receiptSha256,claimSha256:after.claimSha256,journalIdentity:file,logicalSha256,taskId:after.taskId};
 }
 function snapshot(o: EngineeringContinuationBinding, prospective = false) {
   const ready = originalAdmission(o);
   if (ready.status.capMicros !== CAP) fail('allocation_binding');
   const ledgerIdentity = identity(o.ledgerPath), journalIdentity = prospective ? null : identity(join(o.root, 'engineering.sqlite'), true);
   const base = withReadDb(o.ledgerPath, db => prefix(db, o.allocationId));
-  return { baseline: base, ledgerIdentity, journalIdentity, predecessor: predecessor(o, base), holdId: ready.holdId };
+  return { baseline: base, ledgerIdentity, journalIdentity, predecessor: predecessor(o, base), holdId: ready.holdId,
+    ...(o.continuation.afterBlockedContinuation ? {afterBlockedContinuation:blockedContinuation(o)} : {}) };
 }
 function originalAdmission(o: EngineeringContinuationBinding) {
   const reboot=o.continuation.ledgerRebootAttestation;
   return assertEngineeringBudgetAdmission(o.continuation.original, reboot ? {ledgerRebootAttestation:reboot} : {});
 }
-function claimPath(o: EngineeringContinuationBinding) { return join(o.continuation.original.auditDir, o.continuation.original.runId + '.continuation-claim.json'); }
+function claimPath(o: EngineeringContinuationBinding) {
+  const after=o.continuation.afterBlockedContinuation;
+  return after ? join(dirname(after.receiptPath),RUN_TWO+'.continuation-claim.json')
+    : join(o.continuation.original.auditDir,o.continuation.original.runId+'.continuation-claim.json');
+}
 function encode(value: unknown) { return Buffer.from(JSON.stringify(value, null, 2) + '\n'); }
 /** Read-only preparation before a prospective v2 directory or journal exists.
  * It verifies all predecessor evidence but never asserts an uncreated identity. */
@@ -153,7 +238,8 @@ export function previewEngineeringContinuation(input: EngineeringContinuationBin
   if (existsSync(claimPath(o)) || existsSync(o.continuation.receiptPath)) fail('continuation_already_claimed');
   return Object.freeze({ applied:false,canRun:false,baselineAttemptCount:BASE_COUNT,baselineChargedMicros:BASE_CHARGED,
     remainingMicros:CAP-BASE_CHARGED,baselineSha256:digest(evidence.baseline),predecessorSha256:digest(evidence.predecessor),
-    ledgerIdentity:evidence.ledgerIdentity,claimPath:claimPath(o),receiptPath:o.continuation.receiptPath });
+    ledgerIdentity:evidence.ledgerIdentity,claimPath:claimPath(o),receiptPath:o.continuation.receiptPath,
+    ...(evidence.afterBlockedContinuation ? {blockedContinuationSha256:digest(evidence.afterBlockedContinuation)} : {}) });
 }
 /** Invoke only under the operator's existing exclusive admission/resource locks.
  * Both preview and apply reconcile the existing hold; neither enrolls or spends. */

@@ -207,7 +207,7 @@ test('e849a0d reopens nine candidate stores preserving every row, fingerprints, 
     candidate.ledger.createCampaign('engineering-compatibility',5.65);candidate.ledger.enrollTicket('engineering-compatibility',engineeringAllocation,5.65);
     const spendReader=new Database(paths['spend.db']!,{readonly:true});let readerClosed=false;
     const closeSpendReader=()=>{if(!readerClosed){readerClosed=true;spendReader.close();}};cleanup.push(closeSpendReader);
-    const config:EngineeringRuntimeConfig={version:1,grantId:'fixture-grant',campaignId:'engineering-compatibility',allocationId:engineeringAllocation,root:engineeringRoot,
+    const config:EngineeringRuntimeConfig={resourceLock: { path:'/private/tmp/apple-release-xcode.lock',dev:16777232,ino:176033673,uid:501,mode:0o644,nlink:1,bootSessionUUID:'02D97A38-83D2-457D-967F-A01481D5EEFC',apfsVolumeUUID:'7CD7DC2C-1F22-4B7C-BB7A-525D8FF5B697' }, version:1,grantId:'fixture-grant',campaignId:'engineering-compatibility',allocationId:engineeringAllocation,root:engineeringRoot,
       workspacesRoot:privateDir(join(data,'engineering-workspaces')),
       repository:'707-Labs/fixture',baseBranch:'main',baseCommit:'a'.repeat(40),allowedFiles:['fixture.ts'],requiredCommands:['bun test'],deadlineMs:1800000,
       workerImage:'sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab',executorImage:'sha256:0efb49a8f21794948395f7bec2c15557a78473acd760207613fe7714e7c47f8c',
@@ -216,7 +216,7 @@ test('e849a0d reopens nine candidate stores preserving every row, fingerprints, 
     const runtime=createEngineeringRuntime({config,journalDb:engineeringDb,spendDb:spendReader,ledger:candidate.ledger,now:()=>CLOCK,
       repository:{binding:{appId:1,installationId:2},observer:{installation:async()=>external(),repositories:async()=>external()},getCredential:async()=>external()},
       providerApiKey:'synthetic-unused',fetch:async()=>external(),assertGrant(){},assertRuntime(){},assertBudget(){},deliver:async()=>external(),
-      dependencies:{git:{run:async()=>external()},readHeadroom:async()=>external(),acquireLease:async()=>external(),createExecution:()=>external()}});
+      dependencies:{resourceBinding:{observeBoot:()=>({bootSessionUUID:config.resourceLock.bootSessionUUID,apfsVolumeUUID:config.resourceLock.apfsVolumeUUID}),inspection:{lstat:()=>({...config.resourceLock,isFile:()=>true,isSymbolicLink:()=>false}),realpath:p=>p}},git:{run:async()=>external()},readHeadroom:async()=>external(),acquireLease:async()=>external(),createExecution:()=>external()}});
     expect(runtime.ready()).toBe(true);await runtime.stop();
     const envelope={type:'events_api',envelope_id:'synthetic-socket',payload:{type:'event_callback',team_id:audience.teamId,api_app_id:currentSlack.GARY_SLACK.appId,event_id:'EvEngineeringFixture',
       event:{type:'message',channel_type:'im',channel:audience.channelId,user:audience.requesterId,ts:'1791633600.000003',text:'!engineer 707-Labs/fixture Make a synthetic scoped edit'}}};

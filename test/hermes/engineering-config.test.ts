@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, realpathSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, realpathSync, symlinkSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -20,6 +20,8 @@ function fixture() {
     deadlineMs: 1800000, workerImage: 'sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab',
     executorImage: 'sha256:0efb49a8f21794948395f7bec2c15557a78473acd760207613fe7714e7c47f8c', bunCacheVolume: 'gary-bun-cache-20261010-mulligan-4bb2fdde-v2',
     dockerExecutable: '/usr/local/bin/docker', dockerSocketPath: '/Users/tanner/.colima/default/docker.sock', runtimeFiles,
+    resourceLock: { path:'/private/tmp/apple-release-xcode.lock',dev:16777232,ino:176033673,uid:501,mode:0o644,nlink:1,
+      bootSessionUUID:'02D97A38-83D2-457D-967F-A01481D5EEFC',apfsVolumeUUID:'7CD7DC2C-1F22-4B7C-BB7A-525D8FF5B697' },
     sourceRevision: 'b'.repeat(40), publication: 'patch_only', capMicros: 5650000,
     budget: { aggregatePath: join(root, 'aggregate.json'), auditDir: join(root, 'budget-admission'), runId: 'grant' } };
   function load(c = config, a = authority) {
@@ -32,6 +34,18 @@ function fixture() {
 test('exact approved config loads frozen with bounded new allocation, no enrollment side effect', () => {
   const f = fixture(), config = f.load(); expect(Object.isFrozen(config)).toBe(true); expect(Object.isFrozen(config.allowedFiles)).toBe(true);
   expect(config.capMicros).toBe(5650000);
+  expect(Object.isFrozen(config.resourceLock)).toBe(true);
+});
+test('production resource binding is mandatory and cannot widen path, ownership or metadata scope',()=>{
+  const f=fixture();
+  for(const change of [
+    (v:any)=>{delete v.resourceLock;},(v:any)=>{v.resourceLock=null;},
+    (v:any)=>{v.resourceLock.path='/tmp/arbitrary.lock';},(v:any)=>{v.resourceLock.uid=0;},
+    (v:any)=>{v.resourceLock.mode=0o666;},(v:any)=>{v.resourceLock.nlink=2;},
+    (v:any)=>{v.resourceLock.dev=-1;},(v:any)=>{v.resourceLock.ino=0;},
+    (v:any)=>{v.resourceLock.bootSessionUUID='invalid';},(v:any)=>{v.resourceLock.apfsVolumeUUID='invalid';},
+    (v:any)=>{v.resourceLock.discover=true;},
+  ]) {const value=structuredClone(f.config);change(value);expect(()=>f.load(value)).toThrow('engineering_config_rejected');}
 });
 test('worker bind sources require a separate canonical private workspace root',()=>{
   const f=fixture();expect(()=>f.load({...f.config,workspacesRoot:f.root})).toThrow('rejected');
@@ -135,4 +149,39 @@ test('continuation rejects widened identities, changed predecessor pins, extra f
       c.budget.continuation.predecessorJournalPath = join(c.workspacesRoot, 'old', 'engineering.sqlite'); },
   ];
   for (const change of changes) { const candidate = structuredClone(f.config); change(candidate); expect(() => f.load(candidate)).toThrow('engineering_config_rejected'); }
+});
+
+test('grant03 requires the exact new delegation and immutable zero-spend predecessor references',()=>{
+  const f=continuationFixture(),grantId='gary-native-engineering-20261010-03';
+  const original=f.config.budget.continuation!.original;
+  const decisionPath=join(f.root,'continuation-authority.json');
+  const decision=readFileSync(join(import.meta.dir,'../fixtures/engineering-continuation-03-decision.json'));
+  expect(hash(decision.toString())).toBe('61c49e6a05d3a06ce8414b0ede773cb8c691a872d441fedcb821e6ee5c52a246');
+  writeFileSync(decisionPath,decision,{mode:0o600});
+  const config:EngineeringRuntimeConfig={...f.config,grantId,budget:{...f.config.budget,runId:grantId,continuation:{...f.config.budget.continuation!,
+    ledgerRebootAttestation:{path:join(original.auditDir,original.runId+'.ledger-reboot.json'),sha256:'a'.repeat(64)},
+    afterBlockedContinuation:{receiptPath:join(dirname(dirname(original.auditDir)),'engineering-v2/budget-admission/continuation.json'),
+      receiptSha256:'f7b68d23b79e16e291792f924882086af9e7149b8f9dd79bb80a7a25db3a150d',
+      claimSha256:'6bdf4049a16d2165c933c1622d5f20bc91b2eb4e284673b5249c5f6b42e7b316',taskId:'engineering-438c8176-7f19-495d-9a8b-4056a141e1c8'}}}};
+  const authority:EngineeringAuthorityReceipt={...f.authority,grantId,continuationDecision:{path:decisionPath,sha256:hash(decision.toString())}};
+  const load=(c=config,a=authority)=>{
+    const p=join(f.root,'config.json'),ap=join(f.root,'authority.json');const raw=JSON.stringify(c),approval=JSON.stringify(a);
+    writeFileSync(p,raw,{mode:0o600});writeFileSync(ap,approval,{mode:0o600});return loadEngineeringRuntimeConfig(p,hash(raw),ap,hash(approval));
+  };
+  expect(Object.isFrozen(load().budget.continuation!.afterBlockedContinuation)).toBe(true);
+  for(const change of [
+    (v:any)=>{delete v.budget.continuation.afterBlockedContinuation;},
+    (v:any)=>{delete v.budget.continuation.ledgerRebootAttestation;},
+    (v:any)=>{v.budget.continuation.afterBlockedContinuation.receiptPath+='.other';},
+    (v:any)=>{v.budget.continuation.afterBlockedContinuation.receiptSha256='a'.repeat(64);},
+    (v:any)=>{v.budget.continuation.afterBlockedContinuation.claimSha256='a'.repeat(64);},
+    (v:any)=>{v.budget.continuation.afterBlockedContinuation.taskId='different';},
+    (v:any)=>{v.budget.continuation.afterBlockedContinuation.extra=true;},
+  ]){const value=structuredClone(config);change(value);expect(()=>load(value)).toThrow('engineering_config_rejected');}
+  for(const change of [(v:any)=>{delete v.continuationDecision;},(v:any)=>{v.continuationDecision.path+='.other';},
+    (v:any)=>{v.continuationDecision.sha256='a'.repeat(64);},(v:any)=>{v.continuationDecision.extra=true;}]){
+    const value=structuredClone(authority);change(value);expect(()=>load(config,value)).toThrow('engineering_config_rejected');
+  }
+  writeFileSync(decisionPath,Buffer.from(decision.toString().replace('5535224','5535225')),{mode:0o600});
+  expect(()=>load()).toThrow('engineering_config_rejected');
 });

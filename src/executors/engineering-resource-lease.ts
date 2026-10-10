@@ -3,7 +3,7 @@
  * An orphan keeps its fd lock until an operator verifies physical cleanup. */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { lstatSync, realpathSync } from 'node:fs';
+import { lstatSync, realpathSync, type Stats } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
 
 export interface EngineeringResourceBinding { readonly taskId: string; readonly sessionId: string; readonly ownerEpoch: string }
@@ -11,9 +11,10 @@ export interface EngineeringResourceLockPin {
   readonly path: string; readonly dev: number; readonly ino: number; readonly uid: number; readonly mode: number; readonly nlink: number;
 }
 export interface EngineeringResourceRequirements { readonly cpus: number; readonly memoryBytes: number }
-export const ENGINEERING_RESOURCE_LOCK: Readonly<EngineeringResourceLockPin> = Object.freeze({
-  path: '/private/tmp/apple-release-xcode.lock', dev: 16777229, ino: 171769508, uid: 501, mode: 0o644, nlink: 1,
-});
+export interface EngineeringResourceLockInspection {
+  lstat(path: string): Pick<Stats, 'dev' | 'ino' | 'uid' | 'mode' | 'nlink' | 'isFile' | 'isSymbolicLink'>;
+  realpath(path: string): string;
+}
 /** Native worker 2 CPUs/4 GiB plus executor 4 CPUs/12 GiB. */
 export const ENGINEERING_RESOURCE_REQUIREMENTS: Readonly<EngineeringResourceRequirements> = Object.freeze({ cpus: 6, memoryBytes: 16 * 1024 ** 3 });
 export interface EngineeringResourceLeaseReference {
@@ -42,12 +43,14 @@ export interface EngineeringResourceLeaseOptions {
   /** Reviewed host policy only: aggregate simultaneous native + executor budget.
    * Narrowing this value must also narrow the actual workload resource limits. */
   requirements?: EngineeringResourceRequirements;
-  /** Trusted host DI only. Production uses the reviewed default; fixtures use temp files. */
-  lockPin?: EngineeringResourceLockPin;
+  /** Required reviewed host binding. There is no discovered or historical default. */
+  lockPin: EngineeringResourceLockPin;
   pythonExecutable?: string;
   signal?: AbortSignal;
   /** Test seam; never supplied from worker/model arguments. */
   spawn?: typeof spawn;
+  /** Trusted fixture observation only; production observes the host filesystem. */
+  inspection?: EngineeringResourceLockInspection;
 }
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/;
 const CONTROL_MS = 2000;
@@ -56,7 +59,7 @@ function bindingMatches(a: EngineeringResourceBinding, b: EngineeringResourceBin
   return a.taskId === b.taskId && a.sessionId === b.sessionId && a.ownerEpoch === b.ownerEpoch;
 }
 function validatePin(pin: EngineeringResourceLockPin): void {
-  if (!isAbsolute(pin.path) || resolve(pin.path) !== pin.path || /[\x00-\x1f]/.test(pin.path)
+  if (typeof pin.path !== 'string' || !isAbsolute(pin.path) || resolve(pin.path) !== pin.path || /[\x00-\x1f]/.test(pin.path)
     || ![pin.dev, pin.ino, pin.uid, pin.mode, pin.nlink].every(Number.isSafeInteger)
     || pin.dev < 0 || pin.ino < 1 || pin.uid < 0 || pin.mode < 0 || pin.mode > 0o777 || pin.nlink !== 1) fail('invalid_pin');
 }
@@ -66,10 +69,12 @@ function validateRequirements(requirements: EngineeringResourceRequirements): vo
     || !Number.isSafeInteger(requirements.memoryBytes) || requirements.memoryBytes < 1
     || requirements.memoryBytes > ENGINEERING_RESOURCE_REQUIREMENTS.memoryBytes) fail('invalid_requirements');
 }
-function checkPath(pin: EngineeringResourceLockPin): void {
-  const st = lstatSync(pin.path);
-  if (!st.isFile() || st.isSymbolicLink() || realpathSync(pin.path) !== pin.path
-    || st.dev !== pin.dev || st.ino !== pin.ino || st.uid !== pin.uid || (st.mode & 0o7777) !== pin.mode || st.nlink !== pin.nlink) fail('lock_identity_changed');
+function checkPath(pin: EngineeringResourceLockPin, inspection: EngineeringResourceLockInspection): void {
+  try {
+    const st = inspection.lstat(pin.path);
+    if (!st.isFile() || st.isSymbolicLink() || inspection.realpath(pin.path) !== pin.path
+      || st.dev !== pin.dev || st.ino !== pin.ino || st.uid !== pin.uid || (st.mode & 0o7777) !== pin.mode || st.nlink !== pin.nlink) fail('lock_identity_changed');
+  } catch { fail('lock_identity_changed'); }
 }
 function deferred<T>() {
   let resolve!: (value: T) => void, reject!: (reason: Error) => void;
@@ -139,12 +144,13 @@ finally:
  * Never remove the lock or kill a PID inferred from old state. */
 export async function acquireEngineeringResourceLease(options: EngineeringResourceLeaseOptions): Promise<EngineeringResourceLease> {
   options = { ...options };
-  const binding = Object.freeze({ ...options.binding }), pin = Object.freeze({ ...(options.lockPin ?? ENGINEERING_RESOURCE_LOCK) });
+  const binding = Object.freeze({ ...options.binding }), pin = Object.freeze({ ...options.lockPin });
+  const inspection = { lstat: options.inspection?.lstat ?? lstatSync, realpath: options.inspection?.realpath ?? realpathSync };
   const requirements = Object.freeze({ ...(options.requirements === undefined ? ENGINEERING_RESOURCE_REQUIREMENTS : options.requirements) });
   validateRequirements(requirements);
   if (!Object.values(binding).every(value => typeof value === 'string' && ID.test(value))
     || Object.keys(binding).sort().join(',') !== 'ownerEpoch,sessionId,taskId') fail('invalid_binding');
-  validatePin(pin); checkPath(pin); options.signal?.throwIfAborted();
+  validatePin(pin); checkPath(pin, inspection); options.signal?.throwIfAborted();
   const python = options.pythonExecutable ?? '/usr/bin/python3';
   if (!isAbsolute(python) || resolve(python) !== python || /[\x00-\x1f]/.test(python)) fail('invalid_python');
   const birthToken = randomUUID(), abort = new AbortController(), ready = deferred<string>(), closed = deferred<void>();
@@ -201,7 +207,7 @@ export async function acquireEngineeringResourceLease(options: EngineeringResour
   };
   const assertHeld = () => {
     if (!held || exited || releasing || abort.signal.aborted || options.signal?.aborted) fail('not_held');
-    try { checkPath(pin); } catch { lost('lock_identity_changed'); fail('not_held'); }
+    try { checkPath(pin, inspection); } catch { lost('lock_identity_changed'); fail('not_held'); }
   };
   try {
     const startedAtUnixNs = await bounded(ready.promise);

@@ -1,5 +1,10 @@
 import { Database } from 'bun:sqlite';
 import { randomUUID } from 'node:crypto';
+import type { spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import type { EngineeringResourceLockInspection } from '../../src/executors/engineering-resource-lease.ts';
+import type { EngineeringResourceLockBinding } from '../../src/executors/engineering-resource-binding.ts';
 import { afterEach, expect, test } from 'bun:test';
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -10,6 +15,8 @@ import type { EngineeringRuntimeConfig } from '../../src/hermes/engineering-conf
 import type { EngineeringExecutionOptions } from '../../src/hermes/engineering-execution.ts';
 import type { EngineeringContinuationBaseline, EngineeringContinuationConfig } from '../../src/hermes/engineering-continuation-budget.ts';
 import type { EngineeringIngressRequest, EngineeringReceipt } from '../../src/slack/service.ts';
+const CURRENT_RESOURCE_LOCK = Object.freeze({ path: '/private/tmp/apple-release-xcode.lock', dev: 16777232, ino: 176033673, uid: 501, mode: 0o644, nlink: 1,
+  bootSessionUUID: '02D97A38-83D2-457D-967F-A01481D5EEFC', apfsVolumeUUID: '7CD7DC2C-1F22-4B7C-BB7A-525D8FF5B697' });
 const cleanups: (() => void)[] = [];
 afterEach(() => cleanups.splice(0).reverse().forEach(fn => fn()));
 const request: EngineeringIngressRequest = { requestId: 'request', eventId: 'event', eventKey: 'event-key', messageKey: 'message',
@@ -24,7 +31,14 @@ function fixture() {
   ledger.createCampaign('campaign', 5.65); ledger.enrollTicket('campaign', 'allocation', 5.65);
   const spendDb = new Database(join(root, 'spend.sqlite'), { readonly: true });
   cleanups.push(() => { db.close(); spendDb.close(); ledger.close(); rmSync(fixtureRoot, { recursive: true, force: true }); });
-  const config: EngineeringRuntimeConfig = { version: 1, grantId: 'grant', allocationId: 'allocation', campaignId: 'campaign', root, workspacesRoot,
+  let resourceObserved: EngineeringResourceLockBinding = { ...CURRENT_RESOURCE_LOCK };
+  let resourceBoot: { bootSessionUUID: string; apfsVolumeUUID: string } = { bootSessionUUID: CURRENT_RESOURCE_LOCK.bootSessionUUID, apfsVolumeUUID: CURRENT_RESOURCE_LOCK.apfsVolumeUUID };
+  let resourceObservations = 0, providerCalls = 0;
+  const inspection: EngineeringResourceLockInspection = {
+    lstat(path) { expect(path).toBe(CURRENT_RESOURCE_LOCK.path); resourceObservations++; return { ...resourceObserved, isFile: () => true, isSymbolicLink: () => false }; },
+    realpath(path) { expect(path).toBe(CURRENT_RESOURCE_LOCK.path); return path; },
+  };
+  const config: EngineeringRuntimeConfig = { resourceLock: { ...CURRENT_RESOURCE_LOCK }, version: 1, grantId: 'grant', allocationId: 'allocation', campaignId: 'campaign', root, workspacesRoot,
     repository: request.repository, baseBranch: 'main', baseCommit: 'a'.repeat(40), allowedFiles: ['src/fixture.ts'], requiredCommands: ['bun test test/fixture.test.ts'],
     deadlineMs: 1800000, workerImage: 'sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab',
     executorImage: 'sha256:0efb49a8f21794948395f7bec2c15557a78473acd760207613fe7714e7c47f8c', bunCacheVolume: 'gary-bun-cache-20261010-mulligan-4bb2fdde-v2',
@@ -36,17 +50,19 @@ function fixture() {
   let deliveredResolve!: () => void; const finished = new Promise<void>(resolve => { deliveredResolve = resolve; });
   let observations = 0, leaseCount = 0, releaseCount = 0, headroomCount = 0, cleanupCount = 0, revoked = false;
   let baseCommit = config.baseCommit, failConstruction = false, failCleanup = false;
+  let beforeLease = () => {};
   const now = () => 1_000_000;
   const options: EngineeringRuntimeOptions = { config, journalDb: db, spendDb, ledger, now,
     repository: { binding: { appId: 1, installationId: 2 }, observer: {
       async installation() { observations++; return { appId: 1, installationId: 2, accountLogin: '707-Labs', contents: 'write', pullRequests: 'write', observedAtMs: now() }; },
       async repositories() { observations++; return { installationId: 2, totalCount: 1, observedAtMs: now(), repositories: [{ repositoryId: 3, fullName: config.repository, archived: false, disabled: false }] }; },
     }, async getCredential() { return { kind: 'app', appId: 1, installationId: 2, accountLogin: '707-Labs', token: 'host-only-fake-token-'.replaceAll('-', '_').repeat(3), issuedAtMs: now(), expiresAtMs: now() + 60000, permissions: { contents: 'write', pullRequests: 'write' } }; } },
-    providerApiKey: 'fake-model-secret', async fetch() { throw Error('unexpected paid request'); },
+    providerApiKey: 'fake-model-secret', async fetch() { providerCalls++; throw Error('unexpected paid request'); },
     assertGrant() { if (revoked) throw Error('revoked'); }, assertRuntime() {},
     assertBudget() { const s = ledger.status('allocation'); if (s?.attemptCount !== 0 || s.capMicros !== 5650000) throw Error('budget unavailable'); },
     async deliver(value) { delivered.push(value); deliveredResolve(); },
     dependencies: {
+      resourceBinding: { inspection, observeBoot() { return { ...resourceBoot }; } },
       git: { async run(invocation, header) {
         gitCalls.push({ cwd: invocation.cwd, args: invocation.args, authenticated: header !== undefined });
         const args = invocation.args;
@@ -68,7 +84,7 @@ function fixture() {
         executions.push(value); if (failConstruction) throw Error('construction failed');
         let lease: Awaited<ReturnType<EngineeringExecutionOptions['acquireLease']>> | undefined;
         return { async run(prompt) {
-          expect(prompt).toBe(request.task); value.assertOwner();
+          expect(prompt).toBe(request.task); value.assertOwner(); beforeLease();
           lease = await value.acquireLease();
           const fresh = await value.prepareVerifier();
           expect(fresh.workspaceRoot).not.toBe(value.workspaceRoot);
@@ -81,7 +97,11 @@ function fixture() {
         } };
       },
     } };
-  return { root, db, ledger, config, options, gitCalls, delivered, executions, finished,
+  return { root, db, ledger, config, options, gitCalls, delivered, executions, finished, inspection,
+    providerCalls: () => providerCalls, resourceObservations: () => resourceObservations,
+    beforeLease(fn: () => void) { beforeLease = fn; },
+    replaceResourcePin(patch: Partial<typeof resourceObserved>) { resourceObserved = { ...resourceObserved, ...patch }; },
+    replaceBoot(patch: Partial<typeof resourceBoot>) { resourceBoot = { ...resourceBoot, ...patch }; },
     counts: () => ({ observations, leaseCount, releaseCount, headroomCount, cleanupCount }),
     revoke() { revoked = true; }, drift() { baseCommit = 'c'.repeat(40); },
     failConstruction() { failConstruction = true; }, failCleanup() { failCleanup = true; } };
@@ -201,4 +221,121 @@ test('continuation baseline is required with its configuration and passed unchan
   runtime.ingress.start!(ack); await f.finished;
   expect(f.executions).toHaveLength(1); expect(f.executions[0]!.continuationBaseline).toBe(baseline);
   expect(f.ledger.status('allocation')?.attemptCount).toBe(0); await runtime.stop();
+});
+
+/** Only the holder process boundary is controlled: runtime composition, binding
+ * guard, actual lease admission, durable reference and cleanup all stay real.
+ * No OS lock or process is opened, and the fixture never executes a workload. */
+function actualLeaseWithControlledHolder(f: ReturnType<typeof fixture>, busy = false) {
+  delete f.options.dependencies!.acquireLease;
+  const inputs: Record<string, any>[] = [], releases: unknown[] = [];
+  let killed = 0, childrenAlive = 0;
+  f.options.dependencies!.resourceLease = { inspection: f.inspection,
+    spawn: ((executable: string, args: string[], options: Record<string, unknown>) => {
+      expect(executable).toBe('/usr/bin/python3'); expect(args.slice(0, 4)).toEqual(['-I', '-B', '-u', '-c']);
+      expect(options).toEqual({ detached: true, stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: '/usr/bin:/bin', HOME: '/nonexistent' }, cwd: '/' });
+      const input = JSON.parse(args.at(-1)!); inputs.push(input);
+      const child = Object.assign(new EventEmitter(), { pid: 54321, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+        kill() { killed++; return true; } });
+      childrenAlive++;
+      const emit = (value: Record<string, unknown>) => child.stdout.write(JSON.stringify({ birthToken: input.birthToken, ...value }) + '\n');
+      let ended = false;
+      const close = () => { if (!ended) { ended = true; childrenAlive--; child.emit('close', busy ? 2 : 0); } };
+      child.stdin.on('data', bytes => {
+        const message = JSON.parse(bytes.toString()); releases.push(message);
+        expect(message).toEqual({ kind: 'release', birthToken: input.birthToken });
+        queueMicrotask(() => { emit({ kind: 'released' }); close(); });
+      });
+      queueMicrotask(() => {
+        if (busy) { emit({ kind: 'error', reason: 'busy' }); close(); }
+        else emit({ kind: 'held', pid: child.pid, startedAtUnixNs: '1791666390000000000' });
+      });
+      return child;
+    }) as unknown as typeof spawn };
+  return { inputs, releases, childrenAlive: () => childrenAlive, killed: () => killed };
+}
+
+test('actual production composition passes the configured post-reboot pin into real lease admission and durable cleanup', async () => {
+  const f = fixture(), holder = actualLeaseWithControlledHolder(f), runtime = createEngineeringRuntime(f.options);
+  expect(runtime.ready()).toBe(true); expect(holder.inputs).toHaveLength(0);
+  const ack = await runtime.ingress.admit(request, signal(), () => true) as EngineeringReceipt;
+  expect(ack.phase).toBe('admitted'); expect(holder.inputs).toHaveLength(0);
+  runtime.ingress.start!(ack); await f.finished;
+  expect(f.delivered[0]?.status).toBe('completed'); expect(holder.inputs).toHaveLength(1);
+  const { bootSessionUUID: _boot, apfsVolumeUUID: _volume, ...expectedPin } = CURRENT_RESOURCE_LOCK;
+  const input = holder.inputs[0]!;
+  expect(input).toMatchObject({ ...expectedPin, binding: { taskId: ack.taskId }, requirements: { cpus: 3, memoryBytes: 6 * 1024 ** 3 } });
+  expect(input).not.toHaveProperty('bootSessionUUID'); expect(input).not.toHaveProperty('apfsVolumeUUID');
+  expect([input.dev, input.ino]).not.toEqual([16777229, 171769508]);
+  const durable = f.db.query<{ reference_json: string }, []>('SELECT reference_json FROM engineering_runtime_leases').get()!;
+  expect(JSON.parse(durable.reference_json).lock).toEqual(expectedPin);
+  expect(JSON.parse(durable.reference_json)).toMatchObject({ pid: 54321, birthToken: input.birthToken, binding: input.binding });
+  expect(f.counts()).toMatchObject({ leaseCount: 0, headroomCount: 1, cleanupCount: 1 });
+  expect(holder.releases).toEqual([{ kind: 'release', birthToken: input.birthToken }]);
+  expect(holder.childrenAlive()).toBe(0); expect(holder.killed()).toBe(0); expect(f.providerCalls()).toBe(0);
+  expect(f.ledger.status('allocation')?.attemptCount).toBe(0); await runtime.stop();
+});
+
+test('stale pre-reboot pin is refused at construction before resource observation can consume a task', () => {
+  const f = fixture(), holder = actualLeaseWithControlledHolder(f);
+  f.config.resourceLock = { ...CURRENT_RESOURCE_LOCK, dev: 16777229, ino: 171769508 };
+  expect(() => createEngineeringRuntime(f.options)).toThrow('engineering_resource_lock_identity_changed');
+  expect(f.db.query("SELECT name FROM sqlite_master WHERE name='engineering_ingress_requests'").get()).toBeNull();
+  expect(holder.inputs).toHaveLength(0); expect(f.gitCalls).toHaveLength(0); expect(f.providerCalls()).toBe(0);
+  expect(f.ledger.status('allocation')?.attemptCount).toBe(0);
+});
+
+test.each(['boot', 'volume', 'inode', 'device'] as const)('readiness and admission reject changed %s before intent or task consumption', async changed => {
+  const f = fixture(), holder = actualLeaseWithControlledHolder(f), runtime = createEngineeringRuntime(f.options);
+  if (changed === 'boot') f.replaceBoot({ bootSessionUUID: 'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA' });
+  if (changed === 'volume') f.replaceBoot({ apfsVolumeUUID: 'BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB' });
+  if (changed === 'inode') f.replaceResourcePin({ ino: CURRENT_RESOURCE_LOCK.ino + 1 });
+  if (changed === 'device') f.replaceResourcePin({ dev: CURRENT_RESOURCE_LOCK.dev + 1 });
+  expect(runtime.ready()).toBe(false);
+  expect(await runtime.ingress.admit(request, signal(), () => true)).toEqual({ kind: 'rejected', code: 'unavailable' });
+  expect(f.db.query('SELECT count(*) n FROM engineering_ingress_requests').get()).toEqual({ n: 0 });
+  expect(f.db.query('SELECT count(*) n FROM engineering_tasks').get()).toEqual({ n: 0 });
+  expect(holder.inputs).toHaveLength(0); expect(f.gitCalls).toHaveLength(0); expect(f.providerCalls()).toBe(0);
+  expect(f.ledger.status('allocation')?.attemptCount).toBe(0); await runtime.stop();
+});
+
+test('ordinary readiness observes identity without acquisition; contending holder blocks real lease before headroom or workload', async () => {
+  const f = fixture(), holder = actualLeaseWithControlledHolder(f, true), runtime = createEngineeringRuntime(f.options);
+  // Operator owns the slot: metadata can pass startup while flock remains busy.
+  expect(runtime.ready()).toBe(true); expect(holder.inputs).toHaveLength(0);
+  const ack = await runtime.ingress.admit(request, signal(), () => true) as EngineeringReceipt;
+  runtime.ingress.start!(ack); await f.finished;
+  expect(f.delivered[0]?.status).toBe('blocked'); expect(holder.inputs).toHaveLength(1);
+  expect(f.counts()).toMatchObject({ headroomCount: 0, cleanupCount: 1 });
+  expect(f.gitCalls.filter(c => c.args[0] === 'fetch')).toHaveLength(1); // no verifier or workload
+  expect(f.db.query('SELECT count(*) n FROM engineering_runtime_leases').get()).toEqual({ n: 0 });
+  const diagnostics = JSON.stringify(f.db.query('SELECT payload_json FROM engineering_diagnostics_v1').all());
+  expect(diagnostics).toContain('engineering_resource_busy');
+  expect(holder.releases).toEqual([]); expect(holder.childrenAlive()).toBe(0); expect(holder.killed()).toBe(0);
+  expect(f.providerCalls()).toBe(0); expect(f.ledger.status('allocation')?.attemptCount).toBe(0); await runtime.stop();
+});
+
+
+test('serial admission rechecks the resource binding after ready and before consuming the one-use request', async () => {
+  const f = fixture(), holder = actualLeaseWithControlledHolder(f), runtime = createEngineeringRuntime(f.options);
+  await expect(runtime.ingress.admit(request, signal(), () => {
+    f.replaceResourcePin({ ino: CURRENT_RESOURCE_LOCK.ino + 1 }); return true;
+  })).rejects.toThrow('engineering_resource_lock_identity_changed');
+  expect(f.db.query('SELECT count(*) n FROM engineering_ingress_requests').get()).toEqual({ n: 0 });
+  expect(f.db.query('SELECT count(*) n FROM engineering_tasks').get()).toEqual({ n: 0 });
+  expect(holder.inputs).toHaveLength(0); expect(f.gitCalls).toHaveLength(0); expect(f.providerCalls()).toBe(0);
+  await runtime.stop();
+});
+
+test('boot drift after task start is checked again immediately before lease acquisition', async () => {
+  const f = fixture(), holder = actualLeaseWithControlledHolder(f), runtime = createEngineeringRuntime(f.options);
+  const ack = await runtime.ingress.admit(request, signal(), () => true) as EngineeringReceipt;
+  f.beforeLease(() => f.replaceBoot({ bootSessionUUID: 'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA' }));
+  runtime.ingress.start!(ack); await f.finished;
+  expect(f.delivered[0]?.status).toBe('blocked'); expect(holder.inputs).toHaveLength(0);
+  expect(f.counts()).toMatchObject({ headroomCount: 0, cleanupCount: 1 });
+  expect(f.db.query('SELECT count(*) n FROM engineering_runtime_leases').get()).toEqual({ n: 0 });
+  expect(JSON.stringify(f.db.query('SELECT payload_json FROM engineering_diagnostics_v1').all())).toContain('engineering_resource_boot_identity_changed');
+  expect(f.providerCalls()).toBe(0); expect(f.ledger.status('allocation')?.attemptCount).toBe(0);
+  await runtime.stop();
 });

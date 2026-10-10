@@ -423,7 +423,9 @@ function engineeringStartupFixture(continuation = false) {
   const dmPath=join(dmDir,'config.json');
   writeFileSync(dmPath,JSON.stringify({version:1,runId:'hermes-dm-20261008',campaignId:'hermes-dm-20261008',allocationId:'local:hermes-dm-20261008-tanner'}),{mode:0o600});
   const runtimeFiles=['gary_engineering_runtime.py','gary_engineering_environment.py'].map(name=>{const path=join(root,name);writeFileSync(path,'# offline fixture\n',{mode:0o600});return{path,sha256:hash('# offline fixture\n')};});
-  const config:EngineeringRuntimeConfig={version:1,grantId:'grant',allocationId:'allocation',campaignId:'campaign',root,workspacesRoot,repository:'707-Labs/fixture',baseBranch:'main',baseCommit:'a'.repeat(40),
+  const resourceLock={path:'/private/tmp/apple-release-xcode.lock',dev:16777232,ino:176033673,uid:501,mode:0o644,nlink:1,
+    bootSessionUUID:'02D97A38-83D2-457D-967F-A01481D5EEFC',apfsVolumeUUID:'7CD7DC2C-1F22-4B7C-BB7A-525D8FF5B697'};
+  const config:EngineeringRuntimeConfig={resourceLock,version:1,grantId:'grant',allocationId:'allocation',campaignId:'campaign',root,workspacesRoot,repository:'707-Labs/fixture',baseBranch:'main',baseCommit:'a'.repeat(40),
     allowedFiles:['src/fixture.ts'],requiredCommands:['bun test test/fixture.test.ts'],deadlineMs:1800000,
     workerImage:'sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab',executorImage:'sha256:0efb49a8f21794948395f7bec2c15557a78473acd760207613fe7714e7c47f8c',
     bunCacheVolume:'gary-bun-cache-20261010-mulligan-4bb2fdde-v2',dockerExecutable:'/usr/local/bin/docker',dockerSocketPath:'/Users/tanner/.colima/default/docker.sock',runtimeFiles,
