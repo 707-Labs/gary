@@ -329,6 +329,42 @@ describe('persistent engineering session, synthetic command runner only', () => 
 });
 
 describe('real command runner with isolated Python fixtures, never Docker', () => {
+  it('delivers every retained output chunk before reporting a completed command', async () => {
+    const controls = new Runner(), real = createBunEngineeringCommandRunner();
+    const expected = 'x'.repeat(40_000) + 'END-OF-OUTPUT';
+    const runner: EngineeringCommandRunner = { synthetic: true, run: invocation => controls.run(invocation),
+      async start(invocation) {
+        expect(invocation.argv[1]).toBe('exec');
+        const command = await real.start({ argv: ['/usr/bin/printf', '%s', expected],
+          env: {}, timeoutMs: 5000, maxOutputBytes: invocation.maxOutputBytes });
+        // Force the important race: the OS process and pipes are done before
+        // the session's first bounded read, while retained bytes remain unread.
+        const until = Date.now() + 5000;
+        while ((await command.poll()).running && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 5));
+        expect((await command.poll()).running).toBe(false);
+        return command;
+      } };
+    const session = new EngineeringSession({ binding, workspaceRoot: '/offline/fixture', image,
+      deadlineMs: Date.now() + 10_000, runner, journal: createMemoryEngineeringSessionJournal(),
+      validateWorkspace: () => {}, assertOwner: () => {} });
+    let sequence = 0;
+    try {
+      const started = await session.operation({ operation: 'execute', arguments: { binding, operationId: 'start', command: 'fixture', timeoutMs: 5000 } });
+      let received = '', ended = false;
+      for (let i = 0; i < 8; i++) {
+        const result = await session.operation({ operation: 'poll', arguments: { binding, operationId: `poll-${++sequence}`,
+          processId: started.processId!, maxOutputBytes: 16_384 } });
+        expect(result.outputTruncated).toBe(false);
+        expect(Buffer.byteLength(result.output!)).toBeLessThanOrEqual(16_384);
+        received += result.output;
+        if (result.status === 'exited') { expect(result.exitCode).toBe(0); ended = true; break; }
+        expect(result.exitCode).toBeNull();
+      }
+      expect(ended).toBe(true);
+      expect(received).toBe(expected);
+    } finally { await session.operation({ operation: 'close', arguments: { binding, operationId: 'close' } }); }
+  });
+
   it('bounds output, transmits stdin and supplies only explicit environment', async () => {
     const runner = createBunEngineeringCommandRunner();
     const result = await runner.run({ argv: ['/usr/bin/python3', '-I', '-B', '-c',

@@ -1,6 +1,7 @@
 /** Host-owned engineering model route. Inert until explicitly constructed by the host.
  * The native worker receives neither provider credentials nor spending authority.
  * Request intents are durable and single-use; an ambiguous response fences the task. */
+import { assertEngineeringContinuationBaseline, type EngineeringContinuationBaseline } from './engineering-continuation-budget.ts';
 import { randomUUID } from 'node:crypto';
 import type { Database } from 'bun:sqlite';
 import { SpendLedger, spendReservationMicros } from '../spend.ts';
@@ -13,13 +14,14 @@ import { canonicalizeConversation, sameConversation, type ConversationMessage } 
 
 type Json = Record<string, unknown>;
 interface RequestRow { request_id: string; role: EngineeringRequestRole; max_tokens: number;
-  state: 'in_flight' | 'settled' | 'unknown'; ledger_attempt: number | null }
+  state: 'in_flight' | 'settled' | 'unknown'; ledger_attempt: number | null; receipt_hash: string | null }
 interface LedgerRow { id: number; ticket_id: string; provider: string; model: string; max_tokens: number;
   reserved_micros: number; charged_micros: number; state: string; reason: string | null; details_json: string | null }
 export interface EngineeringModelOptions {
   binding: EngineeringProtocolBinding;
   policy: EngineeringTaskPolicy;
   allocationId: string;
+  continuationBaseline?: EngineeringContinuationBaseline;
   ledger: SpendLedger;
   /** Dedicated engineering state, opened by the trusted host; never a worker path. */
   journalDb: Database;
@@ -53,7 +55,7 @@ const copy = <T>(v: T): T => { fingerprintJson(v); return structuredClone(v); };
 export function createEngineeringModelAdapter(input: EngineeringModelOptions): EngineeringModelAdapter {
   const options = { ...input, binding: Object.freeze({ ...input.binding }), tools: copy(input.tools) };
   const { binding, ledger, journalDb: db, spendDb, policy, allocationId } = options;
-  if (!(ledger instanceof SpendLedger) || policy.taskId !== binding.taskId
+  if (!(ledger instanceof SpendLedger) || ledger.databasePath !== spendDb.filename || policy.taskId !== binding.taskId
       || hash(options.protocol.binding) !== hash(binding) || !options.systemPrompt.trim()
       || Buffer.byteLength(options.systemPrompt) > 262_144 || options.tools.length > 64) fail('configuration');
   const names = options.tools.map(tool => {
@@ -72,16 +74,25 @@ export function createEngineeringModelAdapter(input: EngineeringModelOptions): E
       max_tokens INTEGER NOT NULL, state TEXT NOT NULL, request_hash TEXT NOT NULL,
       ledger_attempt INTEGER UNIQUE, receipt_hash TEXT, response_hash TEXT);`);
   if ((db.query('PRAGMA synchronous').get() as { synchronous: number }).synchronous !== 2) fail('journal_not_durable');
+  const baseline = options.continuationBaseline;
+  if (baseline) assertEngineeringContinuationBaseline(baseline, spendDb, db, allocationId);
+  const baselineCount = baseline?.baselineAttemptCount ?? 0;
+  const baselineCharged = baseline?.baselineChargedMicros ?? 0;
+  if (baseline) db.exec('CREATE TABLE IF NOT EXISTS engineering_model_baselines(allocation_id TEXT PRIMARY KEY,receipt_hash TEXT NOT NULL,attempt_count INTEGER NOT NULL,charged_micros INTEGER NOT NULL)');
   const status = ledger.status(allocationId);
   if (!status || status.capMicros !== LIMITS.capMicros || status.campaignCapMicros !== LIMITS.capMicros
-      || status.state !== 'active' || status.terminalReason !== null || status.attemptCount !== 0
+      || (baseline && status.campaignId !== baseline.campaignId) || status.state !== 'active' || status.terminalReason !== null || status.attemptCount !== baselineCount || status.chargedMicros !== baselineCharged
       || status.unknownAttempts !== 0 || (policy.publication === 'draft_pr' && !status.draftPr)
       || ledger.hasCodingReviewReserve(allocationId)) fail('allocation_binding');
   // One construction claims one owner permanently. Recovery never reopens this row.
   db.transaction(() => {
     options.assertOwner();
     if (db.query('SELECT 1 FROM engineering_model_owners WHERE allocation_id=? OR task_id=?').get(allocationId, binding.taskId)) fail('owner_already_claimed');
-    if ((spendDb.query('SELECT count(*) n FROM spend_attempts WHERE ticket_id=?').get(allocationId) as { n: number }).n !== 0) fail('ledger_binding');
+    if ((spendDb.query('SELECT count(*) n FROM spend_attempts WHERE ticket_id=?').get(allocationId) as { n: number }).n !== baselineCount) fail('ledger_binding');
+    if (baseline) {
+      assertEngineeringContinuationBaseline(baseline, spendDb, db, allocationId);
+      db.query('INSERT INTO engineering_model_baselines VALUES(?,?,?,?)').run(allocationId, baseline.receiptSha256, baselineCount, baselineCharged);
+    }
     db.query('INSERT INTO engineering_model_owners VALUES(?,?,?,?,?,?,0)').run(allocationId, binding.taskId,
       binding.sessionId, binding.ownerEpoch, ownerToken, policy.fingerprint);
   }).immediate();
@@ -89,11 +100,16 @@ export function createEngineeringModelAdapter(input: EngineeringModelOptions): E
   let transcript: ConversationMessage[] = [];
   const pending = new Map<string, string | null>(), seenCalls = new Set<string>();
   const rows = (): RequestRow[] => db.query<RequestRow, [string]>(
-    'SELECT request_id,role,max_tokens,state,ledger_attempt FROM engineering_model_requests WHERE allocation_id=? ORDER BY rowid').all(allocationId);
+    'SELECT request_id,role,max_tokens,state,ledger_attempt,receipt_hash FROM engineering_model_requests WHERE allocation_id=? ORDER BY rowid').all(allocationId);
   const attempts = () => rows().map(r => Object.freeze({ requestId: r.request_id, role: r.role, maxTokens: r.max_tokens, state: r.state }));
   const guard = () => {
     if (fenced || Date.now() >= binding.deadlineMs) fail('inactive');
     options.assertOwner();
+    if (baseline) {
+      assertEngineeringContinuationBaseline(baseline, spendDb, db, allocationId);
+      const persisted = db.query('SELECT receipt_hash,attempt_count,charged_micros FROM engineering_model_baselines WHERE allocation_id=?').get(allocationId) as {receipt_hash:string;attempt_count:number;charged_micros:number}|null;
+      if (!persisted || persisted.receipt_hash !== baseline.receiptSha256 || persisted.attempt_count !== baselineCount || persisted.charged_micros !== baselineCharged) fail('baseline_changed');
+    }
     const row = db.query('SELECT owner_token,fenced FROM engineering_model_owners WHERE allocation_id=?').get(allocationId) as { owner_token: string; fenced: number } | null;
     if (!row || row.owner_token !== ownerToken || row.fenced) fail('owner_changed');
   };
@@ -110,7 +126,16 @@ export function createEngineeringModelAdapter(input: EngineeringModelOptions): E
     const requestId = randomUUID(), before = ledger.status(allocationId)!;
     const prior = rows();
     if (before.capMicros !== LIMITS.capMicros || before.campaignCapMicros !== LIMITS.capMicros
-        || before.attemptCount !== prior.length || prior.some(r => r.state !== 'settled')) fail('ledger_history');
+        || before.attemptCount !== baselineCount + prior.length || prior.some(r => r.state !== 'settled')) fail('ledger_history');
+    const assertPrior = (currentAttempt: number | null = null) => {
+      const canonicalIds = spendDb.query<{id:number},[string]>('SELECT id FROM spend_attempts WHERE ticket_id=? ORDER BY id').all(allocationId).slice(baselineCount);
+      if (canonicalIds.length !== prior.length + (currentAttempt === null ? 0 : 1)
+          || hash(rows().slice(0,prior.length)) !== hash(prior)
+          || canonicalIds.slice(0,prior.length).some((r,i) => r.id !== prior[i]?.ledger_attempt)
+          || (currentAttempt !== null && canonicalIds.at(-1)?.id !== currentAttempt)
+          || prior.some(r => r.ledger_attempt === null || hash(receipt(r.ledger_attempt)) !== r.receipt_hash)) fail('ledger_history');
+    };
+    assertPrior();
     assertEngineeringRequestAllowed(policy, { requestId, role, maxTokens }, { attempts: attempts(),
       allocationActive: before.state === 'active' && before.terminalReason === null,
       taskRemainingMicros: before.remainingMicros, campaignRemainingMicros: before.campaignCapMicros - before.campaignChargedMicros,
@@ -137,19 +162,39 @@ export function createEngineeringModelAdapter(input: EngineeringModelOptions): E
           if (!row || row.ticket_id !== allocationId || row.provider !== 'deepseek' || row.model !== 'deepseek-v4-pro'
               || row.max_tokens !== maxTokens || row.reserved_micros !== spendReservationMicros('deepseek', maxTokens)
               || row.state !== 'reserved' || row.reason !== null) fail('reservation_binding');
+          const reservedStatus = ledger.status(allocationId)!;
+          const reviewFloor = role !== 'review' && !prior.some(r => r.role === 'review') ? LIMITS.review.reservationMicros : 0;
+          if (reservedStatus.attemptCount !== baselineCount + prior.length + 1
+              || reservedStatus.chargedMicros !== before.chargedMicros + row.reserved_micros
+              || reservedStatus.remainingMicros < reviewFloor
+              || reservedStatus.campaignCapMicros - reservedStatus.campaignChargedMicros < reviewFloor) fail('reservation_headroom');
+          assertPrior(ledgerAttempt);
           // Durable link to the canonical reservation BEFORE the physical network call.
           const changed = db.query('UPDATE engineering_model_requests SET ledger_attempt=? WHERE request_id=? AND state=\'in_flight\' AND ledger_attempt IS NULL').run(ledgerAttempt, requestId);
           if (changed.changes !== 1) fail('reservation_binding');
           guard(); return options.fetch(request);
         } });
-      const response = await ledger.withPaidRequestGuard(guard, () => transport(new Request('https://gary.invalid/v1/chat/completions', {
-        method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' }, body: JSON.stringify(body), signal })));
+      const response = await ledger.withReservationGuard(reservation => {
+        guard(); signal.throwIfAborted();
+        assertPrior();
+        const current = reservation.status;
+        if (reservation.ticketId !== allocationId || reservation.provider !== LIMITS.provider || reservation.model !== LIMITS.model
+            || reservation.maxTokens !== maxTokens || current.attemptCount !== baselineCount + prior.length
+            || current.chargedMicros !== before.chargedMicros) fail('reservation_history');
+        // This check and the canonical insertion share the SAME SQLite writer lock.
+        assertEngineeringRequestAllowed(policy, { requestId, role, maxTokens }, { attempts: prior.map(r => ({requestId:r.request_id,role:r.role,maxTokens:r.max_tokens,state:r.state})),
+          allocationActive: current.state === 'active' && current.terminalReason === null,
+          taskRemainingMicros: current.remainingMicros, campaignRemainingMicros: current.campaignCapMicros-current.campaignChargedMicros,
+          unresolvedAttempts: current.unknownAttempts });
+      }, () => ledger.withPaidRequestGuard(guard, () => transport(new Request('https://gary.invalid/v1/chat/completions', {
+        method: 'POST', headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' }, body: JSON.stringify(body), signal }))));
       guard(); signal.throwIfAborted();
       const result = await response.json() as Json;
       if (!response.ok || ledgerAttempt === null) fail('transport_failed');
+      assertPrior(ledgerAttempt);
       const row = receipt(ledgerAttempt), after = ledger.status(allocationId)!;
       if (!row || row.ticket_id !== allocationId || row.max_tokens !== maxTokens || row.state !== 'settled'
-          || row.reason !== 'accepted' || row.details_json === null || after.attemptCount !== prior.length + 1
+          || row.reason !== 'accepted' || row.details_json === null || after.attemptCount !== baselineCount + prior.length + 1
           || after.unknownAttempts !== 0 || after.chargedMicros - before.chargedMicros !== row.charged_micros) fail('receipt_unresolved');
       guard();
       const changed = db.query('UPDATE engineering_model_requests SET state=\'settled\',receipt_hash=?,response_hash=? WHERE request_id=? AND state=\'in_flight\' AND ledger_attempt=?')

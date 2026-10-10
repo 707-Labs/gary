@@ -8,6 +8,7 @@ import { SpendLedger } from '../../src/spend.ts';
 import { createEngineeringRuntime, type EngineeringRuntimeOptions } from '../../src/hermes/engineering-runtime.ts';
 import type { EngineeringRuntimeConfig } from '../../src/hermes/engineering-config.ts';
 import type { EngineeringExecutionOptions } from '../../src/hermes/engineering-execution.ts';
+import type { EngineeringContinuationBaseline, EngineeringContinuationConfig } from '../../src/hermes/engineering-continuation-budget.ts';
 import type { EngineeringIngressRequest, EngineeringReceipt } from '../../src/slack/service.ts';
 const cleanups: (() => void)[] = [];
 afterEach(() => cleanups.splice(0).reverse().forEach(fn => fn()));
@@ -173,5 +174,31 @@ test('lease receipt persistence failure releases exact acquired lease before any
   expect(f.counts()).toMatchObject({ leaseCount: 1, releaseCount: 1, cleanupCount: 1 });
   expect(f.gitCalls.filter(c => c.args[0] === 'fetch')).toHaveLength(1);
   expect(f.db.query('SELECT count(*) n FROM engineering_runtime_leases').get()).toEqual({ n: 0 });
+  expect(f.ledger.status('allocation')?.attemptCount).toBe(0); await runtime.stop();
+});
+
+test('continuation baseline is required with its configuration and passed unchanged to execution', async () => {
+  const f = fixture();
+  // Trusted composition fixture: production obtains this opaque value only from
+  // assertEngineeringContinuationBudget; execution separately verifies it.
+  const baseline = { baselineAttemptCount: 1, baselineChargedMicros: 10, receiptSha256: 'd'.repeat(64),
+    assertCurrent() {}, assertPrefix() {}, assertJournal() {} } as unknown as EngineeringContinuationBaseline;
+  f.options.continuationBaseline = baseline;
+  expect(() => createEngineeringRuntime(f.options)).toThrow('continuation_binding');
+  const original = { ...f.config.budget, ledgerPath: f.options.spendDb.filename, grantId: 'original',
+    campaignId: f.config.campaignId, allocationId: f.config.allocationId, sourceRevision: 'a'.repeat(40),
+    runtimeConfigSha256: 'a'.repeat(64), authoritySha256: 'b'.repeat(64) };
+  const continuation: EngineeringContinuationConfig = { version: 1, original,
+    predecessorJournalPath: join(f.root + '-old', 'engineering.sqlite'), predecessorTaskId: 'previous-task',
+    receiptPath: join(f.config.budget.auditDir, 'continuation.json') };
+  f.config.budget = { ...f.config.budget, continuation };
+  delete f.options.continuationBaseline;
+  expect(() => createEngineeringRuntime(f.options)).toThrow('continuation_binding');
+  expect(f.gitCalls).toHaveLength(0); expect(f.executions).toHaveLength(0);
+  f.options.continuationBaseline = baseline;
+  const runtime = createEngineeringRuntime(f.options);
+  const ack = await runtime.ingress.admit(request, signal(), () => true) as EngineeringReceipt;
+  runtime.ingress.start!(ack); await f.finished;
+  expect(f.executions).toHaveLength(1); expect(f.executions[0]!.continuationBaseline).toBe(baseline);
   expect(f.ledger.status('allocation')?.attemptCount).toBe(0); await runtime.stop();
 });

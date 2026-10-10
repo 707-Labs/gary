@@ -285,6 +285,8 @@ class EngineeringSession:
         self.native_entries = {}
         self.events = []
         self.native_context = None
+        self._turn_iteration_limit = False
+        self._turn_tool_counts = dict(toolCalls=0, toolFailures=0, toolBlocks=0, toolResultErrors=0)
 
     def _guard(self):
         if self._closed or self._fenced:
@@ -360,6 +362,7 @@ class EngineeringSession:
         acquired = False
         token = None
         admission = None
+        self._turn_tool_counts["toolCalls"] += 1
         try:
             self._guard()
             if self.environment is not None and self.environment._fenced:
@@ -399,11 +402,34 @@ class EngineeringSession:
             token = _ADMISSION.set(admission)
             self.events.append({"event": "tool.begin", "toolCallId": tool_call_id, "receiptId": reply["receiptId"]})
             try:
+                if tool_name in NATIVE_TOOLS - {"terminal"}:
+                    # Native terminal `workdir` is transient: its session cwd
+                    # stays put while BaseEnvironment.cwd tracks that command.
+                    # File tools resolve/lock/report against the session cwd,
+                    # but V4A headers and default searches execute relative to
+                    # the environment cwd. Align those namespaces only after
+                    # this exact file call has a host admission. A persistent
+                    # terminal `cd` already updates the native session record.
+                    from tools.terminal_tool import get_session_cwd
+                    cwd = get_session_cwd(task_id)
+                    if not isinstance(cwd, str) or not cwd.startswith("/"):
+                        raise EngineeringFault("native_file_cwd_unbound")
+                    self.environment.cwd = cwd
                 result = next_call(copy.deepcopy(args))
                 if len(canonical_json(result).encode()) > self.max_result_bytes:
                     raise EngineeringFault("native_result_limit")
                 status = "completed"
+                # Count only a native handler's explicit JSON error. Keep its
+                # text out of diagnostics; a nonzero shell exit is not itself
+                # a transport or tool-dispatch failure.
+                try:
+                    native_result = json.loads(result) if isinstance(result, str) else result
+                except (ValueError, TypeError):
+                    native_result = None
+                if isinstance(native_result, dict) and native_result.get("error"):
+                    self._turn_tool_counts["toolResultErrors"] += 1
             except Exception:
+                self._turn_tool_counts["toolFailures"] += 1
                 status, result = "failed", json.dumps({"error": "native_tool_failed"})
             finally:
                 admission["active"] = False
@@ -413,6 +439,7 @@ class EngineeringSession:
             self.events.append({"event": "tool.end", "toolCallId": tool_call_id, "receiptId": end["receiptId"]})
             return result
         except Exception:
+            self._turn_tool_counts["toolBlocks"] += 1
             # An explicit value stops native middleware's fail-open fallback.
             return json.dumps({"error": "engineering_tool_blocked", "status": "blocked"})
         finally:
@@ -551,6 +578,7 @@ class EngineeringSession:
                 return client_factory(dict(client_kwargs), reason=reason, shared=shared)
 
             def _handle_max_iterations(self, messages, api_call_count):
+                session._turn_iteration_limit = True
                 # Native contract is str. An empty response avoids inventing
                 # an assistant message without a host-observed model receipt;
                 # native finalization marks this exhausted turn incomplete.
@@ -605,6 +633,8 @@ class EngineeringSession:
             raise EngineeringFault("native_agent_session_mismatch")
         if system_message and system_message != agent._gary_system_prompt:
             raise EngineeringFault("host_system_prompt_changed")
+        self._turn_iteration_limit = False
+        self._turn_tool_counts = dict(toolCalls=0, toolFailures=0, toolBlocks=0, toolResultErrors=0)
         result = agent.run_conversation(prompt, system_message=system_message,
             conversation_history=copy.deepcopy(history or []), task_id=self.binding["taskId"])
         self._guard()
@@ -613,6 +643,13 @@ class EngineeringSession:
         if not isinstance(result, dict) or not isinstance(result.get("messages"), list):
             raise EngineeringFault("native_result_history_missing")
         result["messages"] = native_history(result["messages"])
+        model_requests = result.get("api_calls")
+        if type(model_requests) is not int or not 0 <= model_requests <= 2048:
+            raise EngineeringFault("native_result_count_invalid")
+        result["diagnostics"] = dict(
+            outcome="iteration_limit" if self._turn_iteration_limit else
+                "completed" if result.get("completed") is True else "incomplete",
+            modelRequests=model_requests, **self._turn_tool_counts)
         return result
 
     def close(self):

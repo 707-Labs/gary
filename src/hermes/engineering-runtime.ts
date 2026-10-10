@@ -12,6 +12,7 @@ import { createSqliteEngineeringSessionJournal } from '../executors/engineering-
 import { createEngineeringSessionGuardianFactory } from '../executors/engineering-session-guardian.ts';
 import { acquireEngineeringResourceLease, type EngineeringResourceLeaseOptions } from '../executors/engineering-resource-lease.ts';
 import type { EngineeringRuntimeConfig } from './engineering-config.ts';
+import type { EngineeringContinuationBaseline } from './engineering-continuation-budget.ts';
 import { createEngineeringExecution, type EngineeringExecutionOptions } from './engineering-execution.ts';
 import { createEngineeringHost, type HostEngineeringCleanupProof } from './engineering-host.ts';
 import { createEngineeringTaskPolicy, type EngineeringTaskPolicy } from './engineering-policy.ts';
@@ -29,6 +30,7 @@ export interface EngineeringRuntimeOptions {
   /** Already verified by loadEngineeringRuntimeConfig; startup rechecks its pins. */
   config: Readonly<EngineeringRuntimeConfig>;
   journalDb: Database; spendDb: Database; ledger: SpendLedger;
+  continuationBaseline?: EngineeringContinuationBaseline;
   repository: { binding: EngineeringAppBinding; observer: EngineeringAppObserver; getCredential(repo: string): Promise<EngineeringAppCredential> };
   providerApiKey: string; fetch(request: Request): Promise<Response>;
   assertGrant(): void; assertBudget(): void; assertRuntime(): void;
@@ -84,6 +86,7 @@ function pinnedTools(): readonly Record<string, unknown>[] {
 
 export function createEngineeringRuntime(options: EngineeringRuntimeOptions) {
   const { config, journalDb: db } = options, now = options.now ?? Date.now;
+  if (!!config.budget.continuation !== !!options.continuationBaseline) fail('continuation_binding');
   options.assertRuntime(); options.assertGrant();
   privateDirectory(config.root); privateDirectory(config.workspacesRoot); privateJournal(db, config.root);
   const contains = (base: string, path: string) => { const rel = relative(base, path); return !isAbsolute(rel) && rel !== '..' && !rel.startsWith('..' + sep); };
@@ -147,6 +150,7 @@ export function createEngineeringRuntime(options: EngineeringRuntimeOptions) {
       const executionOptions: EngineeringExecutionOptions = { task, policy: runtime.policy, config,
         workspaceRoot: runtime.workspaceRoot, artifactsRoot: runtime.artifactsRoot, snapshotDirectory: runtime.snapshotDirectory,
         journalDb: db, spendDb: options.spendDb, ledger: options.ledger, tools,
+        ...(options.continuationBaseline ? { continuationBaseline: options.continuationBaseline } : {}),
         providerApiKey: options.providerApiKey, fetch: options.fetch, assertOwner,
         fence(reason) { fenced = true; append(task.taskId, 'fenced', { reason }); },
         session: { image: config.executorImage, runner: createBunEngineeringCommandRunner(), journal,

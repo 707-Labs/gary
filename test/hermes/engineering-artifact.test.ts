@@ -10,6 +10,7 @@ import {
   ENGINEERING_ARTIFACT_LIMITS, verifyEngineeringArtifactFiles,
   type EngineeringArtifactCapture,
 } from '../../src/hermes/engineering-artifact.ts';
+import { createEngineeringHostGitRunner } from '../../src/hermes/engineering-repository.ts';
 
 const temporary: string[] = [];
 function root(): string {
@@ -23,7 +24,7 @@ function file(directory: string, path: string, content: string | Buffer, mode = 
   writeFileSync(absolute, content, { mode });
   chmodSync(absolute, mode);
 }
-const cleanConfig = '[core]\nrepositoryformatversion = 0\nbare = false\nfilemode = true\n[remote "origin"]\nurl = https://github.com/707-Labs/example.git\nfetch = +refs/heads/*:refs/remotes/origin/*\n';
+const cleanConfig = '[core]\nrepositoryformatversion = 0\nbare = false\nfilemode = true\nhooksPath = /dev/null\n[remote "origin"]\nurl = https://github.com/707-Labs/example.git\nfetch = +refs/heads/*:refs/remotes/origin/*\n';
 function verifier(): string {
   const value = root();
   file(value, '.git/config', cleanConfig);
@@ -34,6 +35,25 @@ function verifier(): string {
 afterEach(() => { for (const value of temporary.splice(0)) rmSync(value, { recursive: true, force: true }); });
 
 describe('host engineering artifact transfer', () => {
+  test('imports into real Git metadata produced by the host clone setup with hooks disabled', async () => {
+    const source = root(); file(source, 'a.ts', 'verified source\n');
+    const capture = captureEngineeringArtifactFiles(source, ['a.ts']);
+    const target = root(), git = createEngineeringHostGitRunner({ gitBinary: '/usr/bin/git' });
+    const deadlineMs = Date.now() + 10_000;
+    // These are the production acquisition's local setup commands. No fetch,
+    // credentials, external repository, or model access is needed for this check.
+    for (const args of [['init', '--quiet', '--template=', '.'], ['config', '--local', 'core.hooksPath', '/dev/null'],
+      ['remote', 'add', 'origin', 'https://github.com/707-Labs/example.git']]) {
+      await git.run({ cwd: target, args, deadlineMs });
+    }
+    const config = readFileSync(join(target, '.git/config'), 'utf8');
+    expect(config).toMatch(/^\s*hooksPath = \/dev\/null$/m);
+    expect(applyEngineeringArtifactFiles(target, capture, ['a.ts']).hash).toBe(capture.hash);
+    expect(readFileSync(join(target, 'a.ts'), 'utf8')).toBe('verified source\n');
+    expect(readFileSync(join(target, '.git/config'), 'utf8')).toBe(config);
+    expect(() => verifyEngineeringArtifactFiles(target, capture, ['a.ts'])).not.toThrow();
+  });
+
   test('transfers exact binary bytes, new nested files, executable mode, empty files and deletions', () => {
     const source = root();
     file(source, 'src/binary.bin', Buffer.from([0, 255, 13, 10]));
@@ -194,6 +214,9 @@ describe('host engineering artifact transfer', () => {
     const source = root(); file(source, 'a.ts', 'a');
     const capture = captureEngineeringArtifactFiles(source, ['a.ts']);
     for (const suffix of ['[core]\nworktree = /outside', '[include]\npath = /external', '[core]\nhooksPath = /external',
+      '[core]\nHOOKSPATH = /external', '[core]\nhooksPath = /dev/null/hooks', '[core]\nhooksPath = /dev/./null',
+      '[core]\nhooksPath = "/dev/null"', '[core]\nhooksPath =', '[remote "origin"]\nhooksPath = /dev/null',
+      '[core]\nsshCommand = arbitrary-command',
       '[filter "hostile"]\nsmudge = arbitrary-command', '[credential]\nhelper = arbitrary-command',
       '[http]\nextraheader = secret', '[remote "origin"]\nurl = https://github.com/707-Labs/another.git']) {
       const target = verifier(); file(target, '.git/config', `${cleanConfig}${suffix}\n`);

@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { dirname, isAbsolute, join, normalize, relative, sep } from 'node:path';
 import { isSafeGitBranch } from '../git.ts';
 import { ENGINEERING_ACCEPTANCE_POLICY } from './engineering-policy.ts';
+import type { EngineeringContinuationConfig } from './engineering-continuation-budget.ts';
 export interface EngineeringRuntimeConfig {
   version: 1; grantId: string; allocationId: string; campaignId: string; root: string; workspacesRoot: string;
   repository: string; baseBranch: string; baseCommit: string; allowedFiles: readonly string[]; requiredCommands: readonly string[];
@@ -11,7 +12,7 @@ export interface EngineeringRuntimeConfig {
   dockerExecutable: '/usr/local/bin/docker'; dockerSocketPath: '/Users/tanner/.colima/default/docker.sock';
   runtimeFiles: readonly { path: string; sha256: string }[];
   sourceRevision: string; publication: 'patch_only'; capMicros: 5650000;
-  budget: Readonly<{ aggregatePath: string; auditDir: string; runId: string }>;
+  budget: Readonly<{ aggregatePath: string; auditDir: string; runId: string; continuation?: EngineeringContinuationConfig }>;
 }
 export interface EngineeringAuthorityReceipt {
   version: 1; grantId: string; sourceThreadId: string; assistantMessageId: string; userMessageId: string;
@@ -39,6 +40,30 @@ function overlaps(a: string, b: string): boolean {
   const inside = (base: string, path: string) => { const r = relative(base, path); return !isAbsolute(r) && r !== '..' && !r.startsWith('..' + sep); };
   return inside(a, b) || inside(b, a);
 }
+function validateContinuation(value: Record<string, unknown>, budget: Record<string, unknown>): void {
+  const continuation = budget.continuation;
+  if (!object(continuation) || !exact(continuation, ['version','original','predecessorJournalPath','predecessorTaskId','receiptPath'])
+      || continuation.version !== 1 || !object(continuation.original)) fail();
+  const original = continuation.original;
+  if (!exact(original, ['aggregatePath','ledgerPath','auditDir','runId','grantId','campaignId','allocationId','sourceRevision','runtimeConfigSha256','authoritySha256'])
+      || !safePath(original.aggregatePath) || !safePath(original.ledgerPath) || !safePath(original.auditDir)
+      || original.aggregatePath !== budget.aggregatePath
+      || original.auditDir !== join(dirname(original.auditDir), 'budget-admission')
+      || original.runId !== 'gary-native-engineering-20261010-01' || original.grantId !== original.runId
+      || original.campaignId !== 'gary-native-engineering-20261010-01-campaign' || value.campaignId !== original.campaignId
+      || original.allocationId !== 'gary-native-engineering-20261010-01-allocation' || value.allocationId !== original.allocationId
+      || value.grantId !== 'gary-native-engineering-20261010-02' || budget.runId !== value.grantId
+      || original.sourceRevision !== '9b8b31e7a876e320432e6aead61d5cc5902ad587'
+      || original.runtimeConfigSha256 !== 'cd5324697e222dd9f8e5bca88a7cd1a5795bb584e9048366f6c5919aeae9656d'
+      || original.authoritySha256 !== '883f2b010ddcf6e18793cb95aa1a921e0e6b2403a7b4cf0a77c336cff0724645'
+      || continuation.predecessorTaskId !== 'engineering-1683fa3a-bde9-4d73-b000-f84f88d67b4a'
+      || continuation.predecessorJournalPath !== join(dirname(original.auditDir), 'engineering.sqlite')
+      || continuation.receiptPath !== join(budget.auditDir as string, 'continuation.json')) fail();
+  for (const root of [value.root, value.workspacesRoot] as string[]) {
+    if (overlaps(root, dirname(original.auditDir)) || overlaps(root, original.ledgerPath)) fail();
+  }
+  Object.freeze(original); Object.freeze(continuation);
+}
 export function loadEngineeringRuntimeConfig(path: string, sha: string, authorityPath: string, authoritySha: string): Readonly<EngineeringRuntimeConfig> {
   const value = privateJson(path, sha), authority = privateJson(authorityPath, authoritySha);
   if (!object(authority) || !exact(authority, ['version','grantId','sourceThreadId','assistantMessageId','userMessageId','userApproval','requesterId','teamId','capMicros','scope','mergeAllowed','deploymentAllowed'])
@@ -65,9 +90,10 @@ export function loadEngineeringRuntimeConfig(path: string, sha: string, authorit
       || value.executorImage !== 'sha256:0efb49a8f21794948395f7bec2c15557a78473acd760207613fe7714e7c47f8c'
       || value.bunCacheVolume !== 'gary-bun-cache-20261010-mulligan-4bb2fdde-v2'
       || value.dockerExecutable !== '/usr/local/bin/docker' || value.dockerSocketPath !== '/Users/tanner/.colima/default/docker.sock'
-      || !object(value.budget) || !exact(value.budget, ['aggregatePath','auditDir','runId']) || !safePath(value.budget.aggregatePath)
+      || !object(value.budget) || !exact(value.budget, ['aggregatePath','auditDir','runId', ...(Object.hasOwn(value.budget, 'continuation') ? ['continuation'] : [])]) || !safePath(value.budget.aggregatePath)
       || value.budget.auditDir !== join(value.root, 'budget-admission') || value.budget.runId !== value.grantId
       || !Array.isArray(value.runtimeFiles) || value.runtimeFiles.length < 2 || value.runtimeFiles.length > 8) fail();
+  if (Object.hasOwn(value.budget, 'continuation')) validateContinuation(value, value.budget);
   const workspaces = lstatSync(value.workspacesRoot);
   if (!workspaces.isDirectory() || workspaces.isSymbolicLink() || workspaces.uid !== process.getuid?.()
       || (workspaces.mode & 0o777) !== 0o700 || realpathSync(value.workspacesRoot) !== value.workspacesRoot) fail();

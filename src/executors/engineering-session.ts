@@ -45,7 +45,8 @@ export interface EngineeringCommandResult {
 }
 export interface EngineeringRunningCommand {
   poll(): Promise<{ running: boolean; exitCode: number | null; timedOut: boolean }>;
-  read(maxOutputBytes: number): Promise<{ output: string; outputTruncated: boolean }>;
+  /** An exited OS process can still have unread, bounded output. */
+  read(maxOutputBytes: number): Promise<{ output: string; outputTruncated: boolean; outputPending?: boolean }>;
   /** Stops and drains the host CLI only; container removal proves task cleanup. */
   stop(): Promise<void>;
 }
@@ -443,8 +444,13 @@ export class EngineeringSession {
     const output = await process.command.read(maxOutput);
     await this.guard();
     if (Buffer.byteLength(output.output) > maxOutput) { await this.cleanup(); fail('engineering_runner_output_limit'); }
-    return { processId, status: status.running ? 'running' : 'exited', ...output, exitCode: status.exitCode,
-      receiptId: this.receipt('command_observed', { operationId: args.operationId, processId, exitCode: status.exitCode }) };
+    // Native consumers stop polling on exited. Keep the stream open until the
+    // runner has delivered every retained byte, even if the OS process is done.
+    const running = status.running || output.outputPending === true;
+    const exitCode = running ? null : status.exitCode;
+    return { processId, status: running ? 'running' : 'exited', output: output.output,
+      outputTruncated: output.outputTruncated, exitCode,
+      receiptId: this.receipt('command_observed', { operationId: args.operationId, processId, exitCode }) };
   }
 
   /** Cleanup is deliberately independent of expired/replaced owner authority.
@@ -556,7 +562,7 @@ export function createBunEngineeringCommandRunner(): EngineeringCommandRunner {
         if (length === 0 && buffer.length > 0) { buffer = buffer.subarray(Math.min(maxOutputBytes, buffer.length)); truncated = true; }
         else buffer = buffer.subarray(length);
         const outputTruncated = truncated; truncated = false;
-        return { output, outputTruncated };
+        return { output, outputTruncated, outputPending: buffer.length > 0 };
       },
       async stop() {
         clearTimeout(timeout);

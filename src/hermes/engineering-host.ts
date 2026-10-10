@@ -2,6 +2,7 @@
 import { Database } from 'bun:sqlite';
 import { randomUUID } from 'node:crypto';
 import { fingerprintJson } from './audit-trace.ts';
+import { createEngineeringDiagnosticJournal, engineeringFailure, type EngineeringPhase } from './engineering-diagnostics.ts';
 import { EngineeringTaskStore, type EngineeringScope, type EngineeringTaskView, type EngineeringTaskSpec } from './engineering-task-store.ts';
 
 import type { EngineeringIngressRequest, EngineeringReceipt } from '../slack/service.ts';
@@ -36,6 +37,10 @@ export function createEngineeringHost(options: HostEngineeringOptions) {
   let serial: Promise<unknown> = Promise.resolve();
   const running = new Set<Promise<void>>(), controller = new AbortController();
   let available = true;
+  const recordFailure = (requestId: string, taskId: string, phase: EngineeringPhase, error: unknown, task?: EngineeringTaskView) => {
+    try { createEngineeringDiagnosticJournal(db, { requestId, taskId, sessionId: task?.sessionId ?? null, ownerEpoch: task?.ownerEpoch ?? null })(engineeringFailure(phase, error)); }
+    catch { available = false; /* Cleanup remains mandatory even if diagnostics cannot persist. */ }
+  };
   const pendingStarts = new Map<string, { start(): void; cancel(): void }>();
   const read = (requestId: string) => db.query<RequestRow, [string]>('SELECT * FROM engineering_ingress_requests WHERE request_id=?').get(requestId);
   const receipt = (requestId: string, taskId: string, phase: HostEngineeringReceipt['phase'], status: HostEngineeringReceipt['status'], text: string): HostEngineeringReceipt => {
@@ -61,9 +66,10 @@ export function createEngineeringHost(options: HostEngineeringOptions) {
           || typeof candidate.summary !== 'string' || Buffer.byteLength(candidate.summary) > 12_000
           || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(candidate.summary)) fail('invalid_artifact');
       result = candidate;
-    } catch { result = undefined; /* Never manufacture approval, retry, or a paid summary request. */ }
+    } catch (error) { recordFailure(request.requestId, task.taskId, 'host_execute', error, task); result = undefined; /* Never manufacture approval, retry, or a paid summary request. */ }
     try { cleanup = await options.cleanup(task); }
-    catch {
+    catch (error) {
+      recordFailure(request.requestId, task.taskId, 'host_cleanup', error, task);
       store.cleanupUnknown(task.taskId, task.ownerEpoch!, { reason: 'physical_cleanup_unconfirmed' });
     }
     let final: HostEngineeringReceipt;
@@ -76,7 +82,8 @@ export function createEngineeringHost(options: HostEngineeringOptions) {
           return receipt(request.requestId, task.taskId, 'final', state,
             result?.completed ? result.summary : 'Engineering stopped before verified completion. The isolated work and receipts are preserved; no automatic retry was scheduled.');
         }).immediate();
-      } catch {
+      } catch (error) {
+        recordFailure(request.requestId, task.taskId, 'host_finish', error, task);
         store.cleanupUnknown(task.taskId, task.ownerEpoch!, { reason: 'cleanup_receipt_rejected' });
         final = receipt(request.requestId, task.taskId, 'final', 'cleanup_unknown', 'Engineering stopped because its cleanup receipt could not be verified. The task remains locked.');
       }
@@ -127,7 +134,8 @@ export function createEngineeringHost(options: HostEngineeringOptions) {
         };
         pendingStarts.set(taskId, { start: () => launch(true), cancel: () => launch(false) });
         return ack;
-      } catch {
+      } catch (error) {
+        recordFailure(request.requestId, taskId, 'prepare', error);
         db.query('UPDATE engineering_ingress_requests SET stage=\'blocked\' WHERE request_id=?').run(request.requestId);
         return { kind: 'rejected', code: 'unavailable' };
       }

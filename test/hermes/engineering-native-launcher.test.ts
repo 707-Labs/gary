@@ -235,3 +235,54 @@ test('host resource configuration cannot enlarge the reviewed native worker ceil
     expect(() => createEngineeringNativeLauncher({ ...base, resources })).toThrow('docker_configuration');
   }
 });
+
+test('native result preserves separately attributed bounded counts without messages, prompts or commands', async () => {
+  let calls = 0, cleaned = 0;
+  const s = modelFixture(async () => Response.json(++calls === 1 ? provider([
+    { type: 'tool_use', id: 'call_1', name: 'terminal', input: { command: 'PRIVATE COMMAND' } }], 'tool_use') : provider()));
+  const reported = { outcome: 'iteration_limit' as const, modelRequests: 2, toolCalls: 1, toolFailures: 0, toolBlocks: 0, toolResultErrors: 1 };
+  const file = join(s.root, 'diagnostics.mjs');
+  writeFileSync(file, fixtureScript.replace('completed:true', 'completed:false,diagnostics:' + JSON.stringify(reported)));
+  const receipts: any[] = [], input = nativeInput(s); input.append = r => receipts.push(r);
+  const session = await createEngineeringStdioLauncher({ command: [process.execPath, file], cwd: s.root, env: {}, cleanup: async () => { cleaned++; } })(input, new AbortController().signal);
+  const result = await session.turn({ turnId: 'turn', prompt: 'PRIVATE PROMPT' }); await session.close();
+  expect(result.nativeCompleted).toBe(false); expect(result.workerReported).toEqual(reported);
+  const diagnostic = receipts.find(r => r.kind === 'native_turn_result').diagnostic;
+  expect(diagnostic).toEqual({ version: 1, event: 'native_result', phase: 'native_turn', code: 'none',
+    hostObserved: { modelRequestsReceived: 2, toolBegins: 1, toolEnds: 1, toolFailures: 0, environmentOperations: 1 }, workerReported: reported });
+  expect(JSON.stringify(diagnostic)).not.toContain('PRIVATE'); expect(JSON.stringify(diagnostic)).not.toContain('fixture tool output');
+  expect(cleaned).toBe(1); expect(s.requests).toHaveLength(2);
+});
+test('invalid worker diagnostics never persist arbitrary strings and still prove exact cleanup', async () => {
+  const s = modelFixture(), file = join(s.root, 'bad-diagnostics.mjs');
+  writeFileSync(file, fixtureScript.replace('completed:true', 'completed:true,diagnostics:{outcome:"secret-provider-body",modelRequests:999999}'));
+  const receipts: any[] = [], input = nativeInput(s); input.append = r => receipts.push(r); let cleaned = 0;
+  const session = await createEngineeringStdioLauncher({ command: [process.execPath, file], cwd: s.root, env: {}, cleanup: async () => { cleaned++; } })(input, new AbortController().signal);
+  await expect(session.turn({ turnId: 'turn', prompt: 'Private task.' })).rejects.toThrow('turn_failed');
+  expect(receipts.find(r => r.kind === 'native_diagnostic').diagnostic).toMatchObject({ phase: 'native_turn', code: 'engineering_worker:result_diagnostics', hostObserved: { modelRequestsReceived: 1 } });
+  expect(JSON.stringify(receipts)).not.toContain('secret-provider-body'); expect(cleaned).toBe(1);
+  expect(await session.close()).toEqual({ cleanupConfirmed: true }); expect(s.requests).toHaveLength(1);
+});
+
+test('diagnostic persistence failure cannot skip mandatory native cleanup', async () => {
+  const s = modelFixture(), file = join(s.root, 'bad-persist.mjs'); let cleaned = 0;
+  writeFileSync(file, `process.stdin.once('data',()=>process.stdout.write(JSON.stringify({type:'engineering.ready',sessionId:'session',tools:[],toolSchemas:[]})+'\\n'));`);
+  const input = nativeInput(s); input.append = receipt => { if (receipt.kind === 'native_diagnostic') throw Error('private DB failure'); };
+  await expect(createEngineeringStdioLauncher({ command: [process.execPath, file], cwd: s.root, env: {}, cleanup: async () => { cleaned++; } })(input, new AbortController().signal)).rejects.toThrow('private DB failure');
+  expect(cleaned).toBe(1); expect(s.requests).toHaveLength(0);
+});
+
+test('rejected native RPC retains a safe protocol code while discarding unrecognized response text', async () => {
+  for (const unsafe of [false, true]) {
+    const s = modelFixture(async () => Response.json(provider([{ type: 'tool_use', id: 'call_1', name: 'terminal', input: { command: 'PRIVATE COMMAND' } }], 'tool_use')),
+      { execute: async () => { throw Error('PRIVATE EXECUTOR BODY'); } });
+    const input = nativeInput(s), receipts: any[] = []; input.append = r => receipts.push(r);
+    if (unsafe) input.protocol.accept = async () => ({ ok: false, error: 'engineering_protocol:operation_uncertain PRIVATE SECRET' });
+    let cleaned = 0; const file = join(s.root, 'rejected.mjs'); writeFileSync(file, fixtureScript);
+    const session = await createEngineeringStdioLauncher({ command: [process.execPath, file], cwd: s.root, env: {}, cleanup: async () => { cleaned++; } })(input, new AbortController().signal);
+    await expect(session.turn({ turnId: 'turn', prompt: 'PRIVATE PROMPT' })).rejects.toThrow('turn_failed');
+    expect(receipts.find(r => r.kind === 'native_diagnostic').diagnostic).toMatchObject({ phase: 'native_turn', code: unsafe ? 'engineering_worker:rpc_rejected' : 'engineering_protocol:operation_uncertain' });
+    expect(JSON.stringify(receipts)).not.toContain('PRIVATE'); expect(cleaned).toBe(1); expect(s.requests).toHaveLength(1);
+    expect(await session.close()).toEqual({ cleanupConfirmed: true });
+  }
+});

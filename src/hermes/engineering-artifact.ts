@@ -215,11 +215,13 @@ function checkVerifierMetadata(root: Root): void {
     if (!text || text.startsWith('#') || text.startsWith(';')) continue;
     if (text === '[core]') { section = 'core'; continue; }
     if (text === '[remote "origin"]') { section = 'origin'; continue; }
-    const match = /^([a-z]+)\s*=\s*(.*?)\s*$/.exec(text);
+    const match = /^([A-Za-z]+)\s*=\s*(.*?)\s*$/.exec(text);
     if (!match) fail('git_config');
-    const [, key, value] = match;
+    // Git variable names are case-insensitive; values retain exact validation.
+    const key = match[1]!.toLowerCase(), value = match[2]!;
     if (section === 'core' && ((key === 'repositoryformatversion' && value === '0')
       || (key === 'bare' && value === 'false')
+      || (key === 'hookspath' && value === '/dev/null')
       || (['filemode', 'logallrefupdates', 'ignorecase', 'precomposeunicode'].includes(key!) && /^(true|false)$/.test(value!)))) continue;
     if (section === 'origin' && key === 'url' && /^https:\/\/github\.com\/707-Labs\/[A-Za-z0-9_.-]+\.git$/.test(value!)) { urls++; continue; }
     if (section === 'origin' && key === 'fetch' && value === '+refs/heads/*:refs/remotes/origin/*') continue;

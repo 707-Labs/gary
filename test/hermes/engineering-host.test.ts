@@ -1,6 +1,7 @@
 import { Database } from 'bun:sqlite';
 import { afterEach, expect, test } from 'bun:test';
 import { createEngineeringHost, type HostEngineeringRequest, type HostEngineeringReceipt } from '../../src/hermes/engineering-host.ts';
+import { readEngineeringDiagnostics } from '../../src/hermes/engineering-diagnostics.ts';
 const dbs: Database[] = []; afterEach(() => dbs.splice(0).forEach(db => db.close()));
 const request: HostEngineeringRequest = { requestId: 'request', eventId: 'event', eventKey: 'event-key', messageKey: 'message',
   authority: { authenticated: true, requesterId: 'U0A9M5W16F8', teamId: 'T0AA24R7VUZ', surface: 'private_dm', channelId: 'D0C7EJELQJX', threadTs: '1234.1234' },
@@ -63,4 +64,27 @@ test('stop fences an admitted but unstarted task; invalid executor evidence neve
   const ack2 = await bad.host.admit(request, signal()) as HostEngineeringReceipt;
   bad.host.start(ack2); await new Promise(resolve => setTimeout(resolve, 0)); await bad.host.stop();
   expect(bad.delivered[0]?.status).toBe('blocked');
+});
+
+test('host retains bounded failure evidence across reconstruction without exposing error text or replaying work', async () => {
+  const f = fixture(); let attempts = 0;
+  f.options.execute = async () => { attempts++; throw new Error('secret API key, raw provider body and command'); };
+  const ack = await f.host.admit(request, signal()) as HostEngineeringReceipt;
+  f.host.start(ack); await new Promise(resolve => setTimeout(resolve, 0)); await f.host.stop();
+  const owner = f.options.db.query('SELECT session_id,owner_epoch FROM engineering_tasks').get() as { session_id: string; owner_epoch: string };
+  const records = readEngineeringDiagnostics(f.options.db, { requestId: request.requestId, taskId: ack.taskId, sessionId: owner.session_id, ownerEpoch: owner.owner_epoch });
+  expect(records).toEqual([{ version: 1, event: 'failure', phase: 'host_execute', code: 'unknown_failure' }]);
+  const reopened = createEngineeringHost(f.options); reopened.start(ack);
+  expect(reopened.readReceipt({ requestId: request.requestId, taskId: ack.taskId })?.status).toBe('blocked');
+  expect(JSON.stringify(f.options.db.query('SELECT * FROM engineering_diagnostics_v1').all())).not.toContain('secret');
+  expect(JSON.stringify(f.delivered)).not.toContain('secret'); expect(attempts).toBe(1); await reopened.stop();
+});
+test('prepare failure retains evidence under intent identity and does not invent an admitted task', async () => {
+  const f = fixture(); f.options.prepare = async () => { throw Error('engineering_repository:acquisition_failed'); };
+  expect(await f.host.admit(request, signal())).toEqual({ kind: 'rejected', code: 'unavailable' });
+  const row = f.options.db.query('SELECT task_id,stage FROM engineering_ingress_requests').get() as { task_id: string; stage: string };
+  expect(row.stage).toBe('blocked'); expect(f.options.db.query('SELECT count(*) n FROM engineering_tasks').get()).toEqual({ n: 0 });
+  expect(readEngineeringDiagnostics(f.options.db, { requestId: request.requestId, taskId: row.task_id, sessionId: null, ownerEpoch: null })).toEqual([
+    { version: 1, event: 'failure', phase: 'prepare', code: 'engineering_repository:acquisition_failed' },
+  ]); await f.host.stop();
 });

@@ -39,6 +39,8 @@ export const CODING_SPEND_RESERVE_POLICY = Object.freeze({
 /** The in-flight reservation is deliberately unknown during before_send. */
 export type PaidRequestGuardPhase = "before_request" | "before_send" | "after_response";
 export type PaidRequestGuard = (phase: PaidRequestGuardPhase) => void;
+/** Trusted synchronous host guard, invoked while the reservation writer lock is held. */
+export type SpendReservationGuard = (request: Readonly<{ticketId:string;provider:string;model:string;maxTokens:number;reservedMicros:number;status:Readonly<SpendStatus>}>) => void;
 
 export class SpendLimitError extends Error {
   constructor(readonly reason: string) {
@@ -205,6 +207,7 @@ export class SpendLedger {
   private readonly db: Database;
   private readonly scope = new AsyncLocalStorage<string>();
   private readonly codingRole = new AsyncLocalStorage<CodingSpendRole>();
+  private readonly reservationGuards = new AsyncLocalStorage<readonly SpendReservationGuard[]>();
   private readonly paidRequestGuards = new AsyncLocalStorage<readonly PaidRequestGuard[]>();
 
   constructor(path: string) {
@@ -304,6 +307,8 @@ export class SpendLedger {
     assertId(reason);
     this.db.query("UPDATE spend_tickets SET state='closed', terminal_reason=? WHERE ticket_id=? AND state='active'").run(reason, ticketId);
   }
+  /** Read-only canonical writer binding for host composition checks. */
+  get databasePath(): string { return this.db.filename; }
   close(): void { this.db.close(); }
 
   /** Optional trial admission layered around the existing ticket scope.
@@ -314,6 +319,13 @@ export class SpendLedger {
     if (typeof guard !== "function") throw new SpendLimitError("invalid paid request guard");
     const guards = Object.freeze([...(this.paidRequestGuards.getStore() ?? []), guard]);
     return this.paidRequestGuards.run(guards, fn);
+  }
+
+  /** Optional, default-inert constraint. It composes, never overrides canonical caps.
+   * The callback may only synchronously read evidence; no async work or spending. */
+  withReservationGuard<T>(guard: SpendReservationGuard, fn: () => T): T {
+    if (typeof guard !== "function") throw new SpendLimitError("invalid reservation guard");
+    return this.reservationGuards.run(Object.freeze([...(this.reservationGuards.getStore() ?? []), guard]), fn);
   }
 
   private assertPaidRequestAllowed(phase: PaidRequestGuardPhase): void {
@@ -411,6 +423,14 @@ export class SpendLedger {
     const outcome = this.db.transaction((): number | SpendLimitError => {
       const status = this.status(ticketId);
       if (!status || status.state !== "active") return new SpendLimitError("ticket is not actively enrolled");
+      const request = Object.freeze({ticketId,provider,model:policy.model,maxTokens,reservedMicros:reserved,status:Object.freeze({...status})});
+      for (const guard of this.reservationGuards.getStore() ?? []) {
+        const result: unknown = guard(request);
+        if (result !== undefined) {
+          void Promise.resolve(result).catch(() => {});
+          throw new SpendLimitError("reservation guard must complete synchronously");
+        }
+      }
       if (this.hasCodingReviewReserve(ticketId)) {
         const p = CODING_SPEND_RESERVE_POLICY;
         if (!status.draftPr || status.capMicros !== p.capMicros || status.campaignCapMicros !== p.capMicros || provider !== p.provider) {

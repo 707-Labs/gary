@@ -7,6 +7,7 @@ import { basename, dirname, isAbsolute, join } from 'node:path';
 import { EngineeringProtocol, type EngineeringProtocolBinding } from './engineering-protocol.ts';
 import type { EngineeringModelAdapter } from './engineering-model.ts';
 import { fingerprintJson } from './audit-trace.ts';
+import { engineeringFailure, parseEngineeringWorkerReported, type EngineeringHostObserved, type EngineeringWorkerReported } from './engineering-diagnostics.ts';
 import type { ConversationMessage } from './conversation.ts';
 import { createEngineeringSessionGuardianFactory, type EngineeringSessionGuardian,
   type EngineeringSessionGuardianFactory } from '../executors/engineering-session-guardian.ts';
@@ -38,6 +39,7 @@ export interface EngineeringNativeTurn {
   finalResponse: string;
   /** Worker report only. Tests/review/publication remain separate host decisions. */
   nativeCompleted: boolean;
+  workerReported?: EngineeringWorkerReported;
 }
 export interface EngineeringNativeSession {
   turn(input: { turnId: string; prompt: string }): Promise<EngineeringNativeTurn>;
@@ -74,6 +76,9 @@ export function createEngineeringStdioLauncher(config: EngineeringStdioOptions):
     const stdin = child.stdin!, stdout = child.stdout!;
     let ended = false, exitCode: number | null = null, busy = false, closing = false, stopped = false, operationPending = false;
     let cleanupConfirmed = false;
+    const hostObserved: EngineeringHostObserved = { modelRequestsReceived: 0, toolBegins: 0, toolEnds: 0, toolFailures: 0, environmentOperations: 0 };
+    const failure = (phase: 'native_start' | 'native_turn' | 'native_close', error: unknown) => input.append(Object.freeze({
+      kind: 'native_diagnostic', ...binding, diagnostic: { ...engineeringFailure(phase, error), hostObserved: { ...hostObserved } } }));
     const completion = new Promise<void>(resolve => {
       child.once('error', () => { cancellation.abort(); ended = true; resolve(); });
       child.once('exit', () => { if (operationPending) cancellation.abort(); });
@@ -128,14 +133,24 @@ export function createEngineeringStdioLauncher(config: EngineeringStdioOptions):
         try {
           if (frame.kind === 'model') {
             if (closing) fail('model_during_close');
+            hostObserved.modelRequestsReceived++;
             response = await input.model.handle(frame.body, active);
           } else {
             response = await input.protocol.accept(frame.body, input.transportCapability);
-            if (response.ok !== true) fail('rpc_rejected');
+            if (response.ok !== true) {
+              // Protocol responses contain fixed host codes, but still pass the
+              // exact allowlist before propagating anything from this boundary.
+              const rejected = engineeringFailure('native_turn', new Error(typeof response.error === 'string' ? response.error : ''));
+              if (rejected.code !== 'unknown_failure') throw new Error(rejected.code);
+              fail('rpc_rejected');
+            }
+            if (frame.body.kind === 'tool.begin') hostObserved.toolBegins++;
+            if (frame.body.kind === 'environment.operation') hostObserved.environmentOperations++;
             if (frame.body.kind === 'tool.end') {
               const p = frame.body.payload;
               if (!object(p) || typeof p.toolCallId !== 'string' || typeof p.resultHash !== 'string') fail('tool_result');
               input.model.observeToolResult(p.toolCallId, p.resultHash);
+              hostObserved.toolEnds++; if (p.status === 'failed') hostObserved.toolFailures++;
             }
           }
           guard(); await write({ type: 'engineering.response', id: frame.id, body: response });
@@ -164,7 +179,7 @@ export function createEngineeringStdioLauncher(config: EngineeringStdioOptions):
           || hash(ready.toolSchemas) !== hash(expectedTools)
           || hash(ready.tools) !== hash(expectedTools.map(t => (t.function as Json).name).sort())) fail('native_schema_changed');
       input.append(Object.freeze({ kind: 'native_ready', ...binding, schemasHash: hash(expectedTools) }));
-    } catch { await dispose('native_start_failed'); fail('startup_failed'); }
+    } catch (error) { try { failure('native_start', error); } finally { await dispose('native_start_failed'); } fail('startup_failed'); }
     let closed = false;
     return {
       async turn(turn) {
@@ -176,12 +191,15 @@ export function createEngineeringStdioLauncher(config: EngineeringStdioOptions):
           const frame = await until('engineering.result');
           if (!exact(frame, ['type','turnId','result']) || frame.turnId !== turn.turnId || !object(frame.result)
               || !Array.isArray(frame.result.messages)) fail('result_binding');
+          const workerReported = frame.result.diagnostics === undefined ? undefined : parseEngineeringWorkerReported(frame.result.diagnostics);
           const messages = input.model.finishTurn(frame.result.messages);
           const last = messages.at(-1);
-          input.append(Object.freeze({ kind: 'native_turn_result', ...binding, turnId: turn.turnId, historyHash: hash(messages) }));
+          input.append(Object.freeze({ kind: 'native_turn_result', ...binding, turnId: turn.turnId, historyHash: hash(messages),
+            diagnostic: { version: 1, event: 'native_result', phase: 'native_turn', code: 'none', hostObserved: { ...hostObserved },
+              ...(workerReported ? { workerReported } : {}) } }));
           return { turnId: turn.turnId, messages, finalResponse: last?.role === 'assistant' ? String(last.content ?? '') : '',
-            nativeCompleted: frame.result.completed === true };
-        } catch { closed = true; await dispose('native_turn_failed'); fail('turn_failed'); }
+            nativeCompleted: frame.result.completed === true, ...(workerReported ? { workerReported } : {}) };
+        } catch (error) { closed = true; try { failure('native_turn', error); } finally { await dispose('native_turn_failed'); } fail('turn_failed'); }
         finally { busy = false; }
       },
       async close() {
@@ -199,10 +217,10 @@ export function createEngineeringStdioLauncher(config: EngineeringStdioOptions):
           if (exitCode !== 0) fail('exit_failed');
           await dispose(); closed = true;
           return { cleanupConfirmed: true };
-        } catch {
+        } catch (error) {
           // Execution authority can expire before cooperative close. Physical
           // cleanup remains mandatory and its verified absence is sufficient.
-          closed = true; await dispose('native_close_failed');
+          closed = true; try { failure('native_close', error); } finally { await dispose('native_close_failed'); }
           return { cleanupConfirmed: true };
         }
       },
@@ -376,8 +394,9 @@ export function createEngineeringNativeLauncher(options: EngineeringDockerOption
       input.assertOwner(); signal.throwIfAborted(); guardian.signal.throwIfAborted();
       return await stdio({ command: [pinned.dockerExecutable, 'container', 'start', '--attach', '--interactive', id],
         cwd: '/', env, cleanup })(input, AbortSignal.any([signal, guardian.signal]));
-    } catch {
-      try { await cleanup(); } catch { input.fence('native_cleanup_unknown'); fail('cleanup_unknown'); }
+    } catch (error) {
+      try { input.append(Object.freeze({ kind: 'native_diagnostic', ...input.binding, diagnostic: engineeringFailure('native_start', error) })); }
+      finally { try { await cleanup(); } catch { input.fence('native_cleanup_unknown'); fail('cleanup_unknown'); } }
       fail('launch_failed');
     }
   };

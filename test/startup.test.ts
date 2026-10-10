@@ -23,6 +23,7 @@ import { GARY_SLACK } from '../src/slack/service.ts';
 import type { EngineeringReceipt } from '../src/slack/service.ts';
 import type { EngineeringRuntimeConfig, EngineeringAuthorityReceipt } from '../src/hermes/engineering-config.ts';
 import type { EngineeringRuntimeOptions } from '../src/hermes/engineering-runtime.ts';
+import type { EngineeringContinuationBaseline } from '../src/hermes/engineering-continuation-budget.ts';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -415,7 +416,7 @@ test('actual startup exposes scoped ticket/repository/controller tools, wakes it
  expect(wake!.request()).toBe(false);expect(f.stats().stopped).toBe(true);
 });
 
-function engineeringStartupFixture() {
+function engineeringStartupFixture(continuation = false) {
   const f=slackFixture(),root=join(f.root,'engineering'),workspacesRoot=join(f.root,'engineering-workspaces'),dmDir=join(f.root,'private-dm');
   mkdirSync(root,{mode:0o700});mkdirSync(workspacesRoot,{mode:0o700});mkdirSync(dmDir,{mode:0o700});mkdirSync(f.config.gary.stateDir,{mode:0o700});
   const hash=(value:string)=>createHash('sha256').update(value).digest('hex');
@@ -430,21 +431,41 @@ function engineeringStartupFixture() {
   const authority:EngineeringAuthorityReceipt={version:1,grantId:'grant',sourceThreadId:'01a0fa90-833c-71cc-907b-0b3fc0e1b02d',assistantMessageId:'Sentinel_668b96adaca8819199844e4bbb4f2971',
     userMessageId:'Sentinel_c0289b9b991c81918b40e3a04e870894',userApproval:'yes approve go ahead',requesterId:'U0A9M5W16F8',teamId:'T0AA24R7VUZ',capMicros:5650000,
     scope:'707-Labs-existing-app-isolated-engineering',mergeAllowed:false,deploymentAllowed:false};
+  if(continuation){
+    const original={aggregatePath:config.budget.aggregatePath,ledgerPath:join(f.config.gary.stateDir,'spend.db'),auditDir:join(f.root,'predecessor','budget-admission'),
+      grantId:'gary-native-engineering-20261010-01',runId:'gary-native-engineering-20261010-01',
+      campaignId:'gary-native-engineering-20261010-01-campaign',allocationId:'gary-native-engineering-20261010-01-allocation',
+      sourceRevision:'9b8b31e7a876e320432e6aead61d5cc5902ad587',runtimeConfigSha256:'cd5324697e222dd9f8e5bca88a7cd1a5795bb584e9048366f6c5919aeae9656d',
+      authoritySha256:'883f2b010ddcf6e18793cb95aa1a921e0e6b2403a7b4cf0a77c336cff0724645'};
+    config.grantId='gary-native-engineering-20261010-02';authority.grantId=config.grantId;
+    config.campaignId=original.campaignId;config.allocationId=original.allocationId;
+    config.budget={...config.budget,runId:config.grantId,continuation:{version:1,original,
+      predecessorJournalPath:join(f.root,'predecessor','engineering.sqlite'),predecessorTaskId:'engineering-1683fa3a-bde9-4d73-b000-f84f88d67b4a',
+      receiptPath:join(config.budget.auditDir,'continuation.json')}};
+  }
   const configPath=join(root,'config.json'),authorityPath=join(root,'authority.json');
   writeFileSync(configPath,JSON.stringify(config),{mode:0o600});writeFileSync(authorityPath,JSON.stringify(authority),{mode:0o600});
   const ledger=new SpendLedger(join(f.config.gary.stateDir,'spend.db'));
   ledger.createCampaign('hermes-dm-20261008',5);ledger.enrollTicket('hermes-dm-20261008','local:hermes-dm-20261008-tanner',5);
-  ledger.createCampaign('campaign',5.65);ledger.enrollTicket('campaign','allocation',5.65);
+  ledger.createCampaign(config.campaignId,5.65);ledger.enrollTicket(config.campaignId,config.allocationId,5.65);
   f.config.github={kind:'app',appId:'1',installationId:'2',privateKey:'fake-app-key',username:'fixture'};
   const env={...f.env,GARY_CONVERSATION_RUNTIME_RELEASE:'c'.repeat(40),GARY_SLACK_TANNER_DM_ENABLED:'1',GARY_SLACK_CONVERSATION_CONFIG:dmPath,
     GARY_ENGINEERING_CONFIG:configPath,GARY_ENGINEERING_CONFIG_SHA256:hash(JSON.stringify(config)),GARY_ENGINEERING_AUTHORITY_RECEIPT:authorityPath,GARY_ENGINEERING_AUTHORITY_RECEIPT_SHA256:hash(JSON.stringify(authority))};
   const budgets:boolean[]=[],order:string[]=[];let opts:EngineeringRuntimeOptions|undefined,busy=false,starts=0;
+  const continuationChecks:boolean[]=[];let baselineChecks=0,continuationRevoked=false;
+  const baseline={baselineAttemptCount:1,baselineChargedMicros:10,receiptSha256:'d'.repeat(64),
+    assertCurrent(){baselineChecks++;if(continuationRevoked)throw Error('fixture_continuation_revoked');},assertPrefix(){},assertJournal(){}} as unknown as EngineeringContinuationBaseline;
   const receipts=new Set<string>();let latest:EngineeringReceipt|undefined;
   const originalClose=ledger.close.bind(ledger);ledger.close=()=>{order.push('ledger');originalClose();};
   const deps:StartupDependencies={...f.deps,env,verifyConversationRelease:()=>{},ledger:()=>ledger,slackTransport:()=>f.transport,
     github:()=>({engineeringInstallationCredential:async()=>{throw new Error('unexpected app request');}} as unknown as GitHubClient),
     engineering:{assertBudget:(binding,input)=>{budgets.push(input?.requireUnused===true);expect(binding).toMatchObject({grantId:'grant',campaignId:'campaign',allocationId:'allocation',ledgerPath:join(f.config.gary.stateDir,'spend.db'),runtimeConfigSha256:env.GARY_ENGINEERING_CONFIG_SHA256});
+      if(continuation)throw Error('continuation_must_not_reenroll');
       return{holdId:'fixture',capMicros:5650000,aggregateCurrentSha256:'a'.repeat(64),runtimeHeldUsd:'5.650000000',runtimeUnallocatedUsd:'1.047006994',runtimeUnearmarkedUsd:'1.047006994',status:ledger.status('allocation')!};},
+      assertContinuation:(binding,input)=>{continuationChecks.push(input?.requireUnused===true);
+        expect(binding).toMatchObject({grantId:config.grantId,campaignId:config.campaignId,allocationId:config.allocationId,root,workspacesRoot,
+          ledgerPath:join(f.config.gary.stateDir,'spend.db'),continuation:config.budget.continuation});
+        if(continuationRevoked)throw Error('fixture_continuation_revoked');return baseline;},
       createRuntime:options=>{
         opts=options;expect(options.journalDb.filename).toBe(join(root,'engineering.sqlite'));expect(lstatSync(options.journalDb.filename).mode&0o777).toBe(0o600);
         expect(()=>options.spendDb.exec('CREATE TABLE forbidden(value)')).toThrow();expect(options.repository.binding).toEqual({appId:1,installationId:2});
@@ -454,7 +475,8 @@ function engineeringStartupFixture() {
             latest={requestId:request.requestId,taskId:'engineering-fixture',receiptId:'receipt:ack',phase:'admitted',status:'running',text:'Engineering task admitted.'};receipts.add(JSON.stringify(latest));return latest;},
             verifyReceipt:receipt=>receipts.has(JSON.stringify(receipt)),start(){starts++;}}};
       }}};
-  return{...f,root,engineeringConfig:config,configPath,authorityPath,env,deps,ledger,budgets,order,get opts(){return opts;},get starts(){return starts;},setBusy(value:boolean){busy=value;},
+  return{...f,root,engineeringConfig:config,configPath,authorityPath,env,deps,ledger,budgets,order,baseline,continuationChecks,
+    baselineChecks:()=>baselineChecks,revokeContinuation(){continuationRevoked=true;},get opts(){return opts;},get starts(){return starts;},setBusy(value:boolean){busy=value;},
     final(){const value:EngineeringReceipt={...latest!,receiptId:'receipt:final',phase:'final',status:'completed',text:'Verified engineering result.'};receipts.add(JSON.stringify(value));return value;}};
 }
 
@@ -496,5 +518,36 @@ test('engineering startup rejects source, App and budget mismatches before ingre
     await expect(main({...deps,runLoop:async()=>{polls++;}})).rejects.toThrow();
     expect(factories).toBe(0);expect(polls).toBe(0);expect(f.stats().started).toBe(false);expect(f.networkCalls()).toBe(0);
     if(mode!=='budget')f.ledger.close();
+  }
+});
+
+test('engineering continuation startup reuses an asserted baseline and rechecks unused continuation only at admission',async()=>{
+  const f=engineeringStartupFixture(true);
+  await main({...f.deps,runLoop:async args=>{
+    expect(f.opts!.continuationBaseline).toBe(f.baseline);expect(f.budgets).toEqual([]);
+    expect(f.continuationChecks).toEqual([false]);expect(f.baselineChecks()).toBe(1);
+    f.opts!.assertGrant();expect(f.baselineChecks()).toBe(2);expect(f.continuationChecks).toEqual([false]);
+    const release=args.beginDispatch!();expect(release).toBeFunction();
+    expect(()=>f.opts!.assertBudget()).toThrow('engineering_host_dispatch_busy');expect(f.continuationChecks).toEqual([false]);release!();
+    f.opts!.assertBudget();expect(f.continuationChecks).toEqual([false,true]);
+    f.revokeContinuation();expect(()=>f.opts!.assertGrant()).toThrow('fixture_continuation_revoked');
+    expect(()=>f.opts!.assertBudget()).toThrow('fixture_continuation_revoked');
+    expect(f.ledger.status(f.engineeringConfig.allocationId)?.attemptCount).toBe(0);
+  }});
+  expect(f.budgets).toEqual([]);expect(f.networkCalls()).toBe(0);expect(f.order).toEqual(['engineering','ledger']);
+});
+
+test('engineering continuation rejects another ledger or invalid admission before opening its journal or ingress',async()=>{
+  for(const mode of ['ledger','receipt'] as const){
+    const f=engineeringStartupFixture(true);let factories=0,polls=0;
+    const deps={...f.deps,engineering:{...f.deps.engineering,createRuntime:()=>{factories++;throw Error('must not execute');}}};
+    if(mode==='ledger'){
+      const config=structuredClone(f.engineeringConfig);config.budget.continuation!.original.ledgerPath=join(f.config.gary.stateDir+'-other','spend.db');
+      const raw=JSON.stringify(config);writeFileSync(f.configPath,raw,{mode:0o600});
+      deps.env={...f.env,GARY_ENGINEERING_CONFIG_SHA256:createHash('sha256').update(raw).digest('hex')};
+    }else f.revokeContinuation();
+    await expect(main({...deps,runLoop:async()=>{polls++;}})).rejects.toThrow(mode==='ledger'?'engineering_continuation_ledger_mismatch':'fixture_continuation_revoked');
+    expect(factories).toBe(0);expect(polls).toBe(0);expect(f.stats().started).toBe(false);expect(f.budgets).toEqual([]);expect(f.networkCalls()).toBe(0);
+    expect(()=>lstatSync(join(f.root,'engineering.sqlite'))).toThrow();
   }
 });

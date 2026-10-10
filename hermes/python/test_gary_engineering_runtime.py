@@ -11,6 +11,7 @@ import copy
 import json
 import os
 from pathlib import Path
+import shlex
 import socket
 import subprocess
 import sys
@@ -282,6 +283,64 @@ class NativeHandlerTests(unittest.TestCase):
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(self.host.starts, [])
 
+    def test_native_v4a_uses_task_cwd_after_transient_workdir(self):
+        remote_temp = self.host.root / "remote-tmp"
+        result = self.call("terminal", {"command": "pwd", "workdir": str(remote_temp)})
+        self.assertEqual(result["exit_code"], 0, result)
+        self.assertEqual(self.session.environment.cwd, str(remote_temp))
+        added = self.call("patch", {"mode": "patch", "patch":
+            "*** Begin Patch\n*** Add File: src/value.txt\n+original\n*** End Patch"})
+        self.assertNotIn("error", added, added)
+        self.assertEqual(added["resolved_path"], "/workspace/src/value.txt")
+        self.assertTrue((self.host.workspace / "src/value.txt").is_file(), added)
+        self.assertEqual((self.host.workspace / "src/value.txt").read_text(), "original")
+        self.assertFalse((remote_temp / "src/value.txt").exists())
+        self.call("terminal", {"command": "pwd", "workdir": str(remote_temp)})
+        updated = self.call("patch", {"mode": "patch", "patch":
+            "*** Begin Patch\n*** Update File: src/value.txt\n@@\n-original\n+changed\n*** End Patch"})
+        self.assertNotIn("error", updated, updated)
+        self.assertEqual((self.host.workspace / "src/value.txt").read_text(), "changed")
+        self.assertFalse((remote_temp / "src/value.txt").exists())
+
+    def test_native_v4a_keeps_persistent_cd_after_transient_workdir(self):
+        result = self.call("terminal", {"command": "mkdir -p nested; cd nested"})
+        self.assertEqual(result["exit_code"], 0, result)
+        remote_temp = self.host.root / "remote-tmp"
+        self.call("terminal", {"command": "pwd", "workdir": str(remote_temp)})
+        added = self.call("patch", {"mode": "patch", "patch":
+            "*** Begin Patch\n*** Add File: kept.txt\n+persistent directory\n*** End Patch"})
+        self.assertNotIn("error", added, added)
+        self.assertEqual(added["resolved_path"], "/workspace/nested/kept.txt")
+        self.assertEqual((self.host.workspace / "nested/kept.txt").read_text(), "persistent directory")
+        self.assertFalse((remote_temp / "kept.txt").exists())
+        self.assertFalse((self.host.workspace / "kept.txt").exists())
+
+    def test_denied_v4a_does_not_change_cwd_or_execute_after_transient_workdir(self):
+        remote_temp = self.host.root / "remote-tmp"
+        self.call("terminal", {"command": "pwd", "workdir": str(remote_temp)})
+        starts = len(self.host.starts)
+        self.host.reject_begin = True
+        denied = self.call("patch", {"mode": "patch", "patch":
+            "*** Begin Patch\n*** Add File: blocked.txt\n+blocked\n*** End Patch"})
+        self.assertEqual(denied["status"], "blocked")
+        self.assertEqual(len(self.host.starts), starts)
+        self.assertEqual(self.session.environment.cwd, str(remote_temp))
+        self.assertFalse((self.host.workspace / "blocked.txt").exists())
+        self.assertFalse((remote_temp / "blocked.txt").exists())
+
+    def test_native_file_reads_drain_multiple_output_chunks_before_patch(self):
+        # Internal reads feed the native patch algorithm. All output must be
+        # delivered before the host reports exited, even after its OS process
+        # ended. The fixture mirrors that required host protocol contract.
+        original = "".join("line-%04d %s\n" % (i, "x" * 64) for i in range(600)) + "replace-near-end\n"
+        target = self.host.workspace / "large.txt"
+        target.write_text(original)
+        changed = self.call("patch", {"path": "large.txt", "old_string": "replace-near-end",
+                                      "new_string": "verified-near-end"})
+        self.assertNotIn("error", changed, changed)
+        self.assertEqual(target.read_text(), original.replace("replace-near-end", "verified-near-end"))
+        self.assertGreater(len(original), 32768)
+
     def test_replay_and_unsupported_background_do_not_start(self):
         result = self.call("terminal", {"command": "printf once"})
         self.assertEqual(result["exit_code"], 0, result)
@@ -353,6 +412,8 @@ class NativeHandlerTests(unittest.TestCase):
             self.assertEqual(request["temperature"], 0.3)
             self.assertFalse(request["stream"])
         self.assertTrue(result.get("completed"), result)
+        self.assertEqual(result["diagnostics"], {"outcome": "completed", "modelRequests": 3,
+            "toolCalls": 2, "toolFailures": 0, "toolBlocks": 0, "toolResultErrors": 0})
         self.assertFalse(any(message["role"] == "system" for message in result["messages"]))
         self.assertIn("Native engineering fixture completed", result["final_response"])
         self.assertEqual((host.workspace / "agent.txt").read_text(), "native-agent-fixture\n")
@@ -381,8 +442,65 @@ class NativeHandlerTests(unittest.TestCase):
         result = self.session.run_turn(agent, turn_id="bounded-turn", prompt="Run the bounded native fixture.")
         self.assertEqual(len(requests), 1)
         self.assertFalse(result["completed"])
+        self.assertEqual(result["diagnostics"], {"outcome": "iteration_limit", "modelRequests": 1,
+            "toolCalls": 1, "toolFailures": 0, "toolBlocks": 0, "toolResultErrors": 0})
         self.assertEqual(result["messages"][-1]["role"], "tool")
         self.assertIn("bounded-native", result["messages"][-1]["content"])
+
+    def test_three_native_model_requests_read_test_red_patch_green(self):
+        """Synthetic repository only; no model service or project dependencies."""
+        from openai.types.chat import ChatCompletion
+        (self.host.workspace / "src").mkdir()
+        (self.host.workspace / "CLAUDE.md").write_text("Change only src; demonstrate red then green.\n")
+        source = self.host.workspace / "src/calculator.py"
+        source.write_text("def double(value):\n    return value\n")
+        requests = []
+        host = self.host
+        test_command = shlex.quote(sys.executable) + " src/calculator_test.py"
+        batches = [
+            [("read_file", {"path": "CLAUDE.md"}), ("read_file", {"path": "src/calculator.py"})],
+            [("write_file", {"path": "src/calculator_test.py", "content":
+                "from calculator import double\nassert double(3) == 6\nprint('regression-green')\n"}),
+             ("terminal", {"command": test_command})],
+            [("terminal", {"command": "pwd", "workdir": str(host.root / "remote-tmp")}),
+             ("patch", {"mode": "patch", "patch":
+                "*** Begin Patch\n*** Update File: src/calculator.py\n@@\n-    return value\n+    return value * 2\n*** End Patch"}),
+             ("terminal", {"command": test_command})],
+        ]
+        def create(**kwargs):
+            requests.append(copy.deepcopy(kwargs))
+            number = len(requests)
+            self.assertLessEqual(number, 3, "no extra model summary or retry")
+            if number == 3:
+                red = json.loads([m for m in kwargs["messages"] if m.get("role") == "tool"][-1]["content"])
+                self.assertEqual(red["exit_code"], 1, red)
+                self.assertIn("AssertionError", red["output"])
+            calls = []
+            for index, (name, args) in enumerate(batches[number - 1]):
+                call_id = "engineering-%d-%d" % (number, index)
+                host.observe(call_id, name, args)
+                calls.append({"id": call_id, "type": "function", "function": {
+                    "name": name, "arguments": json.dumps(args)}})
+            return ChatCompletion.model_validate({"id": "engineering-%d" % number,
+                "object": "chat.completion", "created": 1, "model": "deepseek-v4-pro",
+                "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                    "role": "assistant", "content": None, "tool_calls": calls}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}})
+        client = types.SimpleNamespace(api_key="fixture", base_url="https://gary.invalid/v1",
+            chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create)), close=lambda: None)
+        agent = self.session.create_agent(model="deepseek-v4-pro", client_factory=lambda *a, **kw: client,
+                                          max_iterations=3, max_tokens=8192)
+        result = self.session.run_turn(agent, turn_id="engineering-turn", prompt=
+            "Use three model requests to read instructions/source, add and run a failing test, then fix and retest.")
+        self.assertEqual(len(requests), 3)
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["diagnostics"], {"outcome": "iteration_limit", "modelRequests": 3,
+            "toolCalls": 7, "toolFailures": 0, "toolBlocks": 0, "toolResultErrors": 0})
+        self.assertIn("return value * 2", source.read_text())
+        green = json.loads(result["messages"][-1]["content"])
+        self.assertEqual(green["exit_code"], 0, green)
+        self.assertIn("regression-green", green["output"])
+        self.assertFalse((host.root / "remote-tmp/src/calculator.py").exists())
 
 
 if __name__ == "__main__":

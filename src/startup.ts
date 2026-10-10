@@ -39,6 +39,7 @@ import { loadEngineeringRuntimeConfig } from './hermes/engineering-config.ts';
 import { createEngineeringRuntime } from './hermes/engineering-runtime.ts';
 import { createEngineeringGitHubRepositoryServices } from './hermes/engineering-repository.ts';
 import { assertEngineeringBudgetAdmission, type EngineeringBudgetBinding } from './hermes/engineering-budget.ts';
+import { assertEngineeringContinuationBudget, type EngineeringContinuationBinding } from './hermes/engineering-continuation-budget.ts';
 
 /** Test dependencies are trusted code, never environment or task JSON. */
 export interface StartupDependencies extends ReadonlyStartupDependencies {
@@ -59,7 +60,8 @@ export interface StartupDependencies extends ReadonlyStartupDependencies {
   signal?: AbortSignal;
   slackTransport?: (credentials: SlackCredentials) => SlackTransport;
   /** Offline composition seams; never selected by environment or model input. */
-  engineering?: { createRuntime?: typeof createEngineeringRuntime; assertBudget?: typeof assertEngineeringBudgetAdmission };
+  engineering?: { createRuntime?: typeof createEngineeringRuntime; assertBudget?: typeof assertEngineeringBudgetAdmission;
+    assertContinuation?: typeof assertEngineeringContinuationBudget };
 }
 
 function openEngineeringJournal(path: string): Database {
@@ -212,19 +214,27 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
         };
         const ledgerPath=resolve(cfg.gary.stateDir,'spend.db');
         if(realpathSync(ledgerPath)!==ledgerPath||lstatSync(ledgerPath).isSymbolicLink())throw new Error('engineering_canonical_ledger_rejected');
-        const binding:EngineeringBudgetBinding={...pinned.budget,ledgerPath,grantId:pinned.grantId,campaignId:pinned.campaignId,
+        const binding:EngineeringBudgetBinding={aggregatePath:pinned.budget.aggregatePath,auditDir:pinned.budget.auditDir,runId:pinned.budget.runId,
+          ledgerPath,grantId:pinned.grantId,campaignId:pinned.campaignId,
           allocationId:pinned.allocationId,sourceRevision:pinned.sourceRevision,runtimeConfigSha256:host.engineeringConfigSha256!,authoritySha256:host.engineeringAuthorityReceiptSha256!};
         const budget=deps.engineering?.assertBudget??assertEngineeringBudgetAdmission;
-        budget(binding,{requireUnused:false});
+        const continuation=deps.engineering?.assertContinuation??assertEngineeringContinuationBudget;
+        const continuationBinding:EngineeringContinuationBinding|undefined=pinned.budget.continuation
+          ? {...binding,root:pinned.root,workspacesRoot:pinned.workspacesRoot,continuation:pinned.budget.continuation}:undefined;
+        if(continuationBinding&&continuationBinding.continuation.original.ledgerPath!==ledgerPath)throw new Error('engineering_continuation_ledger_mismatch');
+        const continuationBaseline=continuationBinding?continuation(continuationBinding,{requireUnused:false}):undefined;
+        if(!continuationBinding)budget(binding,{requireUnused:false});
         engineeringDb=openEngineeringJournal(join(pinned.root,'engineering.sqlite'));
         engineeringSpendDb=new Database(ledgerPath,{readonly:true,strict:true,create:false});
         if(cfg.github.kind!=='app')throw new Error('engineering_github_app_required');
         const appBinding={appId:Number(cfg.github.appId),installationId:Number(cfg.github.installationId)};
         const repository=createEngineeringGitHubRepositoryServices({client:github,binding:appBinding,fetch:rawFetch});
         engineering=(deps.engineering?.createRuntime??createEngineeringRuntime)({config:pinned,journalDb:engineeringDb,spendDb:engineeringSpendDb,ledger:spend,
+          ...(continuationBaseline?{continuationBaseline}:{}),
           repository:{binding:appBinding,...repository},providerApiKey:providerConfigs[0]!.apiKey,fetch:request=>rawFetch(request),
-          assertGrant:()=>{assertPinned();budget(binding,{requireUnused:false});},assertRuntime:assertPinned,assertBudget:()=>{
-            assertPinned();if(legacyDispatches||conversationDispatches)throw new Error('engineering_host_dispatch_busy');budget(binding,{requireUnused:true});
+          assertGrant:()=>{assertPinned();if(continuationBaseline)continuationBaseline.assertCurrent();else budget(binding,{requireUnused:false});},assertRuntime:assertPinned,assertBudget:()=>{
+            assertPinned();if(legacyDispatches||conversationDispatches)throw new Error('engineering_host_dispatch_busy');
+            if(continuationBinding)continuation(continuationBinding,{requireUnused:true});else budget(binding,{requireUnused:true});
           },
           deliver:receipt=>slack?.deliverEngineeringReceipt(receipt)??Promise.resolve('not_sent')});
         engineeringHealth=()=>{try{assertPinned();return true;}catch{return false;}};
