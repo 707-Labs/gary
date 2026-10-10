@@ -3,6 +3,8 @@ import { Database } from 'bun:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { renderSlackReplyParts, renderSlackReply, SLACK_REPLY_TRUNCATED } from '../../src/slack/render.ts';
 import { createSlackService, GARY_SLACK, READY_DM_TEXT, READONLY_READY_DM_TEXT, PRIVATE_DM_STATUS, type SlackHostHealth, type SlackService, type SlackServiceOptions } from '../../src/slack/service.ts';
 import type { SlackTransport,SlackFrameInfo } from '../../src/slack/transport.ts';
 
@@ -28,7 +30,12 @@ function fakeTransport() {
 function fixture(extra:Partial<SlackServiceOptions>={}) {
   const db=extra.db??new Database(':memory:',{strict:true});if(!extra.db)cleanups.push(()=>db.close());
   const fake=fakeTransport();let health:SlackHostHealth={...healthy},healthCalls=0;
-  const service=createSlackService({db,transport:fake.transport,checkHostHealth:async()=>{healthCalls++;return {...health};},...extra});
+  // Mock responders have no metadata client; supply an explicit trusted authorization stub for their delivery.
+  const shared=extra.sharedConversation;
+  const configured=shared?{...extra,sharedConversation:{...shared,respond:(...args:Parameters<typeof shared.respond>)=>{
+    const [input,deliver,signal,available]=args;return shared.respond(input,(text,kind,authorize)=>deliver(text,kind,authorize??(async()=>true)),signal,available);
+  }}}:extra;
+  const service=createSlackService({db,transport:fake.transport,checkHostHealth:async()=>{healthCalls++;return {...health};},...configured});
   cleanups.push(()=>service.stop().catch(()=>{}));
   return {db,fake,service,set health(value:SlackHostHealth){health=value;},get healthCalls(){return healthCalls;}};
 }
@@ -147,6 +154,34 @@ test('conversation cannot confirm a mismatched delivery row and shutdown waits f
     expect(await deliver('first authenticated body')).toBe('sent');expect(await deliver('different body')).toBe('unknown');entered();await gate;
   }}});f.health=readonlyHealthy;await f.service.start();const event=f.fake.emit(dm());await started;
   let stopped=false;const stop=f.service.stop().then(()=>stopped=true);await Promise.resolve();expect(stopped).toBe(false);finish();await Promise.all([stop,event]);expect(stopped).toBe(true);
+});
+test('DM and shared outboxes authenticate rendered bytes, including expanded multipart output, once per event',async()=>{
+  const markdown='# Summary\n**done**\n'+('& 🐌 '.repeat(3_000)),expected=renderSlackReplyParts(markdown);
+  expect(expected.length).toBeGreaterThan(1);
+  const sha=createHash('sha256').update(JSON.stringify(expected)).digest('hex');
+  for(const shared of [false,true]) {
+    let delivered=0;
+    const respond:NonNullable<SlackServiceOptions['conversation']>['respond']=async(_input,deliver)=>{
+      expect(await deliver(markdown)).toBe('sent');
+      expect(await deliver(markdown)).toBe('sent');
+      expect(await deliver('different answer')).toBe('unknown');delivered++;
+    };
+    const f=fixture(shared?{checkConversationHealth:()=>true,sharedConversation:{joined:()=>true,ready:()=>true,close:()=>({drained:true}),respond}}
+      :{tannerDirectMessages:true,conversation:{ready:()=>true,close:()=>({drained:true}),respond}});
+    f.health=readonlyHealthy;await f.service.start();await f.fake.emit(shared?envelope():dm());await f.fake.emit(shared?envelope():dm());
+    expect(delivered).toBe(1);expect(f.fake.sends).toHaveLength(1+expected.length);expect(f.fake.sends.slice(1).map(p=>p.text)).toEqual(expected);
+    const table=shared?'gary_slack_shared_outbox':'gary_slack_dm_outbox';
+    expect(f.db.query(`SELECT content_sha256,status FROM ${table}`).all()).toEqual([{content_sha256:sha,status:'sent'}]);
+  }
+});
+test('a formatted stop notice uses the same one-claim path and an unknown send is never repeated',async()=>{
+  const f=fixture({checkConversationHealth:()=>true,sharedConversation:{joined:()=>true,ready:()=>false,close:()=>({drained:false}),async respond(_input,deliver){
+    expect(await deliver('## Blocked\n**Output limit**','notice')).toBe('unknown');
+    expect(await deliver('## Blocked\n**Output limit**','notice')).toBe('unknown');
+  }}});
+  f.health={...healthy,ready:false};await f.service.start();f.fake.send=async()=>({ok:false,outcome:'unknown',code:'fixture'});
+  await f.fake.emit(envelope());await f.fake.emit(envelope());
+  expect(f.fake.sends).toEqual([{channel:'C0APPROVED',threadTs:'1791417600.000002',text:'*Blocked*\n*Output limit*'}]);
 });
 test('explicit private DM opt-in replies once only to Tanner in the previously verified private conversation',async()=>{
   const f=fixture({tannerDirectMessages:true});f.health=readonlyHealthy;await f.service.start();
@@ -415,4 +450,59 @@ test('ingress diagnostics distinguish gates without exposing fields; labeled men
   f.fake.identity.teamId='TFOREIGN';records.length=0;await f.fake.emit(envelope());expect(records.at(-1).stage).toBe('shared_health_rejected');
   expect(calls).toHaveLength(2);expect(f.fake.sends).toEqual([]);
   expect(JSON.stringify(records)).not.toContain('synthetic-secret-body');expect(JSON.stringify(records)).not.toContain(GARY_SLACK.tannerId);
+});
+
+test('multipart answer claims every plan then each physical send, confirms aggregate only after all parts, and never replays on restart',async()=>{
+  const text='Detailed ticket evidence. '.repeat(1800),parts=renderSlackReplyParts(text);expect(parts.length).toBeGreaterThan(2);
+  let delivered=0,calls=0;
+  const respond:NonNullable<SlackServiceOptions['conversation']>['respond']=async(_input,deliver)=>{calls++;expect(await deliver(text)).toBe('sent');delivered++;};
+  const f=fixture({checkConversationHealth:()=>true,sharedConversation:{joined:()=>true,ready:()=>true,close:()=>({drained:true}),respond}});
+  f.health={...healthy,ready:false};
+  f.fake.send=async args=>{
+    const index=f.fake.sends.length-1;
+    const records=f.db.query('SELECT part_index,part_count,status,content_sha256 FROM gary_slack_conversation_parts ORDER BY part_index').all() as any[];
+    expect(records).toHaveLength(parts.length);
+    expect(records.map(p=>p.status)).toEqual(parts.map((_,i)=>i<index?'sent':i===index?'unknown':'planned'));
+    expect(records[index].content_sha256).toBe(createHash('sha256').update(args.text).digest('hex'));
+    expect(f.db.query('SELECT status FROM gary_slack_shared_outbox').get()).toEqual({status:'unknown'});
+    expect(args.channel).toBe('C0APPROVED');expect(args.threadTs).toBe('1791417600.000002');
+    return{ok:true,channel:args.channel,ts:'1791417600.'+String(index+10).padStart(6,'0')};
+  };
+  await f.service.start();await f.fake.emit(envelope());await f.fake.emit(envelope());await f.service.stop();
+  expect(delivered).toBe(1);expect(calls).toBe(1);expect(f.fake.sends.map(p=>p.text)).toEqual(parts);
+  expect(f.db.query('SELECT status FROM gary_slack_shared_outbox').get()).toEqual({status:'sent'});
+  const next=fixture({db:f.db,checkConversationHealth:()=>true,sharedConversation:{joined:()=>true,ready:()=>true,close:()=>({drained:true}),respond}});
+  next.health={...healthy,ready:false};await next.service.start();await next.fake.emit(envelope());expect(next.fake.sends).toEqual([]);expect(calls).toBe(1);
+});
+
+test('an uncertain or declined multipart send stops the sequence and preserves confirmed/planned parts across restart',async()=>{
+  for(const outcome of ['unknown','definitely_not_sent'] as const)for(const stopAt of [0,1]){
+    const text='x'.repeat(40_000);let calls=0;
+    const expected=stopAt===0&&outcome==='definitely_not_sent'?'not_sent':'unknown';
+    const respond:NonNullable<SlackServiceOptions['conversation']>['respond']=async(_input,deliver)=>{calls++;expect(await deliver(text)).toBe(expected);expect(await deliver(text)).toBe(expected);};
+    const sharedConversation={joined:()=>true,ready:()=>true,close:()=>({drained:true}),respond};
+    const f=fixture({checkConversationHealth:()=>true,sharedConversation});f.health={...healthy,ready:false};
+    f.fake.send=async args=>f.fake.sends.length-1===stopAt?{ok:false,outcome,code:'offline'}:{ok:true,channel:args.channel,ts:'1791417600.000010'};
+    await f.service.start();await f.fake.emit(envelope());await f.service.stop();
+    expect(f.fake.sends).toHaveLength(stopAt+1);
+    expect(f.db.query('SELECT status FROM gary_slack_conversation_parts ORDER BY part_index').all()).toEqual([0,1,2].map(i=>({status:i<stopAt?'sent':i===stopAt?outcome==='unknown'?'unknown':'not_sent':'planned'})));
+    expect(f.db.query('SELECT status FROM gary_slack_shared_outbox').get()).toEqual({status:expected});
+    const next=fixture({db:f.db,checkConversationHealth:()=>true,sharedConversation});next.health={...healthy,ready:false};
+    await next.service.start();await next.fake.emit(envelope());expect(calls).toBe(1);expect(next.fake.sends).toEqual([]);
+  }
+});
+
+test('rendering beyond five parts refuses before an outbox claim or any outgoing message',async()=>{
+  const f=fixture({checkConversationHealth:()=>true,sharedConversation:{joined:()=>true,ready:()=>true,close:()=>({drained:true}),async respond(_input,deliver){expect(await deliver('&'.repeat(65_000))).toBe('not_sent');}}});
+  f.health={...healthy,ready:false};await f.service.start();await f.fake.emit(envelope());
+  expect(f.fake.sends).toEqual([]);expect(f.db.query('SELECT * FROM gary_slack_shared_outbox').all()).toEqual([]);
+  expect(f.db.query('SELECT * FROM gary_slack_conversation_parts').all()).toEqual([]);
+});
+
+test('shared delivery without a trusted physical-send authorization callback fails closed before any claim',async()=>{
+  const db=new Database(':memory:',{strict:true});cleanups.push(()=>db.close());const fake=fakeTransport();
+  const service=createSlackService({db,transport:fake.transport,checkHostHealth:()=>({...healthy,ready:false}),checkConversationHealth:()=>true,
+    sharedConversation:{joined:()=>true,ready:()=>true,close:()=>({drained:true}),async respond(_input,deliver){expect(await deliver('No authorization callback')).toBe('not_sent');}}});
+  cleanups.push(()=>service.stop());await service.start();await fake.emit(envelope());expect(fake.sends).toEqual([]);
+  expect(db.query('SELECT * FROM gary_slack_shared_outbox').all()).toEqual([]);expect(db.query('SELECT * FROM gary_slack_conversation_parts').all()).toEqual([]);
 });

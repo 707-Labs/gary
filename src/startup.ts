@@ -9,11 +9,11 @@ import { LinearAdapter } from './adapters/linear.ts';
 import { loadConfig, type Config } from './config.ts';
 import { loadHostStartupConfig } from './host-config.ts';
 import { createHermesActivation, loadHermesActivationConfig } from './hermes/activation.ts';
-import { HERMES_CODING_RUNTIME_POLICY } from './hermes/coding-runtime-policy.ts';
+import { HERMES_CODING_RUNTIME_POLICY, fingerprintHermesCodingActivation } from './hermes/coding-runtime-policy.ts';
 import { createCanaryReadiness } from './hermes/host-readiness.ts';
 import type { GaryRuntimeLauncher } from './hermes/gary-loop-adapter.ts';
 import { log } from './logger.ts';
-import { runLoop, type RunLoopArgs } from './loop.ts';
+import { createLoopWake, runLoop, type RunLoopArgs } from './loop.ts';
 import { createProvider, createProviderChain } from './providers.ts';
 import { openDb } from './state/db.ts';
 import { recordEvent } from './state/queries.ts';
@@ -30,6 +30,8 @@ import { createHermesDMResponder, createHermesSharedResponder } from './hermes/d
 import { ProjectAssistant } from './hermes/project-assistant.ts';
 import { loadProjectRuntimeConfig } from './hermes/project-config.ts';
 import { createCurrentWorkReader } from './hermes/work-context.ts';
+import { createLinearTicketReader, createLocalRepositoryReader } from './hermes/project-integrations.ts';
+import { createConversationController, type ConversationControllerRuntime } from './hermes/conversation-controller.ts';
 import { createHermesProjectResponder } from './hermes/project-conversation.ts';
 import { DMReplyError,type DMTurn } from './hermes/dm-conversation.ts';
 
@@ -82,7 +84,11 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
   let projects:ProjectAssistant|undefined;
   let executorJobJournal: ExecutorJobJournal | undefined;
   const controller = new AbortController();
+  const loopWake = createLoopWake();
+  let loopState: ConversationControllerRuntime['loopState'] = 'disabled';
   const abort = () => {
+    loopState = 'stopped';
+    loopWake.stop();
     controller.abort();
     // Stop ingress/sends immediately; the current coding tick retains its normal drain semantics.
     // The finally block awaits the same stop promise before closing canonical handles.
@@ -122,7 +128,17 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
       let projectReply:((turn:DMTurn)=>Promise<string>)|undefined;
       if(projectConfig){
         for(const project of projectConfig.projects)if(project.teamKey!=='GARY'&&cfg.gary.repoMap.get(project.teamKey)!==project.repo)throw new Error('project_repository_map_mismatch');
-        projects=new ProjectAssistant({...projectConfig,currentWork:createCurrentWorkReader(db,projectConfig.projects)});
+        // The hash-pinned host config binds these local roots to repositories. No
+        // model argument can select a checkout, client, team or audience.
+        const repositories=projectConfig.projects.flatMap(project=>project.root
+          ? [{projectId:project.id,repo:project.repo,teamKey:project.teamKey,root:project.root}] : []);
+        projects=new ProjectAssistant({...projectConfig,currentWork:createCurrentWorkReader(db,projectConfig.projects),integrations:{
+          ticketDetail:createLinearTicketReader(linear),repository:createLocalRepositoryReader(repositories),repositoryProjectIds:repositories.map(p=>p.projectId),
+          controller:createConversationController({db,ledger:spend,teamId:projectConfig.teamId,ownerUserId:projectConfig.ownerUserId,
+            projects:projectConfig.projects,...(activation&&activationConfig?{activation:{issueId:activationConfig.issueId,repo:activationConfig.repo,
+              policyFingerprint:fingerprintHermesCodingActivation(activationConfig),allowedActionTypes:activation.allowedActionTypes}}:{}),
+            runtime:()=>({loopState,dispatchReady:!controller.signal.aborted&&!!activation&&loopState!=='disabled'&&loopState!=='stopped'}),
+            wake:()=>!controller.signal.aborted&&loopWake.request()})}});
         const respond=createHermesProjectResponder({...responderDeps,projects});
         projectReply=turn=>{if(!turn.authority)throw new DMReplyError('project_authority_required');return respond({...turn,authority:turn.authority});};
       }
@@ -158,6 +174,7 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
       providers: chain.providers.map(provider => `${provider.name}:${provider.model}`), runtime: host.mode,
       canaryIssueId: activationConfig?.issueId ?? null, slack: slack ? 'connected' : 'disabled', pollIntervalMs: cfg.runtime.pollIntervalMs });
     await (deps.runLoop ?? runLoop)({ db, spend, linear, github, glm, cloudflare,
+      wake:loopWake,onTickState:state=>{loopState=controller.signal.aborted?'stopped':state;},
       repoMap: cfg.gary.repoMap, allowlistedMentionUserIds: cfg.gary.allowlistedMentionUserIds,
       reposDir: cfg.gary.reposDir, workspacesDir: cfg.gary.workspacesDir,
       agentLoopMaxIterations: cfg.runtime.agentLoopMaxIterations, agentLoopTimeoutMs: activation ? HERMES_CODING_RUNTIME_POLICY.actionTimeoutMs : cfg.runtime.agentLoopTimeoutMs,

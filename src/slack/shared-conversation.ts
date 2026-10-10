@@ -5,13 +5,17 @@ import { createSlackIngressEmitter, type SlackIngressObserver } from './ingress-
 import { constants, openSync, closeSync, fstatSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, normalize } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { DM_CONVERSATION_POLICY, DMReplyError, exactDMAllocation, type DMTurn, type DMText } from '../hermes/dm-conversation.ts';
+import { LEGACY_DM_CONVERSATION_POLICY, DM_CONVERSATION_POLICY, DMReplyError, exactDMAllocation, type DMTurn, type DMText } from '../hermes/dm-conversation.ts';
+import { conversationFailureMessage } from './conversation-error.ts';
+import { boundedHistory, replacedHistoryPrefix, recordHistoryCompaction, migrateContextPolicy, rollbackContextPolicy, type ContextMigrationReceipt } from './context-policy.ts';
 import type { SlackMemberMetadata, SlackChannelMetadata } from './transport.ts';
 import type { SpendLedger } from '../spend.ts';
 
 export const SHARED_CONVERSATION_POLICY=Object.freeze({...DM_CONVERSATION_POLICY,version:1,profile:'workspace_channel',trigger:'explicit_mention',metadataMaxAgeMs:15_000,
   appId:'A0C7QFW3PEG',teamId:'T0AA24R7VUZ',botUserId:'U0C7NPEUG1F',codingDispatch:'disabled',conversationRequesters:'active_internal_full_members'} as const);
 const POLICY=SHARED_CONVERSATION_POLICY;
+export const LEGACY_SHARED_CONVERSATION_POLICY=Object.freeze({...LEGACY_DM_CONVERSATION_POLICY,version:1,profile:'workspace_channel',trigger:'explicit_mention',metadataMaxAgeMs:15_000,
+  appId:'A0C7QFW3PEG',teamId:'T0AA24R7VUZ',botUserId:'U0C7NPEUG1F',codingDispatch:'disabled',conversationRequesters:'active_internal_full_members'} as const);
 export interface SlackSharedConversationConfig { readonly version:1; readonly runId:string; readonly campaignId:string; readonly allocationId:string; readonly contextDirectory:string;
   readonly appId:string;readonly teamId:string;readonly botUserId:string;readonly trigger:'explicit_mention' }
 const hash=(value:string)=>createHash('sha256').update(value).digest('hex');
@@ -33,9 +37,22 @@ export function loadSlackSharedConversationConfig(path:string):SlackSharedConver
     ||value.runId!=='hermes-shared-20261008'||value.campaignId!==value.runId||value.allocationId!=='local:hermes-shared-20261008')throw new Error('dm_config_rejected');
   return Object.freeze({version:1,teamId:value.teamId,appId:value.appId,botUserId:value.botUserId,trigger:value.trigger,runId:value.runId,campaignId:value.campaignId,allocationId:value.allocationId,contextDirectory:dirname(path)});
 }
-export function fingerprintSlackSharedConversationConfig(config:SlackSharedConversationConfig):string {
+function fingerprintConfig(config:SlackSharedConversationConfig,policy:unknown):string {
   return hash(JSON.stringify({version:config.version,runId:config.runId,campaignId:config.campaignId,allocationId:config.allocationId,
-    contextDirectory:config.contextDirectory,appId:config.appId,teamId:config.teamId,botUserId:config.botUserId,trigger:config.trigger,policy:POLICY}));
+    contextDirectory:config.contextDirectory,appId:config.appId,teamId:config.teamId,botUserId:config.botUserId,trigger:config.trigger,policy}));
+}
+export function fingerprintSlackSharedConversationConfig(config:SlackSharedConversationConfig):string {return fingerprintConfig(config,POLICY);}
+export function legacyFingerprintSlackSharedConversationConfig(config:SlackSharedConversationConfig):string {return fingerprintConfig(config,LEGACY_SHARED_CONVERSATION_POLICY);}
+/** Operator-only: call after graceful drain, before starting the new runtime. */
+export function migrateSlackSharedConversationPolicy(config:SlackSharedConversationConfig):ContextMigrationReceipt|null {
+  privatePath(config.contextDirectory,true);const file=join(config.contextDirectory,'shared-context.sqlite');privatePath(file,false);
+  const db=new Database(file,{strict:true,create:false});
+  try {return migrateContextPolicy(db,legacyFingerprintSlackSharedConversationConfig(config),fingerprintSlackSharedConversationConfig(config));}finally{db.close();}
+}
+export function rollbackSlackSharedConversationPolicy(config:SlackSharedConversationConfig):void {
+  privatePath(config.contextDirectory,true);const file=join(config.contextDirectory,'shared-context.sqlite');privatePath(file,false);
+  const db=new Database(file,{strict:true,create:false});
+  try {rollbackContextPolicy(db,legacyFingerprintSlackSharedConversationConfig(config),fingerprintSlackSharedConversationConfig(config));}finally{db.close();}
 }
 /** app_mention opens or continues a thread; thread_reply only continues a thread an earlier mention opened. */
 export interface SlackSharedConversationInput { type:'app_mention'|'thread_reply'; appId:string;teamId:string;botUserId:string;requesterId:string;eventId:string;channel:string;ts:string;threadTs:string;text:string }
@@ -56,7 +73,7 @@ function channelAllowed(input:SlackSharedConversationInput,channel:SlackChannelM
 export function sharedMetadataAllowed(input:SlackSharedConversationInput,member:SlackMemberMetadata,channel:SlackChannelMetadata,now=Date.now()):boolean {
   return memberAllowed(input,member,now)&&channelAllowed(input,channel,now);
 }
-export type DMDelivery=(text:string,kind?:'answer'|'notice')=>Promise<'sent'|'unknown'|'not_sent'>;
+export type DMDelivery=(text:string,kind?:'answer'|'notice',authorizeBeforePhysicalSend?:()=>Promise<boolean>)=>Promise<'sent'|'unknown'|'not_sent'>;
 export interface SlackSharedConversation {
   respond(input:SlackSharedConversationInput,deliver:DMDelivery,signal:AbortSignal,isAvailable?:()=>boolean):Promise<void>;
   /** True only for a thread an explicit mention opened that can still take turns; a local read, no Slack call. */
@@ -85,6 +102,7 @@ export function createSlackSharedConversation(options:{config:SlackSharedConvers
       state TEXT NOT NULL CHECK(state IN ('queued','running','sent','failed','unknown')),input_sha256 TEXT NOT NULL,worker_name TEXT,cleanup INTEGER NOT NULL DEFAULT 0,error_code TEXT);`);
     db.query('INSERT OR IGNORE INTO control VALUES (1,?,0)').run(fingerprint);
     if((db.query('SELECT fingerprint FROM control WHERE id=1').get() as any)?.fingerprint!==fingerprint)throw new Error('dm_context_config_mismatch');
+    db.exec('CREATE TABLE IF NOT EXISTS history_compactions (event_key TEXT PRIMARY KEY,session_key TEXT NOT NULL,dropped_messages INTEGER NOT NULL,before_sha256 TEXT NOT NULL,after_sha256 TEXT NOT NULL,archived_history TEXT NOT NULL,archived_bytes INTEGER NOT NULL,created_at TEXT NOT NULL)');
     privatePath(file,false);
   }catch(error){db.close();throw error;}
   const pending=()=>Number((db.query("SELECT count(*) AS n FROM events WHERE cleanup=0").get() as any).n);
@@ -104,6 +122,9 @@ export function createSlackSharedConversation(options:{config:SlackSharedConvers
       observe('shared_metadata_allowed');return true;
     }catch{observe('shared_metadata_unavailable');return false;}
   }
+  // Each Slack part is a separate disclosure: refresh the exact member/channel authority immediately before it.
+  const deliveryAuthorization=(input:SlackSharedConversationInput,signal:AbortSignal,isAvailable:()=>boolean)=>async()=>
+    !closed&&!signal.aborted&&isAvailable()&&await authorize(input,signal)&&!closed&&!signal.aborted&&isAvailable();
   const encodedText=(input:SlackSharedConversationInput)=>JSON.stringify({senderId:input.requesterId,text:input.text});
   async function execute(input:SlackSharedConversationInput,key:string,sessionKey:string,deliver:DMDelivery,signal:AbortSignal,isAvailable:()=>boolean):Promise<void> {
     let cleanup=true,errorCode:string|null=null,reply:string|undefined;
@@ -111,11 +132,18 @@ export function createSlackSharedConversation(options:{config:SlackSharedConvers
       const session=db.query<Session,[string]>('SELECT history,turns,blocked FROM sessions WHERE session_key=?').get(sessionKey)!;
       if(!isAvailable()||signal.aborted||blocked()||session.blocked||!allocationReady()||!await authorize(input,signal)||!isAvailable())throw new DMReplyError('dm_turn_unavailable');
       const history=JSON.parse(session.history) as DMText[],text=encodedText(input);
-      if(session.turns>=POLICY.maxTurns||Buffer.byteLength(JSON.stringify([...history,{role:'user',content:text}]))+POLICY.maxReplyBytes+100>POLICY.maxContextBytes)throw new DMReplyError('dm_context_limit');
+      if(session.turns>=POLICY.maxTurns||Buffer.byteLength(JSON.stringify(history))>POLICY.maxContextBytes)throw new DMReplyError('dm_context_limit');
+      let candidateHistory=history;
+      const compactHistory=(compacted:readonly DMText[])=>{
+        // Validate structure locally; the responder owns summary verification and the original audience binding.
+        const checked=boundedHistory(compacted,'',POLICY.maxContextBytes,0);
+        if(checked.dropped.length)throw new DMReplyError('dm_context_limit');
+        candidateHistory=checked.history;
+      };
       db.query("UPDATE events SET state='running' WHERE event_key=? AND owner=? AND state='queued'").run(key,owner);
       reply=await options.reply({requestId:randomUUID(),ownerId:owner,allocationId:config.allocationId,campaignId:config.campaignId,
         authority:Object.freeze({surface:'shared_channel',requesterId:input.requesterId,teamId:input.teamId,channelId:input.channel,threadTs:input.threadTs}),
-        history,text,signal,
+        history,text,signal,compactHistory,
         assertActive:()=>{
           if(closed||!isAvailable()||blocked()||signal.aborted||(db.query('SELECT state,owner FROM events WHERE event_key=?').get(key) as any)?.owner!==owner
             ||(db.query('SELECT state FROM events WHERE event_key=?').get(key) as any)?.state!=='running')throw new DMReplyError('dm_owner_changed');
@@ -126,24 +154,29 @@ export function createSlackSharedConversation(options:{config:SlackSharedConvers
       });
       if(!isAvailable()||signal.aborted||blocked()||!allocationReady()||!await authorize(input,signal)||!isAvailable())throw new DMReplyError('dm_turn_unavailable');
       if(typeof reply!=='string'||!reply.trim()||Buffer.byteLength(reply)>POLICY.maxReplyBytes)throw new DMReplyError('dm_reply_rejected');
-      const next=[...history,{role:'user',content:text},{role:'assistant',content:reply}];
+      const compacted=boundedHistory(candidateHistory,text,POLICY.maxContextBytes,Buffer.byteLength(JSON.stringify(reply))+64);
+      const next=[...compacted.history,{role:'user',content:text},{role:'assistant',content:reply}];
       if(Buffer.byteLength(JSON.stringify(next))>POLICY.maxContextBytes)throw new DMReplyError('dm_context_limit');
       let delivery:'sent'|'unknown'|'not_sent'='unknown';
-      try {delivery=await deliver(reply,'answer');}catch{/* An ambiguous send is never retried. */}
+      try {delivery=await deliver(reply,'answer',deliveryAuthorization(input,signal,isAvailable));}catch{/* An ambiguous send is never retried. */}
       db.transaction(()=>{
-        if(delivery==='sent')db.query('UPDATE sessions SET history=?,turns=turns+1 WHERE session_key=?').run(JSON.stringify(next),sessionKey);
+        if(delivery==='sent'){
+          if(JSON.stringify(history)!==JSON.stringify(compacted.history))recordHistoryCompaction(db,key,sessionKey,history,compacted.history,replacedHistoryPrefix(history,compacted.history));
+          db.query('UPDATE sessions SET history=?,turns=turns+1 WHERE session_key=?').run(JSON.stringify(next),sessionKey);
+        }
         else db.query('UPDATE sessions SET blocked=1 WHERE session_key=?').run(sessionKey);
         db.query('UPDATE events SET state=?,cleanup=1,error_code=? WHERE event_key=? AND owner=?').run(delivery==='sent'?'sent':delivery==='unknown'?'unknown':'failed',delivery==='sent'?null:'dm_delivery_'+delivery,key,owner);
       }).immediate();
       return;
     }catch(error){
       errorCode=error instanceof DMReplyError?error.code:'dm_turn_failed';cleanup=error instanceof DMReplyError?error.cleanupConfirmed:false;
+      const unknownSpend=Boolean(ledger.status(config.allocationId)?.unknownAttempts);
       db.transaction(()=>{
         db.query('UPDATE sessions SET blocked=1 WHERE session_key=?').run(sessionKey);
         db.query("UPDATE events SET state='failed',cleanup=?,error_code=? WHERE event_key=? AND owner=?").run(cleanup?1:0,errorCode,key,owner);
-        if(!cleanup||ledger.status(config.allocationId)?.unknownAttempts)db.query('UPDATE control SET blocked=1 WHERE id=1').run();
+        if(!cleanup||unknownSpend)db.query('UPDATE control SET blocked=1 WHERE id=1').run();
       }).immediate();
-      if(!signal.aborted&&isAvailable()&&await authorize(input,signal))try {await deliver("I couldn't complete that reply. This thread is paused, and I won't retry the message automatically.",'notice');}catch{/* No retry. */}
+      if(!signal.aborted&&isAvailable()&&await authorize(input,signal))try {await deliver(conversationFailureMessage(errorCode,cleanup,unknownSpend),'notice',deliveryAuthorization(input,signal,isAvailable));}catch{/* No retry. */}
     }
   }
   const ready=()=>!closed&&!blocked()&&allocationReady();
@@ -177,7 +210,7 @@ export function createSlackSharedConversation(options:{config:SlackSharedConvers
       if(reply)return Promise.resolve();
       const claimed=db.transaction(()=>{if(duplicate()||Number((db.query('SELECT count(*) AS n FROM notices').get() as any).n)>=POLICY.maxNotices)return false;
         db.query('INSERT INTO notices VALUES (?,?,?)').run(key,messageKey,reason);return true;}).immediate();
-      return claimed?deliver("I can't answer this message within the current conversation limits. No model call was made.",'notice').then(()=>{},()=>{}):Promise.resolve();
+      return claimed?deliver("I can't answer this message within the current conversation limits. No model call was made.",'notice',deliveryAuthorization(input,signal,isAvailable)).then(()=>{},()=>{}):Promise.resolve();
     };
     if(duplicate()){observe('shared_duplicate');return Promise.resolve();}
     const limited=()=>queued>=POLICY.maxQueued||blocked()||!allocationReady()||Buffer.byteLength(encodedText(input))>POLICY.maxInputBytes;

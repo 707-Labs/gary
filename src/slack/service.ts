@@ -1,6 +1,7 @@
 /** Host Slack service; optional tightly scoped Tanner DM conversation, no coding dispatch. */
 import { createHash, randomUUID } from 'node:crypto';
 import { hasSlackUserMention } from './mentions.ts';
+import { renderSlackReply, renderSlackReplyParts } from './render.ts';
 import { createSlackIngressEmitter, slackEnvelopeShape, type SlackIngressObserver } from './ingress-diagnostics.ts';
 import type { DB } from '../state/db.ts';
 import type { SlackTransport, SlackFrameInfo } from './transport.ts';
@@ -110,6 +111,11 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
       status TEXT NOT NULL CHECK(status IN ('unknown','sent','not_sent')),
       claimed_at TEXT NOT NULL, completed_at TEXT, slack_channel TEXT, slack_ts TEXT, error_code TEXT
     )`);
+    if(options.conversation||options.sharedConversation)options.db.exec(`CREATE TABLE IF NOT EXISTS gary_slack_conversation_parts (
+      delivery_key TEXT NOT NULL,kind TEXT NOT NULL CHECK(kind IN ('dm','shared')),part_index INTEGER NOT NULL,part_count INTEGER NOT NULL,
+      content_sha256 TEXT NOT NULL,claim_id TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('planned','unknown','sent','not_sent')),
+      claimed_at TEXT NOT NULL,completed_at TEXT,slack_channel TEXT,slack_ts TEXT,error_code TEXT,
+      PRIMARY KEY(kind,delivery_key,part_index))`);
     options.alertIntake?.initialize();
     // Validate an idle store before opening ingress. Once connected, a valid
     // event may already be active while start() is awaiting host health.
@@ -131,8 +137,10 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
     } catch {identityVerified=false;}
     return identityVerified;
   }
-  async function sendOnce(input:{key:string;kind:'ready'|'mention'|'dm'|'shared';requestId:string;recipient:string;channel:string;threadTs?:string;text:string}):Promise<void> {
+  async function sendOnce(input:{key:string;kind:'ready'|'mention'|'dm'|'shared';requestId:string;recipient:string;channel:string;threadTs?:string;text:string}):Promise<string|undefined> {
     if(!live()||!identityVerified||!options.transport.socketHealthy())return;
+    // Conversion and the UTF-8 limit happen once, before both the durable claim and delivery.
+    const text=renderSlackReply(input.text),contentHash=hash(text);
     const table=input.kind==='dm'?'gary_slack_dm_outbox':input.kind==='shared'?'gary_slack_shared_outbox':'gary_slack_outbox';
     const claim=randomUUID();
     // An exclusive durable UNKNOWN claim precedes the network request. A process
@@ -141,13 +149,13 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
       (delivery_key,kind,request_id,app_id,team_id,bot_user_id,recipient_id,target_channel,thread_ts,
        content_sha256,readiness_receipt_id,claim_id,status,claimed_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'unknown',?)`).run(input.key,input.kind,input.requestId,GARY_SLACK.appId,GARY_SLACK.teamId,
-        GARY_SLACK.botUserId,input.recipient,input.channel,input.threadTs??null,hash(input.text),receiptId,claim,new Date().toISOString());
-    if(claimed.changes!==1)return;
+        GARY_SLACK.botUserId,input.recipient,input.channel,input.threadTs??null,contentHash,receiptId,claim,new Date().toISOString());
+    if(claimed.changes!==1)return contentHash;
     let status:OutboxRow['status']='unknown',channel:string|null=null,ts:string|null=null,error:string|null='transport_unknown';
     try {
       if(!live()||!options.transport.socketHealthy()) {status='not_sent';error='service_stopped_before_send';}
       else {
-        const result=await options.transport.sendMessage({channel:input.channel,text:input.text,
+        const result=await options.transport.sendMessage({channel:input.channel,text,
           ...(input.threadTs?{threadTs:input.threadTs}:{})},cancellation.signal);
         if(result.ok && typeof result.channel==='string' && TIMESTAMP.test(result.ts)
           && (input.kind==='ready'?/^D[A-Z0-9]{5,32}$/.test(result.channel):result.channel===input.channel)) {
@@ -157,17 +165,71 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
     } catch { /* Retain unknown. Never infer non-delivery from timeout or cancellation. */ }
     options.db.query(`UPDATE ${table} SET status=?, completed_at=?, slack_channel=?, slack_ts=?, error_code=?
       WHERE delivery_key=? AND claim_id=? AND status='unknown'`).run(status,new Date().toISOString(),channel,ts,error,input.key,claim);
+    return contentHash;
   }
-  /** Shared-channel delivery: one durable claim per event, then the row authenticates exactly what left. */
-  function sharedDelivery(key:string,eventId:string,user:string,channel:string,threadTs:string):DMDelivery {
-    return async (text,kind='answer')=>{
-      if(!conversationAvailable()||(kind!=='answer'&&kind!=='notice')||(kind==='answer'&&!options.sharedConversation!.ready()))return 'not_sent';
-      await sendOnce({key,kind:'shared',requestId:eventId,recipient:user,channel,threadTs,text});
-      const row=options.db.query<{status:OutboxRow['status'];content_sha256:string;recipient_id:string;target_channel:string;thread_ts:string},[string]>(
-        'SELECT status,content_sha256,recipient_id,target_channel,thread_ts FROM gary_slack_shared_outbox WHERE delivery_key=?').get(key);
-      if(!row)return 'not_sent';
-      if(row.content_sha256!==hash(text)||row.recipient_id!==user||row.target_channel!==channel||row.thread_ts!==threadTs)return 'unknown';
+  /** One aggregate receipt, with a durable per-physical-message claim before every send. */
+  async function sendConversation(input:{key:string;kind:'dm'|'shared';requestId:string;recipient:string;channel:string;threadTs:string;text:string;authorizeBeforePhysicalSend?:()=>Promise<boolean>}):Promise<OutboxRow['status']> {
+    if(!conversationAvailable()||(input.kind==='shared'&&typeof input.authorizeBeforePhysicalSend!=='function'))return 'not_sent';
+    let parts:string[];
+    try{parts=renderSlackReplyParts(input.text);}catch{return 'not_sent';}
+    const contentHash=hash(parts.length===1?parts[0]!:JSON.stringify(parts)),table=input.kind==='dm'?'gary_slack_dm_outbox':'gary_slack_shared_outbox',claim=randomUUID();
+    type Aggregate={status:OutboxRow['status'];content_sha256:string;recipient_id:string;target_channel:string;thread_ts:string;claim_id:string};
+    const prior=()=>options.db.query<Aggregate,[string]>(`SELECT status,content_sha256,recipient_id,target_channel,thread_ts,claim_id FROM ${table} WHERE delivery_key=?`).get(input.key);
+    const claimed=options.db.transaction(()=>{
+      if(prior())return false;
+      options.db.query(`INSERT INTO ${table} (delivery_key,kind,request_id,app_id,team_id,bot_user_id,recipient_id,target_channel,thread_ts,
+        content_sha256,readiness_receipt_id,claim_id,status,claimed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'unknown',?)`)
+        .run(input.key,input.kind,input.requestId,GARY_SLACK.appId,GARY_SLACK.teamId,GARY_SLACK.botUserId,input.recipient,input.channel,input.threadTs,
+          contentHash,receiptId,claim,new Date().toISOString());
+      parts.forEach((text,index)=>options.db.query(`INSERT INTO gary_slack_conversation_parts
+        (delivery_key,kind,part_index,part_count,content_sha256,claim_id,status,claimed_at) VALUES (?,?,?,?,?,?,'planned',?)`)
+        .run(input.key,input.kind,index,parts.length,hash(text),claim,new Date().toISOString()));
+      return true;
+    }).immediate();
+    if(!claimed){
+      const row=prior();
+      // Existing single-message receipts have no part rows. They remain valid and are never replayed.
+      if(!row||row.content_sha256!==contentHash||row.recipient_id!==input.recipient||row.target_channel!==input.channel||row.thread_ts!==input.threadTs)return 'unknown';
       return row.status;
+    }
+    let confirmed=0,status:OutboxRow['status']='unknown',error:string|null='multipart_incomplete';
+    let finalChannel:string|null=null,finalTs:string|null=null;
+    for(let index=0;index<parts.length;index++){
+      if(!conversationAvailable()) {status=confirmed?'unknown':'not_sent';error='service_stopped_before_send';break;}
+      if(input.kind==='shared'){
+        let authorized=false;
+        try{authorized=await input.authorizeBeforePhysicalSend!()===true;}catch{/* A failed refresh grants no authority. */}
+        if(!authorized){status=confirmed?'unknown':'not_sent';error='shared_authority_unavailable';break;}
+        if(!conversationAvailable()){status=confirmed?'unknown':'not_sent';error='service_stopped_before_send';break;}
+      }
+      const dispatched=options.db.query(`UPDATE gary_slack_conversation_parts SET status='unknown'
+        WHERE kind=? AND delivery_key=? AND part_index=? AND claim_id=? AND status='planned'`).run(input.kind,input.key,index,claim);
+      if(dispatched.changes!==1){error='part_claim_changed';break;}
+      let outcome:OutboxRow['status']='unknown',channel:string|null=null,ts:string|null=null,partError:string|null='transport_unknown';
+      try{
+        if(!conversationAvailable()){outcome='not_sent';partError='service_stopped_before_send';}
+        else {
+          const result=await options.transport.sendMessage({channel:input.channel,text:parts[index]!,threadTs:input.threadTs},cancellation.signal);
+          if(result.ok&&result.channel===input.channel&&TIMESTAMP.test(result.ts)){outcome='sent';channel=result.channel;ts=result.ts;partError=null;}
+          else if(!result.ok&&result.outcome==='definitely_not_sent'){outcome='not_sent';partError='transport_declined';}
+        }
+      }catch{/* The unknown claim is retained; no retry or continuation past this part. */}
+      const completed=options.db.query(`UPDATE gary_slack_conversation_parts SET status=?,completed_at=?,slack_channel=?,slack_ts=?,error_code=?
+        WHERE kind=? AND delivery_key=? AND part_index=? AND claim_id=? AND status='unknown'`)
+        .run(outcome,new Date().toISOString(),channel,ts,partError,input.kind,input.key,index,claim);
+      if(completed.changes!==1){error='part_claim_changed';break;}
+      if(outcome!=='sent'){status=confirmed?'unknown':outcome;error=partError;break;}
+      confirmed++;finalChannel=channel;finalTs=ts;
+    }
+    if(confirmed===parts.length){status='sent';error=null;}
+    options.db.query(`UPDATE ${table} SET status=?,completed_at=?,slack_channel=?,slack_ts=?,error_code=?
+      WHERE delivery_key=? AND claim_id=? AND status='unknown'`).run(status,new Date().toISOString(),finalChannel,finalTs,error,input.key,claim);
+    return prior()?.status??'unknown';
+  }
+  function sharedDelivery(key:string,eventId:string,user:string,channel:string,threadTs:string):DMDelivery {
+    return async (text,kind='answer',authorizeBeforePhysicalSend)=>{
+      if(!conversationAvailable()||(kind!=='answer'&&kind!=='notice')||(kind==='answer'&&!options.sharedConversation!.ready()))return 'not_sent';
+      return sendConversation({key,kind:'shared',requestId:eventId,recipient:user,channel,threadTs,text,...(authorizeBeforePhysicalSend?{authorizeBeforePhysicalSend}:{})});
     };
   }
   async function refresh():Promise<SlackServiceHealth> {
@@ -259,11 +321,7 @@ export function createSlackService(options:SlackServiceOptions):SlackService {
         // Incoming text is passed only after every existing identity/channel/health gate.
         await options.conversation.respond({eventId,channel,ts,threadTs,text:event.text},async (text,kind='answer')=>{
           if(!conversationAvailable()||(kind!=='answer'&&kind!=='notice')||(kind==='answer'&&!options.conversation!.ready()))return 'not_sent';
-          await sendOnce({key,kind:'dm',requestId:eventId,recipient:user,channel,threadTs,text});
-          const row=options.db.query<{status:OutboxRow['status'];content_sha256:string;recipient_id:string;target_channel:string;thread_ts:string},[string]>('SELECT status,content_sha256,recipient_id,target_channel,thread_ts FROM gary_slack_dm_outbox WHERE delivery_key=?').get(key);
-          if(!row)return 'not_sent';
-          if(row.content_sha256!==hash(text)||row.recipient_id!==user||row.target_channel!==channel||row.thread_ts!==threadTs)return 'unknown';
-          return row.status;
+          return sendConversation({key,kind:'dm',requestId:eventId,recipient:user,channel,threadTs,text});
         },cancellation.signal,conversationAvailable);
       } else await sendOnce({key,kind:'dm',requestId:eventId,recipient:user,channel,threadTs,
         text:hostReady?PRIVATE_DM_STATUS:NOT_READY_STATUS});

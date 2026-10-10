@@ -3,8 +3,10 @@ import { Database } from 'bun:sqlite';
 import { constants, openSync, closeSync, fstatSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, normalize } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { DM_CONVERSATION_POLICY as POLICY, DMReplyError, exactDMAllocation, type DMTurn, type DMText } from '../hermes/dm-conversation.ts';
+import { LEGACY_DM_CONVERSATION_POLICY, DM_CONVERSATION_POLICY as POLICY, DMReplyError, exactDMAllocation, type DMTurn, type DMText } from '../hermes/dm-conversation.ts';
 import type { SpendLedger } from '../spend.ts';
+import { conversationFailureMessage } from './conversation-error.ts';
+import { boundedHistory, replacedHistoryPrefix, recordHistoryCompaction, migrateContextPolicy, rollbackContextPolicy, type ContextMigrationReceipt } from './context-policy.ts';
 
 export interface SlackConversationConfig { readonly version:1; readonly runId:string; readonly campaignId:string; readonly allocationId:string; readonly contextDirectory:string }
 const hash=(value:string)=>createHash('sha256').update(value).digest('hex');
@@ -25,9 +27,22 @@ export function loadSlackConversationConfig(path:string):SlackConversationConfig
     ||value.runId!=='hermes-dm-20261008'||value.campaignId!==value.runId||value.allocationId!=='local:hermes-dm-20261008-tanner')throw new Error('dm_config_rejected');
   return Object.freeze({version:1,runId:value.runId,campaignId:value.campaignId,allocationId:value.allocationId,contextDirectory:dirname(path)});
 }
-export function fingerprintSlackConversationConfig(config:SlackConversationConfig):string {
+function fingerprintConfig(config:SlackConversationConfig,policy:unknown):string {
   return hash(JSON.stringify({version:config.version,runId:config.runId,campaignId:config.campaignId,allocationId:config.allocationId,
-    contextDirectory:config.contextDirectory,policy:POLICY}));
+    contextDirectory:config.contextDirectory,policy}));
+}
+export function fingerprintSlackConversationConfig(config:SlackConversationConfig):string {return fingerprintConfig(config,POLICY);}
+export function legacyFingerprintSlackConversationConfig(config:SlackConversationConfig):string {return fingerprintConfig(config,LEGACY_DM_CONVERSATION_POLICY);}
+/** Operator-only: call after graceful drain, before starting the new runtime. */
+export function migrateSlackConversationPolicy(config:SlackConversationConfig):ContextMigrationReceipt|null {
+  privatePath(config.contextDirectory,true);const file=join(config.contextDirectory,'context.sqlite');privatePath(file,false);
+  const db=new Database(file,{strict:true,create:false});
+  try {return migrateContextPolicy(db,legacyFingerprintSlackConversationConfig(config),fingerprintSlackConversationConfig(config));}finally{db.close();}
+}
+export function rollbackSlackConversationPolicy(config:SlackConversationConfig):void {
+  privatePath(config.contextDirectory,true);const file=join(config.contextDirectory,'context.sqlite');privatePath(file,false);
+  const db=new Database(file,{strict:true,create:false});
+  try {rollbackContextPolicy(db,legacyFingerprintSlackConversationConfig(config),fingerprintSlackConversationConfig(config));}finally{db.close();}
 }
 export interface SlackConversationInput { eventId:string; channel:string; ts:string; threadTs:string; text:string }
 export type DMDelivery=(text:string,kind?:'answer'|'notice')=>Promise<'sent'|'unknown'|'not_sent'>;
@@ -55,6 +70,7 @@ export function createSlackConversation(options:{config:SlackConversationConfig;
       state TEXT NOT NULL CHECK(state IN ('queued','running','sent','failed','unknown')),input_sha256 TEXT NOT NULL,worker_name TEXT,cleanup INTEGER NOT NULL DEFAULT 0,error_code TEXT);`);
     db.query('INSERT OR IGNORE INTO control VALUES (1,?,0)').run(fingerprint);
     if((db.query('SELECT fingerprint FROM control WHERE id=1').get() as any)?.fingerprint!==fingerprint)throw new Error('dm_context_config_mismatch');
+    db.exec('CREATE TABLE IF NOT EXISTS history_compactions (event_key TEXT PRIMARY KEY,session_key TEXT NOT NULL,dropped_messages INTEGER NOT NULL,before_sha256 TEXT NOT NULL,after_sha256 TEXT NOT NULL,archived_history TEXT NOT NULL,archived_bytes INTEGER NOT NULL,created_at TEXT NOT NULL)');
     privatePath(file,false);
   }catch(error){db.close();throw error;}
   const pending=()=>Number((db.query("SELECT count(*) AS n FROM events WHERE cleanup=0").get() as any).n);
@@ -69,11 +85,18 @@ export function createSlackConversation(options:{config:SlackConversationConfig;
       const session=db.query<Session,[string]>('SELECT history,turns,blocked FROM sessions WHERE session_key=?').get(sessionKey)!;
       if(!isAvailable()||signal.aborted||blocked()||session.blocked||!allocationReady())throw new DMReplyError('dm_turn_unavailable');
       const history=JSON.parse(session.history) as DMText[];
-      if(session.turns>=POLICY.maxTurns||Buffer.byteLength(JSON.stringify([...history,{role:'user',content:input.text}]))+POLICY.maxReplyBytes+100>POLICY.maxContextBytes)throw new DMReplyError('dm_context_limit');
+      if(session.turns>=POLICY.maxTurns||Buffer.byteLength(JSON.stringify(history))>POLICY.maxContextBytes)throw new DMReplyError('dm_context_limit');
+      let candidateHistory=history;
+      const compactHistory=(compacted:readonly DMText[])=>{
+        // Validate structure locally; the responder owns summary verification and the original audience binding.
+        const checked=boundedHistory(compacted,'',POLICY.maxContextBytes,0);
+        if(checked.dropped.length)throw new DMReplyError('dm_context_limit');
+        candidateHistory=checked.history;
+      };
       db.query("UPDATE events SET state='running' WHERE event_key=? AND owner=? AND state='queued'").run(key,owner);
       reply=await options.reply({requestId:randomUUID(),ownerId:owner,allocationId:config.allocationId,campaignId:config.campaignId,
         authority:Object.freeze({surface:'private_dm',requesterId:'U0A9M5W16F8',teamId:'T0AA24R7VUZ',channelId:input.channel,threadTs:input.threadTs}),
-        history,text:input.text,signal,
+        history,text:input.text,signal,compactHistory,
         assertActive:()=>{
           if(closed||!isAvailable()||blocked()||signal.aborted||(db.query('SELECT state,owner FROM events WHERE event_key=?').get(key) as any)?.owner!==owner
             ||(db.query('SELECT state FROM events WHERE event_key=?').get(key) as any)?.state!=='running')throw new DMReplyError('dm_owner_changed');
@@ -84,24 +107,29 @@ export function createSlackConversation(options:{config:SlackConversationConfig;
       });
       if(!isAvailable()||signal.aborted||blocked()||!allocationReady())throw new DMReplyError('dm_turn_unavailable');
       if(typeof reply!=='string'||!reply.trim()||Buffer.byteLength(reply)>POLICY.maxReplyBytes)throw new DMReplyError('dm_reply_rejected');
-      const next=[...history,{role:'user',content:input.text},{role:'assistant',content:reply}];
+      const compacted=boundedHistory(candidateHistory,input.text,POLICY.maxContextBytes,Buffer.byteLength(JSON.stringify(reply))+64);
+      const next=[...compacted.history,{role:'user',content:input.text},{role:'assistant',content:reply}];
       if(Buffer.byteLength(JSON.stringify(next))>POLICY.maxContextBytes)throw new DMReplyError('dm_context_limit');
       let delivery:'sent'|'unknown'|'not_sent'='unknown';
       try {delivery=await deliver(reply,'answer');}catch{/* An ambiguous send is never retried. */}
       db.transaction(()=>{
-        if(delivery==='sent')db.query('UPDATE sessions SET history=?,turns=turns+1 WHERE session_key=?').run(JSON.stringify(next),sessionKey);
+        if(delivery==='sent'){
+          if(JSON.stringify(history)!==JSON.stringify(compacted.history))recordHistoryCompaction(db,key,sessionKey,history,compacted.history,replacedHistoryPrefix(history,compacted.history));
+          db.query('UPDATE sessions SET history=?,turns=turns+1 WHERE session_key=?').run(JSON.stringify(next),sessionKey);
+        }
         else db.query('UPDATE sessions SET blocked=1 WHERE session_key=?').run(sessionKey);
         db.query('UPDATE events SET state=?,cleanup=1,error_code=? WHERE event_key=? AND owner=?').run(delivery==='sent'?'sent':delivery==='unknown'?'unknown':'failed',delivery==='sent'?null:'dm_delivery_'+delivery,key,owner);
       }).immediate();
       return;
     }catch(error){
       errorCode=error instanceof DMReplyError?error.code:'dm_turn_failed';cleanup=error instanceof DMReplyError?error.cleanupConfirmed:false;
+      const unknownSpend=Boolean(ledger.status(config.allocationId)?.unknownAttempts);
       db.transaction(()=>{
         db.query('UPDATE sessions SET blocked=1 WHERE session_key=?').run(sessionKey);
         db.query("UPDATE events SET state='failed',cleanup=?,error_code=? WHERE event_key=? AND owner=?").run(cleanup?1:0,errorCode,key,owner);
-        if(!cleanup||ledger.status(config.allocationId)?.unknownAttempts)db.query('UPDATE control SET blocked=1 WHERE id=1').run();
+        if(!cleanup||unknownSpend)db.query('UPDATE control SET blocked=1 WHERE id=1').run();
       }).immediate();
-      if(!signal.aborted&&isAvailable())try {await deliver("I couldn't complete that reply. This thread is paused, and I won't retry the message automatically.",'notice');}catch{/* No retry. */}
+      if(!signal.aborted&&isAvailable())try {await deliver(conversationFailureMessage(errorCode,cleanup,unknownSpend),'notice');}catch{/* No retry. */}
     }
   }
   function respond(input:SlackConversationInput,deliver:DMDelivery,signal:AbortSignal,isAvailable:()=>boolean=()=>true):Promise<void> {

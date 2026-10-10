@@ -18,6 +18,8 @@ import { LocalExecutor } from '../src/executors/local.ts';
 import type { AssignedIssue, LinearAdapter } from '../src/adapters/linear.ts';
 import type { GitHubClient } from '../src/adapters/github.ts';
 import { APPROVED_SLACK_IDENTITY, type SlackTransport } from '../src/slack/transport.ts';
+import { runLoop as runExistingLoop, type LoopWake } from '../src/loop.ts';
+import { GARY_SLACK } from '../src/slack/service.ts';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -300,4 +302,112 @@ test('actual startup routes an authenticated Slack question through canonical cu
    expect(providerCalls).toBe(2);expect(sent).toEqual(['ERT-2990 is recorded in progress; that record alone does not prove live execution.']);
    expect(ledger.status('local:hermes-shared-20261008')).toMatchObject({attemptCount:2,unknownAttempts:0});
   }});
+});
+
+test('actual startup exposes scoped ticket/repository/controller tools, wakes its existing loop and keeps private memory out of shared replies',async()=>{
+ const f=slackFixture(),ledger=new SpendLedger(':memory:'),db=openDb(':memory:'),stop=new AbortController();
+ f.activation.repo='707-Labs/mulligan-labs';writeFileSync(f.activationPath,JSON.stringify(f.activation));
+ f.config.gary.repoMap=new Map([['ERT',f.activation.repo]]);
+ const projectDir=join(f.root,'projects'),dmDir=join(f.root,'dm'),sharedDir=join(f.root,'shared');
+ for(const dir of [projectDir,dmDir,sharedDir])mkdirSync(dir,{mode:0o700});
+ const dmPath=join(dmDir,'config.json'),sharedPath=join(sharedDir,'config.json'),projectPath=join(projectDir,'config.json');
+ writeFileSync(dmPath,JSON.stringify({version:1,runId:'hermes-dm-20261008',campaignId:'hermes-dm-20261008',allocationId:'local:hermes-dm-20261008-tanner'}),{mode:0o600});
+ writeFileSync(sharedPath,JSON.stringify({version:1,runId:'hermes-shared-20261008',campaignId:'hermes-shared-20261008',allocationId:'local:hermes-shared-20261008',
+  teamId:'T0AA24R7VUZ',appId:'A0C7QFW3PEG',botUserId:'U0C7NPEUG1F',trigger:'explicit_mention'}),{mode:0o600});
+ const raw=JSON.stringify({version:1,teamId:'T0AA24R7VUZ',ownerUserId:'U0A9M5W16F8',memoryPath:join(projectDir,'project-memory.sqlite'),projects:[{
+  id:'mulligan-labs',repo:f.activation.repo,teamKey:'ERT',label:'Mulligan Labs',summary:'Fixture project.',sharedChannelIds:['C0CHANNEL1'],
+  root:f.workspace,revision:f.activation.policy.baseCommit,readPaths:['task.ts']}]});
+ writeFileSync(projectPath,raw,{mode:0o600});
+ // The repository tool must return committed data, never a simultaneous editor's contents.
+ writeFileSync(join(f.workspace,'task.ts'),'uncommitted fixture text must not be exposed\n');
+ for(const [campaign,allocation] of [['hermes-dm-20261008','local:hermes-dm-20261008-tanner'],['hermes-shared-20261008','local:hermes-shared-20261008']]){
+  ledger.createCampaign(campaign!,5);ledger.enrollTicket(campaign!,allocation!,5);
+ }
+ ledger.createCampaign('coding-fixture',10);ledger.enrollTicket('coding-fixture',issueId,10,{draftPr:true,codingReviewReserve:true});
+ upsertTicket(db,{linearId:issueId,identifier:'ERT-1'});
+ const ticket:AssignedIssue={id:issueId,identifier:'ERT-1',title:'Full fixture ticket',description:'Problem: missing context.\nAcceptance criteria:\n- Preserve all rows.\n- Do not start a duplicate job.',
+  url:'https://linear.app/fixture/issue/ERT-1',stateName:'Todo',stateType:'unstarted',createdAt:'2026-10-10T00:00:00Z',updatedAt:'2026-10-10T01:00:00Z',
+  creatorId:null,creatorName:null,teamId:'fixture-team',teamKey:'ERT',blockedBy:[]};
+ let receive:(envelope:unknown)=>void|Promise<void>=()=>{},providerCalls=0,detailCalls=0,commentCalls=0,polls=0,launches=0;
+ let wake:LoopWake|undefined;const receipts:Record<string,any>={},sent:Array<{channel:string;text:string}>=[];
+ const originalStart=f.transport.start.bind(f.transport);
+ f.transport.start=async(handler,signal)=>{receive=handler;await originalStart(handler,signal);};
+ f.transport.memberInfo=async id=>({id,teamId:'T0AA24R7VUZ',deleted:false,isBot:false,isAppUser:false,isRestricted:false,isUltraRestricted:false,isStranger:false,observedAt:Date.now()});
+ f.transport.channelInfo=async id=>({id,teamId:'T0AA24R7VUZ',isMember:true,isArchived:false,isPrivate:false,isShared:false,isExtShared:false,isOrgShared:false,isPendingExtShared:false,observedAt:Date.now()});
+ f.transport.sendMessage=async request=>{sent.push({channel:request.channel,text:request.text});return{ok:true,channel:request.channel,ts:'1791452000.00000'+sent.length};};
+ const emit=(privateDM:boolean)=>receive({type:'events_api',payload:{type:'event_callback',team_id:'T0AA24R7VUZ',api_app_id:'A0C7QFW3PEG',event_id:privateDM?'EvRichPrivate1':'EvRichShared1',
+  event:privateDM?{type:'message',channel_type:'im',user:'U0A9M5W16F8',channel:'D0FIXTURE1',ts:'1791452100.000001',text:'Read ERT-1 and its source, remember my private note, then ask the existing controller to consider it.'}
+   :{type:'app_mention',user:'U0A97PBGXE3',channel:'C0CHANNEL1',ts:'1791452200.000001',text:'<@U0C7NPEUG1F> Read ERT-1, its source and controller status. What notes are shared here?'}}});
+ const tool=(id:string,name:string,args:Record<string,unknown>)=>({type:'tool_use',id,name,input:{project:'mulligan-labs',...args}});
+ const timer=setTimeout(()=>stop.abort(),2500);
+ try{await main({...f.deps,signal:stop.signal,env:{...f.env,GARY_CONVERSATION_RUNTIME_RELEASE:'c'.repeat(40),GARY_SLACK_TANNER_DM_ENABLED:'1',
+  GARY_SLACK_CONVERSATION_CONFIG:dmPath,GARY_SLACK_SHARED_CONVERSATION_CONFIG:sharedPath,GARY_PROJECT_ASSISTANT_CONFIG:projectPath,
+  GARY_PROJECT_ASSISTANT_CONFIG_SHA256:createHash('sha256').update(raw).digest('hex')},verifyConversationRelease:()=>{},
+  db:()=>db,ledger:()=>ledger,slackTransport:()=>f.transport,
+  linear:()=>({fetchAssignedIssues:async()=>[],fetchByIdentifier:async(identifier:string)=>{expect(identifier).toBe('ERT-1');detailCalls++;return ticket;},
+   fetchComments:async(id:string,limit?:number)=>{expect(id).toBe(issueId);expect(limit).toBe(21);commentCalls++;return[{id:'comment-fixture',body:'Keep the acceptance criteria intact.',createdAt:'2026-10-10T01:00:00Z',userId:null,userName:'Fixture author'}];}} as unknown as LinearAdapter),
+  fetch:(async request=>{
+   providerCalls++;const body:any=await (request as Request).json();
+   let content:any[];
+   if(providerCalls===1)content=[tool('private_ticket','ticket_detail',{ticket:'ERT-1'}),tool('private_repo','repository_read',{path:'task.ts'}),
+    tool('private_status','controller_status',{ticket:'ERT-1'}),tool('private_handoff','controller_handoff',{ticket:'ERT-1'}),
+    tool('private_memory','remember_fact',{text:'Owner-private fixture note alpha.'})];
+   else if(providerCalls===3)content=[tool('shared_ticket','ticket_detail',{ticket:'ERT-1'}),tool('shared_repo','repository_read',{path:'task.ts'}),
+    tool('shared_status','controller_status',{ticket:'ERT-1'}),tool('shared_memory','recall_learning',{}),
+    tool('shared_denied','ticket_detail',{project:'birdup',ticket:'BIRD-1'})];
+   else{
+    expect([2,4]).toContain(providerCalls);expect(JSON.stringify(body.messages)).toContain('Acceptance criteria:');
+    expect(JSON.stringify(body.messages)).toContain('baseline');expect(JSON.stringify(body.messages)).not.toContain('uncommitted fixture text');
+    if(providerCalls===4)expect(JSON.stringify(body)).not.toContain('Owner-private fixture note alpha.');
+    content=[{type:'text',text:providerCalls===2?'Private fixture answer.':'Shared fixture answer.'}];
+   }
+   return Response.json({id:'fixture'+providerCalls,type:'message',role:'assistant',model:'deepseek-v4-pro',content,
+    stop_reason:providerCalls%2?'tool_use':'end_turn',usage:{input_tokens:80,output_tokens:30,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+  }) as typeof fetch,
+  launch:async(m,handle)=>{
+   launches++;const names=m.tools.map(t=>t.function.name);
+   for(const name of ['ticket_detail','repository_read','controller_status'])expect(names).toContain(name);
+   expect(names.includes('controller_handoff')).toBe(launches===1);
+   if(launches===2)expect(m.systemPrompt).not.toContain('Owner-private fixture note alpha.');
+   const history:any[]=[...(m.history??[]),{role:'user',content:m.prompt}];
+   const rpc=(path:string,value:unknown)=>handle(new Request('http://127.0.0.1'+path,{method:'POST',headers:{authorization:'Bearer '+m.capability,'content-type':'application/json'},body:JSON.stringify(value)}));
+   for(let i=0;i<2;i++){
+    const response=await rpc('/v1/chat/completions',{model:m.model,messages:[{role:'system',content:m.systemPrompt},...history],max_tokens:m.maxTokens,temperature:m.temperature,tools:m.tools,stream:false});
+    expect(response.ok).toBe(true);const message=(await response.json() as any).choices[0].message;history.push(message);
+    for(const call of message.tool_calls??[]){
+     const result:any=await(await rpc('/tools/execute',{taskId:m.taskId,ownerEpoch:m.ownerEpoch,token:m.capability,callId:call.id,name:call.function.name,arguments:JSON.parse(call.function.arguments)})).json();
+     receipts[call.id]=JSON.parse(result.content);history.push({role:'tool',tool_call_id:call.id,content:result.content});
+    }
+   }
+   return{taskId:m.taskId,requestId:m.requestId,status:'no_finish',publicationApproved:false,history};
+  },runLoop:async args=>{
+   wake=args.wake;expect(wake).toBeDefined();expect(wake!.request()).toBe(false);
+   expect({providerCalls,detailCalls,commentCalls,launches}).toEqual({providerCalls:0,detailCalls:0,commentCalls:0,launches:0});
+   // Existing DM delivery binds the private channel, as in the deployed store.
+   // This is fixture evidence only; startup must not send another ready notice.
+   db.query(`INSERT INTO gary_slack_outbox(delivery_key,kind,request_id,app_id,team_id,bot_user_id,recipient_id,
+     content_sha256,target_channel,claim_id,claimed_at,status,slack_channel,slack_ts) VALUES(?,'ready',?,?,?,?,?,?,'U0A9M5W16F8','fixture','2026-10-10T00:00:00Z','sent','D0FIXTURE1','1791452000.000000')`)
+     .run(`ready:${GARY_SLACK.readyRequest}:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${GARY_SLACK.tannerId}`,
+       GARY_SLACK.readyRequest,GARY_SLACK.appId,GARY_SLACK.teamId,GARY_SLACK.botUserId,GARY_SLACK.tannerId,'0'.repeat(64));
+   await runExistingLoop({...args,intervalMs:60_000,onTickComplete:async result=>{
+    await args.onTickComplete?.(result);polls++;
+    if(polls===1){await emit(true);expect(receipts.private_handoff).toMatchObject({ok:true,data:{status:'reconsideration_requested'}});}
+    else{
+     await emit(false);await emit(true); // Redelivery does not rerun model, tools or wake.
+     expect(db.query("SELECT count(*) n FROM events WHERE event_type='conversation_controller_handoff'").get()).toEqual({n:1});
+     expect(db.query('SELECT count(*) n FROM actions').get()).toEqual({n:0});
+     expect(ledger.status(issueId)).toMatchObject({state:'active',attemptCount:0,chargedMicros:0});
+     expect(ledger.status('local:hermes-dm-20261008-tanner')).toMatchObject({attemptCount:2,unknownAttempts:0});
+     expect(ledger.status('local:hermes-shared-20261008')).toMatchObject({attemptCount:2,unknownAttempts:0});
+     stop.abort();expect(wake!.request()).toBe(false);
+    }
+   }});
+  }});}finally{clearTimeout(timer);stop.abort();}
+ expect({polls,launches,providerCalls,detailCalls,commentCalls,network:f.networkCalls()}).toEqual({polls:2,launches:2,providerCalls:4,detailCalls:2,commentCalls:2,network:0});
+ expect(sent).toEqual([{channel:'D0FIXTURE1',text:'Private fixture answer.'},{channel:'C0CHANNEL1',text:'Shared fixture answer.'}]);
+ expect(receipts.private_ticket).toMatchObject({ok:true,data:{ticket:'ERT-1',description:{text:ticket.description},comments:[{text:'Keep the acceptance criteria intact.'}]}});
+ expect(receipts.private_repo).toMatchObject({ok:true,data:{source:'local_committed_git',revision:f.activation.policy.baseCommit,text:'baseline\n',uncommittedChangesIncluded:false}});
+ expect(receipts.private_status).toMatchObject({ok:true,data:{runtime:{loopState:'polling',dispatchReady:true},items:[{ticket:'ERT-1',workerState:'not_observed',admission:{handoffEligible:true}}]}});
+ expect(receipts.shared_memory).toMatchObject({ok:true,data:{scopeRecordCount:0}});expect(receipts.shared_denied).toMatchObject({ok:false,error:'project_denied'});
+ expect(wake!.request()).toBe(false);expect(f.stats().stopped).toBe(true);
 });

@@ -1037,27 +1037,76 @@ export interface RunLoopArgs extends LoopDeps {
   intervalMs: number;
   /** Awaited after a successful tick has fully settled. Failure stops the loop. */
   onTickComplete?: (result: TickResult) => Promise<void> | void;
+  /** Optional host-owned wake. It shortens the next wait, never starts a concurrent tick. */
+  wake?: LoopWake;
+  onTickState?: (state: 'idle' | 'polling' | 'stopped') => void;
+}
+
+export interface LoopWake {
+  start(): void;
+  stop(): void;
+  request(): boolean;
+  wait(ms: number, signal?: AbortSignal): Promise<void>;
+}
+
+/** Coalescing interval wake for the one existing serial controller. No task queue. */
+export function createLoopWake(): LoopWake {
+  let running = false, pending = false;
+  let finish: (() => void) | undefined;
+  return {
+    start() { if (running) throw new Error('loop_wake_already_owned'); running = true; },
+    stop() { running = false; pending = false; finish?.(); },
+    request() {
+      if (!running) return false;
+      pending = true;
+      finish?.();
+      return true;
+    },
+    async wait(ms, signal) {
+      if (!running || signal?.aborted) return;
+      if (pending) { pending = false; return; }
+      if (finish) throw new Error('concurrent_loop_wait_rejected');
+      await new Promise<void>(resolve => {
+        let timer: ReturnType<typeof setTimeout>;
+        const done = () => {
+          clearTimeout(timer); signal?.removeEventListener('abort', done);
+          finish = undefined; pending = false; resolve();
+        };
+        timer = setTimeout(done, ms); finish = done;
+        signal?.addEventListener('abort', done, { once: true });
+      });
+    },
+  };
 }
 
 /** Runs the poll loop forever (until aborted). One tick per interval. */
 export async function runLoop(args: RunLoopArgs): Promise<void> {
   log.info("loop starting", { intervalMs: args.intervalMs });
-  while (!args.signal?.aborted) {
-    let result: TickResult | undefined;
-    try {
-      result = await tick(args);
-      log.debug("tick complete", { ...result });
-    } catch (err) {
-      log.error("tick failed", {
-        error: err instanceof Error ? err.message : String(err),
-      });
+  args.wake?.start();
+  try {
+    while (!args.signal?.aborted) {
+      args.onTickState?.('polling');
+      let result: TickResult | undefined;
+      try {
+        result = await tick(args);
+        log.debug("tick complete", { ...result });
+      } catch (err) {
+        log.error("tick failed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      // Keep this outside the recoverable tick catch: readiness/receipt failures
+      // must not silently continue admitting work on the next poll.
+      if (result && !args.signal?.aborted) await args.onTickComplete?.(result);
+      args.onTickState?.('idle');
+      if (args.wake) await args.wake.wait(args.intervalMs, args.signal);
+      else await sleep(args.intervalMs, args.signal);
     }
-    // Keep this outside the recoverable tick catch: readiness/receipt failures
-    // must not silently continue admitting work on the next poll.
-    if (result && !args.signal?.aborted) await args.onTickComplete?.(result);
-    await sleep(args.intervalMs, args.signal);
+  } finally {
+    args.wake?.stop();
+    args.onTickState?.('stopped');
+    log.info("loop stopping");
   }
-  log.info("loop stopping");
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {

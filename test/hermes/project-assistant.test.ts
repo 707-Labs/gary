@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { ProjectAssistant, type ProjectAssistantOptions, type ProjectAudience, type ProjectRegistration } from '../../src/hermes/project-assistant.ts';
+import { createLinearTicketReader, createLocalRepositoryReader, type ProjectTicketSnapshot } from '../../src/hermes/project-integrations.ts';
 
 const privateAudience: ProjectAudience = { surface: 'private_dm', requesterId: 'UOWNER', teamId: 'TTEAM', channelId: 'DOWNER', threadTs: '1234.000001' };
 const sharedAudience: ProjectAudience = { ...privateAudience, surface: 'shared_channel', channelId: 'CONE' };
@@ -70,7 +71,8 @@ describe('host-owned project assistant', () => {
     const f = fixture(), a = f.open({ projects: [{ id: 'green', label: 'Green', summary: 'Source access not bound yet.', sharedChannelIds: ['CONE'] }] });
     expect(data(await exec(a, 'project_list', {})).projects[0].sourceAvailable).toBe(false);
     expect(await exec(a, 'project_read', { project: 'green', path: 'README.md' })).toMatchObject({ ok: false, error: 'source_unavailable' });
-    expect(data(await exec(a, 'current_work', { project: 'green' }))).toEqual({ project: 'green', available: false, items: [] });
+    expect(data(await exec(a, 'current_work', { project: 'green' }))).toMatchObject({ project: 'green', available: false, items: [],
+      source: 'unavailable', observedAt: null, liveState: 'unverified', capabilities: { recordedActions: false, fullTicketDetails: false, retryAction: false } });
   });
   test('private learning survives reopen and session changes without reaching a shared audience', async () => {
     const f = fixture(), a = f.open();
@@ -181,6 +183,45 @@ describe('host-owned project assistant', () => {
     expect(result.items[0].ticket).toBe('ERT-2990');
     expect(JSON.stringify(result)).not.toMatch(/PRIVATE|SENSITIVE|history|prompt/);
     expect(result.items[0].checks).toEqual([{ name: 'focused', status: 'passed' }]);
+  });
+  test('historical work carries local observation provenance and directs live/retry questions to the controller', async () => {
+    const observedAt = '2026-10-10T07:00:00.000Z';
+    const a = fixture().open({ currentWork: async () => [{ ticket: 'BIRD-7', status: 'recorded_in_progress',
+      startedAt: '2026-01-02T12:00:00.000Z', source: 'gary_canonical_database', observedAt, liveState: 'unverified' }] });
+    const before = Date.now();
+    const result = data(await exec(a, 'current_work', { project: 'mulligan' }));
+    expect(result.source).toBe('host_recorded_work_projection');
+    expect(Date.parse(result.observedAt)).toBeGreaterThanOrEqual(before);
+    expect(Date.parse(result.observedAt)).toBeLessThanOrEqual(Date.now());
+    expect(result.items[0]).toMatchObject({ ticket: 'BIRD-7', status: 'recorded_in_progress', observedAt,
+      startedAt: '2026-01-02T12:00:00.000Z', source: 'gary_canonical_database', liveState: 'unverified' });
+    expect(result.observedAtMeaning).toBe('local_projection_read_time_not_upstream_or_worker_freshness');
+    expect(result.liveState).toBe('unverified');
+    expect(result.capabilities).toEqual({ recordedActions: true, fullTicketDetails: false, liveOwner: false,
+      crashDiagnosis: false, retryEligibility: false, retryAction: false });
+    expect(result.nextSteps.fullTicketDetails).toContain('authorized Linear ticket read');
+    expect(result.nextSteps.liveOwner).toContain('existing coding controller');
+    expect(result.nextSteps.retry).toContain('current trial stop reason, admission and budget evidence');
+    expect(result.interpretation).toContain('cannot establish');
+    expect(a.toolsFor(privateAudience).map(tool => tool.function.name)).toEqual([
+      'project_list', 'project_read', 'project_search', 'current_work', 'remember_fact', 'propose_skill', 'recall_learning',
+    ]);
+    expect(await exec(a, 'retry', { project: 'mulligan' })).toMatchObject({ ok: false, error: 'audience_denied' });
+  });
+  test('empty recorded work does not establish idle, crash or retry eligibility', async () => {
+    const a = fixture().open({ currentWork: async () => [] });
+    expect(data(await exec(a, 'current_work', { project: 'mulligan' }))).toMatchObject({
+      available: true, items: [], liveState: 'unverified', capabilities: { liveOwner: false, crashDiagnosis: false, retryEligibility: false },
+    });
+  });
+  test('record provenance cannot claim live verification or carry arbitrary metadata', async () => {
+    const f = fixture();
+    for (const bad of [{ source: 'live_worker' }, { liveState: 'verified_running' }, { observedAt: 'PRIVATE CONTENT' },
+      { observedAt: '2026-02-30T00:00:00.000Z' }]) {
+      const a = f.open({ currentWork: async () => [{ ticket: 'ERT-2990', status: 'recorded_in_progress', ...bad } as any] });
+      expect(await exec(a, 'current_work', { project: 'mulligan' })).toMatchObject({ ok: false, error: 'work_unavailable' });
+      a.close();
+    }
   });
   test('current work reports unavailable and rejects unauthorized PR destinations', async () => {
     const f = fixture();
@@ -316,5 +357,177 @@ describe('host-owned project assistant', () => {
       expect(result.ok ? (result.data as any).truncated : result.error === 'source_unavailable').toBe(true);
       expect(ticks).toBeLessThanOrEqual(8);
     } finally { clock.mockRestore(); }
+  });
+});
+
+describe('audience-bound project integrations and automatic context', () => {
+  function snapshot(description = '## Goal\nRepair the turn.\n## Acceptance\nA settled answer reaches Slack once.'): ProjectTicketSnapshot {
+    return { issue: { id: 'issue-1', identifier: 'ERT-42', title: 'Fix exhaustive summaries', description,
+      url: 'https://linear.app/707-labs/issue/ERT-42/fix-summary', stateName: 'In Progress', stateType: 'started',
+      createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-10T00:00:00.000Z', creatorId: null, creatorName: null,
+      teamId: 'linear-team-ert', teamKey: 'ERT', blockedBy: [] }, comments: [{ id: 'comment-1', body: 'Preserve completed tool evidence.',
+        createdAt: '2026-10-10T00:00:00.000Z', userId: 'linear-user', userName: 'Tanner' }],
+      commentsTruncated: false, observedAt: '2026-10-10T16:00:00.000Z' };
+  }
+  test('ticket tool gives descriptions, acceptance and comments with upstream provenance, not worker claims', async () => {
+    const f = fixture(); let seen: any;
+    const a = f.open({ projects: [{ ...f.project, repo: '707-Labs/mulligan-labs', teamKey: 'ERT' }], integrations: {
+      ticketDetail: async (binding, identifier) => { seen = { binding, identifier }; return snapshot(); },
+    } });
+    const result = data(await exec(a, 'ticket_detail', { project: 'mulligan', ticket: 'ERT-42' }));
+    expect(result.title).toBe('Fix exhaustive summaries');
+    expect(result.description.text).toContain('## Acceptance');
+    expect(result.comments[0].text).toBe('Preserve completed tool evidence.');
+    expect(result).toMatchObject({ source: 'linear', observedAt: '2026-10-10T16:00:00.000Z', workerState: 'not_established_by_upstream_ticket_state' });
+    expect(seen.identifier).toBe('ERT-42'); expect(seen.binding).toMatchObject({ projectId: 'mulligan', repo: '707-Labs/mulligan-labs', teamKey: 'ERT', audience: privateAudience });
+    expect(Object.isFrozen(seen.binding)).toBe(true); expect(Object.isFrozen(seen.binding.audience)).toBe(true);
+  });
+  test('host and project authority precede every integration; caller cannot choose repository or audience', async () => {
+    const f = fixture(); let calls = 0;
+    const a = f.open({ projects: [{ ...f.project, repo: '707-Labs/mulligan-labs', teamKey: 'ERT' }], integrations: {
+      ticketDetail: async () => { calls++; return snapshot(); }, repository: async () => { calls++; return {}; }, controller: async () => { calls++; return {}; },
+    } });
+    for (const args of [{ project: 'mulligan', ticket: 'BIRD-42' }, { project: 'mulligan', ticket: 'ERT-42', repo: '707-Labs/birdup' },
+      { project: 'other', ticket: 'ERT-42' }, { project: 'mulligan', ticket: 'ERT-42', audience: privateAudience }]) expect((await exec(a, 'ticket_detail', args)).ok).toBe(false);
+    expect((await exec(a, 'ticket_detail', { project: 'mulligan', ticket: 'ERT-42' }, { ...sharedAudience, channelId: 'CUNBOUND' })).ok).toBe(false);
+    expect((await exec(a, 'controller_handoff', { project: 'mulligan', ticket: 'ERT-42' }, { ...sharedAudience, requesterId: 'UMEMBER' })).ok).toBe(false);
+    expect((await exec(a, 'repository_read', { project: 'mulligan', path: '../secrets.md' })).ok).toBe(false);
+    expect((await exec(a, 'repository_read', { project: 'mulligan', path: 'README.md', startLine: -1 })).ok).toBe(false);
+    expect(calls).toBe(0);
+    expect(a.toolsFor({ ...sharedAudience, requesterId: 'UMEMBER' }).map(t => t.function.name)).not.toContain('controller_handoff');
+    expect(a.toolsFor(privateAudience)).toHaveLength(13);
+  });
+  test('callback availability is explicit, cards without host identity cannot use another project integration', async () => {
+    const f = fixture(); let calls = 0;
+    const a = f.open({ integrations: { ticketDetail: async () => { calls++; return snapshot(); } } });
+    expect(a.toolsFor(privateAudience).map(t => t.function.name)).not.toContain('ticket_detail');
+    expect((await exec(a, 'ticket_detail', { project: 'mulligan', ticket: 'ERT-42' })).ok).toBe(false); expect(calls).toBe(0);
+    expect(data(await exec(a, 'project_list', {})).projects[0].integrations.ticketDetails).toBe(false);
+  });
+  test('mismatched upstream tickets, credential-bearing data and raw integration exceptions are not disclosed', async () => {
+    const f = fixture(), projects = [{ ...f.project, repo: '707-Labs/mulligan-labs', teamKey: 'ERT' }];
+    const bad = snapshot(); bad.issue.teamKey = 'BIRD';
+    const a = f.open({ projects, integrations: { ticketDetail: async () => bad } });
+    expect(await exec(a, 'ticket_detail', { project: 'mulligan', ticket: 'ERT-42' })).toMatchObject({ ok: false, error: 'ticket_unavailable' });
+    const b = f.open({ projects, integrations: { ticketDetail: async () => snapshot('token xoxb-12345678901234567890') } });
+    expect(await exec(b, 'ticket_detail', { project: 'mulligan', ticket: 'ERT-42' })).toMatchObject({ ok: false, error: 'secret_like_content' });
+    const c = f.open({ projects, integrations: { repository: async () => { throw new Error('PRIVATE INTERNAL CREDENTIAL'); } } });
+    expect(await exec(c, 'repository_revision', { project: 'mulligan' })).toEqual({ ok: false, dataOnly: true, error: 'integration_unavailable' });
+  });
+  test('ticket pages continue without claiming completeness and outside-team relations remain opaque', async () => {
+    const f = fixture(), s = snapshot(Array.from({ length: 430 }, (_, i) => 'Requirement ' + i).join('\n'));
+    s.issue.blockedBy = [{ id: 'other', identifier: 'BIRD-2', stateName: 'Private detail', stateType: 'started', isOpen: true },
+      { id: 'own', identifier: 'ERT-3', stateName: 'Done', stateType: 'completed', isOpen: false }];
+    const a = f.open({ projects: [{ ...f.project, repo: '707-Labs/mulligan-labs', teamKey: 'ERT' }], integrations: { ticketDetail: async () => s } });
+    const first = data(await exec(a, 'ticket_detail', { project: 'mulligan', ticket: 'ERT-42' }));
+    expect(first.description).toMatchObject({ nextLine: 401, truncated: true });
+    expect(first.omittedOutOfScopeRelations).toBe(1); expect(JSON.stringify(first)).not.toContain('Private detail');
+    expect(first.blockedBy.map((r: any) => r.identifier)).toEqual(['ERT-3']);
+    const second = data(await exec(a, 'ticket_detail', { project: 'mulligan', ticket: 'ERT-42', startLine: 401 }));
+    expect(second.description).toMatchObject({ nextLine: null, truncated: false }); expect(second.description.text).toContain('Requirement 429');
+  });
+  test('Linear helper verifies returned issue before comments and reports bounded comment coverage', async () => {
+    let comments = 0;
+    const read = createLinearTicketReader({ fetchByIdentifier: async () => snapshot().issue,
+      fetchComments: async (_id, limit) => { comments++; expect(limit).toBe(21); return Array.from({ length: 21 }, () => snapshot().comments[0]!); } });
+    const binding = { projectId: 'mulligan', repo: '707-Labs/mulligan-labs', teamKey: 'ERT', audience: privateAudience };
+    const result = await read(binding, 'ERT-42'); expect(result?.comments).toHaveLength(20); expect(result?.commentsTruncated).toBe(true); expect(comments).toBe(1);
+    await expect(read(binding, 'BIRD-42')).rejects.toThrow('ticket_denied'); expect(comments).toBe(1);
+    const mismatch = createLinearTicketReader({ fetchByIdentifier: async () => ({ ...snapshot().issue, teamKey: 'BIRD' }), fetchComments: async () => { comments++; return []; } });
+    await expect(mismatch(binding, 'ERT-42')).rejects.toThrow('ticket_denied'); expect(comments).toBe(1);
+  });
+  test('a returned comment ID can retrieve its full bounded page without changing ticket scope', async () => {
+    const f = fixture(), s = snapshot();
+    s.comments = [{ ...s.comments[0]!, body: Array.from({ length: 50 }, (_, i) => 'Comment requirement ' + i).join('\n') }];
+    const a = f.open({ projects: [{ ...f.project, repo: '707-Labs/mulligan-labs', teamKey: 'ERT' }], integrations: { ticketDetail: async () => s } });
+    const first = data(await exec(a, 'ticket_detail', { project: 'mulligan', ticket: 'ERT-42' }));
+    expect(first.comments[0].truncated).toBe(true);
+    const full = data(await exec(a, 'ticket_detail', { project: 'mulligan', ticket: 'ERT-42', commentId: 'comment-1' }));
+    expect(full.selectedComment).toMatchObject({ id: 'comment-1', truncated: false });
+    expect(full.selectedComment.text).toContain('Comment requirement 49'); expect(full.description).toBeUndefined();
+    expect(await exec(a, 'ticket_detail', { project: 'mulligan', ticket: 'ERT-42', commentId: 'other-issue-comment' })).toMatchObject({ ok: false, error: 'ticket_unavailable' });
+  });
+  test('local registered repository exposes committed full source with explicit freshness; dirty files, symlinks and secrets stay excluded', async () => {
+    const f = fixture(); writeFileSync(join(f.repo, 'new.ts'), 'export const additional = "needle";\n');
+    writeFileSync(join(f.repo, '.env'), 'hiddenneedle'); symlinkSync('/etc/passwd', join(f.repo, 'outside.md'));
+    runGit(f.repo, 'add', '.'); runGit(f.repo, '-c', 'commit.gpgsign=false', 'commit', '-qm', 'new source');
+    const revision = runGit(f.repo, 'rev-parse', 'HEAD');
+    writeFileSync(join(f.repo, 'new.ts'), 'DIRTY PRIVATE REPLACEMENT'); writeFileSync(join(f.repo, 'untracked.md'), 'UNTRACKED');
+    const repository = createLocalRepositoryReader([{ projectId: 'mulligan', repo: '707-Labs/mulligan-labs', teamKey: 'ERT', root: f.repo }]);
+    const a = f.open({ projects: [{ ...f.project, repo: '707-Labs/mulligan-labs', teamKey: 'ERT' }], integrations: { repository } });
+    const current = data(await exec(a, 'repository_revision', { project: 'mulligan' }));
+    expect(current).toMatchObject({ revision, source: 'local_committed_git', upstreamFreshness: 'unverified', uncommittedChangesIncluded: false });
+    expect(data(await exec(a, 'repository_read', { project: 'mulligan', path: 'new.ts' })).text).toContain('additional');
+    for (const path of ['.env', 'outside.md', 'untracked.md']) expect((await exec(a, 'repository_read', { project: 'mulligan', path })).ok).toBe(false);
+    const search = data(await exec(a, 'repository_search', { project: 'mulligan', query: 'needle' }));
+    expect(search.matches).toEqual([{ path: 'new.ts', line: 1, text: 'export const additional = "needle";' }]);
+    expect(search.truncated).toBe(false); expect(search.revision).toBe(revision);
+    expect(data(await exec(a, 'project_read', { project: 'mulligan', path: 'README.md' })).revision).toBe(f.revision);
+    expect(await exec(a, 'project_read', { project: 'mulligan', path: 'new.ts' })).toMatchObject({ ok: false, error: 'path_denied' });
+  });
+  test('repository registry and caller mappings are copied and cannot cross projects', async () => {
+    const f = fixture(), registration = { projectId: 'mulligan', repo: '707-Labs/mulligan-labs', teamKey: 'ERT', root: f.repo };
+    const repository = createLocalRepositoryReader([registration]); registration.repo = '707-Labs/birdup';
+    const binding = { projectId: 'mulligan', repo: '707-Labs/mulligan-labs', teamKey: 'ERT', audience: privateAudience };
+    expect((await repository(binding, { operation: 'revision' }) as any).repo).toBe(binding.repo);
+    await expect(repository({ ...binding, repo: '707-Labs/birdup' }, { operation: 'revision' })).rejects.toThrow('source_unavailable');
+    const abort = new AbortController(); abort.abort(); await expect(repository(binding, { operation: 'revision' }, abort.signal)).rejects.toThrow();
+    renameSync(f.repo, f.repo + '-original'); mkdirSync(f.repo);
+    await expect(repository(binding, { operation: 'revision' })).rejects.toThrow('source_unavailable');
+  });
+  test('repository cards, schemas and execution agree on the actual host registration set', async () => {
+    const f = fixture(); let calls = 0; const registered = ['mulligan'];
+    const a = f.open({ projects: [{ ...f.project, repo: '707-Labs/mulligan-labs', teamKey: 'ERT' },
+      { id: 'green', label: 'Green', summary: 'No local source bound.', sharedChannelIds: ['CONE'], repo: '707-Labs/green-ledger', teamKey: 'GREEN' }],
+      integrations: { repositoryProjectIds: registered, repository: async () => { calls++; return {}; } } });
+    registered.push('green');
+    const projects = data(await exec(a, 'project_list', {})).projects;
+    expect(projects[0].integrations.repository).toBe(true); expect(projects[1].integrations.repository).toBe(false);
+    expect((a.toolsFor(privateAudience).find(t => t.function.name === 'repository_read')!.function.parameters.properties as any).project.enum).toEqual(['mulligan']);
+    expect(await exec(a, 'repository_revision', { project: 'green' })).toMatchObject({ ok: false, error: 'integration_unavailable' }); expect(calls).toBe(0);
+  });
+  test('automatic memory and pinned voice stay inside visible project and audience scopes', async () => {
+    const f = fixture({ 'voice.md': 'Speak plainly; own uncertainty.', 'README.md': 'Role fixture.' });
+    const projects = [{ ...f.project, id: 'gary-role' }, { id: 'mulligan', label: 'Mulligan', summary: 'Game', sharedChannelIds: ['CONE', 'CTWO'] }];
+    const a = f.open({ projects });
+    data(await exec(a, 'remember_fact', { project: 'mulligan', text: 'PRIVATE copper-kite' }));
+    data(await exec(a, 'remember_fact', { project: 'mulligan', text: 'SHARED amber' }, sharedAudience));
+    const privateContext = JSON.parse(await a.context(privateAudience));
+    expect(privateContext.garyVoice).toMatchObject({ revision: f.revision, source: 'host_admitted_pinned_git', text: 'Speak plainly; own uncertainty.' });
+    expect(JSON.stringify(privateContext)).toContain('PRIVATE copper-kite'); expect(JSON.stringify(privateContext)).not.toContain('SHARED amber');
+    const sharedContext = await a.context({ ...sharedAudience, requesterId: 'UMEMBER' });
+    expect(sharedContext).toContain('SHARED amber'); expect(sharedContext).not.toContain('PRIVATE copper-kite');
+    expect(await a.context({ ...sharedAudience, channelId: 'CUNBOUND' })).not.toContain('Speak plainly');
+    a.close(); const reopened = f.open({ projects }); expect(await reopened.context(privateAudience)).toContain('PRIVATE copper-kite');
+  });
+  test('automatic tool evidence persists only in exact project/audience/thread and is labeled historical', async () => {
+    const f = fixture(), a = f.open(); const args = { project: 'mulligan', path: 'README.md' };
+    const result = await exec(a, 'project_read', args);
+    await a.recordEvidence({ audience: privateAudience, requestId: 'turn-1:tool-1', toolName: 'project_read', args, result });
+    a.close(); const reopened = f.open();
+    const current = JSON.parse(await reopened.context(privateAudience));
+    expect(current.priorThreadEvidence[0]).toMatchObject({ freshness: 'historical_tool_capture_not_current_observation' });
+    expect(current.priorThreadEvidence[0].records[0].capture.result.text).toContain('browser game');
+    for (const audience of [sharedAudience, { ...privateAudience, threadTs: '9999.000001' }]) expect(JSON.parse(await reopened.context(audience)).priorThreadEvidence[0].records).toEqual([]);
+    await reopened.recordEvidence({ audience: privateAudience, requestId: 'mutation', toolName: 'remember_fact', args: { project: 'mulligan' }, result: { ok: true, dataOnly: true, data: { persisted: true } } });
+    expect(JSON.parse(await reopened.context(privateAudience)).priorThreadEvidence[0].records).toHaveLength(1);
+  });
+  test('large evidence has a marked bounded preview; optional cache does not grow without limit', async () => {
+    const a = fixture().open();
+    for (let i = 0; i < 14; i++) await a.recordEvidence({ audience: privateAudience, requestId: 'capture-' + i,
+      toolName: 'project_search', args: { project: 'mulligan', query: 'query-' + i }, result: { ok: true, dataOnly: true, data: { text: 'Evidence '.repeat(1000), observedAt: '2026-10-10T00:00:00.000Z' } } });
+    const context = JSON.parse(await a.context(privateAudience));
+    const rows = context.priorThreadEvidence[0].records;
+    expect(rows).toHaveLength(2); expect(rows[0].capture.truncated).toBe(true); expect(rows[0].capture.result).toBeUndefined();
+    expect(rows[0].capture.resultSha256).toMatch(/^[a-f0-9]{64}$/); expect(Buffer.byteLength(JSON.stringify(context))).toBeLessThan(64000);
+    expect(rows.map((r: any) => r.requestId)).not.toContain('capture-13');
+  });
+  test('integration cancellation has a finite cause without leaking callback details', async () => {
+    const f = fixture(); const abort = new AbortController(); let seen: AbortSignal | undefined;
+    const a = f.open({ projects: [{ ...f.project, repo: '707-Labs/mulligan-labs', teamKey: 'ERT' }], integrations: {
+      repository: async (_binding, _request, signal) => { seen = signal; return await new Promise(() => {}); },
+    } });
+    const pending = a.execute({ audience: privateAudience, requestId: 'cancel-1', toolName: 'repository_revision', args: { project: 'mulligan' }, signal: abort.signal });
+    abort.abort(); expect(await pending).toMatchObject({ ok: false, error: 'operation_cancelled' }); expect(seen?.aborted).toBe(true);
   });
 });
