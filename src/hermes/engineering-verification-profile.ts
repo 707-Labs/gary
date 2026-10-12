@@ -116,8 +116,12 @@ function derive(workspaceRoot: string, files = capture(workspaceRoot)): Engineer
     // Names are fixed above; untrusted script text never enters this shell command.
     // npm can suppress pre/post hooks. Bun run has no --ignore-scripts switch;
     // its pristine repository hooks remain untrusted code inside the sandbox.
-    requiredCommands.push(runner === 'bun' ? `CI=1 bun --no-env-file --no-install run ${name}`
-      : `CI=1 npm run --ignore-scripts ${name}`);
+    // Exact runner recognition changes presentation only: no filter or bail.
+    // Passed-only omits successful-test logs but preserves failing-test console,
+    // assertions and exit status. Preserve custom scripts/reporters.
+    const conciseVitest = script === 'vitest run' && (name === 'test:run' || name === 'test');
+    requiredCommands.push(runner === 'bun' ? `CI=1 bun --no-env-file --no-install run ${name}${conciseVitest ? ' --reporter=dot --silent=passed-only' : ''}`
+      : `CI=1 npm run --ignore-scripts ${name}${conciseVitest ? ' -- --reporter=dot --silent=passed-only' : ''}`);
   }
   if (!requiredCommands.length) fail('unsupported_verification');
   const dependencyCommands = lock === null ? [] : [runner === 'bun'

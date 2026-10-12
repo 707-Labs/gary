@@ -18,7 +18,7 @@ describe('host-derived offline verification profiles', () => {
     const profile = createEngineeringVerificationProfile({ workspaceRoot: root });
     expect(profile.kind).toBe('javascript_bun');
     expect(profile.dependencyCommands).toEqual(['bun install --frozen-lockfile --offline --ignore-scripts']);
-    expect(profile.requiredCommands).toEqual(['CI=1 bun --no-env-file --no-install run check', 'CI=1 bun --no-env-file --no-install run test:run', 'CI=1 bun --no-env-file --no-install run lint']);
+    expect(profile.requiredCommands).toEqual(['CI=1 bun --no-env-file --no-install run check', 'CI=1 bun --no-env-file --no-install run test:run --reporter=dot --silent=passed-only', 'CI=1 bun --no-env-file --no-install run lint']);
     expect(Object.isFrozen(profile)).toBe(true); expect(Object.isFrozen(profile.requiredCommands)).toBe(true);
     expect(Object.isFrozen(profile.dependencyCommands)).toBe(true);
     expect(readFileSync(join(root, 'package.json'))).toEqual(original);
@@ -114,4 +114,17 @@ describe('dependency edits retain original host verification authority',()=>{
   const candidateRoot=fixture({...original,dependencies:{demo:'1.0.0'}},'package-lock.json');
   const candidate=createEngineeringCandidateVerificationProfile(base,{workspaceRoot:candidateRoot});expect(candidate.dependencyCommands).toEqual(['npm ci --offline --ignore-scripts --no-audit --no-fund']);expect(candidate.requiredCommands).toEqual(base.requiredCommands);
  });
+});
+
+test('exact Vitest run scripts use concise presentation without changing test selection', () => {
+  for (const lock of ['bun.lock', 'package-lock.json']) {
+    const profile = createEngineeringVerificationProfile({ workspaceRoot: fixture({ scripts: { 'test:run': 'vitest run' } }, lock) });
+    expect(profile.requiredCommands).toEqual([lock === 'bun.lock'
+      ? 'CI=1 bun --no-env-file --no-install run test:run --reporter=dot --silent=passed-only'
+      : 'CI=1 npm run --ignore-scripts test:run -- --reporter=dot --silent=passed-only']);
+  }
+  for (const script of ['vitest run --coverage', 'vitest run --reporter=json', 'custom-test', 'setup && vitest run']) {
+    const profile = createEngineeringVerificationProfile({ workspaceRoot: fixture({ scripts: { 'test:run': script } }) });
+    expect(profile.requiredCommands).toEqual(['CI=1 bun --no-env-file --no-install run test:run']);
+  }
 });

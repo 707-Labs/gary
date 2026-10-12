@@ -34,6 +34,7 @@ function provider(content: unknown[], stop_reason = 'end_turn') {
 interface Flags {
   nativeLaunch?: 'unknown' | 'proven_absent';
   testFails?: boolean;
+  verboseTestOutput?: boolean;
   verifierMutatesOnRemoval?: boolean;
   executorRemovalUnknown?: boolean;
   reviewRejects?: boolean;
@@ -114,6 +115,11 @@ function fixture(flags: Flags = {}) {
           if (c.root === author && existsSync(join(author, FILE))) writeFileSync(join(author, FILE), FINAL);
           if (c.root === verifierRoot && flags.verifierMutatesOnRemoval) writeFileSync(join(verifierRoot, FILE), 'late descendant mutation\n');
         }
+      } else if (op === 'exec') {
+        // The 4-GiB executor prepares its already-approved workspace cache.
+        const c = containers.get(args[2]!)!;
+        expect(c.live).toBe(true); expect(leaseHeld).toBe(true);
+        expect(args.slice(3)).toEqual(['/usr/bin/env','-i','PATH=/usr/bin:/bin','mkdir','-p','-m','700','/workspace/node_modules/.cache/gary-runtime-tmp']);
       } else throw new Error('unexpected fake Docker control: ' + op);
       return { output, outputTruncated: false, exitCode, timedOut: false };
     },
@@ -135,6 +141,12 @@ function fixture(flags: Flags = {}) {
         expect(c.root).toBe(verifierRoot); expect(readFileSync(join(c.root, FILE), 'utf8')).toBe(FINAL);
         events.push('verifier:test'); exitCode = flags.testFails ? 1 : 0; output = exitCode ? 'fixture test failed' : 'fixture test passed';
       } else throw new Error('unexpected fixture command: ' + command);
+      if (command === REQUIRED && flags.verboseTestOutput) {
+        let chunks = 18;
+        return { async poll() { return { running: false, exitCode, timedOut: false }; },
+          async read() { chunks--; return { output: 'x'.repeat(65_536), outputTruncated: false, outputPending: chunks > 0 }; },
+          async stop() { events.push(phase(c.root) + ':cli-drained'); } };
+      }
       let read = false;
       return { async poll() { return { running: false, exitCode, timedOut: false }; },
         async read() { const result = { output: read ? '' : output, outputTruncated: false }; read = true; return result; },
@@ -333,8 +345,8 @@ test('a failed native launch with durable exact-absence evidence permits cleanup
 
 test('uncertain executor removal prevents host capture, verifier preparation and resource release', async () => {
   const f = fixture({ executorRemovalUnknown: true });
-  await expect(f.execution.run('Implement the approved scoped edit.', signal())).rejects.toThrow('cleanup_uncertain');
-  await expect(f.execution.cleanup()).rejects.toThrow('cleanup_uncertain');
+  await expect(f.execution.run('Implement the approved scoped edit.', signal())).rejects.toThrow('engineering_execution:cleanup_unknown');
+  await expect(f.execution.cleanup()).rejects.toThrow('engineering_execution:cleanup_unknown');
   expect(f.events).not.toContain('host:prepare-verifier'); expect(existsSync(join(f.artifacts, 'source-files.json'))).toBe(false);
   expect(f.state()).toMatchObject({ authorLive: true, nativeLive: false, leaseHeld: true, releases: 0 });
   const stored = f.journalDb.query('SELECT state_json FROM engineering_session_journal_v1 WHERE task_id=?').get('task') as { state_json: string };
@@ -387,4 +399,12 @@ test('arbitrary verifier acquisition errors retain phase but discard message, ca
     { version: 1, event: 'failure', phase: 'verifier_acquire', code: 'unknown_failure' },
   ]);
   expect(JSON.stringify(f.journalDb.query('SELECT * FROM engineering_diagnostics_v1').all())).not.toContain(secret);
+});
+
+// Concise reporter selection must never relax the existing generic output guard.
+test('verbose arbitrary verification output still fails at the original host accumulator bound', async () => {
+  const f = fixture({ verboseTestOutput: true });
+  await expect(f.execution.run('Implement the approved scoped edit.', signal())).rejects.toThrow('command_output_limit');
+  await f.execution.cleanup();
+  expect(f.state()).toMatchObject({ nativeLive: false, authorLive: false, releases: 1 });
 });
