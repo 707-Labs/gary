@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import {
   constants, closeSync, fchmodSync, fsyncSync, fstatSync, lstatSync, mkdirSync,
   openSync, readSync, readdirSync, realpathSync, renameSync, unlinkSync, writeSync, mkdtempSync, rmSync, writeFileSync, opendirSync,
-  type Stats,
+  readlinkSync, type Stats,
 } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -325,6 +325,8 @@ export interface EngineeringRepositoryBaseline {
   readonly bytes: number;
 }
 type RepositoryEntry = Readonly<{ kind: 'directory' }> | Readonly<{
+  kind: 'symlink'; target: string; resolvedPath: string;
+}> | Readonly<{
   kind: 'file'; size: number; mode: 0o644 | 0o755; sha256: string;
 }>;
 interface RepositoryInventory { entries: Map<string, RepositoryEntry>; bytes: number }
@@ -363,10 +365,57 @@ function repositoryPaths(input: readonly string[]): readonly string[] {
 }
 function entryEqual(a: RepositoryEntry | undefined, b: RepositoryEntry | undefined): boolean {
   return a?.kind === 'directory' ? b?.kind === 'directory'
+    : a?.kind === 'symlink' ? b?.kind === 'symlink' && a.target === b.target && a.resolvedPath === b.resolvedPath
     : a?.kind === 'file' && b?.kind === 'file' && a.size === b.size && a.mode === b.mode && a.sha256 === b.sha256;
 }
 function inventoryHash(entries: Map<string, RepositoryEntry>, filesOnly = false): string {
-  return sha(JSON.stringify([...entries].filter(([, entry]) => !filesOnly || entry.kind === 'file').sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)));
+  return sha(JSON.stringify([...entries].filter(([, entry]) => !filesOnly || entry.kind !== 'directory').sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)));
+}
+/** Inventory existing file links without following them for reads or writes.
+ * Every hop stays in this root and avoids protected paths and linked parents.
+ * As with regular capture, the caller must first exclude concurrent writers. */
+function repositorySymlink(root: Root, path: string, observed: Stats): RepositoryEntry {
+  const nodes: { path: string; stat: Stats; target?: string }[] = [];
+  const parents: Parent[] = [], seen = new Set<string>();
+  let current = path, originalTarget = '';
+  for (let hops = 0; ; hops++) {
+    if (hops > 40 || seen.has(current)) fail('unsafe_file');
+    seen.add(current); repositoryPath(current);
+    checkRoot(root);
+    let parent = root.path;
+    for (const component of current.split('/').slice(0, -1)) {
+      parent = join(parent, component);
+      const stat = directory(parent);
+      if (realpathSync(parent) !== parent) fail('parent_changed');
+      parents.push({ path: parent, stat });
+    }
+    const absolute = join(root.path, current), stat = statIfPresent(absolute);
+    if (!stat) fail('unsafe_file');
+    if (hops === 0 && !sameFile(observed, stat)) fail('file_changed');
+    if (!stat.isSymbolicLink()) {
+      regular(stat); nodes.push({ path: absolute, stat }); break;
+    }
+    if (stat.uid !== uid() || stat.nlink !== 1 || stat.size > 512) fail('unsafe_file');
+    const target = readlinkSync(absolute);
+    // Do not lexically collapse dot components: kernel traversal through a
+    // linked directory before '..' could resolve differently from resolve().
+    if (!target || isAbsolute(target) || target.split('/').some(part => !part || part === '.' || part === '..')
+        || /[\x00-\x1f\x7f-\x9f\\:]/.test(target)) fail('unsafe_file');
+    if (hops === 0) originalTarget = target;
+    nodes.push({ path: absolute, stat, target });
+    const resolved = resolve(dirname(absolute), target);
+    if (!resolved.startsWith(root.path + '/')) fail('unsafe_file');
+    current = resolved.slice(root.path.length + 1);
+  }
+  for (const parent of parents) {
+    if (!sameNode(parent.stat, directory(parent.path)) || realpathSync(parent.path) !== parent.path) fail('parent_changed');
+  }
+  for (const node of nodes) {
+    const stat = statIfPresent(node.path);
+    if (!stat || !sameFile(node.stat, stat) || node.target !== undefined && readlinkSync(node.path) !== node.target) fail('file_changed');
+  }
+  checkRoot(root);
+  return Object.freeze({ kind: 'symlink', target: originalTarget, resolvedPath: current });
 }
 /** Stream baseline bytes instead of retaining a copy of the repository in RAM. */
 function hashRepositoryFile(root: Root, leaf: Leaf, maximum: number): RepositoryEntry {
@@ -425,6 +474,9 @@ function repositoryInventory(root: Root, baseline?: RepositoryInventory, ignored
       if (stat.isDirectory()) {
         directory(join(root.path, path));
         entries.set(path, Object.freeze({ kind: 'directory' })); pending.push(path);
+      } else if (stat.isSymbolicLink()) {
+        if (baseline && baseline.entries.get(path)?.kind !== 'symlink') fail('unsafe_file');
+        entries.set(path, repositorySymlink(root, path, stat));
       } else {
         const entry = hashRepositoryFile(root, inspectLeaf(root, path), ENGINEERING_REPOSITORY_ARTIFACT_LIMITS.inventoryBytes - bytes);
         if (entry.kind !== 'file') fail('inventory_invalid');
@@ -521,6 +573,7 @@ export function captureEngineeringRepositoryChanges(authorRoot: string, baseline
   for (const path of new Set([...original.inventory.entries.keys(), ...current.entries.keys()])) {
     const before = original.inventory.entries.get(path), after = current.entries.get(path);
     if (entryEqual(before, after)) continue;
+    if (before?.kind === 'symlink' || after?.kind === 'symlink') fail('symlink_changed');
     if (repositoryPath(path, true)) fail('protected_path_changed');
     if (before?.kind === 'file' || after?.kind === 'file') {
       if (before?.kind === 'directory' || after?.kind === 'directory') fail('path_collision');

@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import * as fs from 'node:fs';
 import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
   symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -35,6 +36,82 @@ function pair(files: Record<string, string | Buffer> = {}) {
 afterEach(() => { for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true }); });
 
 describe('repository-scope host artifact provenance', () => {
+  test('preserves internal baseline file links and chains while importing regular source edits', () => {
+    const { author, verifier } = pair({ 'CLAUDE.md': 'instructions', 'source.ts': 'base' });
+    for (const directory of [author, verifier]) {
+      symlinkSync('CLAUDE.md', join(directory, 'AGENTS.md'));
+      symlinkSync('AGENTS.md', join(directory, 'AGENTS.override.md'));
+    }
+    const baseline = captureEngineeringRepositoryBaseline(author);
+    file(author, 'source.ts', 'edit');
+    const { capture, paths } = captureEngineeringRepositoryChanges(author, baseline, verifier);
+    expect(paths).toEqual(['source.ts']);
+    applyEngineeringRepositoryArtifact(verifier, capture, paths);
+    expect(fs.readlinkSync(join(verifier, 'AGENTS.md'))).toBe('CLAUDE.md');
+    expect(verifyEngineeringRepositoryArtifact(verifier, capture, paths)).toBe(capture);
+    rmSync(join(verifier, 'AGENTS.md')); symlinkSync('source.ts', join(verifier, 'AGENTS.md'));
+    expect(() => verifyEngineeringRepositoryArtifact(verifier, capture, paths)).toThrow('artifact_changed');
+  });
+
+  test('rejects external targets, chained escapes, loops, broken links and directory links', () => {
+    for (const kind of ['absolute', 'relative', 'chain', 'loop', 'broken', 'directory', 'protected']) {
+      const author = root(), outside = root(); file(author, 'source.ts', 'source'); file(outside, 'external.ts', 'external');
+      let target = kind === 'absolute' ? join(outside, 'external.ts') : kind === 'relative' ? '../external.ts'
+        : kind === 'broken' ? 'missing.ts' : kind === 'directory' ? 'dir' : kind === 'protected' ? '.git/config' : 'other';
+      if (kind === 'directory') mkdirSync(join(author, 'dir'), { mode: 0o700 });
+      if (kind === 'protected') file(author, '.git/config', 'protected');
+      if (kind === 'chain') symlinkSync(join(outside, 'external.ts'), join(author, 'other'));
+      if (kind === 'loop') symlinkSync('link', join(author, 'other'));
+      symlinkSync(target, join(author, 'link'));
+      expect(() => captureEngineeringRepositoryBaseline(author)).toThrow();
+      expect(readFileSync(join(outside, 'external.ts'), 'utf8')).toBe('external');
+    }
+  });
+
+  test('rejects link additions, deletions and retargeting instead of importing links', () => {
+    for (const mutation of ['add', 'delete', 'retarget']) {
+      const { author, verifier } = pair({ 'a.ts': 'a', 'b.ts': 'b' });
+      for (const directory of [author, verifier]) symlinkSync('a.ts', join(directory, 'link'));
+      const baseline = captureEngineeringRepositoryBaseline(author);
+      if (mutation === 'add') symlinkSync('a.ts', join(author, 'new-link'));
+      else { rmSync(join(author, 'link')); if (mutation === 'retarget') symlinkSync('b.ts', join(author, 'link')); }
+      expect(() => captureEngineeringRepositoryChanges(author, baseline, verifier)).toThrow();
+    }
+  });
+
+  test('rejects a linked parent even when its destination is inside the repository', () => {
+    const author = root(); file(author, 'real/source.ts', 'source');
+    symlinkSync('real', join(author, 'alias')); symlinkSync('alias/source.ts', join(author, 'link'));
+    expect(() => captureEngineeringRepositoryBaseline(author)).toThrow();
+  });
+
+  test('rejects lexical dot collapse through an intermediate linked directory', () => {
+    const author = root(), outside = root(); file(author, 'source.ts', 'source');
+    symlinkSync(outside, join(author, 'alias')); symlinkSync('alias/../source.ts', join(author, 'AGENTS.md'));
+    expect(() => captureEngineeringRepositoryBaseline(author)).toThrow('unsafe_file');
+  });
+
+  test('detects link inode replacement and target substitution during resolution', () => {
+    for (const mutation of ['link', 'target', 'parent']) {
+      const author = root(), outside = root(); file(author, 'dir/source.ts', 'source'); file(outside, 'external.ts', 'external');
+      const link = join(author, 'AGENTS.md'); symlinkSync('dir/source.ts', link);
+      const original = fs.readlinkSync; let changed = false;
+      const spy = spyOn(fs, 'readlinkSync').mockImplementation(((path: fs.PathLike, options?: any) => {
+        const result = original(path, options);
+        if (String(path) === link && !changed) {
+          changed = true;
+          if (mutation === 'link') { rmSync(link); symlinkSync('dir/source.ts', link); }
+          else if (mutation === 'target') { rmSync(join(author, 'dir/source.ts')); symlinkSync(join(outside, 'external.ts'), join(author, 'dir/source.ts')); }
+          else { fs.renameSync(join(author, 'dir'), join(author, 'old-dir')); symlinkSync(outside, join(author, 'dir')); }
+        }
+        return result;
+      }) as typeof fs.readlinkSync);
+      try { expect(() => captureEngineeringRepositoryBaseline(author)).toThrow(); expect(changed).toBe(true); }
+      finally { spy.mockRestore(); }
+      expect(readFileSync(join(outside, 'external.ts'), 'utf8')).toBe('external');
+    }
+  });
+
   test('transfers new routes, deletions, binary bytes and modes while a large unchanged baseline stays out of capture', () => {
     const { author, verifier, baseline } = pair({ 'large.dat': Buffer.alloc(3 * 1024 * 1024, 1), 'gone.ts': 'gone', 'run.sh': 'echo ok\n' });
     expect(baseline.bytes).toBeGreaterThan(ENGINEERING_REPOSITORY_ARTIFACT_LIMITS.bytes);
