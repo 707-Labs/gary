@@ -418,3 +418,16 @@ describe('independent workspace validation', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
+
+
+it('4 GiB commands use the proven bounded Node heap without expanding physical resources', async () => {
+  const f=setup({resourceProfile:{cpus:2,memoryMiB:4096}});await f.execute('CI=1 bun --no-env-file --no-install run check');
+  const create=f.runner.calls.find(c=>c.argv[1]==='create')!;
+  expect(create.argv).toContain('--cpus=2');expect(create.argv).toContain('--memory=4096m');expect(create.argv).toContain('--memory-swap=4096m');
+  expect(create.argv).toContain('--pids-limit=512');expect(create.argv.slice(create.argv.indexOf('--ulimit'),create.argv.indexOf('--ulimit')+2)).toEqual(['--ulimit','core=0:0']);
+  const command=f.runner.calls.find(c=>c.argv[1]==='exec'&&c.argv.includes('CI=1 bun --no-env-file --no-install run check'))!;
+  expect(command.argv).toContain('NODE_OPTIONS=--max-old-space-size=3072');
+  expect(command.argv.at(-1)).toBe('CI=1 bun --no-env-file --no-install run check');await f.close();
+  for(const memoryMiB of [2048,12288]) {const g=setup({resourceProfile:{cpus:1,memoryMiB}});await g.execute();
+    expect(g.runner.calls.flatMap(c=>c.argv).some(v=>v.startsWith('NODE_OPTIONS='))).toBeFalse();await g.close();}
+});

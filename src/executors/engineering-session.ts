@@ -341,7 +341,7 @@ export class EngineeringSession {
       }
       const created = await this.control(['create', '--name', this.containerName, '--init', '--pull=never', '--network=none',
         '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges', `--cpus=${this.resourceProfile.cpus}`,
-        `--memory=${this.resourceProfile.memoryMiB}m`, `--memory-swap=${this.resourceProfile.memoryMiB}m`, '--pids-limit=512',
+        `--memory=${this.resourceProfile.memoryMiB}m`, `--memory-swap=${this.resourceProfile.memoryMiB}m`, '--pids-limit=512', '--ulimit', 'core=0:0',
         '--user', `${uid}:${gid}`, '--label', `gary.task=${this.binding.taskId}`, '--label', `gary.session=${this.binding.sessionId}`,
         '--label', `gary.owner=${this.binding.ownerEpoch}`, '--label', `gary.admission=${this.binding.admissionId}`,
         ...(this.guardian ? ['--label', `dev.gary.executor-job=${this.guardian.reference.invocationId}`,
@@ -423,6 +423,10 @@ export class EngineeringSession {
         const command = await this.options.runner.start(this.invocation(['exec', '--interactive', '--workdir', '/workspace', this.containerId!,
           '/usr/bin/env', '-i', 'PATH=/usr/local/bin:/usr/bin:/bin', 'HOME=/tmp', 'CI=1', 'LANG=C.UTF-8',
           ...(this.options.bunCacheVolume ? ['BUN_INSTALL_CACHE_DIR=/tmp/bun-cache'] : []),
+          // Node's automatic ~2 GiB heap aborts the baseline project check.
+          // This reviewed setting fits the existing 4 GiB cgroup; smaller
+          // and other profiles retain their native defaults.
+          ...(this.resourceProfile.memoryMiB === 4096 ? ['NODE_OPTIONS=--max-old-space-size=3072'] : []),
           'bash', '--noprofile', '--norc', '-c', args.command], timeoutMs, args.stdin));
         this.processes.set(processId, { command, deadlineMs: commandDeadline, terminal: null });
         this.armTimeout(Math.max(1, commandDeadline - this.now()), processId);
