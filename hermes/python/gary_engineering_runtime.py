@@ -75,7 +75,7 @@ def native_history(value):
 
 # Diagnostics contain fixed codes and source locations only: no messages,
 # arguments, paths, source text, locals, or arbitrary exception class names.
-SAFE_FAULT_CODES = frozenset(['child_delegation_denied', 'cleanup_unconfirmed', 'close_during_native_tool', 'code_cleanup_unconfirmed', 'code_process_cleanup_unconfirmed', 'code_requires_isolated_native_worker', 'concurrent_environment_execution', 'cross_profile_denied', 'cross_profile_session_lookup_denied', 'environment_fenced', 'environment_operation_limit', 'environment_operation_rejected', 'expired_tool_admission', 'foreign_native_module', 'frame_limit', 'host_rejected', 'host_reply_limit', 'host_system_prompt_changed', 'incomplete_process_output', 'inherited_call_limit', 'inherited_process_mode_denied', 'invalid_code_authorization', 'invalid_command', 'invalid_command_timeout', 'invalid_deadline', 'invalid_delegation_depth', 'invalid_engineering_binding', 'invalid_engineering_start', 'invalid_host_system_prompt', 'invalid_model_limits', 'invalid_native_context', 'invalid_native_context_tools', 'invalid_native_history', 'invalid_native_source', 'invalid_native_tool_call', 'invalid_process_start', 'invalid_process_status', 'invalid_result_presentation', 'invalid_scoped_directory', 'invalid_scoped_home', 'invalid_scoped_session_path', 'invalid_stdin', 'invalid_task_operation', 'invalid_task_result', 'invalid_turn_frame', 'local_process_denied', 'missing_guarded_model_client_or_profile', 'missing_process_exit_code', 'missing_scoped_directory', 'missing_scoped_session_db', 'model_request_limit', 'model_response_shape', 'model_route_denied', 'native_agent_session_mismatch', 'native_batch_history_changed', 'native_batch_overlap', 'native_batch_result_mismatch', 'native_call_identity_changed', 'native_call_identity_replayed', 'native_dotenv_present', 'native_environment_collision', 'native_file_cwd_unbound', 'native_handler_changed', 'native_identity_mismatch', 'native_pin_mismatch', 'native_presentation_limit', 'native_process_action_not_implemented', 'native_process_feature_not_implemented', 'native_profile_changed', 'native_profile_not_installed', 'native_registry_mismatch', 'native_result_count_invalid', 'native_result_history_missing', 'native_result_limit', 'native_scope_mismatch', 'parallel_native_tool_denied', 'process_deadline_exceeded', 'process_identity_mismatch', 'process_observation_failed', 'process_output_limit', 'scoped_config_symlink', 'scoped_directory_contains_symlink', 'scoped_home_symlink', 'scoped_memory_identity_changed', 'scoped_session_checkpoint_busy', 'scoped_session_checkpoint_incomplete', 'scoped_session_identity_changed', 'session_closed', 'session_deadline', 'session_fenced', 'skill_roots_overlap', 'stdio_frame_limit', 'stdio_reply_mismatch', 'stdio_transport_fenced', 'tool_arguments_changed', 'tool_arguments_limit', 'tool_limit', 'tool_not_allowed_or_replayed', 'turn_replay_or_limit', 'unapproved_native_tool', 'unbound_background_start', 'unbound_code_invocation', 'unbound_environment_operation', 'unbound_inherited_call', 'unbound_native_environment', 'unbound_task_operation', 'unknown_environment_operation', 'unknown_native_capability'])
+SAFE_FAULT_CODES = frozenset(['child_delegation_denied', 'cleanup_unconfirmed', 'close_during_native_tool', 'code_cleanup_unconfirmed', 'code_process_cleanup_unconfirmed', 'code_requires_isolated_native_worker', 'concurrent_environment_execution', 'cross_profile_denied', 'cross_profile_session_lookup_denied', 'environment_closed', 'environment_closing', 'polling_cleanup_unconfirmed', 'environment_fenced', 'environment_operation_limit', 'environment_operation_rejected', 'expired_tool_admission', 'foreign_native_module', 'frame_limit', 'host_rejected', 'host_reply_limit', 'host_system_prompt_changed', 'incomplete_process_output', 'inherited_call_limit', 'inherited_process_mode_denied', 'invalid_code_authorization', 'invalid_command', 'invalid_command_timeout', 'invalid_deadline', 'invalid_delegation_depth', 'invalid_engineering_binding', 'invalid_engineering_start', 'invalid_host_system_prompt', 'invalid_model_limits', 'invalid_native_context', 'invalid_native_context_tools', 'invalid_native_history', 'invalid_native_source', 'invalid_native_tool_call', 'invalid_process_start', 'invalid_process_status', 'invalid_result_presentation', 'invalid_scoped_directory', 'invalid_scoped_home', 'invalid_scoped_session_path', 'invalid_stdin', 'invalid_task_operation', 'invalid_task_result', 'invalid_turn_frame', 'local_process_denied', 'missing_guarded_model_client_or_profile', 'missing_process_exit_code', 'missing_scoped_directory', 'missing_scoped_session_db', 'model_request_limit', 'model_response_shape', 'model_route_denied', 'native_agent_session_mismatch', 'native_batch_history_changed', 'native_batch_overlap', 'native_batch_result_mismatch', 'native_call_identity_changed', 'native_call_identity_replayed', 'native_dotenv_present', 'native_environment_collision', 'native_file_cwd_unbound', 'native_handler_changed', 'native_identity_mismatch', 'native_pin_mismatch', 'native_presentation_limit', 'native_process_action_not_implemented', 'native_process_feature_not_implemented', 'native_profile_changed', 'native_profile_not_installed', 'native_registry_mismatch', 'native_result_count_invalid', 'native_result_history_missing', 'native_result_limit', 'native_scope_mismatch', 'parallel_native_tool_denied', 'process_deadline_exceeded', 'process_identity_mismatch', 'process_observation_failed', 'process_output_limit', 'scoped_config_symlink', 'scoped_directory_contains_symlink', 'scoped_home_symlink', 'scoped_memory_identity_changed', 'scoped_session_checkpoint_busy', 'scoped_session_checkpoint_incomplete', 'scoped_session_identity_changed', 'session_closed', 'session_deadline', 'session_fenced', 'skill_roots_overlap', 'stdio_frame_limit', 'stdio_reply_mismatch', 'stdio_transport_fenced', 'tool_arguments_changed', 'tool_arguments_limit', 'tool_limit', 'tool_not_allowed_or_replayed', 'turn_replay_or_limit', 'unapproved_native_tool', 'unbound_background_start', 'unbound_code_invocation', 'unbound_environment_operation', 'unbound_inherited_call', 'unbound_native_environment', 'unbound_task_operation', 'unknown_environment_operation', 'unknown_native_capability'])
 SAFE_FAULT_FILES = frozenset({"gary_engineering_runtime.py", "gary_engineering_environment.py", "gary_runtime.py", "tool_executor.py", "terminal_tool.py", "conversation_loop.py"})
 
 def worker_fault(error):
@@ -407,12 +407,24 @@ class EngineeringSession:
         self._turn_tool_counts = dict(toolCalls=0, toolFailures=0, toolBlocks=0, toolResultErrors=0)
         self._turn_tool_error_details = []
         self._first_fault = None
+        self._fault_lock = threading.Lock()
 
     def _record_backend_fault(self, error):
         # Backend cancellation/observation failure drains the owned session.
         # Native error conversion must not permit another model turn on it.
-        self._first_fault = self._first_fault or worker_fault(error)
-        self._fenced = True
+        with self._fault_lock:
+            self._first_fault = self._first_fault or worker_fault(error)
+            self._fenced = True
+
+    def failure_diagnostic(self, error):
+        with self._fault_lock:
+            diagnostic = copy.deepcopy(self._first_fault) if self._first_fault else worker_fault(error)
+        environment = self.environment
+        if environment is not None:
+            with environment._operation_lock:
+                if environment._first_transition:
+                    diagnostic["lifecycle"] = copy.deepcopy(environment._first_transition)
+        return diagnostic
 
     def _guard(self):
         if self._closed or self._fenced:
@@ -441,8 +453,8 @@ class EngineeringSession:
                 if len(canonical_json(reply).encode()) > self.max_result_bytes:
                     raise EngineeringFault("host_reply_limit")
                 return reply
-            except BaseException:
-                self._fenced = True
+            except BaseException as error:
+                self._record_backend_fault(error)
                 raise
 
     def begin_turn(self, turn_id):
@@ -698,7 +710,8 @@ class EngineeringSession:
                             "resultHash": digest(result),
                         })
             except Exception as error:
-                self._first_fault = self._first_fault or worker_fault(error)
+                with self._fault_lock:
+                    self._first_fault = self._first_fault or worker_fault(error)
                 self._turn_tool_counts["toolFailures"] += 1
                 status, result = "failed", json.dumps({"error": "native_tool_failed"})
             finally:
@@ -1141,9 +1154,10 @@ def main(*, input_stream=None, output_stream=None):
     except Exception as error:
         # The trusted supervisor owns physical cleanup if a pipe/protocol fails.
         # Never attempt a fresh session/admission or command replay here.
+        diagnostic = session.failure_diagnostic(error) if session else worker_fault(error)
         channel.write({"type": "engineering.error", "error": "engineering_runtime_failed",
                        "cleanupConfirmed": bool(session and session._closed),
-                       "diagnostic": session._first_fault if session and session._first_fault else worker_fault(error)})
+                       "diagnostic": diagnostic})
         return 1
 
 

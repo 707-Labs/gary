@@ -77,9 +77,12 @@ test('bounded error detail overflow survives private journal roundtrip within it
 
 test('maximum redacted worker cause chain fits the existing journal cap and rejects extra text',()=>{
  const db=new Database(':memory:'),write=createEngineeringDiagnosticJournal(db,binding);
- const workerFault={version:1 as const,causes:Array.from({length:4},()=>({code:'process_observation_failed',frames:Array.from({length:4},()=>({file:'gary_engineering_environment.py',line:99999}))}))};
+ const workerFault={version:1 as const,lifecycle:{state:'closing' as const,reason:'environment_close' as const,initiator:'close' as const,atMs:1791839027750,operationCount:406},causes:Array.from({length:4},()=>({code:'process_observation_failed',frames:Array.from({length:4},()=>({file:'gary_engineering_environment.py',line:99999}))}))};
  const diagnostic={...engineeringFailure('native_turn',Error('engineering_worker:runtime_failed')),workerFault};
  write(diagnostic);expect(readEngineeringDiagnostics(db,binding)).toEqual([diagnostic]);
  expect(()=>write({...diagnostic,workerFault:{...workerFault,secret:'private'} as any})).toThrow('frame_shape');
+ for (const lifecycle of [{...workerFault.lifecycle,reason:'private exception'}, {...workerFault.lifecycle,operationCount:-1}, {...workerFault.lifecycle,command:'secret'}, {...workerFault.lifecycle,atMs:Infinity}]) {
+   expect(()=>write({...diagnostic,workerFault:{...workerFault,lifecycle} as any})).toThrow('frame_shape');
+ }
  db.close();
 });

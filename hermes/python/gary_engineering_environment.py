@@ -43,12 +43,17 @@ class GaryProcessHandle:
         self._done = threading.Event()
         self._cancel_lock = threading.Lock()
         self._cancelled = False
+        self._stop = threading.Event()
         read_fd, self._write_fd = os.pipe()
         self._stdout = os.fdopen(read_fd, "r", encoding="utf-8", errors="replace")
         self._deadline = time.monotonic() + timeout
         context = contextvars.copy_context()
         self._thread = threading.Thread(target=lambda: context.run(self._pump), daemon=True)
-        self._thread.start()
+        with environment._operation_lock:
+            environment._handles.add(self)
+            if environment._closing or environment._closed:
+                self._stop.set()
+            self._thread.start()
 
     @property
     def stdout(self):
@@ -62,9 +67,9 @@ class GaryProcessHandle:
         total = 0
         poll_delay = 0.25
         try:
-            while True:
+            while not self._stop.is_set():
                 if time.monotonic() >= self._deadline:
-                    self.kill()
+                    # Record the initiating deadline before cancellation changes state.
                     raise EnvironmentFault("process_deadline_exceeded")
                 result = self.environment._operation("poll", {
                     "processId": self.process_id, "maxOutputBytes": 16384,
@@ -89,7 +94,7 @@ class GaryProcessHandle:
                     # command deadline; no poll/transport fault is replayed.
                     if output:
                         poll_delay = 0.25
-                    self._done.wait(min(poll_delay, max(0, self._deadline - time.monotonic())))
+                    self._stop.wait(min(poll_delay, max(0, self._deadline - time.monotonic())))
                     poll_delay = min(poll_delay * 2, 2.0)
                     continue
                 if status not in ("exited", "cancelled"):
@@ -100,19 +105,24 @@ class GaryProcessHandle:
                 self._returncode = code
                 break
         except BaseException as exc:
+            if self._stop.is_set() and type(exc) is EnvironmentFault and str(exc) in ("environment_closing", "environment_closed"):
+                self._returncode = -15
+                return
             self._fault = exc
-            observer = getattr(self.environment, "_fault_observer", None)
-            if observer is not None:
-                observer(exc)
+            self.environment._fence(exc, "pump")
             # The backend's cancel drains the entire owned session. No PID from
             # sandbox output is ever used for cleanup.
             try:
                 self.kill()
-            except BaseException:
-                self.environment._fenced = True
+            except BaseException as cleanup_error:
+                self.environment._fence(cleanup_error, "cancel")
         finally:
+            if self._stop.is_set() and self._returncode is None and self._fault is None:
+                self._returncode = -15
             os.close(self._write_fd)
             self._done.set()
+            with self.environment._operation_lock:
+                self.environment._handles.discard(self)
 
     def poll(self):
         if self._fault is not None:
@@ -130,10 +140,13 @@ class GaryProcessHandle:
             if self._cancelled or self._done.is_set():
                 return
             self._cancelled = True
+            self._stop.set()
+            self.environment._transition("fenced", "process_cancel", "cancel")
             result = self.environment._operation("cancel", {"processId": self.process_id})
-            self.environment._fenced = True
             if result.get("cleanupConfirmed") is not True:
-                raise EnvironmentFault("cleanup_unconfirmed")
+                error = EnvironmentFault("cleanup_unconfirmed")
+                self.environment._fence(error, "cancel")
+                raise error
 
 
 class GaryEnvironment(BaseEnvironment):
@@ -151,9 +164,13 @@ class GaryEnvironment(BaseEnvironment):
         self._session_scoped = True
         self._temp_dir = temp_dir
         self._closed = False
+        self._closing = False
         self._fenced = False
+        self._first_transition = None
+        self._first_error = None
+        self._handles = set()
         self._operation_count = 0
-        self._operation_lock = threading.Lock()
+        self._operation_lock = threading.RLock()
         self._execution_lock = threading.Lock()
         self.max_operations = max_operations
         self.max_output_bytes = max_output_bytes
@@ -166,14 +183,38 @@ class GaryEnvironment(BaseEnvironment):
     def get_temp_dir(self):
         return self._temp_dir
 
+    def _transition(self, state, reason, initiator):
+        with self._operation_lock:
+            if self._first_transition is None:
+                self._first_transition = dict(state=state, reason=reason, initiator=initiator,
+                    atMs=int(time.time() * 1000), operationCount=self._operation_count)
+            if state == "fenced":
+                self._fenced = True
+
+    def _fence(self, error, initiator):
+        # No exception text is retained; worker_fault applies the fixed code allowlist.
+        with self._operation_lock:
+            first = self._first_error is None
+            if first:
+                self._first_error = error
+            self._transition("fenced", "backend_fault", initiator)
+        observer = getattr(self, "_fault_observer", None)
+        if first and observer is not None:
+            observer(error)
+
     def _operation(self, operation, arguments):
         with self._operation_lock:
-            if self._closed or (self._fenced and operation not in ("cancel", "close")):
+            if self._closed:
+                raise EnvironmentFault("environment_closed")
+            if self._closing and operation not in ("cancel", "close"):
+                raise EnvironmentFault("environment_closing")
+            if self._fenced and operation not in ("cancel", "close"):
                 raise EnvironmentFault("environment_fenced")
             self._operation_count += 1
             if self._operation_count > self.max_operations and operation not in ("cancel", "close"):
-                self._fenced = True
-                raise EnvironmentFault("environment_operation_limit")
+                error = EnvironmentFault("environment_operation_limit")
+                self._fence(error, "operation")
+                raise error
             arguments = dict(arguments, operationId=uuid.uuid4().hex)
         try:
             result = self._rpc(operation, arguments)
@@ -183,8 +224,8 @@ class GaryEnvironment(BaseEnvironment):
             with self._operation_lock:
                 self.receipts.append(receipt)
             return result
-        except BaseException:
-            self._fenced = True
+        except BaseException as error:
+            self._fence(error, "operation")
             raise
 
     def _start_bash(self, cmd_string, *, timeout=120, stdin_data=None):
@@ -203,8 +244,9 @@ class GaryEnvironment(BaseEnvironment):
         result = self._operation("execute", arguments)
         process_id = _identifier(result.get("processId"), "process_id")
         if result.get("status") != "running" or process_id in self._process_ids:
-            self._fenced = True
-            raise EnvironmentFault("invalid_process_start")
+            error = EnvironmentFault("invalid_process_start")
+            self._fence(error, "operation")
+            raise error
         self._process_ids.add(process_id)
         return process_id
 
@@ -241,13 +283,37 @@ class GaryEnvironment(BaseEnvironment):
         return command, None
 
     def cleanup(self):
-        if self._closed:
-            return
-        result = self._operation("close", {})
-        if result.get("cleanupConfirmed") is not True:
-            self._fenced = True
-            raise EnvironmentFault("cleanup_unconfirmed")
-        self._closed = True
+        with self._operation_lock:
+            if self._closed:
+                return
+            self._transition("closing", "environment_close", "close")
+            self._closing = True
+            handles = list(self._handles)
+            for handle in handles:
+                handle._stop.set()
+        # Physical cancellation remains host-owned, with the same close receipt.
+        failed = False
+        try:
+            result = self._operation("close", {})
+            if result.get("cleanupConfirmed") is not True:
+                raise EnvironmentFault("cleanup_unconfirmed")
+            with self._operation_lock:
+                self._closed = True
+        except BaseException as error:
+            failed = True
+            self._fence(error, "close")
+            raise
+        finally:
+            # Only threads created by this adapter are joined; never native/global threads.
+            deadline = time.monotonic() + 2.0
+            for handle in handles:
+                if handle._thread is not threading.current_thread():
+                    handle._thread.join(max(0, deadline - time.monotonic()))
+            if any(handle._thread.is_alive() for handle in handles):
+                error = EnvironmentFault("polling_cleanup_unconfirmed")
+                self._fence(error, "close")
+                if not failed:
+                    raise error
 
     def __del__(self):
         # Lifecycle is explicit and host-owned. Interpreter teardown must not
@@ -303,7 +369,7 @@ def native_process_registry(environment, *, task_id, session_id, current_admissi
                 self._cancel_all_observed()
                 return process
             if not isinstance(result.get("output"), str) or result.get("outputTruncated") is not False:
-                environment._fenced = True
+                environment._fence(EnvironmentFault("incomplete_process_output"), "registry")
                 raise EnvironmentFault("incomplete_process_output")
             with process._lock:
                 process.output_buffer = (process.output_buffer + result["output"])[-process.max_output_chars:]
@@ -322,7 +388,7 @@ def native_process_registry(environment, *, task_id, session_id, current_admissi
             return process
 
         def _cancel_all_observed(self):
-            environment._fenced = True
+            environment._transition("fenced", "process_cancel", "registry")
             with self._lock:
                 for process in self._running.values():
                     process.exited, process.exit_code = True, -15
@@ -339,7 +405,7 @@ def native_process_registry(environment, *, task_id, session_id, current_admissi
                 return {"status": "not_found", "error": "Unknown task process"}
             result = environment._operation("cancel", {"processId": process.id})
             if result.get("cleanupConfirmed") is not True:
-                environment._fenced = True
+                environment._fence(EnvironmentFault("cleanup_unconfirmed"), "registry")
                 raise EnvironmentFault("cleanup_unconfirmed")
             self._cancel_all_observed()
             return {"session_id": process.id, "status": "killed", "cleanup_confirmed": True,
