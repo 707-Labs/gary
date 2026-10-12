@@ -200,7 +200,8 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
               policyFingerprint:fingerprintHermesCodingActivation(activationConfig),allowedActionTypes:activation.allowedActionTypes}}:{}),
             runtime:()=>({loopState,dispatchReady:!controller.signal.aborted&&!!activation&&loopState!=='disabled'&&loopState!=='stopped'}),
             wake:()=>!controller.signal.aborted&&loopWake.request()})}});
-        const respond=createHermesProjectResponder({...responderDeps,projects});
+        const respond=createHermesProjectResponder({...responderDeps,projects,
+          onFailureDiagnostic:value=>log.error('project turn diagnostic',value)});
         projectReply=turn=>{if(!turn.authority)throw new DMReplyError('project_authority_required');return respond({...turn,authority:turn.authority});};
       }
       if(conversationConfig){

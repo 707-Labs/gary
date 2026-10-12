@@ -23,6 +23,7 @@ export const PROJECT_CONVERSATION_POLICY = Object.freeze({
 export interface ProjectTurn extends DMTurn { authority: ProjectAudience }
 export interface ProjectReplyDependencies extends DMReplyDependencies {
   projects: Pick<ProjectAssistant, 'toolsFor' | 'context' | 'execute'> & Partial<Pick<ProjectAssistant, 'recordEvidence'>>;
+  onFailureDiagnostic?(value: Readonly<{ stage: string; exception: string; code: string }>): void;
 }
 export class ProjectReplyError extends DMReplyError {}
 function fail(code: string, cleanup = true): never { throw new ProjectReplyError(code, cleanup); }
@@ -116,6 +117,7 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
     let expected: ConversationMessage[] = [], preparedHistory: DMText[] = [];
     let historyCompacted = false, answerOnlyContext = false;
     const pending = new Map<string, { name: string; arguments: string }>();
+    let stage = 'prepare_history';
     const guard = () => {
       signal.throwIfAborted(); if (Date.now() >= deadlineMs || fault) fail('project_turn_inactive'); turn.assertActive();
       const status = deps.ledger.status(turn.allocationId);
@@ -135,6 +137,7 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
       }
       safeText(JSON.stringify(turn.history), p.maxContextBytes);
       safeText(JSON.stringify(expected), p.maxContextBytes + p.maxInputBytes + 128); guard();
+      stage = 'prepare_tools';
       const tools = freeze(structuredClone(deps.projects.toolsFor(authority, turn.engineering))) as ProjectToolDefinition[];
       if (!Array.isArray(tools) || tools.length < 1 || tools.length > 16
         || tools.some(t => !object(t) || Object.keys(t).length !== 2 || t.type !== 'function' || !object(t.function)
@@ -144,6 +147,7 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
       const names = new Set(tools.map(t => t.function.name)); if (names.size !== tools.length) fail('project_tools_rejected');
       const toolBinding = toolSetBinding(tools); safeText(toolBinding, p.maxToolSchemaBytes);
       preparedHistory = turn.history.map(message => ({ ...message }));
+      stage = 'project_context';
       const context = await deps.projects.context(authority, signal); guard();
       if (typeof context !== 'string') fail('project_context_rejected'); safeText(context, p.maxProjectContextBytes);
       const reference = { role: 'user', content: JSON.stringify({ kind: 'project_reference_data', dataOnly: true, content: context }) };
@@ -169,6 +173,7 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
         answerOnlyContext = true;
         return { content: bounded(low), truncated: true };
       };
+      stage = 'transport_setup';
       const route = createModelTransport({ ledger: deps.ledger, providerApiKey: deps.providerApiKey, fetch: deps.fetch,
         bearerToken: capability, thinking: 'disabled', onFailure: failure => { transportFailure = failure.errorCode; },
         capability: { provider: 'deepseek', model: 'deepseek-v4-pro', ticketId: turn.allocationId, ownerId: turn.ownerId,
@@ -197,6 +202,7 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
         safeText(JSON.stringify(message), p.maxReplyBytes);
         return value;
       };
+      stage = 'prepare_native_history';
       // Native Hermes verifies exact request/response history. Compact an old prefix
       // before launch through the same admitted route, never accept worker rewrites.
       // This spends one of this turn's six physical requests and saves no independent
@@ -335,6 +341,7 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
           fault = true; controller.abort(); throw failure;
         } finally { if (acquired) busy = false; }
       };
+      stage = 'native_launch';
       const launch = deps.launch ?? createDockerRuntimeLauncher({ imageDigest: p.workerImage, dockerExecutable: p.dockerExecutable, dockerHost: p.dockerHost }, {
         stdio: options => {
           const name = options.command[options.command.indexOf('--name') + 1];
@@ -361,6 +368,17 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
       if (historyCompacted) turn.compactHistory?.(preparedHistory.map(message => ({ ...message })));
       return answer;
     } catch (error) {
+      // Exception messages/stacks may contain private source or credentials.
+      // Only finite, host-owned categories may enter diagnostics.
+      const exception = error instanceof TypeError ? 'TypeError' : error instanceof RangeError ? 'RangeError'
+        : error instanceof SyntaxError ? 'SyntaxError' : error instanceof Error ? 'Error' : 'non_error';
+      const admittedCodes = new Set(['source_unavailable', 'memory_unavailable', 'result_too_large',
+        'path_denied', 'secret_like_content', 'audience_denied', 'assistant_closed', 'operation_cancelled',
+        'dm_owner_changed', 'dm_worker_binding_rejected', 'dm_budget_unavailable', 'invalid_conversation_history',
+        'EACCES', 'EPERM', 'ENOENT', 'SQLITE_ERROR', 'SQLITE_BUSY', 'SQLITE_READONLY', 'SQLITE_CORRUPT']);
+      const candidate = error instanceof DMReplyError ? error.code : error instanceof Error ? error.message : '';
+      const code = admittedCodes.has(candidate) ? candidate : 'unclassified';
+      try { deps.onFailureDiagnostic?.(Object.freeze({ stage, exception, code })); } catch { /* Preserve cleanup outcome. */ }
       if (error instanceof ProjectReplyError) throw error;
       throw new ProjectReplyError(signal.aborted ? 'project_turn_cancelled' : 'project_turn_failed', cleanupConfirmed);
     } finally { clearTimeout(timer); controller.abort(); }

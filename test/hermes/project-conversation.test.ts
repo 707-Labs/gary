@@ -37,6 +37,30 @@ const provider = (content: any[] = [{ type: 'text', text: 'I inspected the curre
   stop_reason: content.some(x => x.type === 'tool_use') ? 'tool_use' : 'end_turn',
   usage: { input_tokens: 40, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, ...extra,
 });
+test('unexpected preparation diagnostics expose only a finite stage and exception category', async () => {
+  const f = fixture(), diagnostics: unknown[] = []; let fetches = 0, launches = 0;
+  const privateText = 'private request and synthetic provider credential';
+  f.projects.context = async () => { throw new TypeError(privateText); };
+  const respond = createHermesProjectResponder({ ...f, providerApiKey: privateText,
+    fetch: async () => { fetches++; return provider(); },
+    launch: async () => { launches++; throw new Error('unreachable'); },
+    onFailureDiagnostic: value => { diagnostics.push(value); throw new Error(privateText); },
+  });
+  await expect(respond(turn())).rejects.toThrow('project_turn_failed');
+  expect(diagnostics).toEqual([{ stage: 'project_context', exception: 'TypeError', code: 'unclassified' }]);
+  expect(JSON.stringify(diagnostics)).not.toContain(privateText);
+  expect(fetches).toBe(0); expect(launches).toBe(0);
+});
+
+test('known preparation failures retain a finite diagnostic code', async () => {
+  const f = fixture(), diagnostics: unknown[] = [];
+  f.projects.context = async () => { throw new Error('source_unavailable'); };
+  const respond = createHermesProjectResponder({ ...f, providerApiKey: 'fixture-key', fetch: async () => provider(),
+    onFailureDiagnostic: value => { diagnostics.push(value); },
+  });
+  await expect(respond(turn())).rejects.toThrow('project_turn_failed');
+  expect(diagnostics).toEqual([{ stage: 'project_context', exception: 'Error', code: 'source_unavailable' }]);
+});
 const call = (id = 'call_1', name = 'current_work', input: Record<string, unknown> = { project: 'fixture' }) => ({ type: 'tool_use', id, name, input });
 function rpc(m: Readonly<GaryRuntimeManifest>, handle: RuntimeRequestHandler, path: string, body: any) {
   return handle(new Request('http://127.0.0.1' + path, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + m.capability }, body: JSON.stringify(body) }));
