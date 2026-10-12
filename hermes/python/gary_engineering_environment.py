@@ -60,9 +60,10 @@ class GaryProcessHandle:
 
     def _pump(self):
         total = 0
+        poll_delay = 0.25
         try:
             while True:
-                if time.monotonic() > self._deadline:
+                if time.monotonic() >= self._deadline:
                     self.kill()
                     raise EnvironmentFault("process_deadline_exceeded")
                 result = self.environment._operation("poll", {
@@ -82,7 +83,14 @@ class GaryProcessHandle:
                     data = data[written:]
                 status = result.get("status")
                 if status == "running":
-                    time.sleep(0.01)
+                    # Empty observations back off instead of spending the
+                    # task's fixed RPC budget in a 100 Hz polling loop. Output
+                    # remains responsive, and every wait fits the original
+                    # command deadline; no poll/transport fault is replayed.
+                    if output:
+                        poll_delay = 0.25
+                    self._done.wait(min(poll_delay, max(0, self._deadline - time.monotonic())))
+                    poll_delay = min(poll_delay * 2, 2.0)
                     continue
                 if status not in ("exited", "cancelled"):
                     raise EnvironmentFault("invalid_process_status")
