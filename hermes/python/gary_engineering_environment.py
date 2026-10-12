@@ -190,6 +190,9 @@ class GaryEnvironment(BaseEnvironment):
                     atMs=int(time.time() * 1000), operationCount=self._operation_count)
             if state == "fenced":
                 self._fenced = True
+                observer = getattr(self, "_fence_observer", None)
+                if observer is not None:
+                    observer()
 
     def _fence(self, error, initiator):
         # No exception text is retained; worker_fault applies the fixed code allowlist.

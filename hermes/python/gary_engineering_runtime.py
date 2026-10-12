@@ -416,12 +416,23 @@ class EngineeringSession:
             self._first_fault = self._first_fault or worker_fault(error)
             self._fenced = True
 
+    def _fence_from_environment(self):
+        # Intentional cancellation must still revoke model/tool use, without
+        # inventing an exception from a deliberately stopped polling thread.
+        with self._fault_lock:
+            self._fenced = True
+
     def failure_diagnostic(self, error):
         with self._fault_lock:
-            diagnostic = copy.deepcopy(self._first_fault) if self._first_fault else worker_fault(error)
+            has_first_fault = self._first_fault is not None
+            diagnostic = copy.deepcopy(self._first_fault) if has_first_fault else worker_fault(error)
         environment = self.environment
         if environment is not None:
             with environment._operation_lock:
+                # A poll thread may have recorded its cause just before its
+                # observer acquires the session lock. Never report a later guard.
+                if not has_first_fault and environment._first_error is not None:
+                    diagnostic = worker_fault(environment._first_error)
                 if environment._first_transition:
                     diagnostic["lifecycle"] = copy.deepcopy(environment._first_transition)
         return diagnostic
@@ -770,6 +781,7 @@ class EngineeringSession:
         self._handlers = {name: entry.handler for name, entry in self.native_entries.items()}
         self.environment = GaryEnvironment(self.environment_rpc, cwd=cwd, temp_dir=temp_dir)
         self.environment._fault_observer = self._record_backend_fault
+        self.environment._fence_observer = self._fence_from_environment
         if "process" in self.native_entries:
             processes = importlib.import_module("tools.process_registry")
             owned_registry = native_process_registry(self.environment, task_id=task_id,

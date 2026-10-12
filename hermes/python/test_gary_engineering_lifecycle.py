@@ -55,7 +55,17 @@ class LifecycleTests(unittest.TestCase):
         env._fault_observer = observed.append
         handle = GaryProcessHandle(env, 'owned', 10)
         self.assertTrue(polled.wait(1))
+        session = object.__new__(EngineeringSession)
+        session._fault_lock = threading.Lock()
+        session._first_fault = None
+        session._fenced = False
+        session._closed = False
+        env._fence_observer = session._fence_from_environment
         handle.kill()
+        self.assertTrue(session._fenced)
+        with self.assertRaisesRegex(Exception, '^session_fenced$'):
+            session._guard()
+        self.assertIsNone(session._first_fault)
         self.assertEqual(handle.wait(1), -15)
         self.assertEqual(observed, [])
         self.assertTrue(env._fenced)
@@ -80,6 +90,12 @@ class LifecycleTests(unittest.TestCase):
             handle.poll()
         self.assertIs(raised.exception.__cause__, original)
         self.assertEqual(worker_fault(original)['causes'][0]['code'], 'process_identity_mismatch')
+        session = object.__new__(EngineeringSession)
+        session._fault_lock = threading.Lock()
+        session._first_fault = None
+        session.environment = env
+        diagnostic = session.failure_diagnostic(EnvironmentFault('environment_fenced'))
+        self.assertEqual(diagnostic['causes'][0]['code'], 'process_identity_mismatch')
         handle.stdout.close()
 
     def test_deadline_fault_precedes_cancel_and_secondary_fenced_poll(self):
