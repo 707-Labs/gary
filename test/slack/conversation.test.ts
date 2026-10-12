@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { createSlackConversation, migrateSlackConversationPolicy, rollbackSlackConversationPolicy, legacyFingerprintSlackConversationConfig, fingerprintSlackConversationConfig, loadSlackConversationConfig, type SlackConversationInput } from '../../src/slack/conversation.ts';
 import { createHermesDMResponder, DM_CONVERSATION_POLICY as POLICY, DMReplyError, type DMTurn } from '../../src/hermes/dm-conversation.ts';
 import { SpendLedger } from '../../src/spend.ts';
+import { createConversationEngineeringCapability } from '../../src/hermes/conversation-engineering.ts';
 const cleanup:Array<()=>void>=[];
 afterEach(()=>{for(const fn of cleanup.splice(0).reverse())fn();});
 function fixture(persistentLedger=false){const dir=realpathSync(mkdtempSync(join(tmpdir(),'gary-dm-context-')));chmodSync(dir,0o700);cleanup.push(()=>rmSync(dir,{recursive:true,force:true}));
@@ -20,6 +21,19 @@ const paidRequest=(maxTokens=4096)=>new Request('https://api.deepseek.com/anthro
   body:JSON.stringify({model:'deepseek-v4-pro',max_tokens:maxTokens,messages:[{role:'user',content:'synthetic queue fixture'}]})});
 const paidReceipt=(inputTokens=30)=>Response.json({id:'msg_queue_fixture',type:'message',role:'assistant',model:'deepseek-v4-pro',content:[{type:'text',text:'fixture reply'}],stop_reason:'end_turn',
   usage:{input_tokens:inputTokens,output_tokens:9,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+
+test('queued input retains original host engineering capability and text without serializing authority into history',async()=>{
+  const f=fixture(),release=deferred(),started=deferred(),turns:DMTurn[]=[];
+  const engineering=createConversationEngineeringCapability({surface:'private_dm',requesterId:'U0A9M5W16F8',teamId:'T0AA24R7VUZ',channelId:'D0FIXTURE1',threadTs:input(1).ts},
+    async()=>({ok:true,dataOnly:true,data:null}));
+  const service=createSlackConversation({...f,reply:async turn=>{turns.push(turn);if(turns.length===1){started.resolve();await release.promise;}return 'reply';}});
+  const first=service.respond(input(1),sent,signal);await started.promise;
+  const secondInput=input(2,{threadTs:input(1).ts,text:'Fix 707-Labs/new-app',engineering});
+  const second=service.respond(secondInput,sent,signal);secondInput.text='mutated';delete secondInput.engineering;
+  release.resolve();await Promise.all([first,second]);
+  expect(turns[1]!.text).toBe('Fix 707-Labs/new-app');expect(turns[1]!.engineering).toBe(engineering);
+  expect(JSON.stringify(turns[1]!.history)).not.toContain('host_conversation_engineering');expect(service.close()).toEqual({drained:true});
+});
 
 test('a real held guarded reservation queues a follow-up, settles, and executes it once with committed history',async()=>{
   const f=fixture(),started=deferred(),release=deferred(),turns:DMTurn[]=[],messages:Array<{text:string;kind?:string}>=[];

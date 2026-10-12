@@ -46,9 +46,33 @@ test('fresh host cannot adopt old ownership or reuse the acceptance allocation',
 });
 test('uncertain cleanup is reported without freeing task or claiming success', async () => {
   const f = fixture(); f.failCleanup(); const ack = await f.host.admit(request, signal()) as HostEngineeringReceipt;
-  f.host.start(ack); await f.host.stop(); expect(f.delivered[0]?.status).toBe('cleanup_unknown');
+  f.host.start(ack); expect(await f.host.stop()).toEqual({ drained: false }); expect(f.delivered[0]?.status).toBe('cleanup_unknown');
   const state = f.options.db.query('SELECT state,cleanup_confirmed FROM engineering_tasks').get();
   expect(state).toEqual({ state: 'cleanup_unknown', cleanup_confirmed: 0 });
+});
+test('immutable project scope uses only the validated host-acquired repository ID and keeps audience exact', async () => {
+  for (const mutation of ['none', 'audience', 'id', 'project']) {
+    const f = fixture();
+    const prepare = f.options.prepare;
+    const host = createEngineeringHost({ ...f.options, immutableRepositoryScope: true,
+      async prepare(r, taskId) {
+        const p = await prepare(r, taskId); p.spec.scope.projectId = 'repository:123';
+        if (mutation === 'audience') p.spec.scope.audienceId = 'someone-else';
+        if (mutation === 'id') p.spec.repositoryId = '123\n';
+        if (mutation === 'project') p.spec.scope.projectId = 'repository:456';
+        return p;
+      } });
+    const result = await host.admit(request, signal());
+    if (mutation === 'none') {
+      expect(result).toMatchObject({ phase: 'admitted' });
+      expect(host.store.get((result as HostEngineeringReceipt).taskId, {
+        teamId: request.authority.teamId, surface: 'private_dm',
+        audienceId: request.authority.requesterId, projectId: 'repository:123',
+      })?.spec.scope.projectId).toBe('repository:123');
+      host.start(result as HostEngineeringReceipt);
+    } else expect(result).toEqual({ kind: 'rejected', code: 'unavailable' });
+    expect(await host.stop()).toEqual({ drained: true });
+  }
 });
 test('unauthenticated and shared requests cannot enter a private pilot', async () => {
   const f = fixture();

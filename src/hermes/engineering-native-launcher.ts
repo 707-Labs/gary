@@ -3,7 +3,7 @@ import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants, closeSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync,
   realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { EngineeringProtocol, type EngineeringProtocolBinding } from './engineering-protocol.ts';
 import type { EngineeringModelAdapter } from './engineering-model.ts';
 import { fingerprintJson } from './audit-trace.ts';
@@ -15,6 +15,9 @@ import { createEngineeringSessionGuardianFactory, type EngineeringSessionGuardia
 export const ENGINEERING_WORKER_IMAGE = 'sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab';
 const RUNTIME = '/opt/gary-hermes-runtime', OVERLAY = '/opt/gary-engineering';
 const FILES = ['gary_engineering_environment.py', 'gary_engineering_runtime.py'];
+const TASK_TOOLS_FILE = 'gary_engineering_task_tools.py';
+const CORE_TOOLS = new Set(['terminal','read_file','write_file','patch','search_files']);
+const CONTEXT_TOOLS = new Set(['process','todo','memory','session_search','skills_list','skill_view','skill_manage','delegate_task','execute_code']);
 const MAX_FRAME = 2 * 1024 * 1024;
 type Json = Record<string, unknown>;
 const object = (v: unknown): v is Json => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -47,6 +50,28 @@ export interface EngineeringNativeInput {
   fence(reason: string): void;
   /** Durable host evidence; append completes before launching any worker. */
   append(receipt: Readonly<Json>): void;
+  /** Host-materialized task paths, never model fields or canonical stores. */
+  nativeContext?: EngineeringNativeContext;
+  /** Same fixed original task window for parent and all children. */
+  standingSession?: { startedAtMs: number; deadlineMs: number };
+}
+export interface EngineeringNativeContext {
+  scopeKey: string;
+  /** Host profile may include core tools; only added state capabilities cross this wire. */
+  tools: readonly string[];
+  delegationDepth: 0 | 1;
+  homeDirectory: string;
+  approvedSkillsDirectory: string;
+  draftSkillsDirectory: string;
+  assertCurrent(): void;
+}
+function contextWire(context: EngineeringNativeContext, confinedCode=false) {
+  context.assertCurrent();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$/.test(context.scopeKey) || context.scopeKey.trim()!==context.scopeKey
+      || ![0,1].includes(context.delegationDepth) || new Set(context.tools).size!==context.tools.length
+      || context.tools.some(t=>!CONTEXT_TOOLS.has(t)&&!CORE_TOOLS.has(t)) || context.delegationDepth===1&&context.tools.includes('delegate_task')) fail('native_context');
+  if (context.tools.includes('execute_code')&&!confinedCode) fail('code_requires_isolated_native_worker');
+  return Object.freeze({version:1,scopeKey:context.scopeKey,tools:context.tools.filter(t=>CONTEXT_TOOLS.has(t)).sort(),delegationDepth:context.delegationDepth,confinedCode});
 }
 export interface EngineeringNativeTurn {
   turnId: string;
@@ -65,6 +90,8 @@ export interface EngineeringStdioOptions {
   command: readonly string[]; cwd: string; env: Readonly<Record<string, string>>;
   /** Trusted offline fixture paths only. The Docker composition never supplies this seam. */
   fixturePaths?: { nativeSource: string; scopedHome: string };
+  /** Set only by the reviewed Docker composition after container binding. */
+  isolatedNativeWorker?: true;
   /** Must prove exact worker absence, even if its attached CLI already exited. */
   cleanup(): Promise<void>;
 }
@@ -77,6 +104,7 @@ export function createEngineeringStdioLauncher(config: EngineeringStdioOptions):
   if (!isAbsolute(paths.nativeSource) || !isAbsolute(paths.scopedHome)) fail('configuration');
   return async (input, signal) => {
     const binding = Object.freeze({ ...input.binding }), systemPrompt = input.systemPrompt;
+    const nativeContext = input.nativeContext ? contextWire(input.nativeContext,config.isolatedNativeWorker===true) : undefined;
     const expectedTools = structuredClone(input.tools);
     // One trusted model policy supplies both paid-route admission and native
     // iteration/output limits. The worker never chooses a second allowance.
@@ -172,7 +200,7 @@ export function createEngineeringStdioLauncher(config: EngineeringStdioOptions):
             if (frame.body.kind === 'tool.end') {
               const p = frame.body.payload;
               if (!object(p) || typeof p.toolCallId !== 'string' || typeof p.resultHash !== 'string') fail('tool_result');
-              if (input.protocol.resultPresentation === 'raw') input.model.observeToolResult(p.toolCallId, p.resultHash);
+              if (input.protocol.resultPresentation === 'raw' && response.nested !== true) input.model.observeToolResult(p.toolCallId, p.resultHash);
               hostObserved.toolEnds++; if (p.status === 'failed') hostObserved.toolFailures++;
             }
             if (frame.body.kind === 'tool.presentation') {
@@ -203,7 +231,7 @@ export function createEngineeringStdioLauncher(config: EngineeringStdioOptions):
       if (ended) fail('spawn_failed');
       input.append(Object.freeze({ kind: 'native_stdio_start', ...binding, modelLimits: limits, ...ownedProcess }));
       await write({ type: 'engineering.start', binding, systemPrompt,
-        ...paths,
+        ...paths, ...(nativeContext ? {scopedHome: config.fixturePaths?.scopedHome ?? '/task/native-home', nativeContext} : {}),
         model: limits.model, maxIterations: limits.maxIterations, maxTokens: limits.maxTokens,
         resultPresentation: input.protocol.resultPresentation });
       const ready = await until('engineering.ready');
@@ -296,27 +324,51 @@ function source(file: EngineeringRuntimeFile): Buffer {
 }
 
 /** Construction is inert. Production execution uses immutable image, clean environment,
- * no network/socket/home mounts, and only two reviewed read-only Python overlays. */
+ * no network/socket/canonical-store mounts. Reviewed Python overlays are read-only;
+ * standing tasks receive only their exact private materialized native paths. */
 export function createEngineeringNativeLauncher(options: EngineeringDockerOptions, dependencies: {
   run?: EngineeringDockerRunner; stdio?: typeof createEngineeringStdioLauncher;
   guardian?: EngineeringSessionGuardianFactory;
 } = {}): EngineeringNativeLauncher {
   const pinned = structuredClone(options);
   if (pinned.dockerExecutable !== '/usr/local/bin/docker' || pinned.dockerHost !== 'unix:///Users/tanner/.colima/default/docker.sock'
-      || hash(pinned.runtimeFiles.map(f => basename(f.path)).sort()) !== hash(FILES) || !isAbsolute(pinned.snapshotDirectory)
+      || ![hash(FILES),hash([...FILES,TASK_TOOLS_FILE].sort())].includes(hash(pinned.runtimeFiles.map(f => basename(f.path)).sort())) || !isAbsolute(pinned.snapshotDirectory)
       || !isAbsolute(pinned.guardianDirectory) || /[,\x00-\x1f]/.test(pinned.snapshotDirectory)
       || !pinned.resources || !Number.isFinite(pinned.resources.cpus) || pinned.resources.cpus < 0.25 || pinned.resources.cpus > 2
       || !Number.isSafeInteger(pinned.resources.memoryMiB) || pinned.resources.memoryMiB < 256 || pinned.resources.memoryMiB > 4096) fail('docker_configuration');
   const run = dependencies.run ?? runDocker, stdio = dependencies.stdio ?? createEngineeringStdioLauncher;
   const guardians = dependencies.guardian ?? createEngineeringSessionGuardianFactory({ directory: pinned.guardianDirectory });
   return async (input, signal) => {
+    const nativeContext=input.nativeContext ? Object.freeze({...input.nativeContext,tools:Object.freeze([...input.nativeContext.tools])}) : undefined;
+    const standingSession=input.standingSession?Object.freeze({...input.standingSession}):undefined;
+    let containerUser='65532:65532';
     let files: {name: string; raw: Buffer; sha256: string}[], snapshot: string;
     try {
       input.assertOwner(); signal.throwIfAborted();
+      if (standingSession && (!nativeContext || !Number.isSafeInteger(standingSession.startedAtMs)
+          || standingSession.startedAtMs<=0 || standingSession.deadlineMs!==input.binding.deadlineMs
+          || (standingSession.deadlineMs-standingSession.startedAtMs<60_000||standingSession.deadlineMs-standingSession.startedAtMs>150*60_000))) fail('standing_session_window');
       const parent = lstatSync(pinned.snapshotDirectory);
       if (!parent.isDirectory() || parent.uid !== process.getuid?.() || parent.mode & 0o077
           || realpathSync(pinned.snapshotDirectory) !== pinned.snapshotDirectory) fail('snapshot_directory');
       files = pinned.runtimeFiles.map(f => ({ name: basename(f.path), raw: source(f), sha256: f.sha256 }));
+      if (nativeContext) {
+        contextWire(nativeContext,true);
+        const uid=process.getuid?.(),gid=process.getgid?.();
+        if (!Number.isSafeInteger(uid)||!Number.isSafeInteger(gid)||uid!<=0||gid!<0) fail('native_context_user');
+        containerUser=`${uid}:${gid}`;
+        if (nativeContext.tools.some(t=>['delegate_task','execute_code'].includes(t))&&!files.some(f=>f.name===TASK_TOOLS_FILE)) fail('native_task_tools_source_missing');
+        const dirs=[nativeContext.homeDirectory,nativeContext.approvedSkillsDirectory,nativeContext.draftSkillsDirectory];
+        for (const path of dirs) {
+          const stat=lstatSync(path);
+          if (!isAbsolute(path)||/[,\x00-\x1f]/.test(path)||realpathSync(path)!==path||!stat.isDirectory()
+              ||stat.uid!==process.getuid?.()||stat.mode&0o077) fail('native_context_directory');
+        }
+        for (let i=0;i<dirs.length;i++) for(let j=i+1;j<dirs.length;j++) {
+          const a=relative(dirs[i]!,dirs[j]!),b=relative(dirs[j]!,dirs[i]!);
+          if (!a||!a.startsWith('../')||!b.startsWith('../')) fail('native_context_overlap');
+        }
+      }
       snapshot = mkdtempSync(join(pinned.snapshotDirectory, 'native-'));
     } catch (error) {
       input.append(Object.freeze({ kind: 'native_cleanup_confirmed', ...input.binding, noContainerAttempted: true }));
@@ -390,7 +442,9 @@ export function createEngineeringNativeLauncher(options: EngineeringDockerOption
           || (config.Volumes !== null && config.Volumes !== undefined && (!object(config.Volumes) || Object.keys(config.Volumes).length))
           || config.Healthcheck !== undefined && config.Healthcheck !== null) fail('image_unverified');
       input.assertOwner(); signal.throwIfAborted();
+      nativeContext?.assertCurrent();
       guardian = await guardians.arm({ binding: { ...input.binding, admissionId }, containerName: name,
+        ...(standingSession?{standingSession}:{}),
         deadlineMs: input.binding.deadlineMs, workspaceRoot: snapshot, image: ENGINEERING_WORKER_IMAGE,
         dockerBinary: pinned.dockerExecutable, dockerHost: pinned.dockerHost, runner: {
           run: async invocation => { const r = await run(invocation.argv, invocation.env, invocation.timeoutMs);
@@ -400,7 +454,7 @@ export function createEngineeringNativeLauncher(options: EngineeringDockerOption
       input.append(Object.freeze({ kind: 'native_guardian_armed', ...input.binding, containerName: name,
         admissionId, daemonId: guardian.daemonId, dockerHost: pinned.dockerHost, guardian: guardian.reference }));
       const command = [pinned.dockerExecutable, 'container', 'create', '--rm', '--interactive', '--init', '--name', name,
-        '--pull', 'never', '--restart', 'no', '--network', 'none', '--read-only', '--user', '65532:65532',
+        '--pull', 'never', '--restart', 'no', '--network', 'none', '--read-only', '--user', containerUser,
         '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges=true', '--pids-limit', '128', '--memory', `${pinned.resources.memoryMiB}m`,
         '--memory-swap', `${pinned.resources.memoryMiB}m`, '--cpus', String(pinned.resources.cpus), '--ulimit', 'nofile=256:256', '--stop-timeout', '5', '--no-healthcheck',
         '--log-driver', 'none', '--tmpfs', '/tmp:rw,noexec,nosuid,nodev,size=268435456,mode=1777',
@@ -409,11 +463,17 @@ export function createEngineeringNativeLauncher(options: EngineeringDockerOption
         '--label', `dev.gary.executor-job=${guardian.reference.invocationId}`,
         '--label', `dev.gary.executor-journal=${guardian.reference.journalId}`,
         ...files.flatMap(f => ['--mount', `type=bind,source=${join(snapshot, f.name)},target=${OVERLAY}/${f.name},readonly`]),
+        ...(nativeContext ? [
+          '--mount',`type=bind,source=${nativeContext.homeDirectory},target=/task/native-home`,
+          '--mount',`type=bind,source=${nativeContext.approvedSkillsDirectory},target=/task/skills-approved,readonly`,
+          '--mount',`type=bind,source=${nativeContext.draftSkillsDirectory},target=/task/skill-drafts`,
+        ] : []),
         '--workdir', RUNTIME, '--entrypoint', '/usr/bin/env', ENGINEERING_WORKER_IMAGE, '-i',
         'PATH=/usr/local/bin:/usr/bin:/bin', 'HOME=/tmp', 'PYTHONNOUSERSITE=1', 'PYTHONDONTWRITEBYTECODE=1',
         'python', '-I', '-B', '-c', `import sys,runpy;sys.path[:0]=['${OVERLAY}','${RUNTIME}/python'];runpy.run_path('${OVERLAY}/gary_engineering_runtime.py',run_name='__main__')`];
       input.append(Object.freeze({ kind: 'native_container_intent', ...input.binding, containerName: name,
-        imageDigest: ENGINEERING_WORKER_IMAGE, resources: pinned.resources,
+        imageDigest: ENGINEERING_WORKER_IMAGE, resources: pinned.resources, containerUser,
+        ...(nativeContext?{scopeKey:nativeContext.scopeKey,nativeTools:[...nativeContext.tools],delegationDepth:nativeContext.delegationDepth}:{}),
         sourceFiles: files.map(f => ({ name: f.name, sha256: f.sha256 })) }));
       await verifyDaemon(); input.assertOwner(); signal.throwIfAborted(); guardian.signal.throwIfAborted();
       creationAttempted = true;
@@ -425,7 +485,7 @@ export function createEngineeringNativeLauncher(options: EngineeringDockerOption
       await verifyContainer(id); await guardian.bind(id);
       input.assertOwner(); signal.throwIfAborted(); guardian.signal.throwIfAborted();
       return await stdio({ command: [pinned.dockerExecutable, 'container', 'start', '--attach', '--interactive', id],
-        cwd: '/', env, cleanup })(input, AbortSignal.any([signal, guardian.signal]));
+        cwd: '/', env, cleanup, isolatedNativeWorker:true })({...input,...(nativeContext?{nativeContext}:{})}, AbortSignal.any([signal, guardian.signal]));
     } catch (error) {
       try { input.append(Object.freeze({ kind: 'native_diagnostic', ...input.binding, diagnostic: engineeringFailure('native_start', error) })); }
       finally { try { await cleanup(); } catch { input.fence('native_cleanup_unknown'); fail('cleanup_unknown'); } }

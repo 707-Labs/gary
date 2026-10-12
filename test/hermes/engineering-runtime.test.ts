@@ -182,7 +182,9 @@ test('construction and cleanup uncertainty retain ownership; restart cannot adop
     const restarted = createEngineeringRuntime(f.options); expect(restarted.ready()).toBe(false); expect(restarted.busy()).toBe(true);
     restarted.ingress.start!(ack); expect(f.executions).toHaveLength(1);
     expect(await restarted.ingress.admit(request, signal(), () => true)).toEqual({ kind: 'rejected', code: 'unavailable' });
-    expect(f.counts().releaseCount).toBe(0); await restarted.stop(); await runtime.stop();
+    expect(f.counts().releaseCount).toBe(0);
+    await expect(restarted.stop()).rejects.toThrow('shutdown_cleanup_unknown');
+    await expect(runtime.stop()).rejects.toThrow('shutdown_cleanup_unknown');
   }
 });
 test('private storage rejects symlinks and writable journals without workload effects', () => {

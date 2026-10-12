@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EngineeringSession, createBunEngineeringCommandRunner, createMemoryEngineeringSessionJournal, validateEngineeringWorkspace,
   type EngineeringCommandRunner, type EngineeringInvocation, type EngineeringRunningCommand,
-  type EngineeringSessionBinding, type EngineeringSessionJournal, type EngineeringSessionResourceProfile, type EngineeringTaskJournal } from '../../src/executors/engineering-session.ts';
+  type EngineeringSessionBinding, type EngineeringSessionJournal, type EngineeringSessionResourceProfile, type EngineeringSessionOptions, type EngineeringTaskJournal } from '../../src/executors/engineering-session.ts';
 
 // No Docker or subprocess seam is used: every command is interpreted by this fake.
 const binding: EngineeringSessionBinding = { taskId: 'task-fixture', sessionId: 'session-fixture', ownerEpoch: 'epoch-1', admissionId: 'admission-fixture' };
@@ -40,7 +40,7 @@ class Runner implements EngineeringCommandRunner {
     const process = new Process(); this.processes.push(process); await this.onStart?.(); return process;
   }
 }
-function setup(extra: { journal?: EngineeringSessionJournal; binding?: EngineeringSessionBinding; maxProcesses?: number; maxCommands?: number; bunCacheVolume?: string; dockerSocketPath?: string; resourceProfile?: EngineeringSessionResourceProfile } = {}) {
+function setup(extra: { journal?: EngineeringSessionJournal; binding?: EngineeringSessionBinding; maxProcesses?: number; maxCommands?: number; bunCacheVolume?: string; dockerSocketPath?: string; resourceProfile?: EngineeringSessionResourceProfile; dependencyBundle?: EngineeringSessionOptions['dependencyBundle'] } = {}) {
   const runner = new Runner(), journal = extra.journal ?? createMemoryEngineeringSessionJournal();
   let clock = 1_000, owner = binding.ownerEpoch;
   const session = new EngineeringSession({ binding: extra.binding ?? binding, workspaceRoot: '/offline/fixture', image,
@@ -48,7 +48,8 @@ function setup(extra: { journal?: EngineeringSessionJournal; binding?: Engineeri
     assertOwner: current => { if (current.ownerEpoch !== owner) throw new Error('owner_lost'); },
     ...(extra.maxProcesses ? { maxProcesses: extra.maxProcesses } : {}), ...(extra.maxCommands ? { maxCommands: extra.maxCommands } : {}),
     ...(extra.bunCacheVolume ? { bunCacheVolume: extra.bunCacheVolume } : {}), ...(extra.dockerSocketPath ? { dockerSocketPath: extra.dockerSocketPath } : {}),
-    ...(extra.resourceProfile ? { resourceProfile: extra.resourceProfile } : {}) });
+    ...(extra.resourceProfile ? { resourceProfile: extra.resourceProfile } : {}),
+    ...(extra.dependencyBundle ? { dependencyBundle: extra.dependencyBundle } : {}) });
   let sequence = 0;
   const next = () => `op-${++sequence}`;
   const execute = (command = 'printf fixture', timeoutMs = 10_000) => session.operation({ operation: 'execute', arguments: { binding: extra.binding ?? binding, operationId: next(), command, timeoutMs } });
@@ -59,6 +60,25 @@ function setup(extra: { journal?: EngineeringSessionJournal; binding?: Engineeri
 }
 
 describe('persistent engineering session, synthetic command runner only', () => {
+  it('mounts only the verified dependency bundle read-only and rechecks before effects', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'engineering-bundle-')));
+    try {
+      let current = true, checks = 0;
+      const bundle = { root, assertCurrent() { checks++; if (!current) throw Error('bundle_changed'); } };
+      const f = setup({ dependencyBundle: bundle });
+      bundle.root = '/untrusted-replacement';
+      await f.execute();
+      const create = f.runner.calls.find(c => c.argv[1] === 'create')!;
+      expect(create.argv).toContain(`type=bind,src=${root},dst=/task/dependency-bundle,readonly`);
+      expect(create.argv.join(' ')).not.toContain('untrusted-replacement');
+      expect(checks).toBeGreaterThanOrEqual(3);
+      await f.close();
+      const g = setup({ dependencyBundle: { root, assertCurrent: bundle.assertCurrent } });
+      current = false;
+      await expect(g.execute()).rejects.toThrow('bundle_changed');
+      expect(g.runner.calls).toHaveLength(0);
+    } finally { rmSync(root, { recursive: true }); }
+  });
   it('keeps one container, uses scoped opaque handles, and reads bounded output incrementally', async () => {
     const f = setup();
     const first = await f.execute('printf first'); const second = await f.execute('printf second');

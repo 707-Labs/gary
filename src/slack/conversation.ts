@@ -44,7 +44,10 @@ export function rollbackSlackConversationPolicy(config:SlackConversationConfig):
   const db=new Database(file,{strict:true,create:false});
   try {rollbackContextPolicy(db,legacyFingerprintSlackConversationConfig(config),fingerprintSlackConversationConfig(config));}finally{db.close();}
 }
-export interface SlackConversationInput { eventId:string; channel:string; ts:string; threadTs:string; text:string }
+export interface SlackConversationInput { eventId:string; channel:string; ts:string; threadTs:string; text:string;
+  engineering?: import('../hermes/conversation-engineering.ts').ConversationEngineeringCapability;
+  /** Host-only post-commit evidence; never a model callback or part of conversation history. */
+  onEngineeringOutcome?(outcome:'reply_committed'|'failed_clean'|'cleanup_unknown'):void }
 export type DMDelivery=(text:string,kind?:'answer'|'notice')=>Promise<'sent'|'unknown'|'not_sent'>;
 export interface SlackConversation {
   respond(input:SlackConversationInput,deliver:DMDelivery,signal:AbortSignal,isAvailable?:()=>boolean):Promise<void>;
@@ -146,7 +149,7 @@ export function createSlackConversation(options:{config:SlackConversationConfig;
       };
       reply=await budget.run(assertActive,()=>options.reply({requestId:randomUUID(),ownerId:owner,allocationId:config.allocationId,campaignId:config.campaignId,
         authority:Object.freeze({surface:'private_dm',requesterId:'U0A9M5W16F8',teamId:'T0AA24R7VUZ',channelId:input.channel,threadTs:input.threadTs}),
-        history,text:input.text,signal,compactHistory,
+        history,text:input.text,signal,compactHistory,...(input.engineering ? {engineering:input.engineering} : {}),
         assertActive,
         recordWorker:name=>{if(!/^gary-hermes-worker-[a-f0-9-]{36}$/.test(name))throw new DMReplyError('dm_worker_binding_rejected');
           const result=db.query("UPDATE events SET worker_name=? WHERE event_key=? AND owner=? AND state='running' AND worker_name IS NULL").run(name,key,owner);
@@ -167,6 +170,7 @@ export function createSlackConversation(options:{config:SlackConversationConfig;
         else db.query('UPDATE sessions SET blocked=1 WHERE session_key=?').run(sessionKey);
         db.query('UPDATE events SET state=?,cleanup=1,error_code=? WHERE event_key=? AND owner=?').run(delivery==='sent'?'sent':delivery==='unknown'?'unknown':'failed',delivery==='sent'?null:'dm_delivery_'+delivery,key,owner);
       }).immediate();
+      input.onEngineeringOutcome?.(delivery==='sent'?'reply_committed':'failed_clean');
       return;
     }catch(error){
       errorCode=error instanceof DMReplyError?error.code:'dm_turn_failed';cleanup=error instanceof DMReplyError?error.cleanupConfirmed:false;
@@ -176,10 +180,13 @@ export function createSlackConversation(options:{config:SlackConversationConfig;
         db.query("UPDATE events SET state='failed',cleanup=?,error_code=? WHERE event_key=? AND owner=?").run(cleanup?1:0,errorCode,key,owner);
         if(!cleanup||unknownSpend)db.query('UPDATE control SET blocked=1 WHERE id=1').run();
       }).immediate();
+      input.onEngineeringOutcome?.(cleanup&&!unknownSpend?'failed_clean':'cleanup_unknown');
       if(!signal.aborted&&isAvailable())try {await deliver(conversationFailureMessage(errorCode,cleanup,unknownSpend),'notice');}catch{/* No retry. */}
     }
   }
   function respond(input:SlackConversationInput,deliver:DMDelivery,signal:AbortSignal,isAvailable:()=>boolean=()=>true):Promise<void> {
+    // Preserve the ingress snapshot while queued; an opaque host capability keeps its identity.
+    input=Object.freeze({...input});
     if(closed||!isAvailable()||signal.aborted||!input.text.trim()||!/^Ev[A-Za-z0-9]{1,80}$/.test(input.eventId)
       ||!/^D[A-Z0-9]{5,32}$/.test(input.channel)||!/^\d{10,16}\.\d{6}$/.test(input.ts)||!/^\d{10,16}\.\d{6}$/.test(input.threadTs))return Promise.resolve();
     const key=config.runId+':'+input.eventId,messageKey=input.channel+':'+input.ts,sessionKey=input.channel+':'+input.threadTs;

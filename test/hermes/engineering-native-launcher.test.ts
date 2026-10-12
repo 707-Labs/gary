@@ -187,14 +187,14 @@ test.skipIf(!existsSync(nativeSource) || !existsSync(cachedPython))('actual pinn
   expect(s.fences).toEqual([]);
 }, 65_000);
 
-function dockerFixture({ replacement = false, daemonChanged = false, uncertainCreate = false } = {}) {
+function dockerFixture({ replacement = false, daemonChanged = false, uncertainCreate = false, taskTools = false } = {}) {
   const s = modelFixture(), snapshots = join(s.root, 'snapshots'); mkdirSync(snapshots, { mode: 0o700 });
-  const paths = ['gary_engineering_runtime.py', 'gary_engineering_environment.py'].map(name => {
+  const paths = ['gary_engineering_runtime.py', 'gary_engineering_environment.py', ...(taskTools?['gary_engineering_task_tools.py']:[])].map(name => {
     const path = join(s.root, name); writeFileSync(path, '# reviewed fixture\n', { mode: 0o600 });
     return { path, sha256: createHash('sha256').update(readFileSync(path)).digest('hex') };
   });
   const commands: string[][] = [], events: string[] = [], receipts: any[] = [];
-  let spec: any, created = false, labels: Record<string, string> = {}, daemon = 'daemon-fixture';
+  let spec: any, guardianInput: any, created = false, labels: Record<string, string> = {}, daemon = 'daemon-fixture';
   const id = 'a'.repeat(64), foreign = 'b'.repeat(64), guardianAbort = new AbortController();
   const input = nativeInput(s); input.append = receipt => { receipts.push(receipt); events.push(String(receipt.kind)); };
   const launch = createEngineeringNativeLauncher({ runtimeFiles: paths, snapshotDirectory: snapshots,
@@ -218,7 +218,7 @@ function dockerFixture({ replacement = false, daemonChanged = false, uncertainCr
         stdout: command.at(-1)!.startsWith('id=') ? (created ? id : '') : replacement ? foreign : (created ? id : '') };
       return { exitCode: 0, stdout: '' };
     },
-    guardian: { arm: async () => { events.push('arm'); return { daemonId: 'daemon-fixture', signal: guardianAbort.signal,
+    guardian: { arm: async input => { guardianInput=input; events.push('arm'); return { daemonId: 'daemon-fixture', signal: guardianAbort.signal,
       reference: { directory: '/fixture', databasePath: '/fixture/db', journalId: 'journal', invocationId: 'invocation', pid: 123 },
       bind: async found => { expect(found).toBe(id); events.push('bind'); },
       complete: async () => { events.push('drained'); if (daemonChanged) daemon = 'foreign-daemon'; throw Error('guardian failed after drain'); },
@@ -227,7 +227,7 @@ function dockerFixture({ replacement = false, daemonChanged = false, uncertainCr
       return { turn: async () => { signal.throwIfAborted(); throw new Error('unused'); },
         close: async () => { await options.cleanup(); return { cleanupConfirmed: true }; } }; },
   });
-  return { s, snapshots, launch, input, events, receipts, commands, id, guardianAbort, get spec() { return spec; } };
+  return { s, snapshots, launch, input, events, receipts, commands, id, guardianAbort, get spec() { return spec; }, get guardianInput() { return guardianInput; } };
 }
 
 test('Docker creation is guarded before start, pins ID, and only mounts reviewed read-only overlays', async () => {
@@ -249,6 +249,32 @@ test('Docker creation is guarded before start, pins ID, and only mounts reviewed
   await session.close(); expect(readdirSync(f.snapshots)).toEqual([]);
   expect(f.events.indexOf('drained')).toBeLessThan(f.events.indexOf('remove'));
   expect(f.receipts.at(-1)).toMatchObject({ kind: 'native_cleanup_confirmed', containerId: f.id });
+});
+
+test('scoped native context mounts only the materialized home and distinct approved/draft roots', async () => {
+  const f=dockerFixture();let checks=0;
+  const dirs=['home','approved','drafts'].map(name=>{const path=join(f.s.root,name);mkdirSync(path,{mode:0o700});return path;});
+  f.input.nativeContext={scopeKey:'scope',tools:['process','todo','memory'],delegationDepth:0,
+    homeDirectory:dirs[0]!,approvedSkillsDirectory:dirs[1]!,draftSkillsDirectory:dirs[2]!,assertCurrent:()=>{checks++;}};
+  const session=await f.launch(f.input,new AbortController().signal),create=f.commands.find(c=>c[2]==='create')!;
+  const mounts=create.filter(s=>s.startsWith('type=bind'));
+  expect(mounts).toHaveLength(5);
+  expect(mounts).toContain(`type=bind,source=${dirs[0]},target=/task/native-home`);
+  expect(mounts).toContain(`type=bind,source=${dirs[1]},target=/task/skills-approved,readonly`);
+  expect(mounts).toContain(`type=bind,source=${dirs[2]},target=/task/skill-drafts`);
+  expect(create).toContain('none');expect(checks).toBeGreaterThanOrEqual(2);
+  await session.close();
+});
+
+test('native scoped paths, recursion and missing adapter source fail before Docker access',async()=>{
+  for(const mode of ['overlap','child','adapter','revoked','unknown'] as const){
+    const f=dockerFixture(),dirs=['home','approved','drafts'].map(name=>{const path=join(f.s.root,name);mkdirSync(path,{mode:0o700});return path;});
+    f.input.nativeContext={scopeKey:'scope',tools:mode==='unknown'?['foreign']:mode==='child'||mode==='adapter'?['delegate_task']:['todo'],delegationDepth:mode==='child'?1:0,
+      homeDirectory:dirs[0]!,approvedSkillsDirectory:mode==='overlap'?dirs[0]!:dirs[1]!,draftSkillsDirectory:dirs[2]!,
+      assertCurrent:()=>{if(mode==='revoked')throw Error('revoked');}};
+    await expect(f.launch(f.input,new AbortController().signal)).rejects.toThrow();
+    expect(f.commands).toHaveLength(0);expect(f.receipts.at(-1)).toMatchObject({kind:'native_cleanup_confirmed',noContainerAttempted:true});
+  }
 });
 
 test('cleanup deletes only owned ID after name replacement and never touches the replacement', async () => {
@@ -340,4 +366,48 @@ test('rejected native RPC retains a safe protocol code while discarding unrecogn
     expect(JSON.stringify(receipts)).not.toContain('PRIVATE'); expect(cleaned).toBe(1); expect(s.requests).toHaveLength(1);
     expect(await session.close()).toEqual({ cleanupConfirmed: true });
   }
+});
+
+
+test('native scoped code requires container isolation and forwards the original fixed standing window',async()=>{
+  const f=dockerFixture({taskTools:true});
+  const dirs=['home','approved','drafts'].map(name=>{const path=join(f.s.root,name);mkdirSync(path,{mode:0o700});return path;});
+  f.input.nativeContext={scopeKey:'scope',tools:['terminal','read_file','write_file','patch','search_files','process','todo','memory','session_search','skills_list','skill_view','skill_manage','execute_code','delegate_task'],delegationDepth:0,
+    homeDirectory:dirs[0]!,approvedSkillsDirectory:dirs[1]!,draftSkillsDirectory:dirs[2]!,assertCurrent:()=>{}};
+  f.input.standingSession={startedAtMs:f.input.binding.deadlineMs-150*60_000,deadlineMs:f.input.binding.deadlineMs};
+  let cleanupCalls=0;
+  const host=createEngineeringStdioLauncher({command:['/nonexistent-must-not-spawn'],cwd:'/',env:{},cleanup:async()=>{cleanupCalls++;}});
+  await expect(host(f.input,new AbortController().signal)).rejects.toThrow('code_requires_isolated_native_worker');
+  expect(cleanupCalls).toBe(0);
+  const session=await f.launch(f.input,new AbortController().signal);
+  const create=f.commands.find(c=>c[2]==='create')!;
+  expect(create.filter(s=>s.startsWith('type=bind'))).toHaveLength(6);
+  expect(create.slice(create.indexOf('--user'),create.indexOf('--user')+2)).toEqual(['--user',`${process.getuid!()}:${process.getgid!()}`]);
+  expect(f.spec.isolatedNativeWorker).toBe(true);
+  expect(f.guardianInput.standingSession).toEqual(f.input.standingSession);
+  await session.close();
+});
+
+test('native scoped standing window never refreshes the admitted deadline',async()=>{
+  for(const duration of [0,59_999,150*60_000+1]){
+    const f=dockerFixture();
+    const dirs=['home','approved','drafts'].map(name=>{const path=join(f.s.root,name);mkdirSync(path,{mode:0o700});return path;});
+    f.input.nativeContext={scopeKey:'scope',tools:['terminal','todo'],delegationDepth:0,
+      homeDirectory:dirs[0]!,approvedSkillsDirectory:dirs[1]!,draftSkillsDirectory:dirs[2]!,assertCurrent:()=>{}};
+    f.input.standingSession={startedAtMs:f.input.binding.deadlineMs-duration,deadlineMs:f.input.binding.deadlineMs};
+    await expect(f.launch(f.input,new AbortController().signal)).rejects.toThrow('standing_session_window');
+    expect(f.commands).toHaveLength(0);
+  }
+});
+
+
+test('native scoped configured shorter window stays bounded to the original admission',async()=>{
+  const f=dockerFixture();
+  const dirs=['home','approved','drafts'].map(name=>{const path=join(f.s.root,name);mkdirSync(path,{mode:0o700});return path;});
+  f.input.nativeContext={scopeKey:'scope',tools:['terminal','todo'],delegationDepth:0,
+    homeDirectory:dirs[0]!,approvedSkillsDirectory:dirs[1]!,draftSkillsDirectory:dirs[2]!,assertCurrent:()=>{}};
+  f.input.standingSession={startedAtMs:f.input.binding.deadlineMs-60_000,deadlineMs:f.input.binding.deadlineMs};
+  const session=await f.launch(f.input,new AbortController().signal);
+  expect(f.guardianInput.standingSession).toEqual(f.input.standingSession);
+  await session.close();
 });

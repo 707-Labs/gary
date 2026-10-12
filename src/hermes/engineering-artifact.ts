@@ -1,10 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import {
   constants, closeSync, fchmodSync, fsyncSync, fstatSync, lstatSync, mkdirSync,
-  openSync, readSync, readdirSync, realpathSync, renameSync, unlinkSync, writeSync,
+  openSync, readSync, readdirSync, realpathSync, renameSync, unlinkSync, writeSync, mkdtempSync, rmSync, writeFileSync, opendirSync,
   type Stats,
 } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 
 export const ENGINEERING_ARTIFACT_LIMITS = Object.freeze({ files: 128, bytes: 128 * 1024 });
 
@@ -310,4 +312,302 @@ export function verifyEngineeringArtifactFiles(
   const current = captureEngineeringArtifactFiles(root, allowedFiles);
   if (current.hash !== capture.hash) fail('artifact_changed');
   return current;
+}
+
+/** Separate repository-scope limits; the original explicit-file API is unchanged. */
+export const ENGINEERING_REPOSITORY_ARTIFACT_LIMITS = Object.freeze({
+  files: 512, bytes: 2 * 1024 * 1024, inventoryEntries: 100_000,
+  inventoryBytes: 512 * 1024 * 1024, ignoreBytes: 1024 * 1024, ignoreFiles: 1024,
+});
+export interface EngineeringRepositoryBaseline {
+  readonly hash: string;
+  readonly fileCount: number;
+  readonly bytes: number;
+}
+type RepositoryEntry = Readonly<{ kind: 'directory' }> | Readonly<{
+  kind: 'file'; size: number; mode: 0o644 | 0o755; sha256: string;
+}>;
+interface RepositoryInventory { entries: Map<string, RepositoryEntry>; bytes: number }
+interface RepositoryBaselineBinding { root: Root; inventory: RepositoryInventory }
+type IgnoreRule = Readonly<{ path: string; bytes: Buffer }>;
+interface RepositoryCaptureBinding extends CaptureBinding {
+  baseline: RepositoryInventory; expected: Map<string, RepositoryEntry>;
+  verifierPath: string; verifierIdentity: string; ignores: readonly IgnoreRule[];
+}
+const repositoryBaselines = new WeakMap<object, RepositoryBaselineBinding>();
+const repositoryCaptures = new WeakMap<object, RepositoryCaptureBinding>();
+const protectedComponent = /^(?:\.git|\.git-credentials|\.gitconfig|git~\d|\.hg|\.svn|\.beads|\.aws|\.ssh|\.gnupg|\.azure|\.gcloud|\.kube|\.npmrc|\.pypirc|\.netrc|\.docker|\.env.*|(?:secrets?|credentials?)(?:\..*)?|(?:id_rsa|id_ed25519)(?:\..*)?)$/i;
+function repositoryPath(path: string, permitProtected = false): boolean {
+  if (typeof path !== 'string' || !path || path.length > 512 || /[\x00-\x1f\x7f-\x9f\\:]/.test(path)
+      || isAbsolute(path) || path.normalize('NFC') !== path) fail('unsafe_path');
+  let protectedPath = false;
+  for (const part of path.split('/')) {
+    if (!part || part === '.' || part === '..' || part.endsWith('.') || part.trim() !== part || Buffer.byteLength(part) > 255) fail('unsafe_path');
+    if (protectedComponent.test(part)) protectedPath = true;
+  }
+  if (protectedPath && !permitProtected) fail('protected_path');
+  return protectedPath;
+}
+function repositoryPaths(input: readonly string[]): readonly string[] {
+  if (!Array.isArray(input) || input.length > ENGINEERING_REPOSITORY_ARTIFACT_LIMITS.files) fail('file_count');
+  const paths = [...input].sort(), seen = new Set<string>();
+  for (const path of paths) {
+    repositoryPath(path);
+    if (seen.has(path.toLowerCase())) fail('duplicate_path');
+    seen.add(path.toLowerCase());
+  }
+  for (const path of paths) for (let parent = dirname(path); parent !== '.'; parent = dirname(parent)) {
+    if (seen.has(parent.toLowerCase())) fail('path_collision');
+  }
+  return Object.freeze(paths);
+}
+function entryEqual(a: RepositoryEntry | undefined, b: RepositoryEntry | undefined): boolean {
+  return a?.kind === 'directory' ? b?.kind === 'directory'
+    : a?.kind === 'file' && b?.kind === 'file' && a.size === b.size && a.mode === b.mode && a.sha256 === b.sha256;
+}
+function inventoryHash(entries: Map<string, RepositoryEntry>, filesOnly = false): string {
+  return sha(JSON.stringify([...entries].filter(([, entry]) => !filesOnly || entry.kind === 'file').sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)));
+}
+/** Stream baseline bytes instead of retaining a copy of the repository in RAM. */
+function hashRepositoryFile(root: Root, leaf: Leaf, maximum: number): RepositoryEntry {
+  if (!leaf.stat || leaf.stat.size > maximum) fail('inventory_byte_limit');
+  regular(leaf.stat);
+  const fd = openSync(leaf.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const before = fstatSync(fd); regular(before);
+    if (!sameFile(leaf.stat, before)) fail('file_changed');
+    const buffer = Buffer.alloc(64 * 1024), digest = createHash('sha256');
+    let count = 0;
+    for (;;) {
+      const read = readSync(fd, buffer, 0, Math.min(buffer.length, before.size - count + 1), count);
+      if (!read) break;
+      count += read;
+      if (count > before.size) fail('file_changed');
+      digest.update(buffer.subarray(0, read));
+    }
+    if (count !== before.size || !sameFile(before, fstatSync(fd))) fail('file_changed');
+    checkLeaf(root, leaf);
+    return Object.freeze({ kind: 'file', size: count, mode: before.mode & 0o111 ? 0o755 : 0o644, sha256: digest.digest('hex') });
+  } finally { closeSync(fd); }
+}
+type IgnoreQuery = (paths: readonly string[]) => Set<string>;
+function repositoryInventory(root: Root, baseline?: RepositoryInventory, ignored?: IgnoreQuery): RepositoryInventory {
+  const entries = new Map<string, RepositoryEntry>(), aliases = new Set<string>();
+  let bytes = 0, visited = 0;
+  const pending = ['']; let cursor = 0;
+  while (cursor < pending.length) {
+    const relative = pending[cursor++]!, parent = join(root.path, relative);
+    const parentStat = directory(parent);
+    if (realpathSync(parent) !== parent) fail('parent_changed');
+    const children: { path: string; stat: Stats }[] = [];
+    const handle = opendirSync(parent);
+    try {
+      for (let child = handle.readSync(); child !== null; child = handle.readSync()) {
+        if (relative === '' && child.name === '.git') continue;
+        const path = relative ? `${relative}/${child.name}` : child.name;
+        if (++visited > ENGINEERING_REPOSITORY_ARTIFACT_LIMITS.inventoryEntries) fail('inventory_entry_limit');
+        const protectedPath = repositoryPath(path, true);
+        if (aliases.has(path.toLowerCase())) fail('duplicate_path');
+        aliases.add(path.toLowerCase());
+        if (path.split('/').length > 64) fail('inventory_depth_limit');
+        if (baseline && protectedPath && !baseline.entries.has(path)) fail('protected_path_changed');
+        children.push({ path, stat: lstatSync(join(root.path, path)) });
+      }
+    } finally { handle.closeSync(); }
+    children.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+    // Only newly created paths may be ignored. Tracked baseline files remain
+    // source even when the pristine base's ignore rules happen to match them.
+    const candidates = children.filter(({ path }) => baseline && !baseline.entries.has(path))
+      .map(({ path, stat }) => path + (stat.isDirectory() ? '/' : ''));
+    const excluded = ignored && candidates.length ? ignored(candidates) : new Set<string>();
+    for (const { path, stat } of children) {
+      if (excluded.has(path + (stat.isDirectory() ? '/' : ''))) continue;
+      if (stat.isDirectory()) {
+        directory(join(root.path, path));
+        entries.set(path, Object.freeze({ kind: 'directory' })); pending.push(path);
+      } else {
+        const entry = hashRepositoryFile(root, inspectLeaf(root, path), ENGINEERING_REPOSITORY_ARTIFACT_LIMITS.inventoryBytes - bytes);
+        if (entry.kind !== 'file') fail('inventory_invalid');
+        bytes += entry.size; entries.set(path, entry);
+      }
+    }
+    if (!sameNode(parentStat, directory(parent)) || realpathSync(parent) !== parent) fail('parent_changed');
+    checkRoot(root);
+  }
+  return { entries, bytes };
+}
+function pristineIgnoreRules(root: Root, inventory: RepositoryInventory): readonly IgnoreRule[] {
+  const rules: IgnoreRule[] = []; let bytes = 0;
+  for (const [path, entry] of inventory.entries) {
+    if (entry.kind !== 'file' || path.split('/').at(-1) !== '.gitignore') continue;
+    if (rules.length >= ENGINEERING_REPOSITORY_ARTIFACT_LIMITS.ignoreFiles) fail('ignore_limit');
+    const raw = readRegular(root, inspectLeaf(root, path), ENGINEERING_REPOSITORY_ARTIFACT_LIMITS.ignoreBytes - bytes);
+    if (sha(raw) !== entry.sha256) fail('file_changed');
+    bytes += raw.length; rules.push(Object.freeze({ path, bytes: raw }));
+  }
+  return Object.freeze(rules);
+}
+/** An ephemeral host-owned tree contains ONLY original verifier .gitignore
+ * bytes. This preserves the base rules even when authored .gitignore changes
+ * are imported. No author Git metadata or info/exclude is consulted. */
+function withPristineIgnores<T>(rules: readonly IgnoreRule[], operation: (query: IgnoreQuery) => T): T {
+  const path = realpathSync(mkdtempSync(join(tmpdir(), 'gary-repository-ignore-')));
+  try {
+    mkdirSync(join(path, '.git'), { mode: 0o700 });
+    mkdirSync(join(path, '.git/objects'), { mode: 0o700 });
+    mkdirSync(join(path, '.git/refs'), { mode: 0o700 });
+    writeFileSync(join(path, '.git/HEAD'), 'ref: refs/heads/unused\n', { flag: 'wx', mode: 0o600 });
+    writeFileSync(join(path, '.git/config'), '[core]\nrepositoryformatversion = 0\nbare = false\nhooksPath = /dev/null\n', { flag: 'wx', mode: 0o600 });
+    for (const rule of rules) {
+      mkdirSync(dirname(join(path, rule.path)), { recursive: true, mode: 0o700 });
+      writeFileSync(join(path, rule.path), rule.bytes, { flag: 'wx', mode: 0o400 });
+    }
+    let queries = 0;
+    const deadline = Date.now() + 30_000;
+    return operation(paths => {
+      const matches = new Set<string>();
+      for (let offset = 0; offset < paths.length; offset += 1024) {
+        if (++queries > 512 || Date.now() >= deadline) fail('ignore_query_limit');
+        const batch = paths.slice(offset, offset + 1024), requested = new Set(batch);
+        const result = spawnSync('/usr/bin/git', ['--no-optional-locks', '-c', 'core.hooksPath=/dev/null',
+          '-c', 'core.fsmonitor=false', '-c', 'core.excludesFile=/dev/null', '-c', 'credential.helper=',
+          '-c', 'protocol.allow=never', 'check-ignore', '--no-index', '-z', '--stdin'], {
+          cwd: path, shell: false, input: Buffer.from(batch.join('\0') + '\0'), encoding: 'buffer',
+          env: { PATH: '/usr/bin:/bin', HOME: '/nonexistent', XDG_CONFIG_HOME: '/nonexistent', LC_ALL: 'C',
+            GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_GLOBAL: '/dev/null',
+            GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: '/usr/bin/false' },
+          timeout: Math.min(5000, deadline - Date.now()), maxBuffer: 1024 * 1024,
+        });
+        // macOS's system Git wrapper can emit sandbox/cache warnings despite
+        // a successful query. Exit status and the bounded NUL protocol decide
+        // the result; raw stderr is never surfaced or treated as instructions.
+        if (result.error || result.signal || ![0, 1].includes(result.status ?? -1)) fail('ignore_query_failed');
+        const output = result.stdout.toString('utf8');
+        if ((result.status === 0) !== !!output || output && !output.endsWith('\0')) fail('ignore_query_failed');
+        for (const value of output ? output.slice(0, -1).split('\0') : []) {
+          if (!requested.has(value)) fail('ignore_query_failed'); matches.add(value);
+        }
+      }
+      return matches;
+    });
+  } finally { rmSync(path, { recursive: true, force: true }); }
+}
+
+/** Host MUST call before any dependency, sandbox or model command in the newly
+ * acquired author clone. Source root .git is deliberately never inspected. */
+export function captureEngineeringRepositoryBaseline(authorRoot: string): EngineeringRepositoryBaseline {
+  const root = rootDirectory(authorRoot), inventory = repositoryInventory(root);
+  const baseline = Object.freeze({ hash: inventoryHash(inventory.entries),
+    fileCount: [...inventory.entries.values()].filter(entry => entry.kind === 'file').length, bytes: inventory.bytes });
+  repositoryBaselines.set(baseline, { root, inventory });
+  return baseline;
+}
+
+/** Host MUST first prove primary writers absent. The verifier must be a fresh
+ * independently acquired clone at the same base, with no dependency/model access. */
+export function captureEngineeringRepositoryChanges(authorRoot: string, baseline: EngineeringRepositoryBaseline,
+  freshVerifierRoot: string): Readonly<{ capture: EngineeringArtifactCapture; paths: readonly string[] }> {
+  const original = repositoryBaselines.get(baseline);
+  if (!original || !Object.isFrozen(baseline) || original.root.path !== authorRoot) fail('baseline_provenance');
+  checkRoot(original.root);
+  const verifier = rootDirectory(freshVerifierRoot);
+  if (identity(verifier.stat) === identity(original.root.stat) || usedVerifiers.has(identity(verifier.stat))) fail('verifier_reuse');
+  checkVerifierMetadata(verifier);
+  const pristine = repositoryInventory(verifier);
+  if (inventoryHash(pristine.entries) !== baseline.hash) fail('baseline_mismatch');
+  const ignores = pristineIgnoreRules(verifier, pristine);
+  const current = withPristineIgnores(ignores, query => repositoryInventory(original.root, original.inventory, query));
+  const changed: string[] = [];
+  for (const path of new Set([...original.inventory.entries.keys(), ...current.entries.keys()])) {
+    const before = original.inventory.entries.get(path), after = current.entries.get(path);
+    if (entryEqual(before, after)) continue;
+    if (repositoryPath(path, true)) fail('protected_path_changed');
+    if (before?.kind === 'file' || after?.kind === 'file') {
+      if (before?.kind === 'directory' || after?.kind === 'directory') fail('path_collision');
+      changed.push(path);
+    }
+  }
+  const paths = repositoryPaths(changed);
+  let bytes = 0;
+  const files = paths.map(path => {
+    const leaf = inspectLeaf(original.root, path), entry = current.entries.get(path);
+    if (!entry) {
+      if (leaf.stat) fail('file_changed'); checkLeaf(original.root, leaf);
+      return Object.freeze({ path, kind: 'deleted' as const, mode: null, base64: null, sha256: null });
+    }
+    if (entry.kind !== 'file') fail('path_collision');
+    const raw = readRegular(original.root, leaf, ENGINEERING_REPOSITORY_ARTIFACT_LIMITS.bytes - bytes);
+    bytes += raw.length;
+    if (sha(raw) !== entry.sha256 || (leaf.stat!.mode & 0o111 ? 0o755 : 0o644) !== entry.mode) fail('file_changed');
+    return Object.freeze({ path, kind: 'file' as const, mode: entry.mode, base64: raw.toString('base64'), sha256: entry.sha256 });
+  });
+  checkRoot(original.root); checkRoot(verifier);
+  const capture = Object.freeze({ files: Object.freeze(files), hash: captureHash(files) });
+  repositoryCaptures.set(capture, { paths, sourceIdentity: identity(original.root.stat), baseline: pristine,
+    expected: current.entries, verifierPath: freshVerifierRoot, verifierIdentity: identity(verifier.stat), ignores });
+  return Object.freeze({ capture, paths });
+}
+function repositoryCapture(capture: EngineeringArtifactCapture, scope: readonly string[]): RepositoryCaptureBinding {
+  const paths = repositoryPaths(scope), binding = repositoryCaptures.get(capture);
+  if (!binding || !Object.isFrozen(capture) || !Object.isFrozen(capture.files)) fail('capture_provenance');
+  if (JSON.stringify(paths) !== JSON.stringify(binding.paths)) fail('file_scope');
+  if (capture.hash !== captureHash(capture.files)) fail('capture_hash');
+  return binding;
+}
+
+/** Import once into the exact pristine verifier pinned during change capture.
+ * A failed partial import consumes this verifier. Old scoped captures cannot
+ * be promoted to this API or vice versa. */
+export function applyEngineeringRepositoryArtifact(verifierRoot: string, capture: EngineeringArtifactCapture,
+  paths: readonly string[]): EngineeringArtifactCapture {
+  const binding = repositoryCapture(capture, paths), root = rootDirectory(verifierRoot);
+  if (verifierRoot !== binding.verifierPath || identity(root.stat) !== binding.verifierIdentity
+      || usedVerifiers.has(identity(root.stat))) fail('verifier_reuse');
+  checkVerifierMetadata(root);
+  if (inventoryHash(repositoryInventory(root).entries) !== inventoryHash(binding.baseline.entries)) fail('baseline_mismatch');
+  const preflight = binding.paths.map(path => inspectLeaf(root, path));
+  for (const leaf of preflight) checkLeaf(root, leaf);
+  usedVerifiers.add(identity(root.stat));
+  for (const [index, file] of capture.files.entries()) {
+    const original = preflight[index]!; checkLeaf(root, original);
+    if (file.kind === 'deleted') { if (original.stat) unlinkSync(original.path); continue; }
+    makeParents(root, file.path);
+    const leaf = inspectLeaf(root, file.path);
+    if (original.stat ? !leaf.stat || !sameFile(original.stat, leaf.stat) : leaf.stat !== null) fail('file_changed');
+    const temporary = join(dirname(leaf.path), `.gary-artifact-${randomUUID()}`);
+    const fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    let created: Stats | undefined, renamed = false;
+    try {
+      created = fstatSync(fd); regular(created);
+      const bytes = Buffer.from(file.base64, 'base64');
+      let written = 0;
+      while (written < bytes.length) {
+        const count = writeSync(fd, bytes, written, bytes.length - written);
+        if (count <= 0) fail('write_failed'); written += count;
+      }
+      fchmodSync(fd, file.mode); fsyncSync(fd); created = fstatSync(fd); regular(created);
+      checkLeaf(root, leaf);
+      if (!sameFile(created, lstatSync(temporary))) fail('file_changed');
+      renameSync(temporary, leaf.path); renamed = true;
+    } finally {
+      closeSync(fd);
+      if (!renamed && created) { const stat = statIfPresent(temporary); if (stat && sameNode(created, stat)) unlinkSync(temporary); }
+    }
+  }
+  return verifyEngineeringRepositoryArtifact(verifierRoot, capture, paths);
+}
+
+/** Verify the complete non-generated source inventory, including unchanged and
+ * protected files. New files created by tests cannot escape the exact artifact
+ * by modifying .gitignore; only original base rules are used. */
+export function verifyEngineeringRepositoryArtifact(verifierRoot: string, capture: EngineeringArtifactCapture,
+  paths: readonly string[]): EngineeringArtifactCapture {
+  const binding = repositoryCapture(capture, paths), root = rootDirectory(verifierRoot);
+  if (verifierRoot !== binding.verifierPath || identity(root.stat) !== binding.verifierIdentity) fail('verifier_reuse');
+  const current = withPristineIgnores(binding.ignores, query => repositoryInventory(root, binding.baseline, query));
+  if (inventoryHash(current.entries, true) !== inventoryHash(binding.expected, true)) fail('artifact_changed');
+  for (const [path, before] of binding.baseline.entries) {
+    if (repositoryPath(path, true) && !entryEqual(before, current.entries.get(path))) fail('protected_path_changed');
+  }
+  return capture;
 }

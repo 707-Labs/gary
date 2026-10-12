@@ -15,9 +15,19 @@ export interface HostEngineeringPrepared {
 }
 export interface HostEngineeringCleanupProof { receiptId: string; taskId: string; sessionId: string; ownerEpoch: string; absent: true }
 export interface HostEngineeringOptions {
-  db: Database; grantId: string; allocationId: string;
+  db: Database; grantId: string;
+  /** A standing host derives a distinct allocation identity per authenticated
+   * request. This callback selects no funds and never comes from model input. */
+  allocationId: string | ((request: Readonly<HostEngineeringRequest>) => string);
+  /** Standing service admission is serialized across processes, including preparation. */
+  singleActiveRequest?: true;
+  /** Trusted repository acquisition supplies the immutable numeric ID. This
+   * changes only project identity; authenticated audience fields stay exact. */
+  immutableRepositoryScope?: true;
   assertGrant(): void;
   assertBudget(): void;
+  /** New-task headroom is distinct from a running task's already committed funds. */
+  assertAdmissionBudget?(): void;
   prepare(request: Readonly<HostEngineeringRequest>, taskId: string, signal: AbortSignal): Promise<HostEngineeringPrepared>;
   execute(task: EngineeringTaskView, prepared: HostEngineeringPrepared, signal: AbortSignal): Promise<{ completed: boolean; artifactReceiptId: string; summary: string }>;
   cleanup(task: EngineeringTaskView): Promise<HostEngineeringCleanupProof>;
@@ -108,18 +118,28 @@ export function createEngineeringHost(options: HostEngineeringOptions) {
         if (old.request_hash !== requestHash) return { kind: 'rejected', code: 'invalid_request' };
         return old.admitted_json ? JSON.parse(old.admitted_json) as HostEngineeringReceipt : { kind: 'rejected', code: 'unavailable' };
       }
-      options.assertBudget();
+      try { (options.assertAdmissionBudget ?? options.assertBudget)(); } catch { return { kind: 'rejected', code: 'budget_unavailable' }; }
       const taskId = 'engineering-' + randomUUID();
-      try { db.query('INSERT INTO engineering_ingress_requests VALUES(?,?,?,?,?,\'preparing\',NULL,NULL)')
-        .run(request.requestId, requestHash, request.messageKey, taskId, options.allocationId); }
+      const allocationId = typeof options.allocationId === 'string' ? options.allocationId : options.allocationId(request);
+      if (!id(allocationId)) return { kind: 'rejected', code: 'invalid_request' };
+      try { db.transaction(() => {
+        if (options.singleActiveRequest && db.query("SELECT 1 FROM engineering_ingress_requests WHERE stage NOT IN ('completed','blocked','paused') LIMIT 1").get()) fail('busy');
+        db.query('INSERT INTO engineering_ingress_requests VALUES(?,?,?,?,?,\'preparing\',NULL,NULL)')
+          .run(request.requestId, requestHash, request.messageKey, taskId, allocationId);
+      }).immediate(); }
       catch { return { kind: 'rejected', code: 'busy' }; }
       // Persist intent first. Failure or process death leaves a latched stop, not replay.
       let prepared: HostEngineeringPrepared;
       try {
         prepared = await options.prepare(Object.freeze(request), taskId, AbortSignal.any([signal, controller.signal]));
         const expectedScope = scopeFor(request), spec = prepared.spec;
+        if (options.immutableRepositoryScope) {
+          if (typeof spec.repositoryId !== 'string' || !/^[1-9][0-9]*$/.test(spec.repositoryId)
+              || !Number.isSafeInteger(Number(spec.repositoryId))) fail('prepared_repository_identity');
+          expectedScope.projectId = 'repository:' + spec.repositoryId;
+        }
         if (spec.taskId !== taskId || spec.requestId !== request.requestId || spec.grantId !== options.grantId
-            || spec.allocationId !== options.allocationId || spec.repository !== request.repository
+            || spec.allocationId !== allocationId || spec.repository !== request.repository
             || fingerprintJson(spec.scope).sha256 !== fingerprintJson(expectedScope).sha256) fail('prepared_binding');
         if (signal.aborted || controller.signal.aborted || !isAvailable()) fail('unavailable');
         const { owned, ack } = db.transaction(() => {
@@ -144,6 +164,13 @@ export function createEngineeringHost(options: HostEngineeringOptions) {
   }
   return {
     admit,
+    cancelPending(value: HostEngineeringReceipt): void {
+      const row = read(value.requestId);
+      if (!row?.admitted_json || fingerprintJson(JSON.parse(row.admitted_json)).sha256 !== fingerprintJson(value).sha256) fail('cancel_receipt');
+      const pending = pendingStarts.get(value.taskId);
+      if (!pending) return; // Never cancel an executing or historical owner.
+      pendingStarts.delete(value.taskId); pending.cancel();
+    },
     start(value: HostEngineeringReceipt): void {
       const row = read(value.requestId);
       if (!row?.admitted_json || fingerprintJson(JSON.parse(row.admitted_json)).sha256 !== fingerprintJson(value).sha256) fail('start_receipt');
@@ -171,7 +198,15 @@ export function createEngineeringHost(options: HostEngineeringOptions) {
       return saved ? Object.freeze(JSON.parse(saved)) as HostEngineeringReceipt : null;
     },
     ready() { return available && !controller.signal.aborted; },
-    async stop() { available = false; controller.abort(); await serial; const waiting = [...pendingStarts.values()]; pendingStarts.clear(); waiting.forEach(p => p.cancel()); await Promise.allSettled([...running]); },
+    async stop() {
+      available = false; controller.abort(); await serial;
+      const waiting = [...pendingStarts.values()]; pendingStarts.clear(); waiting.forEach(p => p.cancel());
+      await Promise.allSettled([...running]);
+      // A settled orchestration promise does not prove the sandbox is gone.
+      // Callers must retain stores/custody when this durable evidence is absent.
+      const uncertain = db.query("SELECT 1 FROM engineering_tasks WHERE state IN ('running','cleanup_unknown') AND cleanup_confirmed=0 LIMIT 1").get();
+      return { drained: !uncertain };
+    },
     store,
   };
 }

@@ -28,7 +28,19 @@ export const ENGINEERING_ACCEPTANCE_POLICY_V2 = Object.freeze({
   maxPhysicalRequests: 13,
   work: Object.freeze({ ...ENGINEERING_ACCEPTANCE_POLICY.work, maxRequests: 12 }),
 } as const);
-export type EngineeringAcceptancePolicy = typeof ENGINEERING_ACCEPTANCE_POLICY | typeof ENGINEERING_ACCEPTANCE_POLICY_V2;
+export type EngineeringStandingAcceptancePolicy = Omit<typeof ENGINEERING_ACCEPTANCE_POLICY_V2, 'capMicros'> & { readonly capMicros: number };
+export type EngineeringAcceptancePolicy = typeof ENGINEERING_ACCEPTANCE_POLICY | typeof ENGINEERING_ACCEPTANCE_POLICY_V2 | EngineeringStandingAcceptancePolicy;
+export const ENGINEERING_STANDING_MIN_TASK_CAP_MICROS = 2_816_878;
+function standingAcceptance(capMicros: number): EngineeringStandingAcceptancePolicy {
+  if (!Number.isSafeInteger(capMicros) || capMicros < ENGINEERING_STANDING_MIN_TASK_CAP_MICROS) {
+    throw new Error('engineering_policy_rejected:standing_task_cap');
+  }
+  return Object.freeze({ ...ENGINEERING_ACCEPTANCE_POLICY_V2, capMicros });
+}
+/** The canonical allocator separately proves that this finite task ceiling is funded. */
+export function engineeringStandingBudgetPolicySha256(capMicros: number): string {
+  return createHash('sha256').update(JSON.stringify(standingAcceptance(capMicros))).digest('hex');
+}
 export function engineeringAcceptancePolicySha256(version: 1 | 2): string {
   if (version !== 1 && version !== 2) throw new Error('engineering_policy_rejected:policy_version');
   return createHash('sha256').update(JSON.stringify(version === 1
@@ -75,6 +87,10 @@ export interface EngineeringTaskPolicy {
   readonly publication: 'patch_only' | 'draft_pr';
   readonly acceptance: EngineeringAcceptancePolicy;
   readonly fingerprint: string;
+  /** Only the separate host constructor can mint these standing-policy fields. */
+  readonly fundingKind?: 'standing';
+  readonly scope?: Readonly<{ kind: 'repository' }>;
+  readonly verificationProfileSha256?: string;
 }
 export type EngineeringRequestRole = 'work' | 'review' | 'classification' | 'repair' | 'retry' | 'summary'
   | 'compression' | 'subagent' | 'publication_body' | 'publication_title' | 'auxiliary';
@@ -243,6 +259,65 @@ export function createEngineeringTaskPolicy(input: {
   policies.add(result); return result;
 }
 
+/** Host-only standing-grant composition. Repository access and task funding are
+ * independently checked; this constructor neither discovers authority nor spends. */
+export function createStandingEngineeringTaskPolicy(input: {
+  taskId: string; repository: ResolvedEngineeringRepository; baseCommit: string;
+  requiredCommands: readonly string[]; verificationProfileSha256: string;
+  publication: 'patch_only' | 'draft_pr'; capMicros: number;
+}): EngineeringTaskPolicy {
+  const value = data(input, ['taskId', 'repository', 'baseCommit', 'requiredCommands',
+    'verificationProfileSha256', 'publication', 'capMicros'], 'standing_task');
+  const taskId = identifier(value.taskId, 'task');
+  if (!value.repository || !resolved.has(value.repository as object)) fail('repository_binding');
+  const repository = value.repository as ResolvedEngineeringRepository;
+  if (repository.authority.surface !== 'private_dm') fail('standing_private_dm_required');
+  if (typeof value.baseCommit !== 'string' || !SHA.test(value.baseCommit)) fail('base_commit');
+  if (!['patch_only', 'draft_pr'].includes(String(value.publication))) fail('publication_mode');
+  if (value.publication === 'draft_pr' && (repository.contents !== 'write' || repository.pullRequests !== 'write')) fail('publication_permissions');
+  if (typeof value.verificationProfileSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(value.verificationProfileSha256)) fail('verification_profile');
+  const requiredCommands = distinct(list(value.requiredCommands, 16, 'test_commands').map(command => {
+    if (typeof command !== 'string' || !command.trim() || command !== command.trim()
+        || Buffer.byteLength(command) > 1024 || /[\x00-\x1f\x7f]/.test(command)) fail('test_commands');
+    return command;
+  }), 'test_commands');
+  const policy = { version: 1 as const, taskId, repository, baseCommit: value.baseCommit,
+    allowedFiles: Object.freeze([]) as readonly string[], requiredCommands,
+    publication: value.publication as 'patch_only' | 'draft_pr', acceptance: standingAcceptance(value.capMicros as number),
+    fundingKind: 'standing' as const, scope: Object.freeze({ kind: 'repository' as const }),
+    verificationProfileSha256: value.verificationProfileSha256 };
+  const result = Object.freeze({ ...policy, fingerprint: 'sha256:' + createHash('sha256').update(JSON.stringify(policy)).digest('hex') });
+  policies.add(result); return result;
+}
+
+export function isEngineeringRepositoryScopedPolicy(policy: EngineeringTaskPolicy): boolean {
+  known(policy);
+  return policy.fundingKind === 'standing' && policy.scope?.kind === 'repository';
+}
+
+/** Final artifact authority is a bounded repository scope, never a glob supplied
+ * by the model. Capture additionally rejects unsafe inode types and ignored output. */
+export function assertEngineeringTaskFileScope(policy: EngineeringTaskPolicy, raw: readonly string[]): readonly string[] {
+  known(policy);
+  if (!isEngineeringRepositoryScopedPolicy(policy)) {
+    const changed = distinct(list(raw, 128, 'file_scope').map(path), 'file_scope');
+    if (changed.some(file => !policy.allowedFiles.includes(file))) fail('file_scope');
+    return changed;
+  }
+  const changed = distinct(list(raw, 512, 'file_scope').map(value => {
+    if (typeof value !== 'string' || !value || Buffer.byteLength(value) > 1024 || /[\\\x00-\x1f\x7f]/.test(value)
+        || value.startsWith('/') || /^[A-Za-z]:/.test(value)) fail('file_scope');
+    for (const part of value.split('/')) {
+      if (!part || part === '.' || part === '..' || part.endsWith('.') || Buffer.byteLength(part) > 255
+          || /^(?:\.git|\.git-credentials|\.gitconfig|git~\d|\.hg|\.svn|\.beads|\.aws|\.ssh|\.gnupg|\.azure|\.gcloud|\.kube|\.npmrc|\.pypirc|\.netrc|\.docker|\.env.*)$/i.test(part)
+          || /^(?:secrets?|credentials?|id_rsa|id_ed25519)(?:\..*)?$/i.test(part)) fail('file_scope');
+    }
+    return value;
+  }), 'file_scope');
+  if (new Set(changed.map(file => file.toLowerCase())).size !== changed.length) fail('file_scope');
+  return changed;
+}
+
 function known(policy: EngineeringTaskPolicy): void {
   if (!policy || !policies.has(policy)) fail('task_policy_untrusted');
 }
@@ -309,8 +384,7 @@ export function assertEngineeringPublicationAllowed(policy: EngineeringTaskPolic
   matches(policy, e as unknown as ArtifactEvidence, exact);
   if (e.activeOwner !== true || e.cleanupVerified !== true || e.worktreeClean !== true || e.stopReason !== null
       || integer(e.unresolvedAttempts, 'publication_evidence') !== 0) fail('publication_stopped');
-  const changed = distinct(list(e.changedFiles, 128, 'file_scope').map(path), 'file_scope');
-  if (changed.some(file => !policy.allowedFiles.includes(file))) fail('file_scope');
+  assertEngineeringTaskFileScope(policy, e.changedFiles as readonly string[]);
   const history = attempts(e.requests as readonly EngineeringRequestAttempt[], policy.acceptance);
   if (!history.work || history.review !== 1 || history.records.some(a => a.state !== 'settled')) fail('review_request_missing');
   const tests = list(e.tests, 16, 'test_evidence').map(raw => {

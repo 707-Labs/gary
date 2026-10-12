@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { closeSync, constants, fsyncSync, lstatSync, mkdirSync, openSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { armExecutorJobGuardian } from './job-guardian.ts';
+import { executorGuardianDeadlineDelay, snapshotStandingEngineeringSessionWindow, type StandingEngineeringSessionWindow } from './guardian-deadline.ts';
 import type { EngineeringCommandRunner, EngineeringSessionBinding } from './engineering-session.ts';
 
 export interface EngineeringGuardianContext {
@@ -40,14 +41,21 @@ function syncDirectory(path: string): void {
   const fd = openSync(path, constants.O_RDONLY); try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
-/** The reused guardian has a reviewed 30-minute maximum. Host task policy must
- * narrow the session to that bound; it cannot silently renew the guardian. */
-export function createEngineeringSessionGuardianFactory(options: { directory: string }): EngineeringSessionGuardianFactory {
+/** Legacy callers retain 30 minutes. Standing callers supply the original
+ * admission window once; no arm call can renew or replace that fixed deadline. */
+export function createEngineeringSessionGuardianFactory(options: {
+  directory: string; standingSession?: StandingEngineeringSessionWindow;
+}): EngineeringSessionGuardianFactory {
   const root = options.directory;
+  const standingSession = options.standingSession === undefined ? undefined : snapshotStandingEngineeringSessionWindow(options.standingSession);
   return { async arm(context) {
     const invocationId = context.containerName.replace(/^gary-longjob-/, '');
+    const expectedBinding = JSON.stringify({ ...context.binding, workspaceRoot: context.workspaceRoot, image: context.image,
+      ...(standingSession ? { standingSession } : {}) });
+    const deadlineBinding = { deadlineMs: context.deadlineMs, expectedBinding, ...(standingSession ? { standingSession } : {}) };
+    try { executorGuardianDeadlineDelay(deadlineBinding, Date.now()); }
+    catch { fail('engineering_guardian_context_invalid'); }
     if (!/^[a-f0-9-]{36}$/.test(invocationId) || context.containerName !== `gary-longjob-${invocationId}`
-      || !Number.isSafeInteger(context.deadlineMs) || context.deadlineMs <= Date.now() || context.deadlineMs > Date.now() + 30 * 60_000
       || !isAbsolute(context.dockerBinary) || !/^unix:\/\/\/[^\x00-\x1f]+\.sock$/.test(context.dockerHost)) fail('engineering_guardian_context_invalid');
     const rel = relative(realpathSync(context.workspaceRoot), root);
     if (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`)) fail('engineering_guardian_inside_workspace');
@@ -69,7 +77,6 @@ export function createEngineeringSessionGuardianFactory(options: { directory: st
       const daemonId = result.output.trim();
       if (result.exitCode !== 0 || result.timedOut || result.outputTruncated || !/^[a-zA-Z0-9:._-]{8,128}$/.test(daemonId)) fail('engineering_guardian_daemon_unverified');
       const journalId = randomUUID(), ownerToken = randomUUID();
-      const expectedBinding = JSON.stringify({ ...context.binding, workspaceRoot: context.workspaceRoot, image: context.image });
       db.transaction(() => {
         db.query('INSERT INTO meta VALUES(1,?,?,?,?,?,?)').run(journalId, daemonId, process.pid, ownerToken, context.dockerHost, context.dockerBinary);
         db.query('INSERT INTO invocations VALUES(?,?,?,?,NULL,NULL)').run(invocationId, context.containerName, expectedBinding, context.deadlineMs);
@@ -77,7 +84,8 @@ export function createEngineeringSessionGuardianFactory(options: { directory: st
       syncDirectory(directory); syncDirectory(root);
       const guardian = await armExecutorJobGuardian({ directory, dockerConfig: config, databasePath,
         dockerBinary: context.dockerBinary, dockerHost: context.dockerHost, journalId, invocationId,
-        containerName: context.containerName, deadlineMs: context.deadlineMs, expectedBinding, ownerToken, ownerPid: process.pid });
+        containerName: context.containerName, deadlineMs: context.deadlineMs, expectedBinding, ownerToken, ownerPid: process.pid,
+        ...(standingSession ? { standingSession } : {}) });
       try { db.query('UPDATE invocations SET guardian_pid=? WHERE id=?').run(guardian.pid, invocationId); }
       catch (error) { await guardian.complete().catch(() => {}); throw error; }
       let completed: Promise<{ containerId: string; absenceVerified: true }> | undefined;

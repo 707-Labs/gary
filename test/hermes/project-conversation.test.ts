@@ -4,6 +4,7 @@ import { createHermesProjectResponder, PROJECT_CONVERSATION_POLICY, projectRespo
   type ProjectTurn, type ProjectReplyDependencies } from '../../src/hermes/project-conversation.ts';
 import type { GaryRuntimeLauncher, GaryRuntimeManifest, RuntimeRequestHandler } from '../../src/hermes/gary-loop-adapter.ts';
 import { ProjectAssistant, type ProjectAudience } from '../../src/hermes/project-assistant.ts';
+import { createConversationEngineeringCapability } from '../../src/hermes/conversation-engineering.ts';
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -93,6 +94,26 @@ test('native project tool round trip uses host authority, exact transcript and t
   expect(JSON.stringify(requests)).not.toContain('worker prompt'); expect(JSON.stringify(requests)).not.toContain('fake-secret');
   expect(requests[0].system[0].text).toContain('untrusted data'); expect(requests[0].thinking).toEqual({ type: 'disabled' });
   expect(f.ledger.status(allocation)).toMatchObject({ attemptCount: 2, unknownAttempts: 0, state: 'active' });
+});
+
+test('native RPC carries only repository; the current host capability and active guard reach engineering execution separately', async () => {
+  const f = fixture(), requests: any[] = [];
+  const engineering = createConversationEngineeringCapability(authority, async () => ({ ok: true, dataOnly: true, data: null }));
+  let offered = 0;
+  f.projects.toolsFor = (a, capability) => {
+    expect(a).toEqual(authority); expect(capability).toBe(engineering); offered++;
+    return [{ type: 'function', function: { name: 'engineering_submit', description: 'Submit current authenticated request',
+      parameters: { type: 'object', properties: { repository: { type: 'string' } }, required: ['repository'], additionalProperties: false } } }];
+  };
+  const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fake-secret', launch: native(), fetch: async req => {
+    requests.push(await req.json());
+    return requests.length === 1 ? provider([call('submit_1', 'engineering_submit', { repository: '707-Labs/new-app' })]) : provider();
+  } });
+  expect(await reply(turn({ engineering, text: 'Fix the bug in 707-Labs/new-app' }))).toBe('I inspected the current work.');
+  expect(offered).toBe(1); expect(f.executions).toHaveLength(1);
+  expect(f.executions[0].engineering).toBe(engineering); expect(typeof f.executions[0].assertActive).toBe('function');
+  expect(f.executions[0].args).toEqual({ repository: '707-Labs/new-app' });
+  expect(JSON.stringify(requests)).not.toContain('host_conversation_engineering');
 });
 
 test('six physical requests maximum; the sixth request is host-forced answer-only', async () => {

@@ -19,6 +19,10 @@ export interface HostStartupConfig {
   engineeringConfigSha256?:string;
   engineeringAuthorityReceiptPath?:string;
   engineeringAuthorityReceiptSha256?:string;
+  standingEngineeringConfigPath?:string;
+  standingEngineeringConfigSha256?:string;
+  standingEngineeringAuthorityPath?:string;
+  standingEngineeringAuthoritySha256?:string;
   slack?: { credentialsPath: string; approvedChannelIds: readonly string[]; tannerDirectMessages?:true };
 }
 
@@ -43,6 +47,12 @@ export function loadHostStartupConfig(env: Readonly<Record<string, string | unde
   const alertConfig=env.GARY_SLACK_ALERT_CONFIG,alertSha=env.GARY_SLACK_ALERT_CONFIG_SHA256;
   const engineeringConfig=env.GARY_ENGINEERING_CONFIG,engineeringSha=env.GARY_ENGINEERING_CONFIG_SHA256;
   const engineeringAuthority=env.GARY_ENGINEERING_AUTHORITY_RECEIPT,engineeringAuthoritySha=env.GARY_ENGINEERING_AUTHORITY_RECEIPT_SHA256;
+  const standingConfig=env.GARY_STANDING_ENGINEERING_CONFIG,standingSha=env.GARY_STANDING_ENGINEERING_CONFIG_SHA256;
+  const standingAuthority=env.GARY_STANDING_ENGINEERING_AUTHORITY,standingAuthoritySha=env.GARY_STANDING_ENGINEERING_AUTHORITY_SHA256;
+  if([standingConfig,standingSha,standingAuthority,standingAuthoritySha].some(v=>v!==undefined)
+    &&(!combinedConversation||!conversation||!projectConfig||direct!=='1'||!standingConfig||!standingSha||!standingAuthority||!standingAuthoritySha
+      ||!/^[a-f0-9]{64}$/.test(standingSha)||!/^[a-f0-9]{64}$/.test(standingAuthoritySha)))throw new Error('standing_engineering_requires_pinned_owner_dm_runtime');
+  if(standingConfig&&(engineeringConfig||standingConfig===standingAuthority))throw new Error('standing_engineering_requires_separate_authority_and_runtime');
   if([engineeringConfig,engineeringSha,engineeringAuthority,engineeringAuthoritySha].some(value=>value!==undefined)
     &&(!combinedConversation||!conversation||direct!=='1'||!engineeringConfig||!engineeringSha||!engineeringAuthority||!engineeringAuthoritySha
       ||!/^[a-f0-9]{64}$/.test(engineeringSha)||!/^[a-f0-9]{64}$/.test(engineeringAuthoritySha)))throw new Error('engineering_requires_pinned_owner_dm_runtime');
@@ -99,6 +109,8 @@ export function loadHostStartupConfig(env: Readonly<Record<string, string | unde
     ...(alertConfig?{slackAlertConfigPath:path(alertConfig),slackAlertConfigSha256:alertSha!}:{}),
     ...(engineeringConfig?{engineeringConfigPath:path(engineeringConfig),engineeringConfigSha256:engineeringSha!,
       engineeringAuthorityReceiptPath:path(engineeringAuthority),engineeringAuthorityReceiptSha256:engineeringAuthoritySha!}:{}),
+    ...(standingConfig?{standingEngineeringConfigPath:path(standingConfig),standingEngineeringConfigSha256:standingSha!,
+      standingEngineeringAuthorityPath:path(standingAuthority),standingEngineeringAuthoritySha256:standingAuthoritySha!}:{}),
     slack: Object.freeze({ credentialsPath: path(env.GARY_SLACK_CREDENTIALS_FILE), approvedChannelIds: Object.freeze(approvedChannelIds),
       ...(direct==='1'?{tannerDirectMessages:true as const}:{}) }) });
 }

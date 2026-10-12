@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { ProjectAssistant, type ProjectAssistantOptions, type ProjectAudience, type ProjectRegistration } from '../../src/hermes/project-assistant.ts';
 import { createLinearTicketReader, createLocalRepositoryReader, type ProjectTicketSnapshot } from '../../src/hermes/project-integrations.ts';
+import { createConversationEngineeringCapability } from '../../src/hermes/conversation-engineering.ts';
 
 const privateAudience: ProjectAudience = { surface: 'private_dm', requesterId: 'UOWNER', teamId: 'TTEAM', channelId: 'DOWNER', threadTs: '1234.000001' };
 const sharedAudience: ProjectAudience = { ...privateAudience, surface: 'shared_channel', channelId: 'CONE' };
@@ -34,6 +35,25 @@ const exec = (a: ProjectAssistant, toolName: string, args: Record<string, unknow
 function data(result: Awaited<ReturnType<typeof exec>>): any { expect(result.ok).toBe(true); if (!result.ok) throw new Error(result.error); return result.data; }
 
 describe('host-owned project assistant', () => {
+  test('engineering tool is per-message private authority, accepts repository only, and needs no project registration', async () => {
+    const a = fixture().open({ projects: [] }), calls: string[] = [];
+    const engineering = createConversationEngineeringCapability(privateAudience, async repository => {
+      calls.push(repository); return { ok: true, dataOnly: true, data: { status: 'queued', started: false } };
+    });
+    expect(a.toolsFor(privateAudience).some(t => t.function.name === 'engineering_submit')).toBeFalse();
+    expect(a.toolsFor(sharedAudience, engineering).some(t => t.function.name === 'engineering_submit')).toBeFalse();
+    expect(a.toolsFor(privateAudience, JSON.parse(JSON.stringify(engineering))).some(t => t.function.name === 'engineering_submit')).toBeFalse();
+    const tool = a.toolsFor(privateAudience, engineering).find(t => t.function.name === 'engineering_submit')!;
+    expect(tool.function.parameters.required).toEqual(['repository']);
+    const base = { audience: privateAudience, requestId: 'submit-1', toolName: 'engineering_submit', engineering,
+      signal: new AbortController().signal, assertActive() {} };
+    for (const extra of [{ task: 'model instructions' }, { authority: privateAudience }, { budget: 100 }, { project: 'mulligan' }]) {
+      expect((await a.execute({ ...base, args: { repository: '707-Labs/new-app', ...extra } })).ok).toBeFalse();
+    }
+    expect(calls).toEqual([]);
+    expect(await a.execute({ ...base, args: { repository: '707-Labs/new-app' } })).toEqual({ ok: true, dataOnly: true, data: { status: 'queued', started: false } });
+    expect(calls).toEqual(['707-Labs/new-app']);
+  });
   test('tool schemas omit empty required lists while project_list accepts only an empty object', async () => {
     const a = fixture().open();
     for (const audience of [privateAudience, sharedAudience, { ...sharedAudience, requesterId: 'UMEMBER' }]) {

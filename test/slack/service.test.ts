@@ -1,12 +1,16 @@
 import { afterEach, expect, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { renderSlackReplyParts, renderSlackReply, SLACK_REPLY_TRUNCATED } from '../../src/slack/render.ts';
 import { createSlackService, GARY_SLACK, READY_DM_TEXT, READONLY_READY_DM_TEXT, PRIVATE_DM_STATUS, type EngineeringIngressRequest, type EngineeringReceipt, type EngineeringIngress, type SlackHostHealth, type SlackService, type SlackServiceOptions } from '../../src/slack/service.ts';
 import type { SlackTransport,SlackFrameInfo } from '../../src/slack/transport.ts';
+import { submitConversationEngineering } from '../../src/hermes/conversation-engineering.ts';
+import { createSlackConversation } from '../../src/slack/conversation.ts';
+import { DMReplyError } from '../../src/hermes/dm-conversation.ts';
+import { SpendLedger } from '../../src/spend.ts';
 
 const cleanups:Array<()=>void|Promise<void>>=[];
 afterEach(async()=>{for(const cleanup of cleanups.splice(0).reverse())await cleanup();});
@@ -522,6 +526,120 @@ function engineeringFixture(extra:Partial<SlackServiceOptions>={},override?:Engi
   return {...f,requests,issue,ingress,receipts,get chats(){return chats;},get enabled(){return enabled;},set enabled(value:boolean){enabled=value;}};
 }
 const engineeringMessage=(event:Record<string,unknown>={},payload:Record<string,unknown>={})=>dm({text:'!engineer 707-Labs/gary fix the fixture\nRun the offline checks.',...event},payload);
+
+const ordinaryAudience=(input:{channel:string;threadTs:string})=>({surface:'private_dm' as const,requesterId:GARY_SLACK.tannerId,teamId:GARY_SLACK.teamId,channelId:input.channel,threadTs:input.threadTs});
+test('standing ordinary DM admits exact original text once, separates answer delivery, then wakes after cleanup',async()=>{
+  const text='Can you fix the login bug in 707-Labs/new-app?\nAdd a regression test.';
+  let finished=false,wakes=0,toolResult:any,retained:unknown;
+  const f=engineeringFixture({standingEngineeringEnabled:true,conversation:{ready:()=>true,close:()=>({drained:true}),async respond(input,deliver,signal){
+    retained=input.engineering;expect(input.engineering).toBeDefined();
+    toolResult=await submitConversationEngineering(input.engineering,ordinaryAudience(input),'707-Labs/new-app',signal,()=>{});
+    expect(toolResult).toMatchObject({ok:true,data:{status:'queued',started:false,repository:'707-Labs/new-app'}});
+    expect(wakes).toBe(0);expect(f.fake.sends).toHaveLength(1);
+    expect((await submitConversationEngineering(input.engineering,ordinaryAudience(input),'707-Labs/new-app',signal,()=>{})).ok).toBeFalse();
+    expect(await deliver('Your engineering task is queued.')).toBe('sent');expect(wakes).toBe(0);input.onEngineeringOutcome?.('reply_committed');finished=true;
+  }}});
+  f.ingress.start=()=>{expect(finished).toBeTrue();wakes++;};
+  await f.service.start();await f.fake.emit(dm({text}));
+  expect(wakes).toBe(1);expect(f.requests).toHaveLength(1);
+  expect(f.requests[0]).toMatchObject({task:text,repository:'707-Labs/new-app',eventId:'EvFixture1',
+    messageKey:`${GARY_SLACK.appId}:${GARY_SLACK.teamId}:D0FIXTURE1:1791417600.000002`,authority:{authenticated:true,...ordinaryAudience({channel:'D0FIXTURE1',threadTs:'1791417600.000002'})}});
+  expect(Object.isFrozen(f.requests[0])).toBeTrue();expect(Object.isFrozen(f.requests[0]!.authority)).toBeTrue();
+  expect(f.db.query('SELECT state,command_sha256 FROM gary_slack_engineering_ingress').get()).toEqual({state:'bound',command_sha256:createHash('sha256').update(text).digest('hex')});
+  expect(f.fake.sends).toHaveLength(2);expect(f.fake.sends[1]!.text).toBe('Your engineering task is queued.');
+  await f.fake.emit(dm({text}));expect(f.requests).toHaveLength(1);expect(wakes).toBe(1);
+  expect((await submitConversationEngineering(retained,ordinaryAudience({channel:'D0FIXTURE1',threadTs:'1791417600.000002'}),'707-Labs/new-app',new AbortController().signal,()=>{})).ok).toBeFalse();
+  expect(await f.service.deliverEngineeringReceipt(f.issue(f.requests[0]!,'final'))).toBe('sent');
+  expect(f.fake.sends.at(-1)!.channel).toBe('D0FIXTURE1');
+});
+
+test('ordinary engineering cannot promote quoted, unrelated, absent or model-selected repository scope',async()=>{
+  for(const [text,repository] of [['What is 707-Labs/new-app doing?','707-Labs/new-app'],['Please explain:\n> Fix 707-Labs/new-app','707-Labs/new-app'],
+    ['Fix 707-Labs/one and 707-Labs/two','707-Labs/one'],['Fix 707-Labs/one','707-Labs/two'],['Fix the bug','707-Labs/new-app']]) {
+    let result:any;
+    const f=engineeringFixture({standingEngineeringEnabled:true,conversation:{ready:()=>true,close:()=>({drained:true}),async respond(input,deliver,signal){
+      result=await submitConversationEngineering(input.engineering,ordinaryAudience(input),repository,signal,()=>{});await deliver('Please clarify the repository and action.');
+    }}});await f.service.start();await f.fake.emit(dm({text}));
+    expect(result.ok).toBeFalse();expect(f.requests).toEqual([]);expect(f.db.query('SELECT * FROM gary_slack_engineering_ingress').all()).toEqual([]);
+  }
+});
+
+test('standing tool retains unknown admission and refuses wake after failed delivery, cancellation or cleanup',async()=>{
+  for(const failure of ['admission','delivery','cleanup','cancel'] as const) {
+    let wakes=0,ready=true,retained:unknown;const abort=new AbortController();
+    let f:ReturnType<typeof engineeringFixture>;
+    f=engineeringFixture({standingEngineeringEnabled:true,conversation:{ready:()=>ready,close:()=>({drained:true}),async respond(input,deliver,signal){
+      retained=input.engineering;
+      if(failure==='cancel')abort.abort();
+      try{await submitConversationEngineering(input.engineering,ordinaryAudience(input),'707-Labs/new-app',failure==='cancel'?abort.signal:signal,()=>{});}catch{/* Cancellation prevents submission. */}
+      if(failure==='cleanup'){ready=false;return;}
+      await deliver('Recorded result.');
+    }}},async request=>{if(failure==='admission')throw Error('unknown_admission');return f.issue(request);});
+    f.ingress.start=()=>{wakes++;};await f.service.start();
+    if(failure==='delivery')f.fake.send=async()=>({ok:false,outcome:'unknown',code:'fixture'});
+    await f.fake.emit(dm({text:'Fix 707-Labs/new-app'}));expect(wakes).toBe(0);
+    if(failure==='cancel')expect(f.requests).toEqual([]);
+    else expect(f.requests).toHaveLength(1);
+    const state=f.db.query('SELECT state FROM gary_slack_engineering_ingress').get();
+    expect(state).toEqual(failure==='cancel'?null:{state:failure==='admission'?'unknown':'bound'});
+    // A later verified admission callback must not wake a task fenced after cleanup/delivery failure.
+    if(failure==='cleanup'||failure==='delivery')await f.service.deliverEngineeringReceipt(f.issue(f.requests[0]!));
+    expect(wakes).toBe(0);
+    expect((await submitConversationEngineering(retained,ordinaryAudience({channel:'D0FIXTURE1',threadTs:'1791417600.000002'}),'707-Labs/new-app',new AbortController().signal,()=>{})).ok).toBeFalse();
+  }
+});
+
+test('absent standing flag preserves legacy ordinary DM and foreign ingress never obtains a capability',async()=>{
+  let seen:any,calls=0;
+  const legacy=engineeringFixture({conversation:{ready:()=>true,close:()=>({drained:true}),async respond(input,deliver){seen=input;await deliver('ordinary reply');}}});
+  await legacy.service.start();await legacy.fake.emit(dm({text:'Fix 707-Labs/new-app'}));expect(seen.engineering).toBeUndefined();expect(legacy.requests).toEqual([]);
+  const f=engineeringFixture({standingEngineeringEnabled:true,conversation:{ready:()=>true,close:()=>({drained:true}),async respond(){calls++;}}});await f.service.start();
+  for(const event of [{user:GARY_SLACK.benId},{channel:'D0FOREIGN'},{channel_type:'mpim'},{bot_id:'B0BOT123'},{subtype:'message_changed'},{team:'T0FOREIGN'}])await f.fake.emit(dm({text:'Fix 707-Labs/new-app',...event}));
+  for(const payload of [{team_id:'T0FOREIGN'},{api_app_id:'A0FOREIGN'},{context_team_id:'T0FOREIGN'},{is_ext_shared_channel:true}])await f.fake.emit(dm({text:'Fix 707-Labs/new-app'},payload));
+  expect(calls).toBe(0);expect(f.requests).toEqual([]);
+});
+
+test('standing admission snapshots authenticated envelope before asynchronous health and receipt callbacks cannot wake early',async()=>{
+  let checking=false,entered!:()=>void,release!:()=>void,wakes=0;
+  const waiting=new Promise<void>(r=>entered=r),gate=new Promise<void>(r=>release=r);
+  const original='Fix the test failure in 707-Labs/new-app';
+  let f:ReturnType<typeof engineeringFixture>;
+  f=engineeringFixture({standingEngineeringEnabled:true,checkHostHealth:async()=>{if(checking){entered();await gate;}return healthy;},
+    conversation:{ready:()=>true,close:()=>({drained:true}),async respond(input,deliver,signal){
+      expect(input.text).toBe(original);expect(input.channel).toBe('D0FIXTURE1');expect(input.eventId).toBe('EvFixture1');
+      expect((await submitConversationEngineering(input.engineering,ordinaryAudience(input),'707-Labs/new-app',signal,()=>{})).ok).toBeTrue();
+      expect(wakes).toBe(0);expect(f.fake.sends).toHaveLength(1);await deliver('Queued.');input.onEngineeringOutcome?.('reply_committed');
+    }}},async request=>{const receipt=f.issue(request);await f.service.deliverEngineeringReceipt(receipt);expect(wakes).toBe(0);return receipt;});
+  f.ingress.start=()=>{wakes++;};await f.service.start();checking=true;
+  const envelope=dm({text:original}),running=f.fake.emit(envelope);await waiting;
+  Object.assign(envelope.payload.event,{text:'Fix 707-Labs/other',channel:'D0FOREIGN',user:GARY_SLACK.benId});envelope.payload.event_id='EvChanged';
+  release();await running;expect(wakes).toBe(1);expect(f.requests).toHaveLength(1);
+  expect(f.requests[0]!.task).toBe(original);expect(f.requests[0]!.authority.requesterId).toBe(GARY_SLACK.tannerId);
+  expect(f.fake.sends.at(-1)!.channel).toBe('D0FIXTURE1');
+});
+
+test('real conversation committed answer permits wake; swallowed clean error notice cancels pending; unknown cleanup stays fenced',async()=>{
+  for(const result of ['answer','clean_error','unknown_cleanup'] as const) {
+    const dir=realpathSync(mkdtempSync(join(tmpdir(),'gary-standing-conversation-')));cleanups.push(()=>rmSync(dir,{recursive:true,force:true}));
+    const config={version:1 as const,runId:'standing-conversation',campaignId:'standing-conversation',allocationId:'local:standing-conversation',contextDirectory:dir};
+    const ledger=new SpendLedger(':memory:');cleanups.push(()=>ledger.close());ledger.createCampaign(config.campaignId,5);ledger.enrollTicket(config.campaignId,config.allocationId,5);
+    let wakes=0,cancels=0;
+    const conversation=createSlackConversation({config,ledger,reply:async turn=>{
+      expect((await submitConversationEngineering(turn.engineering,turn.authority!,'707-Labs/new-app',turn.signal,turn.assertActive)).ok).toBeTrue();
+      if(result!=='answer')throw new DMReplyError('dm_reply_rejected',result==='clean_error');
+      return 'Engineering task is queued.';
+    }});cleanups.push(()=>{conversation.close();});
+    const f=engineeringFixture({standingEngineeringEnabled:true,conversation});
+    f.ingress.start=()=>{wakes++;};f.ingress.cancelPending=receipt=>{expect(receipt.taskId).toBe('engineering-offline-fixture');cancels++;};
+    await f.service.start();await f.fake.emit(dm({text:'Fix 707-Labs/new-app'}));
+    expect(f.requests).toHaveLength(1);expect(wakes).toBe(result==='answer'?1:0);expect(cancels).toBe(result==='clean_error'?1:0);
+    const context=new Database(join(dir,'context.sqlite'),{readonly:true});
+    expect(context.query('SELECT state,cleanup FROM events').get()).toEqual({state:result==='answer'?'sent':'failed',cleanup:result==='unknown_cleanup'?0:1});context.close();
+    if(result!=='answer')expect(f.fake.sends.at(-1)!.text).toContain('worker has not started');
+    if(result==='clean_error')expect(conversation.ready()).toBeTrue(); // Global readiness cannot distinguish this failed turn.
+    await f.service.deliverEngineeringReceipt(f.issue(f.requests[0]!));expect(wakes).toBe(result==='answer'?1:0);
+  }
+});
 
 test('engineering claims the authenticated message before admission, dedupes events/messages, and skips chat budget',async()=>{
   let release!:()=>void,entered!:()=>void;const gate=new Promise<void>(r=>release=r),started=new Promise<void>(r=>entered=r);

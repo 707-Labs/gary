@@ -135,7 +135,7 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
       }
       safeText(JSON.stringify(turn.history), p.maxContextBytes);
       safeText(JSON.stringify(expected), p.maxContextBytes + p.maxInputBytes + 128); guard();
-      const tools = freeze(structuredClone(deps.projects.toolsFor(authority))) as ProjectToolDefinition[];
+      const tools = freeze(structuredClone(deps.projects.toolsFor(authority, turn.engineering))) as ProjectToolDefinition[];
       if (!Array.isArray(tools) || tools.length < 1 || tools.length > 16
         || tools.some(t => !object(t) || Object.keys(t).length !== 2 || t.type !== 'function' || !object(t.function)
           || Object.keys(t.function).some(k => !['name', 'description', 'parameters'].includes(k))
@@ -147,7 +147,8 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
       const context = await deps.projects.context(authority, signal); guard();
       if (typeof context !== 'string') fail('project_context_rejected'); safeText(context, p.maxProjectContextBytes);
       const reference = { role: 'user', content: JSON.stringify({ kind: 'project_reference_data', dataOnly: true, content: context }) };
-      const hostSystem = systemPrompt(authority.surface);
+      const hostSystem = systemPrompt(authority.surface) + (names.has('engineering_submit')
+        ? '\nFor a direct engineering request naming one 707-Labs repository in the current owner message, use engineering_submit under the standing host policy without asking for that existing permission again. Pass only that repository. The host forwards the original message and enforces scope, budget and stops. If it asks for clarification, ask for the missing repository or action. A queued receipt means admitted, not started; never infer execution or completion from an acknowledgement.' : '');
       const checkContext = () => { safeText(JSON.stringify([reference, ...expected]), p.maxContextBytes); };
       const fitToolResult = (raw: string, callId: string, ok: boolean): { content: string; truncated: boolean } => {
         const fits = (content: string) => Buffer.byteLength(JSON.stringify([reference, ...expected,
@@ -255,7 +256,8 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
             // Consume before execution: cancellation, errors and repeats can never repeat a mutation.
             pending.delete(body.callId as string); toolCalls++;
             const result = await deps.projects.execute({ audience: authority, requestId: turn.requestId + ':' + body.callId,
-              toolName: call.name, args: freeze(JSON.parse(call.arguments)), signal });
+              toolName: call.name, args: freeze(JSON.parse(call.arguments)), signal,
+              ...(turn.engineering ? { engineering: turn.engineering, assertActive: guard } : {}) });
             guard();
             if (!object(result) || typeof result.ok !== 'boolean' || result.dataOnly !== true) fail('project_tool_result_rejected');
             const rawContent = safeText(JSON.stringify(result), p.maxToolResultBytes);

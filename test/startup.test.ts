@@ -24,6 +24,11 @@ import type { EngineeringReceipt } from '../src/slack/service.ts';
 import type { EngineeringRuntimeConfig, EngineeringAuthorityReceipt } from '../src/hermes/engineering-config.ts';
 import type { EngineeringRuntimeOptions } from '../src/hermes/engineering-runtime.ts';
 import type { EngineeringContinuationBaseline } from '../src/hermes/engineering-continuation-budget.ts';
+import { createStandingEngineeringBudget } from '../src/hermes/engineering-standing-budget.ts';
+import { createStandingEngineeringFundingGuard } from '../src/hermes/engineering-standing-funding.ts';
+import { openEngineeringRoutineServices } from '../src/hermes/engineering-routine-composition.ts';
+import { ENGINEERING_ROUTINE_TOOLS_SHA256, type StandingEngineeringRuntimeConfig } from '../src/hermes/standing-engineering-config.ts';
+import { ENGINEERING_WORKER_IMAGE } from '../src/hermes/engineering-native-launcher.ts';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -551,5 +556,186 @@ test('engineering continuation rejects another ledger or invalid admission befor
     await expect(main({...deps,runLoop:async()=>{polls++;}})).rejects.toThrow(mode==='ledger'?'engineering_continuation_ledger_mismatch':'fixture_continuation_revoked');
     expect(factories).toBe(0);expect(polls).toBe(0);expect(f.stats().started).toBe(false);expect(f.budgets).toEqual([]);expect(f.networkCalls()).toBe(0);
     expect(()=>lstatSync(join(f.root,'engineering.sqlite'))).toThrow();
+  }
+});
+
+/** Real config/funding/conversation composition, with only external execution mocked. */
+function standingStartupFixture(enroll=true) {
+  const f=engineeringStartupFixture(),hash=(text:string)=>createHash('sha256').update(text).digest('hex');
+  const write=(path:string,value:unknown)=>{const text=JSON.stringify(value);writeFileSync(path,text,{mode:0o600});return hash(text);};
+  const projectDir=join(f.root,'..','standing-projects');mkdirSync(projectDir,{mode:0o700});
+  const projectPath=join(projectDir,'config.json'),projectSha=write(projectPath,{version:1,teamId:GARY_SLACK.teamId,ownerUserId:GARY_SLACK.tannerId,
+    memoryPath:join(projectDir,'project-memory.sqlite'),projects:[{id:'gary-role',repo:'707-Labs/gary',teamKey:'GARY',label:'Gary',summary:'Synthetic context only.',sharedChannelIds:[]}]});
+  const authoritySha=write(f.authorityPath,{version:1,kind:'standing_engineering_authority',grantId:'standing-grant',requesterId:GARY_SLACK.tannerId,teamId:GARY_SLACK.teamId,
+    sourceThreadId:'offline-startup-fixture',userApprovalEvidenceSha256:'a'.repeat(64),scope:'707-Labs-existing-app-isolated-engineering',ordinaryOwnerDMTasks:true,mergeAllowed:false,deploymentAllowed:false});
+  const aggregatePath=join(f.root,'aggregate.json'),fundingAuthorityPath=join(f.root,'funding.json'),fundingHoldReceiptPath=join(f.root,'hold.json');
+  const ledgerPath=join(f.config.gary.stateDir,'spend.db');
+  const funding={version:1 as const,poolId:'standing-engineering-startup',campaignId:'standing-engineering-startup-campaign',capMicros:6_000_000,taskCapMicros:3_000_000,
+    authoritySha256:'',holdReceiptSha256:''};
+  funding.authoritySha256=write(fundingAuthorityPath,{version:1,kind:'standing_engineering_funding',approved:true,poolId:funding.poolId,campaignId:funding.campaignId,
+    capMicros:funding.capMicros,taskCapMicros:funding.taskCapMicros,aggregatePath,ledgerPath,approvalEvidenceSha256:'b'.repeat(64),aggregateBeforeRuntimePoolMicros:60_000_000,additionalRuntimePoolMicros:0});
+  const before={schemaVersion:2,totalCeilingUsd:100,runtimePoolUsd:60,other90HoldUsd:30,bufferHoldUsd:10,runtimeCommittedOrHeldUsd:50,runtimeUnallocatedUsd:10,
+    totalCommittedOrHeldUsd:90,runtimeUnknownHoldsUsd:4.5,runtimeAuthorizationRetiredUsd:0,runtimeAllocations:[{id:'historical',amountUsd:50,retainedAmountUsd:50,
+      retiredUnusedAuthorizationUsd:0,retainedUnknownCostsUsd:4.5,admission:{kind:'classifier_canary',commonfieldEarmarkMicros:3000000}}]};
+  const beforePath=join(f.root,'funding-before.json'),beforeSha=write(beforePath,before);
+  const hold={id:'standing-engineering:'+funding.poolId,amountUsd:6,state:'held_for_standing_engineering',retainedAmountUsd:6,retiredUnusedAuthorizationUsd:0,retainedUnknownCostsUsd:0,
+    admission:{kind:'standing_engineering',poolId:funding.poolId,campaignId:funding.campaignId,capMicros:funding.capMicros,taskCapMicros:funding.taskCapMicros,
+      authoritySha256:funding.authoritySha256,ledgerPath,auditRecord:fundingHoldReceiptPath,aggregateBeforeSha256:beforeSha}};
+  const after={...before,runtimeAllocations:[...before.runtimeAllocations,hold],runtimeCommittedOrHeldUsd:56,runtimeUnallocatedUsd:4,totalCommittedOrHeldUsd:96,bookkeepingUpdatedAt:'2026-10-11T01:00:00Z'};
+  const afterPath=join(f.root,'funding-after.json'),afterSha=write(afterPath,after);write(aggregatePath,after);
+  funding.holdReceiptSha256=write(fundingHoldReceiptPath,{version:1,kind:'standing_engineering_hold',poolId:funding.poolId,campaignId:funding.campaignId,
+    capMicros:funding.capMicros,taskCapMicros:funding.taskCapMicros,authoritySha256:funding.authoritySha256,aggregatePath,ledgerPath,
+    before:{path:beforePath,sha256:beforeSha},after:{path:afterPath,sha256:afterSha},aggregateBeforeRuntimePoolMicros:60_000_000,additionalRuntimePoolMicros:0});
+  const old=f.engineeringConfig;
+  const config:StandingEngineeringRuntimeConfig={version:1,kind:'standing_engineering',grantId:'standing-grant',sourceRevision:old.sourceRevision,authoritySha256:authoritySha,
+    requesterId:GARY_SLACK.tannerId,teamId:GARY_SLACK.teamId,organization:'707-Labs',surface:'private_dm',repositoryAccess:'current_existing_github_app',
+    root:old.root,workspacesRoot:old.workspacesRoot,deadlineMs:old.deadlineMs,workerImage:ENGINEERING_WORKER_IMAGE,executorImage:old.executorImage,bunCacheVolume:old.bunCacheVolume,
+    dockerExecutable:old.dockerExecutable,dockerSocketPath:old.dockerSocketPath,runtimeFiles:[...old.runtimeFiles],resourceLock:old.resourceLock!,
+    funding,fundingAuthorityPath,fundingHoldReceiptPath,aggregatePath,publication:'patch_only',mergeAllowed:false,deploymentAllowed:false};
+  const configSha=write(f.configPath,config);
+  const {GARY_ENGINEERING_CONFIG:_config,GARY_ENGINEERING_CONFIG_SHA256:_sha,GARY_ENGINEERING_AUTHORITY_RECEIPT:_authority,
+    GARY_ENGINEERING_AUTHORITY_RECEIPT_SHA256:_authoritySha,...prior}=f.env;
+  const env={...prior,GARY_STANDING_ENGINEERING_CONFIG:f.configPath,GARY_STANDING_ENGINEERING_CONFIG_SHA256:configSha,
+    GARY_STANDING_ENGINEERING_AUTHORITY:f.authorityPath,GARY_STANDING_ENGINEERING_AUTHORITY_SHA256:authoritySha,
+    GARY_PROJECT_ASSISTANT_CONFIG:projectPath,GARY_PROJECT_ASSISTANT_CONFIG_SHA256:projectSha};
+  if(enroll){const pool=createStandingEngineeringBudget({ledger:f.ledger,authority:funding,
+    assertAuthority:createStandingEngineeringFundingGuard({authority:funding,fundingAuthorityPath,fundingHoldReceiptPath,aggregatePath,ledgerPath})});pool.enrollPool();pool.close();}
+  f.ledger.markTerminal(old.allocationId,'historical_acceptance_closed');
+  f.ledger.createCampaign('historical-ert',5.65);f.ledger.enrollTicket('historical-ert',issueId,5.65);f.ledger.markTerminal(issueId,'historical_ert_closed');
+  let options:EngineeringRuntimeOptions|undefined,busy=false,starts=0,admissions=0,runtimeFactories=0;
+  const receipts=new Set<string>();
+  const deps:StartupDependencies={...f.deps,env,engineering:{createRuntime:value=>{
+    runtimeFactories++;options=value;expect(value.standing).toBeDefined();expect(value.continuationBaseline).toBeUndefined();value.assertGrant();value.assertBudget();
+    return{ready:()=>true,busy:()=>busy,async stop(){},ingress:{async admit(request,_signal,available){
+      expect(available()).toBeTrue();value.assertBudget();expect(request.repository).toBe('707-Labs/unregistered-app');
+      expect(request.task).toBe('Fix the login bug in 707-Labs/unregistered-app');
+      value.standing!.budget.allocate({requestId:request.requestId,requestHash:hash(JSON.stringify(request)),taskId:'standing-startup-task'});
+      busy=true;admissions++;const receipt:EngineeringReceipt={requestId:request.requestId,taskId:'standing-startup-task',receiptId:'standing-startup-admission',phase:'admitted',status:'queued',text:'Task queued.'};
+      receipts.add(JSON.stringify(receipt));return receipt;},verifyReceipt:r=>receipts.has(JSON.stringify(r)),start(receipt){
+        expect(receipts.has(JSON.stringify(receipt))).toBeTrue();value.assertExecutionReady!();starts++;
+      }}};
+  }}};
+  return{...f,deps,env,standingConfig:config,get options(){return options;},counts:()=>({starts,admissions,runtimeFactories})};
+}
+
+test('standing startup never autoenrolls or ignores missing funding before ingress',async()=>{
+  for(const mode of ['not_enrolled','missing_hold'] as const){
+    const f=standingStartupFixture(false);if(mode==='missing_hold')rmSync(f.standingConfig.fundingHoldReceiptPath);
+    let polls=0;await expect(main({...f.deps,runLoop:async()=>{polls++;}})).rejects.toThrow();
+    expect(f.counts()).toEqual({starts:0,admissions:0,runtimeFactories:0});expect(polls).toBe(0);expect(f.stats().started).toBeFalse();
+    const db=new Database(join(f.config.gary.stateDir,'spend.db'),{readonly:true});
+    expect(db.query("SELECT 1 FROM spend_campaigns WHERE id=?").get(f.standingConfig.funding.campaignId)).toBeNull();
+    expect(db.query("SELECT 1 FROM sqlite_master WHERE name='standing_engineering_pools'").get()).toBeNull();db.close();
+    expect(f.networkCalls()).toBe(0);
+  }
+});
+
+test('standing startup admits beyond closed ERT history and drains both preexisting conversations before engineering start',async()=>{
+  const f=standingStartupFixture(),deferred=()=>{let resolve!:()=>void;const promise=new Promise<void>(r=>resolve=r);return{promise,resolve};};
+  const firstEntered=deferred(),firstRelease=deferred(),secondEntered=deferred(),secondRelease=deferred();
+  let receive:Parameters<SlackTransport['start']>[0]=()=>{},launches=0,providerCalls=0;const posts:string[]=[];
+  const originalStart=f.transport.start;f.transport.start=async(handler,signal)=>{receive=handler;await originalStart(handler,signal);};
+  f.transport.sendMessage=async input=>{posts.push(input.text);return{ok:true,channel:input.channel,ts:'1791452000.000010'};};
+  const modelReply=(content:unknown[])=>Response.json({id:'standing-fixture-'+providerCalls,type:'message',role:'assistant',model:'deepseek-v4-pro',content,
+    stop_reason:providerCalls===1?'tool_use':'end_turn',usage:{input_tokens:30,output_tokens:10,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+  await main({...f.deps,fetch:(async()=>{providerCalls++;return modelReply(providerCalls===1
+    ?[{type:'tool_use',id:'submit_task',name:'engineering_submit',input:{repository:'707-Labs/unregistered-app'}}]
+    :[{type:'text',text:providerCalls===2?'Your task is queued.':'Second conversation complete.'}]);}) as unknown as typeof fetch,
+    launch:async(m,handle)=>{
+      launches++;const ordinal=launches;expect(m.tools.some(t=>t.function.name==='engineering_submit')).toBeTrue();
+      if(ordinal===1){firstEntered.resolve();await firstRelease.promise;}else{secondEntered.resolve();await secondRelease.promise;}
+      const history:any[]=[...(m.history??[]),{role:'user',content:m.prompt}];
+      const rpc=(path:string,value:unknown)=>handle(new Request('http://127.0.0.1'+path,{method:'POST',headers:{authorization:'Bearer '+m.capability,'content-type':'application/json'},body:JSON.stringify(value)}));
+      for(let i=0;i<(ordinal===1?2:1);i++){
+        const reply=await rpc('/v1/chat/completions',{model:m.model,messages:[{role:'system',content:m.systemPrompt},...history],max_tokens:m.maxTokens,temperature:m.temperature,tools:m.tools,stream:false});
+        expect(reply.ok).toBeTrue();const message=(await reply.json() as any).choices[0].message;history.push(message);
+        for(const call of message.tool_calls??[]){const result:any=await(await rpc('/tools/execute',{taskId:m.taskId,ownerEpoch:m.ownerEpoch,token:m.capability,
+          callId:call.id,name:call.function.name,arguments:JSON.parse(call.function.arguments)})).json();expect(JSON.parse(result.content).ok).toBeTrue();history.push({role:'tool',tool_call_id:call.id,content:result.content});}
+      }
+      return{taskId:m.taskId,requestId:m.requestId,status:'no_finish',publicationApproved:false,history};
+    },runLoop:async args=>{
+      upsertTicket(args.db,{linearId:issueId,identifier:'ERT-3434'});expect(args.spend!.status(issueId)?.terminalReason).toBe('historical_ert_closed');
+      expect(f.options!.standing!.budget.status()).toMatchObject({enrolled:true,committedCapMicros:0});
+      args.db.query(`INSERT INTO gary_slack_outbox(delivery_key,kind,request_id,app_id,team_id,bot_user_id,recipient_id,target_channel,content_sha256,claim_id,status,claimed_at,slack_channel)
+        VALUES(?,'ready','fixture',?,?,?,?,?,'fixture','fixture','sent','fixture',?)`).run(`ready:${GARY_SLACK.readyRequest}:${GARY_SLACK.appId}:${GARY_SLACK.teamId}:${GARY_SLACK.tannerId}`,
+          GARY_SLACK.appId,GARY_SLACK.teamId,GARY_SLACK.botUserId,GARY_SLACK.tannerId,'D0FIXTURE1','D0FIXTURE1');
+      const emit=(n:number,text:string)=>Promise.resolve(receive({type:'events_api',payload:{type:'event_callback',api_app_id:GARY_SLACK.appId,team_id:GARY_SLACK.teamId,event_id:'EvStanding'+n,
+        event:{type:'message',channel:'D0FIXTURE1',channel_type:'im',user:GARY_SLACK.tannerId,ts:'1791452100.00000'+n,text}}}));
+      const first=emit(1,'Fix the login bug in 707-Labs/unregistered-app');await firstEntered.promise;
+      const second=emit(2,'How are you doing?');
+      const context=new Database(join(f.env.GARY_SLACK_CONVERSATION_CONFIG,'..','context.sqlite'),{readonly:true});
+      for(let tries=0;tries<100&&(context.query('SELECT count(*) n FROM events').get() as any).n!==2;tries++)await new Promise<void>(r=>setImmediate(r));
+      expect((context.query('SELECT count(*) n FROM events').get() as any).n).toBe(2);context.close();
+      firstRelease.resolve();await secondEntered.promise;await first;
+      expect(f.counts()).toEqual({runtimeFactories:1,admissions:1,starts:0});
+      expect(()=>f.options!.assertExecutionReady!()).toThrow('standing_engineering_conversation_not_drained');
+      expect(args.beginDispatch!()).toBeNull();await emit(3,'Another message while busy');expect(launches).toBe(2);
+      secondRelease.resolve();await second;expect(f.counts()).toEqual({runtimeFactories:1,admissions:1,starts:1});
+      expect(f.options!.standing!.budget.status()).toMatchObject({committedCapMicros:3_000_000,uncommittedCapMicros:3_000_000});
+      expect(args.spend!.status(issueId)?.terminalReason).toBe('historical_ert_closed');
+      expect(args.spend!.status('allocation')?.terminalReason).toBe('historical_acceptance_closed');
+    }});
+  expect(providerCalls).toBe(3);expect(posts).toEqual(['Your task is queued.','Second conversation complete.']);expect(f.networkCalls()).toBe(0);
+},15_000);
+
+
+function routineStartupFixture(enroll = true) {
+  const f = standingStartupFixture(enroll), scopedRoot = join(realpathSync(join(f.root, '..')), 'routine-scoped'); mkdirSync(scopedRoot, { mode: 0o700 });
+  const integrityKeyPath = join(f.standingConfig.root, 'routine-key'); writeFileSync(integrityKeyPath, 'r'.repeat(32), { mode: 0o600 });
+  const extra = join(f.standingConfig.root, 'gary_engineering_task_tools.py'); writeFileSync(extra, '# fixture task tools', { mode: 0o600 });
+  const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+  const config = { ...f.standingConfig, deadlineMs: 150 * 60_000,
+    runtimeFiles: [...f.standingConfig.runtimeFiles, { path: extra, sha256: hash('# fixture task tools') }],
+    routine: { version: 1 as const, toolsProfileSha256: ENGINEERING_ROUTINE_TOOLS_SHA256, scopedRoot, integrityKeyPath,
+      integrityKeySha256: hash('r'.repeat(32)), dependencyDownloads: true as const, allowLifecycleScripts: false } as const };
+  const bytes = JSON.stringify(config); writeFileSync(f.configPath, bytes, { mode: 0o600 });
+  const env = { ...f.env, GARY_STANDING_ENGINEERING_CONFIG_SHA256: hash(bytes) };
+  return { ...f, routineConfig: config, deps: { ...f.deps, env } };
+}
+
+test('routine startup owns scoped persistence and closes it only after engineering drain', async () => {
+  const f = routineStartupFixture(), order: string[] = [];
+  let service: ReturnType<typeof openEngineeringRoutineServices> | undefined;
+  await main({ ...f.deps, engineering: { ...f.deps.engineering,
+    createRoutine(input) { service = openEngineeringRoutineServices(input); const base = service;
+      return { ...base, close() { order.push('scoped_close'); base.close(); } }; },
+    createRuntime(input) {
+      expect(input.routine).toBeDefined(); expect(input.config.deadlineMs).toBe(150 * 60_000);
+      expect('routine' in input.config && input.config.routine).toEqual(f.routineConfig.routine);
+      const runtime = f.deps.engineering!.createRuntime!(input);
+      return { ...runtime, async stop() { order.push('engineering_drained'); await runtime.stop(); } };
+    },
+  }, runLoop: async () => { expect(service).toBeDefined(); service!.assertCurrent(); } });
+  expect(order.at(-1)).toBe('scoped_close'); expect(order.slice(0, -1).every(value => value === 'engineering_drained')).toBeTrue();
+  expect(() => service!.assertCurrent()).toThrow('closed'); expect(f.networkCalls()).toBe(0);
+});
+
+test('routine startup cannot open scoped services before standing funding is enrolled', async () => {
+  const f = routineStartupFixture(false); let opened = 0;
+  await expect(main({ ...f.deps, engineering: { ...f.deps.engineering, createRoutine(input) { opened++; return openEngineeringRoutineServices(input); } },
+    runLoop: async () => { throw Error('unexpected loop'); } })).rejects.toThrow('funding_not_enrolled');
+  expect(opened).toBe(0); expect(f.networkCalls()).toBe(0);
+});
+
+test('routine startup retains private and canonical handles when physical cleanup is unknown', async () => {
+  const f = routineStartupFixture();
+  let service: ReturnType<typeof openEngineeringRoutineServices> | undefined;
+  let options: EngineeringRuntimeOptions | undefined;
+  let canonicalDb: Database | undefined, scopedCloses = 0;
+  try {
+    await expect(main({ ...f.deps, engineering: { ...f.deps.engineering,
+      createRoutine(input) { service = openEngineeringRoutineServices(input); const base = service;
+        return { ...base, close() { scopedCloses++; base.close(); } }; },
+      createRuntime(input) { options = input; const base = f.deps.engineering!.createRuntime!(input);
+        return { ...base, async stop() { throw Error('engineering_runtime:shutdown_cleanup_unknown'); } }; },
+    }, runLoop: async args => { canonicalDb = args.db; } })).rejects.toThrow('shutdown_cleanup_unknown');
+    expect(scopedCloses).toBe(0); expect(f.order).not.toContain('ledger');
+    expect(options!.journalDb.query('SELECT 1 n').get()).toEqual({ n: 1 });
+    expect(options!.spendDb.query('SELECT 1 n').get()).toEqual({ n: 1 });
+    expect(canonicalDb!.query('SELECT 1 n').get()).toEqual({ n: 1 });
+  } finally {
+    // This fixture never launches a writer; dispose only its temp handles after
+    // proving production shutdown deliberately retained them.
+    service?.close(); options?.journalDb.close(); options?.spendDb.close(); canonicalDb?.close(); f.ledger.close();
   }
 });

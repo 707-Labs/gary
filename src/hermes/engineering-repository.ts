@@ -209,6 +209,44 @@ export function createEngineeringGitHubRepositoryServices(input: {
   };
 }
 
+/** Pin the default branch's current commit from the same authenticated App
+ * repository observation. No task text can choose an API URL or credential. */
+export async function resolveEngineeringDefaultBase(input: {
+  resolution: EngineeringRepositoryResolution; getCredential(repo: string): Promise<EngineeringAppCredential>;
+  fetch: typeof fetch; now?: () => number;
+}): Promise<Readonly<{ branch: string; commit: string }>> {
+  const options = bindings.get(input.resolution);
+  if (!options) fail('untrusted_resolution');
+  const now = input.now ?? Date.now, repo = input.resolution.repository;
+  const auth = credential(await input.getCredential(repo.repo), options.binding, now());
+  const read = async (suffix: string): Promise<Record<string, unknown>> => {
+    const response = await input.fetch(`https://api.github.com/repos/${repo.repo}${suffix}`, {
+      method: 'GET', redirect: 'error', credentials: 'omit', signal: AbortSignal.timeout(15_000),
+      headers: { Authorization: `Bearer ${auth.token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' },
+    });
+    if (response.status !== 200 || response.redirected || !response.body) fail('base_unavailable');
+    const reader = response.body.getReader(), chunks: Uint8Array[] = []; let size = 0;
+    try {
+      for (;;) { const next = await reader.read(); if (next.done) break;
+        if ((size += next.value.byteLength) > 256 * 1024) { await reader.cancel(); fail('base_response_limit'); }
+        chunks.push(next.value);
+      }
+    } finally { reader.releaseLock(); }
+    const value: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) fail('base_unavailable');
+    return value as Record<string, unknown>;
+  };
+  try {
+    const metadata = await read('');
+    if (metadata.id !== repo.repositoryId || metadata.full_name !== repo.repo || metadata.archived !== false
+        || metadata.disabled !== false || typeof metadata.default_branch !== 'string' || !isSafeGitBranch(metadata.default_branch)) fail('repository_changed');
+    const head = await read('/branches/' + encodeURIComponent(metadata.default_branch));
+    const commit = head.commit as Record<string, unknown> | undefined;
+    if (head.name !== metadata.default_branch || !commit || typeof commit.sha !== 'string' || !SHA.test(commit.sha)) fail('base_unavailable');
+    return Object.freeze({ branch: metadata.default_branch, commit: commit.sha });
+  } catch { return fail('base_unavailable'); }
+}
+
 export interface EngineeringRepositoryGitInvocation {
   readonly cwd: string; readonly args: readonly string[]; readonly deadlineMs: number;
 }
@@ -297,6 +335,9 @@ export interface EngineeringCloneReceipt {
 
 export async function acquireEngineeringRepository(input: {
   taskId: string; resolution: EngineeringRepositoryResolution; base: { branch: string; commit: string };
+  /** Fresh verifier reuses the host-observed immutable base even if the default
+   * branch advances while the author works. Never selected by model input. */
+  pinnedCommit?: true;
   workspaceRoot: string; deadlineMs: number; git: EngineeringRepositoryGitRunner;
   getCredential(repo: string): Promise<EngineeringAppCredential>;
   assertOwner(): void; append(receipt: Readonly<EngineeringCloneReceipt>): void;
@@ -331,7 +372,8 @@ export async function acquireEngineeringRepository(input: {
     await run(['remote', 'add', 'origin', cleanUrl]);
     const auth = credential(await input.getCredential(current.repository.repo), options.binding, now());
     if (auth.permissions.contents !== current.repository.contents || auth.permissions.pullRequests !== current.repository.pullRequests) fail('credential_permissions_changed');
-    await run(['fetch', '--quiet', '--no-tags', '--no-recurse-submodules', '--depth=1', 'origin', `refs/heads/${input.base.branch}`],
+    await run(['fetch', '--quiet', '--no-tags', '--no-recurse-submodules', '--depth=1', 'origin',
+      input.pinnedCommit ? input.base.commit : `refs/heads/${input.base.branch}`],
       `Authorization: Basic ${Buffer.from(`x-access-token:${auth.token}`).toString('base64')}`);
     if ((await run(['rev-parse', '--verify', 'FETCH_HEAD^{commit}'])).stdout.trim() !== input.base.commit) fail('base_changed');
     await run(['checkout', '--quiet', '--detach', input.base.commit, '--']);

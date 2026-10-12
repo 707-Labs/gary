@@ -17,6 +17,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+import uuid
 from unittest.mock import patch
 
 PROTOCOL = "gary.engineering.v1"
@@ -91,6 +92,7 @@ def scoped_home(root, *, restore=False):
         raise EngineeringFault("invalid_scoped_home")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     previous, previous_cwd = dict(os.environ), os.getcwd()
+    previous_umask = os.umask(0o077)
     for name in ("home", "hermes", "plugins", "config", "cache", "data", "tmp", "work"):
         path = root / name
         if path.is_symlink():
@@ -127,6 +129,7 @@ def scoped_home(root, *, restore=False):
         yield
     finally:
         os.chdir(previous_cwd)
+        os.umask(previous_umask)
         os.environ.clear()
         if restore:
             os.environ.update(previous)
@@ -168,7 +171,7 @@ class ScopedNativeContext:
     """
 
     def __init__(self, *, scope_key, tools, approved_skills=None, draft_skills=None,
-                 memory_dir=None, session_db=None, advanced_adapters=None):
+                 memory_dir=None, session_db=None, advanced_adapters=None, owns_session_db=False):
         self.scope_key = _id(scope_key, "scope_key")
         self.tools = frozenset(tools)
         if not self.tools <= NATIVE_MODULES.keys() - NATIVE_TOOLS:
@@ -176,6 +179,9 @@ class ScopedNativeContext:
         self.approved_skills, self.draft_skills = approved_skills, draft_skills
         self.memory_dir, self.session_db = memory_dir, session_db
         self.advanced_adapters = advanced_adapters or {}
+        self.owns_session_db = owns_session_db
+        self._database_closed = False
+        self._database_checkpointed = False
         self.dispatch_kwargs = {}
         self.todo_store = self.memory_store = None
 
@@ -248,13 +254,16 @@ class ScopedNativeContext:
                 skills._SKILLS_CACHE.clear()
                 stack.callback(skills._SKILLS_CACHE.clear)
                 stack.callback(skills.reset_skill_view_dedup, session.binding["taskId"])
+            installed = set()
             for tool in self.tools & {"delegate_task", "execute_code"}:
                 adapter = self.advanced_adapters.get(tool)
                 if adapter is None or getattr(adapter, "scope_key", None) != self.scope_key:
                     raise EngineeringFault("missing_scoped_" + tool + "_adapter")
                 # Adapter installs a native dispatch seam, never a replacement
                 # registry handler. It must account for every child/model call.
-                stack.enter_context(adapter.install(session))
+                if id(adapter) not in installed:
+                    stack.enter_context(adapter.install(session))
+                    installed.add(id(adapter))
             yield
 
     def configure_agent(self, agent):
@@ -265,8 +274,77 @@ class ScopedNativeContext:
             agent._memory_manager = None  # no external provider synchronization
         if "session_search" in self.tools:
             agent._get_session_db_for_recall = lambda: self.session_db
-        for adapter in self.advanced_adapters.values():
+        if self.session_db is not None:
+            agent._session_db = self.session_db
+            agent._owns_session_db = False
+            agent._persist_disabled = False
+        for adapter in {id(v): v for v in self.advanced_adapters.values()}.values():
             adapter.configure_agent(agent)
+
+    def close(self):
+        """Close the exact materialized database before the host snapshots it."""
+        if self.owns_session_db and not self._database_closed:
+            self.session_db.close()
+            self._database_closed = True
+        if self.owns_session_db and not self._database_checkpointed:
+            # Native close releases its readers/writer. Explicitly checkpoint
+            # the selected DB only; do not copy or discard a surviving WAL.
+            import sqlite3
+            path = Path(self.session_db.db_path)
+            if path.is_symlink() or path.resolve() != path:
+                raise EngineeringFault("scoped_session_identity_changed")
+            path.chmod(0o600)
+            db = sqlite3.connect(str(path), timeout=1)
+            try:
+                row = db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if row is None or row[0] != 0:
+                    raise EngineeringFault("scoped_session_checkpoint_busy")
+            finally:
+                db.close()
+            if any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm")):
+                raise EngineeringFault("scoped_session_checkpoint_incomplete")
+            if self.memory_dir:
+                for name in ("MEMORY.md", "USER.md"):
+                    memory = Path(self.memory_dir) / name
+                    if memory.is_symlink():
+                        raise EngineeringFault("scoped_memory_identity_changed")
+                    if memory.exists():
+                        memory.chmod(0o600)
+            self._database_checkpointed = True
+
+
+def native_context_from_start(value, home):
+    """Only the launcher selects these paths, never native/model arguments."""
+    if not isinstance(value, dict) or set(value) != {"version", "scopeKey", "tools", "delegationDepth", "confinedCode"} or value["version"] != 1 or type(value["confinedCode"]) is not bool:
+        raise EngineeringFault("invalid_native_context")
+    tools = value["tools"]
+    if not isinstance(tools, list) or any(not isinstance(t, str) for t in tools) or len(set(tools)) != len(tools) or not set(tools) <= NATIVE_MODULES.keys() - NATIVE_TOOLS:
+        raise EngineeringFault("invalid_native_context_tools")
+    if type(value["delegationDepth"]) is not int or value["delegationDepth"] not in (0, 1):
+        raise EngineeringFault("invalid_delegation_depth")
+    if value["delegationDepth"] and "delegate_task" in tools:
+        raise EngineeringFault("child_delegation_denied")
+    if "execute_code" in tools and not value["confinedCode"]:
+        raise EngineeringFault("code_requires_isolated_native_worker")
+    root = ScopedNativeContext._directory(home)
+    memory = ScopedNativeContext._directory(root / "hermes" / "memory")
+    db_path = root / "hermes" / "session.sqlite"
+    if db_path.is_symlink() or db_path.resolve() != db_path:
+        raise EngineeringFault("invalid_scoped_session_path")
+    from hermes_state import SessionDB
+    adapters = {}
+    if set(tools) & {"delegate_task", "execute_code"}:
+        from gary_engineering_task_tools import NativeTaskTools
+        adapter = NativeTaskTools(scope_key=value["scopeKey"], delegation_depth=value["delegationDepth"], confined_code=value["confinedCode"])
+        adapters = {name: adapter for name in set(tools) & {"delegate_task", "execute_code"}}
+    db = SessionDB(db_path=db_path)
+    try:
+        return ScopedNativeContext(scope_key=value["scopeKey"], tools=tools,
+            approved_skills="/task/skills-approved", draft_skills="/task/skill-drafts",
+            memory_dir=memory, session_db=db, advanced_adapters=adapters, owns_session_db=True)
+    except BaseException:
+        db.close()
+        raise
 
 
 class EngineeringSession:
@@ -291,6 +369,8 @@ class EngineeringSession:
         self._sequence = 0
         self._rpc_lock = threading.Lock()
         self._tool_lock = threading.Lock()
+        self._code_tool_lock = threading.Lock()
+        self._code_invocation = None
         self._fenced = False
         self._closed = False
         self.environment = None
@@ -363,7 +443,135 @@ class EngineeringSession:
             "operation": operation, "arguments": arguments,
         }, cleanup=operation == "cancel")
         admission["receipts"].append(reply["receiptId"])
+        if admission.get("codeInvocationId"):
+            self._code_invocation["receipts"].append(reply["receiptId"])
         return reply
+
+    def begin_code(self, source, cleanup_guard=None):
+        parent = _ADMISSION.get()
+        if (not parent or parent["session"] is not self or not parent["active"]
+                or parent["toolName"] != "execute_code" or parent["args"] != {"code": source}
+                or self._code_invocation is not None or parent.get("codeConsumed")):
+            raise EngineeringFault("unbound_code_invocation")
+        parent["codeConsumed"] = True
+        ids = {"toolCallId": parent["toolCallId"], "admissionId": parent["admissionId"]}
+        authorized = self._send("code.authorize", dict(ids, codeHash=digest(source)))
+        tools = authorized.get("allowedTools")
+        if (authorized.get("deadlineMs") != self.deadline_ms or not isinstance(tools, list)
+                or not set(tools) <= NATIVE_TOOLS or len(set(tools)) != len(tools)):
+            raise EngineeringFault("invalid_code_authorization")
+        parent["receipts"].append(authorized["receiptId"])
+        started = self._send("code.start", dict(ids, codeCapability=_id(authorized.get("codeCapability"), "code_capability")))
+        parent["receipts"].append(started["receiptId"])
+        self._code_invocation = {"id": _id(started.get("codeInvocationId"), "code_invocation"),
+            "parent": parent, "tools": frozenset(tools), "receipts": [], "calls": 0, "cleanup_guard": cleanup_guard}
+        return frozenset(tools)
+
+    def end_code(self, result, status):
+        invocation = self._code_invocation
+        if invocation is None:
+            return
+        parent = _ADMISSION.get()
+        if parent is not invocation["parent"] or not self._code_tool_lock.acquire(blocking=False):
+            self._fenced = True
+            raise EngineeringFault("code_cleanup_unconfirmed")
+        try:
+            # Exclude late buffered SDK RPC calls throughout absence checks and
+            # host completion. No inherited call can begin after this proof.
+            if invocation.get("cleanup_guard") is not None:
+                invocation["cleanup_guard"]()
+            ended = self._send("code.end", {"toolCallId": parent["toolCallId"], "admissionId": parent["admissionId"],
+                "codeInvocationId": invocation["id"], "status": status, "resultHash": digest(result),
+                "operationReceipts": list(invocation["receipts"])})
+            parent["receipts"].append(ended["receiptId"])
+            self._code_invocation = None
+        except Exception:
+            self._fenced = True
+            raise EngineeringFault("code_process_cleanup_unconfirmed")
+        finally:
+            self._code_tool_lock.release()
+
+    def inherited_middleware(self, tool_name, args, original_args, next_call, task_id, session_id):
+        """Actual native core handlers called by the confined native code SDK.
+
+        The host mints these nested admissions from the original code call;
+        they are never presented as additional model-observed tool calls.
+        """
+        parent = _ADMISSION.get()
+        invocation = self._code_invocation
+        acquired = False
+        token = None
+        nested = None
+        try:
+            self._guard()
+            if (invocation is None or invocation["parent"] is not parent or not parent["active"]
+                    or task_id != self.binding["taskId"] or session_id not in ("", self.binding["sessionId"])
+                    or tool_name not in invocation["tools"] or tool_name not in self.native_entries
+                    or not isinstance(args, dict) or args != original_args or len(canonical_json(args).encode()) > 262144):
+                raise EngineeringFault("unbound_inherited_call")
+            if tool_name == "terminal" and any(args.get(k) for k in ("background", "pty", "notify_on_complete", "watch_patterns", "force")):
+                raise EngineeringFault("inherited_process_mode_denied")
+            if args.get("cross_profile"):
+                raise EngineeringFault("cross_profile_denied")
+            entry = self.registry.get_entry(tool_name)
+            if entry is not self.native_entries[tool_name] or entry.handler is not self._handlers[tool_name]:
+                raise EngineeringFault("native_handler_changed")
+            acquired = self._code_tool_lock.acquire(blocking=False)
+            if not acquired or self._code_invocation is not invocation or invocation["calls"] >= 50:
+                raise EngineeringFault("inherited_call_limit")
+            invocation["calls"] += 1
+            call_id = "code-" + uuid.uuid4().hex
+            # Nested UUIDs have a separate per-invocation 50-call ceiling;
+            # they do not consume the observed-model-call dedupe allowance.
+            started = self._send("tool.begin", {"toolCallId": call_id, "toolName": tool_name,
+                "originalArgs": original_args, "effectiveArgs": args, "codeInvocationId": invocation["id"],
+                "parentToolCallId": parent["toolCallId"], "parentAdmissionId": parent["admissionId"]})
+            invocation["receipts"].append(started["receiptId"])
+            nested = {"session": self, "toolCallId": call_id, "toolName": tool_name, "args": copy.deepcopy(args),
+                "admissionId": _id(started.get("admissionId"), "admission_id"), "active": True,
+                "receipts": [], "codeInvocationId": invocation["id"]}
+            token = _ADMISSION.set(nested)
+            try:
+                if tool_name in NATIVE_TOOLS - {"terminal"}:
+                    from tools.terminal_tool import get_session_cwd
+                    self.environment.cwd = get_session_cwd(task_id)
+                result = next_call(copy.deepcopy(args))
+                if len(canonical_json(result).encode()) > self.max_result_bytes:
+                    raise EngineeringFault("native_result_limit")
+                status = "completed"
+            except Exception:
+                status, result = "failed", json.dumps({"error": "native_tool_failed"})
+            nested["active"] = False
+            ended = self._send("tool.end", {"toolCallId": call_id, "admissionId": nested["admissionId"],
+                "status": status, "resultHash": digest(result), "operationReceipts": list(nested["receipts"]),
+                "codeInvocationId": invocation["id"]})
+            invocation["receipts"].append(ended["receiptId"])
+            return result
+        except Exception:
+            return json.dumps({"error": "engineering_tool_blocked", "status": "blocked"})
+        finally:
+            if nested is not None:
+                nested["active"] = False
+            if token is not None:
+                _ADMISSION.reset(token)
+            if acquired:
+                self._code_tool_lock.release()
+
+    def task_rpc(self, operation, arguments):
+        admission = _ADMISSION.get()
+        if admission is None or admission["session"] is not self or not admission["active"]:
+            raise EngineeringFault("unbound_task_operation")
+        expected = {"delegate.run": "delegate_task", "code.run": "execute_code"}.get(operation)
+        if expected is None or admission["toolName"] != expected or not isinstance(arguments, dict) or "operationId" in arguments:
+            raise EngineeringFault("invalid_task_operation")
+        reply = self._send("task.operation", {"toolCallId": admission["toolCallId"],
+            "admissionId": admission["admissionId"], "operation": operation,
+            "arguments": dict(arguments, operationId=uuid.uuid4().hex)})
+        if not isinstance(reply.get("result"), dict):
+            self._fenced = True
+            raise EngineeringFault("invalid_task_result")
+        admission["receipts"].append(reply["receiptId"])
+        return copy.deepcopy(reply["result"])
 
     def middleware(self, *, tool_name, args, original_args, next_call,
                    task_id="", session_id="", tool_call_id="", **context):
@@ -373,6 +581,9 @@ class EngineeringSession:
         Consequently all pre-dispatch failures must become a terminal result.
         The environment independently enforces admission as a second boundary.
         """
+        current = _ADMISSION.get()
+        if current is not None and current.get("session") is self and current.get("toolName") == "execute_code":
+            return self.inherited_middleware(tool_name, args, original_args, next_call, task_id, session_id)
         acquired = False
         token = None
         admission = None
@@ -415,6 +626,7 @@ class EngineeringSession:
                          "admissionId": _id(reply.get("admissionId"), "admission_id"),
                          "active": True, "receipts": [], "args": copy.deepcopy(args)}
             token = _ADMISSION.set(admission)
+            status, result = "failed", json.dumps({"error": "native_tool_interrupted"})
             self.events.append({"event": "tool.begin", "toolCallId": tool_call_id, "receiptId": reply["receiptId"]})
             try:
                 if tool_name in NATIVE_TOOLS - {"terminal"}:
@@ -457,6 +669,8 @@ class EngineeringSession:
                 self._turn_tool_counts["toolFailures"] += 1
                 status, result = "failed", json.dumps({"error": "native_tool_failed"})
             finally:
+                if tool_name == "execute_code" and self._code_invocation is not None:
+                    self.end_code(result, status)
                 admission["active"] = False
             end = self._send("tool.end", {"toolCallId": tool_call_id,
                 "admissionId": admission["admissionId"], "status": status,
@@ -565,6 +779,29 @@ class EngineeringSession:
                     + schema["function"]["description"])
             if schema["function"]["name"] == "process":
                 schema["function"]["parameters"]["properties"]["action"]["enum"] = ["list", "poll", "log", "wait", "kill"]
+                schema["function"]["description"] = "Manage this task's host-owned background processes: list, poll, log, wait, or kill. Kill cancels the entire owned sandbox. Live stdin and PTY are unavailable."
+            if schema["function"]["name"] == "skill_manage":
+                schema["function"]["description"] = "Create, patch, edit, delete, write_file or remove_file in this task's skill drafts only. Approved skills remain immutable. Same-scope improvements are authorized within the task; promotion requires the host's bounded evaluation and independent review before later sessions can discover the new version."
+            if schema["function"]["name"] == "delegate_task":
+                schema["function"]["description"] = "Run up to two child agents in separate writable clones, one delegation level, within this task's audience, allocation and fixed deadline. Children execute and integrate serially; this call returns after they finish."
+                properties = schema["function"]["parameters"]["properties"]
+                for name in list(properties):
+                    if name not in ("goal", "context", "tasks", "max_iterations", "role"):
+                        del properties[name]
+                properties["role"]["enum"] = ["leaf"]
+                properties["role"]["description"] = "Children are leaves and cannot delegate."
+                properties["tasks"]["maxItems"] = 2
+                properties["tasks"]["description"] = "Up to two goals, run in separate clones and integrated serially."
+                child = properties["tasks"]["items"]["properties"]
+                child.pop("output_schema", None)
+                child["role"]["enum"] = ["leaf"]
+            if schema["function"]["name"] == "execute_code":
+                code = importlib.import_module("tools.code_execution_tool")
+                schema["function"] = code.build_execute_code_schema(
+                    enabled_sandbox_tools=set(self.native_entries) & NATIVE_TOOLS, mode="strict")
+                schema["function"]["description"] = schema["function"]["description"].replace(
+                    "Scripts run in their own temp dir, not the session's CWD — use absolute paths (os.path.expanduser('~/.hermes/.env')) or terminal()/read_file() for user files.",
+                    "Scripts run in a confined native-worker temporary directory. Use the native core tools to access /workspace and project dependencies in the separate admitted project sandbox.")
         return schemas
 
     def dispatch_native(self, name, arguments, call_id):
@@ -743,6 +980,8 @@ class EngineeringSession:
             return
         if self._tool_lock.locked():
             raise EngineeringFault("close_during_native_tool")
+        if self.native_context is not None:
+            self.native_context.close()
         if self.environment is not None:
             self.environment.cleanup()
         else:
@@ -821,7 +1060,7 @@ def main(*, input_stream=None, output_stream=None):
     session = None
     try:
         start = channel.read()
-        allowed = {"type", "binding", "nativeSource", "scopedHome", "model", "maxIterations", "maxTokens", "systemPrompt", "resultPresentation"}
+        allowed = {"type", "binding", "nativeSource", "scopedHome", "model", "maxIterations", "maxTokens", "systemPrompt", "resultPresentation", "nativeContext"}
         if not isinstance(start, dict) or set(start) - allowed or start.get("type") != "engineering.start":
             raise EngineeringFault("invalid_engineering_start")
         if not isinstance(start.get("binding"), dict):
@@ -838,7 +1077,10 @@ def main(*, input_stream=None, output_stream=None):
         with scoped_home(start.get("scopedHome")), open(os.devnull, "w") as sink:
             with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
                 load_native_source(start.get("nativeSource"))
-                with session.native_profile():
+                native_context = native_context_from_start(start["nativeContext"], start.get("scopedHome")) if "nativeContext" in start else None
+                if native_context is not None:
+                    session.scope_key = native_context.scope_key
+                with session.native_profile(native_context=native_context):
                     agent = session.create_agent(model=model, client_factory=channel.model_client,
                         max_iterations=iterations, max_tokens=tokens,
                         system_prompt=start.get("systemPrompt", "You are Gary. Complete the admitted engineering task using only the available tools."))

@@ -1,0 +1,197 @@
+/** Finite, operator-funded standing pool. No existing campaign is adopted and
+ * no completed allocation is recycled. All enrollment shares the canonical
+ * spend database's SQLite writer lock; model reservations remain SpendLedger's. */
+import { Database } from 'bun:sqlite';
+import { createHash } from 'node:crypto';
+import { lstatSync, realpathSync } from 'node:fs';
+import { isAbsolute } from 'node:path';
+import { SpendLedger } from '../spend.ts';
+import { fingerprintJson } from './audit-trace.ts';
+import { ENGINEERING_STANDING_MIN_TASK_CAP_MICROS, engineeringStandingBudgetPolicySha256 } from './engineering-policy.ts';
+
+export interface StandingEngineeringBudgetAuthority {
+  version: 1;
+  poolId: string;
+  campaignId: string;
+  capMicros: number;
+  taskCapMicros: number;
+  /** Host-verified standing user authority and a distinct funded aggregate hold. */
+  authoritySha256: string;
+  holdReceiptSha256: string;
+}
+export interface StandingEngineeringTaskBudget {
+  readonly requestId: string;
+  readonly requestHash: string;
+  readonly taskId: string;
+  readonly allocationId: string;
+  readonly campaignId: string;
+  readonly taskCapMicros: number;
+  readonly poolCapMicros: number;
+  readonly policySha256: string;
+  assertCurrent(): void;
+}
+export interface StandingEngineeringBudgetStatus {
+  readonly enrolled: boolean;
+  readonly poolCapMicros: number;
+  readonly committedCapMicros: number;
+  readonly uncommittedCapMicros: number;
+  /** Includes full charged reservations and unknown holds, not just settled bills. */
+  readonly chargedMicros: number;
+  readonly chargedHeadroomMicros: number;
+  readonly canAllocate: boolean;
+}
+interface TaskRow { pool_id: string; request_id: string; request_hash: string; task_id: string; allocation_id: string; cap_micros: number }
+const minted = new WeakMap<object, { ledgerPath: string; assert(): void }>();
+const id = (v: unknown): v is string => typeof v === 'string' && v === v.trim() && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(v);
+const sha = (v: unknown): v is string => typeof v === 'string' && v.length === 64 && /^[a-f0-9]{64}$/.test(v);
+const digest = (v: unknown) => fingerprintJson(v).sha256;
+function fail(code: string): never { throw new Error('engineering_standing_budget:' + code); }
+function exact(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) return false;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  return Reflect.ownKeys(descriptors).length === keys.length && keys.every(k => Object.hasOwn(descriptors,k)
+    && Object.hasOwn(descriptors[k]!, 'value'));
+}
+function identity(path: string) {
+  if (!isAbsolute(path) || realpathSync(path) !== path) fail('ledger_path');
+  const s = lstatSync(path);
+  if (!s.isFile() || s.isSymbolicLink() || s.nlink !== 1 || s.uid !== process.getuid?.() || (s.mode & 0o022)) fail('ledger_metadata');
+  return {dev:s.dev,ino:s.ino,uid:s.uid,gid:s.gid,mode:s.mode & 0o777,nlink:s.nlink};
+}
+
+export function createStandingEngineeringBudget(options: {
+  ledger: SpendLedger;
+  authority: StandingEngineeringBudgetAuthority;
+  /** Rechecks pinned authority + distinct aggregate hold; synchronous and mandatory. */
+  assertAuthority(): void;
+}) {
+  if (!(options.ledger instanceof SpendLedger) || typeof options.assertAuthority !== 'function'
+      || !exact(options.authority, ['version','poolId','campaignId','capMicros','taskCapMicros','authoritySha256','holdReceiptSha256'])) fail('authority');
+  const a = Object.freeze(structuredClone(options.authority));
+  if (a.version !== 1 || !id(a.poolId) || !id(a.campaignId) || !a.poolId.startsWith('standing-engineering-')
+      || !a.campaignId.startsWith('standing-engineering-') || a.poolId === a.campaignId
+      || !sha(a.authoritySha256) || !sha(a.holdReceiptSha256)
+      || !Number.isSafeInteger(a.capMicros) || a.capMicros > 1_000_000_000
+      || !Number.isSafeInteger(a.taskCapMicros) || a.taskCapMicros < ENGINEERING_STANDING_MIN_TASK_CAP_MICROS
+      || a.taskCapMicros > a.capMicros) fail('authority');
+  const ledgerPath = options.ledger.databasePath, ledgerIdentity = identity(ledgerPath), authorityHash = digest(a);
+  const policySha256 = engineeringStandingBudgetPolicySha256(a.taskCapMicros);
+  let closed = false;
+  function guard() {
+    if (closed) fail('closed');
+    const result: unknown = options.assertAuthority();
+    if (result !== undefined) { void Promise.resolve(result).catch(()=>{}); fail('authority_must_be_synchronous'); }
+    if (options.ledger.databasePath !== ledgerPath || digest(identity(ledgerPath)) !== digest(ledgerIdentity)) fail('ledger_changed');
+  }
+  guard();
+  const tables = (db: Database) => !!db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='standing_engineering_pools'").get();
+  function open<T>(write: boolean, fn: (db: Database) => T): T {
+    guard();
+    const db = new Database(ledgerPath, {readonly:!write,create:false,strict:true});
+    try {
+      if (write) db.exec('PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000');
+      else db.exec('PRAGMA query_only=ON');
+      return fn(db);
+    } finally { db.close(); }
+  }
+  function enrolled(db: Database): boolean {
+    if (!tables(db)) return false;
+    const row = db.query<{authority_hash:string;authority_json:string;ledger_identity_json:string;campaign_id:string},[string]>(
+      'SELECT authority_hash,authority_json,ledger_identity_json,campaign_id FROM standing_engineering_pools WHERE pool_id=?').get(a.poolId);
+    if (!row) return false;
+    if (row.authority_hash !== authorityHash || digest(JSON.parse(row.authority_json)) !== authorityHash
+        || row.campaign_id !== a.campaignId || digest(JSON.parse(row.ledger_identity_json)) !== digest(ledgerIdentity)) fail('pool_binding');
+    const campaign = db.query<{cap_micros:number},[string]>('SELECT cap_micros FROM spend_campaigns WHERE id=?').get(a.campaignId);
+    if (campaign?.cap_micros !== a.capMicros) fail('campaign_changed');
+    // No external enrollments may consume this dedicated standing campaign.
+    if (db.query(`SELECT 1 FROM spend_tickets t LEFT JOIN standing_engineering_allocations s ON s.allocation_id=t.ticket_id
+      WHERE t.campaign_id=? AND (s.allocation_id IS NULL OR s.pool_id<>? OR s.cap_micros<>t.cap_micros OR t.draft_pr<>0) LIMIT 1`).get(a.campaignId,a.poolId)) fail('foreign_allocation');
+    if (db.query(`SELECT 1 FROM standing_engineering_allocations s LEFT JOIN spend_tickets t ON t.ticket_id=s.allocation_id
+      WHERE s.pool_id=? AND (t.ticket_id IS NULL OR t.campaign_id<>? OR t.cap_micros<>s.cap_micros OR s.cap_micros<>?) LIMIT 1`).get(a.poolId,a.campaignId,a.taskCapMicros)) fail('allocation_changed');
+    return true;
+  }
+  function statusIn(db: Database): StandingEngineeringBudgetStatus {
+    const exists = enrolled(db);
+    const committed = exists ? db.query<{n:number},[string]>('SELECT COALESCE(SUM(cap_micros),0) n FROM spend_tickets WHERE campaign_id=?').get(a.campaignId)!.n : 0;
+    const charged = exists ? db.query<{n:number},[string]>(`SELECT COALESCE(SUM(x.charged_micros),0) n FROM spend_attempts x
+      JOIN spend_tickets t ON t.ticket_id=x.ticket_id WHERE t.campaign_id=?`).get(a.campaignId)!.n : 0;
+    if (![committed,charged].every(n=>Number.isSafeInteger(n)&&n>=0) || committed > a.capMicros || charged > committed) fail('pool_accounting');
+    return Object.freeze({enrolled:exists,poolCapMicros:a.capMicros,committedCapMicros:committed,
+      uncommittedCapMicros:a.capMicros-committed,chargedMicros:charged,chargedHeadroomMicros:a.capMicros-charged,
+      canAllocate:exists && a.capMicros-committed >= a.taskCapMicros});
+  }
+  const allocationIdFor = (requestId: string) => {
+    if (!id(requestId)) fail('request_id');
+    return 'standing-engineering:' + createHash('sha256').update(JSON.stringify([a.poolId,requestId])).digest('hex');
+  };
+  function assertRow(db: Database, expected: TaskRow) {
+    if (!enrolled(db)) fail('pool_not_enrolled');
+    const row = db.query<TaskRow,[string,string]>('SELECT * FROM standing_engineering_allocations WHERE pool_id=? AND request_id=?').get(a.poolId,expected.request_id);
+    if (!row || digest(row) !== digest(expected)) fail('task_binding');
+    const ticket = db.query<{campaign_id:string;cap_micros:number;draft_pr:number;state:string;terminal_reason:string|null},[string]>(
+      'SELECT campaign_id,cap_micros,draft_pr,state,terminal_reason FROM spend_tickets WHERE ticket_id=?').get(row.allocation_id);
+    if (!ticket || ticket.campaign_id !== a.campaignId || ticket.cap_micros !== a.taskCapMicros || ticket.draft_pr !== 0
+        || ticket.state !== 'active' || ticket.terminal_reason !== null
+        || db.query('SELECT 1 FROM spend_coding_policies WHERE ticket_id=?').get(row.allocation_id)) fail('task_unavailable');
+    statusIn(db);
+  }
+  function mint(row: TaskRow): StandingEngineeringTaskBudget {
+    const expected = Object.freeze({...row});
+    const assertCurrent = () => open(false, db=>assertRow(db,expected));
+    const value = Object.freeze({requestId:row.request_id,requestHash:row.request_hash,taskId:row.task_id,allocationId:row.allocation_id,
+      campaignId:a.campaignId,taskCapMicros:a.taskCapMicros,poolCapMicros:a.capMicros,policySha256,assertCurrent});
+    minted.set(value,{ledgerPath,assert:assertCurrent}); return value;
+  }
+  return {
+    /** Operator-only activation after distinct funding is verified; never startup auto-enrollment. */
+    enrollPool(): void {
+      open(true, db=>db.transaction(()=>{
+        guard();
+        db.exec(`CREATE TABLE IF NOT EXISTS standing_engineering_pools(pool_id TEXT PRIMARY KEY,campaign_id TEXT NOT NULL UNIQUE,
+          authority_hash TEXT NOT NULL,authority_json TEXT NOT NULL,ledger_identity_json TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS standing_engineering_allocations(pool_id TEXT NOT NULL REFERENCES standing_engineering_pools(pool_id),
+          request_id TEXT NOT NULL,request_hash TEXT NOT NULL,task_id TEXT NOT NULL UNIQUE,allocation_id TEXT NOT NULL UNIQUE REFERENCES spend_tickets(ticket_id),
+          cap_micros INTEGER NOT NULL CHECK(cap_micros>0),PRIMARY KEY(pool_id,request_id));`);
+        if (enrolled(db)) return;
+        if (db.query('SELECT 1 FROM spend_campaigns WHERE id=?').get(a.campaignId)) fail('campaign_already_exists');
+        db.query('INSERT INTO spend_campaigns(id,cap_micros) VALUES(?,?)').run(a.campaignId,a.capMicros);
+        db.query('INSERT INTO standing_engineering_pools VALUES(?,?,?,?,?)').run(a.poolId,a.campaignId,authorityHash,JSON.stringify(a),JSON.stringify(ledgerIdentity));
+        guard();
+      }).immediate());
+    },
+    ready(): boolean { try { return open(false,db=>statusIn(db).canAllocate); } catch { return false; } },
+    status: () => open(false,statusIn),
+    allocationIdFor,
+    allocate(input: {requestId:string;requestHash:string;taskId:string}): StandingEngineeringTaskBudget {
+      if (!exact(input,['requestId','requestHash','taskId']) || !id(input.requestId) || !id(input.taskId) || !sha(input.requestHash)) fail('request_binding');
+      const expected: TaskRow = {pool_id:a.poolId,request_id:input.requestId,request_hash:input.requestHash,task_id:input.taskId,
+        allocation_id:allocationIdFor(input.requestId),cap_micros:a.taskCapMicros};
+      const saved = open(true,db=>db.transaction(()=>{
+        guard(); if (!enrolled(db)) fail('pool_not_enrolled');
+        const old = db.query<TaskRow,[string,string]>('SELECT * FROM standing_engineering_allocations WHERE pool_id=? AND request_id=?').get(a.poolId,input.requestId);
+        if (old) { if (digest(old)!==digest(expected)) fail('request_replay_mismatch'); return old; }
+        if (!statusIn(db).canAllocate) fail('uncommitted_pool_exhausted');
+        db.query('INSERT INTO spend_tickets(ticket_id,campaign_id,cap_micros,draft_pr) VALUES(?,?,?,0)').run(expected.allocation_id,a.campaignId,a.taskCapMicros);
+        db.query('INSERT INTO standing_engineering_allocations VALUES(?,?,?,?,?,?)').run(a.poolId,input.requestId,input.requestHash,input.taskId,expected.allocation_id,a.taskCapMicros);
+        assertRow(db,expected); guard(); return expected;
+      }).immediate());
+      return mint(saved);
+    },
+    assertTask(value: StandingEngineeringTaskBudget) {
+      assertStandingEngineeringTaskBudget(value, options.ledger, value?.taskId, value?.allocationId);
+      if (value.campaignId !== a.campaignId || value.poolCapMicros !== a.capMicros || value.taskCapMicros !== a.taskCapMicros) fail('foreign_task');
+    },
+    /** Closes this capability only. Never closes ledger, allocations, or releases funds. */
+    close() { closed = true; },
+  };
+}
+
+/** Worker-shaped objects cannot manufacture funding authority. */
+export function assertStandingEngineeringTaskBudget(value: StandingEngineeringTaskBudget, ledger: SpendLedger,
+  taskId: string, allocationId: string): void {
+  const authority = value && minted.get(value);
+  if (!authority || !(ledger instanceof SpendLedger) || authority.ledgerPath !== ledger.databasePath
+      || value.taskId !== taskId || value.allocationId !== allocationId
+      || value.policySha256 !== engineeringStandingBudgetPolicySha256(value.taskCapMicros)) fail('untrusted_task_budget');
+  authority.assert();
+}

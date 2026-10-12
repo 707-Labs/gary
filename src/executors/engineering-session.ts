@@ -113,6 +113,8 @@ export interface EngineeringSessionOptions {
   dockerSocketPath?: string;
   /** Existing reviewed dependency cache, mounted read-only. */
   bunCacheVolume?: string;
+  /** Host-created integrity-checked package bytes, never a model-selected path. */
+  dependencyBundle?: { readonly root: string; assertCurrent(): void };
   /** Host-admitted aggregate cap for this entire container, never a model argument. */
   resourceProfile?: EngineeringSessionResourceProfile;
   now?: () => number;
@@ -189,6 +191,14 @@ export class EngineeringSession {
     if (options.dockerSocketPath !== undefined && (!isAbsolute(options.dockerSocketPath) || resolve(options.dockerSocketPath) !== options.dockerSocketPath
       || /[\r\n\0]/.test(options.dockerSocketPath) || !options.dockerSocketPath.endsWith('.sock'))) fail('engineering_invalid_docker_socket');
     if (options.bunCacheVolume !== undefined && !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(options.bunCacheVolume)) fail('engineering_invalid_cache_volume');
+    if (options.dependencyBundle) {
+      const root = options.dependencyBundle.root;
+      if (!isAbsolute(root) || resolve(root) !== root || /[,\r\n\0]/.test(root)
+          || realpathSync(root) !== root || lstatSync(root).isSymbolicLink() || !lstatSync(root).isDirectory()
+          || lstatSync(root).uid !== process.getuid?.() || (lstatSync(root).mode & 0o022) !== 0
+          || root === options.workspaceRoot || root.startsWith(options.workspaceRoot + '/') || options.workspaceRoot.startsWith(root + '/')) fail('engineering_invalid_dependency_bundle');
+      options.dependencyBundle.assertCurrent();
+    }
     integer(options.deadlineMs, 1, Number.MAX_SAFE_INTEGER);
     this.maxOutput = options.maxOutputBytes ?? OUTPUT_CAP;
     this.maxProcesses = options.maxProcesses ?? 4;
@@ -199,7 +209,8 @@ export class EngineeringSession {
     integer(resources.cpus, 1, 4); integer(resources.memoryMiB, 256, 12 * 1024);
     this.resourceProfile = Object.freeze({ ...resources });
     this.binding = Object.freeze({ ...options.binding });
-    this.options = { ...options, binding: this.binding };
+    this.options = { ...options, binding: this.binding,
+      ...(options.dependencyBundle ? { dependencyBundle: Object.freeze({ ...options.dependencyBundle }) } : {}) };
     this.now = options.now ?? Date.now;
     this.containerName = `gary-longjob-${randomUUID()}`;
   }
@@ -302,6 +313,7 @@ export class EngineeringSession {
     if (this.opened) return;
     await this.guard();
     (this.options.validateWorkspace ?? validateEngineeringWorkspace)(this.options.workspaceRoot);
+    this.options.dependencyBundle?.assertCurrent();
     this.options.journal.transaction(this.binding.taskId, state => {
       if (state.cleanupUncertain) fail('engineering_cleanup_uncertain');
       if (state.activeSessionId !== null || state.sessions[this.binding.sessionId]) fail('engineering_reconciliation_required');
@@ -338,6 +350,7 @@ export class EngineeringSession {
         '--tmpfs', `/tmp:rw,nosuid,nodev,size=1g,uid=${uid},gid=${gid}`,
         '--mount', `type=bind,src=${this.options.workspaceRoot},dst=/workspace`, '--workdir', '/workspace',
         ...(this.options.bunCacheVolume ? ['--mount', `type=volume,src=${this.options.bunCacheVolume},dst=/bun-cache,readonly`] : []),
+        ...(this.options.dependencyBundle ? ['--mount', `type=bind,src=${this.options.dependencyBundle.root},dst=/task/dependency-bundle,readonly`] : []),
         '--entrypoint', '/usr/bin/env', this.options.image, '-i', 'PATH=/usr/local/bin:/usr/bin:/bin', 'HOME=/tmp', 'CI=1', 'LANG=C.UTF-8',
         'sleep', 'infinity']);
       const id = created.output.trim();
@@ -347,6 +360,7 @@ export class EngineeringSession {
       this.receipt('session_created');
       await this.guardian?.bind(id);
       await this.guard();
+      this.options.dependencyBundle?.assertCurrent();
       const started = await this.control(['start', id]);
       if (started.exitCode !== 0 || started.timedOut) fail('engineering_session_start_failed');
       await this.guard();

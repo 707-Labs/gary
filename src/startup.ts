@@ -21,7 +21,7 @@ import { recordEvent } from './state/queries.ts';
 import { openSpendLedger } from './spend.ts';
 import { loadSlackCredentials, type SlackCredentials } from './slack/credentials.ts';
 import { createSlackTransport, type SlackTransport } from './slack/transport.ts';
-import { createSlackService, type SlackService } from './slack/service.ts';
+import { createSlackService, type SlackService, type EngineeringReceipt } from './slack/service.ts';
 import { runReadonlyGaryHost, verifyReadonlyRelease, type ReadonlyStartupDependencies } from './readonly-startup.ts';
 import { createSlackConversation, loadSlackConversationConfig, fingerprintSlackConversationConfig, type SlackConversation } from './slack/conversation.ts';
 import { createSlackSharedConversation, loadSlackSharedConversationConfig, fingerprintSlackSharedConversationConfig, type SlackSharedConversation } from './slack/shared-conversation.ts';
@@ -36,8 +36,12 @@ import { createConversationController, type ConversationControllerRuntime } from
 import { createHermesProjectResponder } from './hermes/project-conversation.ts';
 import { DMReplyError,type DMTurn } from './hermes/dm-conversation.ts';
 import { loadEngineeringRuntimeConfig } from './hermes/engineering-config.ts';
+import { openEngineeringRoutineServices } from './hermes/engineering-routine-composition.ts';
 import { createEngineeringRuntime } from './hermes/engineering-runtime.ts';
-import { createEngineeringGitHubRepositoryServices } from './hermes/engineering-repository.ts';
+import { createEngineeringGitHubRepositoryServices, resolveEngineeringDefaultBase } from './hermes/engineering-repository.ts';
+import { loadStandingEngineeringConfig } from './hermes/standing-engineering-config.ts';
+import { createStandingEngineeringBudget } from './hermes/engineering-standing-budget.ts';
+import { createStandingEngineeringFundingGuard } from './hermes/engineering-standing-funding.ts';
 import { assertEngineeringBudgetAdmission, type EngineeringBudgetBinding } from './hermes/engineering-budget.ts';
 import { assertEngineeringContinuationBudget, type EngineeringContinuationBinding } from './hermes/engineering-continuation-budget.ts';
 
@@ -60,7 +64,7 @@ export interface StartupDependencies extends ReadonlyStartupDependencies {
   signal?: AbortSignal;
   slackTransport?: (credentials: SlackCredentials) => SlackTransport;
   /** Offline composition seams; never selected by environment or model input. */
-  engineering?: { createRuntime?: typeof createEngineeringRuntime; assertBudget?: typeof assertEngineeringBudgetAdmission;
+  engineering?: { createRoutine?: typeof openEngineeringRoutineServices; createRuntime?: typeof createEngineeringRuntime; assertBudget?: typeof assertEngineeringBudgetAdmission;
     assertContinuation?: typeof assertEngineeringContinuationBudget };
 }
 
@@ -94,16 +98,23 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
   const alertConfig=host.slackAlertConfigPath?loadSlackAlertConfig(host.slackAlertConfigPath,host.slackAlertConfigSha256!):undefined;
   const engineeringConfig=host.engineeringConfigPath?loadEngineeringRuntimeConfig(host.engineeringConfigPath,host.engineeringConfigSha256!,
     host.engineeringAuthorityReceiptPath!,host.engineeringAuthorityReceiptSha256!):undefined;
+  const standingConfig=host.standingEngineeringConfigPath?loadStandingEngineeringConfig(host.standingEngineeringConfigPath,
+    host.standingEngineeringConfigSha256!,host.standingEngineeringAuthorityPath!,host.standingEngineeringAuthoritySha256!):undefined;
+  if(standingConfig&&standingConfig.sourceRevision!==host.conversationRuntimeRelease)throw new Error('standing_engineering_source_release_mismatch');
   if(engineeringConfig&&engineeringConfig.sourceRevision!==host.conversationRuntimeRelease)throw new Error('engineering_source_release_mismatch');
   if(engineeringConfig&&[conversationConfig?.contextDirectory,sharedConfig?.contextDirectory,alertConfig?.directory,
     host.projectAssistantConfigPath?dirname(host.projectAssistantConfigPath):undefined].some(path=>path&&(overlappingRoots(engineeringConfig.root,path)
       ||overlappingRoots(engineeringConfig.workspacesRoot,path))))throw new Error('engineering_context_must_be_separate');
+  if(standingConfig&&[conversationConfig?.contextDirectory,sharedConfig?.contextDirectory,alertConfig?.directory,
+    host.projectAssistantConfigPath?dirname(host.projectAssistantConfigPath):undefined].some(path=>path&&(overlappingRoots(standingConfig.root,path)
+      ||overlappingRoots(standingConfig.workspacesRoot,path)
+      ||standingConfig.routine&&overlappingRoots(standingConfig.routine.scopedRoot,path))))throw new Error('standing_engineering_context_must_be_separate');
   if(alertConfig&&[conversationConfig?.contextDirectory,sharedConfig?.contextDirectory,host.projectAssistantConfigPath?dirname(host.projectAssistantConfigPath):undefined].includes(alertConfig.directory))throw new Error('alert_context_must_be_separate');
   if(conversationConfig&&sharedConfig&&conversationConfig.contextDirectory===sharedConfig.contextDirectory)throw new Error('conversation_contexts_must_be_separate');
   const activationConfig = host.activationPath ? loadHermesActivationConfig(host.activationPath) : undefined;
   const cfg = (deps.config ?? loadConfig)();
   const providerConfigs = cfg.providers.filter(provider => provider.name === 'deepseek');
-  if(engineeringConfig&&(cfg.github.kind!=='app'||providerConfigs.length!==1||providerConfigs[0]?.model!=='deepseek-v4-pro'
+  if((engineeringConfig||standingConfig)&&(cfg.github.kind!=='app'||providerConfigs.length!==1||providerConfigs[0]?.model!=='deepseek-v4-pro'
     ||providerConfigs[0]?.baseUrl!=='https://api.deepseek.com/anthropic'||!providerConfigs[0]?.apiKey))throw new Error('engineering_host_route_rejected');
   if (activationConfig && (providerConfigs.length !== 1 || providerConfigs[0]?.model !== activationConfig.model
       || providerConfigs[0]?.baseUrl !== 'https://api.deepseek.com/anthropic'
@@ -121,14 +132,24 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
   let executorJobJournal: ExecutorJobJournal | undefined;
   let engineering:ReturnType<typeof createEngineeringRuntime>|undefined;
   let engineeringDb:Database|undefined,engineeringSpendDb:Database|undefined;
+  let routineServices:ReturnType<typeof openEngineeringRoutineServices>|undefined;
+  let standingBudget:ReturnType<typeof createStandingEngineeringBudget>|undefined;
   let legacyDispatches=0,conversationDispatches=0;
+  const pendingEngineeringStarts=new Map<string,EngineeringReceipt>();
   const controller = new AbortController();
+  const flushEngineeringStarts=()=>{
+    if(controller.signal.aborted||legacyDispatches||conversationDispatches||!engineering)return;
+    for(const [id,receipt] of pendingEngineeringStarts){
+      pendingEngineeringStarts.delete(id);engineering.ingress.start?.(receipt);
+    }
+  };
   const loopWake = createLoopWake();
   let loopState: ConversationControllerRuntime['loopState'] = 'disabled';
   const abort = () => {
     loopState = 'stopped';
     loopWake.stop();
     controller.abort();
+    pendingEngineeringStarts.clear();
     // Stop ingress/sends immediately; the current coding tick retains its normal drain semantics.
     // The finally block awaits the same stop promise before closing canonical handles.
     void slack?.stop().catch(() => undefined);
@@ -186,7 +207,7 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
         const base=createSlackConversation({config:conversationConfig,ledger:spend,reply:projectReply??createHermesDMResponder(responderDeps)});
         conversation={...base,async respond(...args){
           if(engineering?.busy())return;
-          conversationDispatches++;try{await base.respond(...args);}finally{conversationDispatches--;}
+          conversationDispatches++;try{await base.respond(...args);}finally{conversationDispatches--;flushEngineeringStarts();}
         }};
       }
       if(sharedConfig){
@@ -196,7 +217,7 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
             metadata:{memberInfo:(id,signal)=>transport.memberInfo!(id,signal),channelInfo:(id,signal)=>transport.channelInfo!(id,signal)}});
           sharedConversation={...base,async respond(...args){
             if(engineering?.busy())return;
-            conversationDispatches++;try{await base.respond(...args);}finally{conversationDispatches--;}
+            conversationDispatches++;try{await base.respond(...args);}finally{conversationDispatches--;flushEngineeringStarts();}
           }};
         }catch{log.warn('shared conversation unavailable',{reason:'shared_runtime_initialization_rejected'});}
       }
@@ -242,10 +263,55 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
         log.info('engineering runtime ready',{release:pinned.sourceRevision,configSha256:host.engineeringConfigSha256,
           grantId:pinned.grantId,allocationId:pinned.allocationId,capMicros:pinned.capMicros,publication:'patch_only',ready:true});
       }
+      if(standingConfig){
+        const pinned=standingConfig;
+        const assertPinned=()=>{
+          if(controller.signal.aborted)throw new Error('standing_engineering_stopped');
+          const current=loadStandingEngineeringConfig(host.standingEngineeringConfigPath!,host.standingEngineeringConfigSha256!,
+            host.standingEngineeringAuthorityPath!,host.standingEngineeringAuthoritySha256!);
+          if(current.sourceRevision!==host.conversationRuntimeRelease)throw new Error('standing_engineering_source_release_mismatch');
+        };
+        const ledgerPath=resolve(cfg.gary.stateDir,'spend.db');
+        if(realpathSync(ledgerPath)!==ledgerPath||lstatSync(ledgerPath).isSymbolicLink()
+          ||overlappingRoots(pinned.workspacesRoot,ledgerPath)||overlappingRoots(pinned.root,ledgerPath)||pinned.routine&&overlappingRoots(pinned.routine.scopedRoot,ledgerPath))throw new Error('standing_engineering_canonical_ledger_rejected');
+        const assertFunding=createStandingEngineeringFundingGuard({
+          authority:pinned.funding,fundingAuthorityPath:pinned.fundingAuthorityPath,
+          fundingHoldReceiptPath:pinned.fundingHoldReceiptPath,aggregatePath:pinned.aggregatePath,ledgerPath,
+        });
+        standingBudget=createStandingEngineeringBudget({ledger:spend,authority:pinned.funding,
+          assertAuthority:()=>{assertPinned();assertFunding();}});
+        // Startup observes explicit enrollment; it cannot create or borrow funds.
+        const assertBudget=()=>{if(!standingBudget!.status().enrolled)throw new Error('standing_engineering_funding_not_enrolled');};
+        assertBudget();
+        engineeringDb=openEngineeringJournal(join(pinned.root,'engineering.sqlite'));
+        engineeringSpendDb=new Database(ledgerPath,{readonly:true,strict:true,create:false});
+        if(cfg.github.kind!=='app')throw new Error('engineering_github_app_required');
+        const appBinding={appId:Number(cfg.github.appId),installationId:Number(cfg.github.installationId)};
+        const repository=createEngineeringGitHubRepositoryServices({client:github,binding:appBinding,fetch:rawFetch});
+        if(pinned.routine)routineServices=(deps.engineering?.createRoutine??openEngineeringRoutineServices)({
+          config:pinned.routine,ledger:spend,assertCurrent:()=>{assertPinned();assertFunding();}});
+        engineering=(deps.engineering?.createRuntime??createEngineeringRuntime)({config:pinned,journalDb:engineeringDb,
+          ...(routineServices?{routine:routineServices}:{}),spendDb:engineeringSpendDb,ledger:spend,standing:{budget:standingBudget,
+            resolveBase:resolution=>resolveEngineeringDefaultBase({resolution,getCredential:repository.getCredential,fetch:rawFetch})},
+          repository:{binding:appBinding,...repository},providerApiKey:providerConfigs[0]!.apiKey,fetch:request=>rawFetch(request),
+          assertGrant:()=>{assertPinned();assertFunding();},assertRuntime:assertPinned,
+          assertBudget:()=>{assertBudget();if(legacyDispatches)throw new Error('standing_engineering_legacy_dispatch_busy');},
+          assertExecutionReady:()=>{if(legacyDispatches||conversationDispatches)throw new Error('standing_engineering_conversation_not_drained');},
+          deliver:receipt=>slack?.deliverEngineeringReceipt(receipt)??Promise.resolve('not_sent')});
+        engineeringHealth=()=>{try{assertPinned();assertFunding();return true;}catch{return false;}};
+        if(!engineering.ready())throw new Error('standing_engineering_reconciliation_required');
+        log.info('standing engineering runtime ready',{grantId:pinned.grantId,publication:pinned.publication,
+          poolId:pinned.funding.poolId,ready:true});
+      }
       slack = createSlackService({ db, transport, onIngressDiagnostic:logSlackIngressDiagnostic, checkHostHealth: readiness.check, approvedChannelIds: host.slack.approvedChannelIds,
         ...(conversation?{conversation,tannerDirectMessages:true as const}:{}),...(sharedConversation?{sharedConversation}:{}),
         ...(alertIntake?{alertIntake}:{}),
-        ...(engineering?{engineeringIngress:engineering.ingress,checkEngineeringHealth:engineeringHealth!,checkConversationAdmission:()=>!engineering!.busy()}:{}),
+        ...(engineering?{engineeringIngress:standingConfig?{...engineering.ingress,start(receipt:EngineeringReceipt){
+          // The service verifies before requesting wake; host.start rechecks
+          // the exact durable receipt when the shared conversation slot drains.
+          pendingEngineeringStarts.set(receipt.taskId,receipt);flushEngineeringStarts();
+        }}:engineering.ingress,checkEngineeringHealth:engineeringHealth!,checkConversationAdmission:()=>!engineering!.busy()}:{}),
+        ...(standingConfig?{standingEngineeringEnabled:true as const}:{}),
         ...(host.conversationRuntimeRelease?{checkConversationHealth:()=>!controller.signal.aborted}: {}) });
       const health = await slack.start();
       if (controller.signal.aborted) return;
@@ -265,7 +331,7 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
     await (deps.runLoop ?? runLoop)({ db, spend, linear, github, glm, cloudflare,
       ...(engineering?{beginDispatch:()=>{
         if(controller.signal.aborted||engineering!.busy())return null;
-        legacyDispatches++;let released=false;return()=>{if(!released){released=true;legacyDispatches--;}};
+        legacyDispatches++;let released=false;return()=>{if(!released){released=true;legacyDispatches--;flushEngineeringStarts();}};
       }}:{}),
       wake:loopWake,onTickState:state=>{loopState=controller.signal.aborted?'stopped':state;},
       repoMap: cfg.gary.repoMap, allowlistedMentionUserIds: cfg.gary.allowlistedMentionUserIds,
@@ -291,6 +357,8 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
       // Abort first, then drain both sandboxes/guardians before any canonical or
       // private database handle can close underneath a late completion.
       await engineering?.stop();
+      routineServices?.close();
+      standingBudget?.close();
       engineeringSpendDb?.close();engineeringDb?.close();
       try {
         try{if(conversation)log.info('conversation runtime stopped',{kind:'private_dm',drained:conversation.close().drained});}
