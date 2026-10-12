@@ -411,3 +411,25 @@ test('native scoped configured shorter window stays bounded to the original admi
   expect(f.guardianInput.standingSession).toEqual(f.input.standingSession);
   await session.close();
 });
+
+test('exact worker failure envelope retains bounded diagnostics and still requires physical cleanup',async()=>{
+ for(const diagnostic of [undefined,{version:1,causes:[{code:'process_deadline_exceeded',frames:[{file:'gary_engineering_environment.py',line:68}]}]}]){
+  const s=modelFixture(),file=join(s.root,'error.mjs'),receipts:any[]=[];let cleaned=0;
+  const envelope={type:'engineering.error',error:'engineering_runtime_failed',cleanupConfirmed:true,...(diagnostic?{diagnostic}:{})};
+  writeFileSync(file,fixtureScript.replace("const messages=[...turn.history,{role:'user',content:turn.prompt}];",`send(${JSON.stringify(envelope)});process.exit(1);const messages=[...turn.history,{role:'user',content:turn.prompt}];`));
+  const input=nativeInput(s);input.append=v=>receipts.push(v);
+  const session=await createEngineeringStdioLauncher({command:[process.execPath,file],cwd:s.root,env:{},cleanup:async()=>{cleaned++;}})(input,new AbortController().signal);
+  await expect(session.turn({turnId:'turn',prompt:'Work.'})).rejects.toThrow('turn_failed');
+  expect(s.requests).toHaveLength(0);expect(cleaned).toBe(1);
+  expect(receipts.find(r=>r.kind==='native_diagnostic').diagnostic).toMatchObject({code:'engineering_worker:runtime_failed',...(diagnostic?{workerFault:diagnostic}:{})});
+ }
+});
+test('malformed error envelope cannot bypass frame validation or persist secret diagnostics',async()=>{
+ const s=modelFixture(),file=join(s.root,'malformed.mjs'),receipts:any[]=[];
+ writeFileSync(file,fixtureScript.replace("const messages=[...turn.history,{role:'user',content:turn.prompt}];","send({type:'engineering.error',error:'engineering_runtime_failed',cleanupConfirmed:true,diagnostic:{version:1,causes:[{code:'secret-token',frames:[]}]}});process.exit(1);const messages=[...turn.history,{role:'user',content:turn.prompt}];"));
+ const input=nativeInput(s);input.append=v=>receipts.push(v);
+ const session=await createEngineeringStdioLauncher({command:[process.execPath,file],cwd:s.root,env:{},cleanup:async()=>{}})(input,new AbortController().signal);
+ await expect(session.turn({turnId:'turn',prompt:'Work.'})).rejects.toThrow('turn_failed');
+ expect(receipts.find(r=>r.kind==='native_diagnostic').diagnostic.code).toBe('engineering_worker:frame_shape');
+ expect(JSON.stringify(receipts)).not.toContain('secret-token');
+});

@@ -32,6 +32,7 @@ export interface HostEngineeringOptions {
   execute(task: EngineeringTaskView, prepared: HostEngineeringPrepared, signal: AbortSignal): Promise<{ completed: boolean; artifactReceiptId: string; summary: string }>;
   cleanup(task: EngineeringTaskView): Promise<HostEngineeringCleanupProof>;
   deliver(receipt: HostEngineeringReceipt): Promise<unknown>;
+  onTerminal?(receipt: HostEngineeringReceipt): void;
   now?: () => number;
 }
 interface RequestRow { request_id: string; request_hash: string; task_id: string; stage: string; admitted_json: string | null; final_json: string | null }
@@ -99,6 +100,7 @@ export function createEngineeringHost(options: HostEngineeringOptions) {
       }
     }
     // Delivery uncertainty does not reopen execution; the Slack outbox owns retries.
+    if (cleanup && options.onTerminal) { try { options.onTerminal(final); } catch (error) { recordFailure(request.requestId,task.taskId,'host_finish',error,task); } }
     try { await options.deliver(final); } catch { /* Immutable final remains available to a later scoped read. */ }
   }
   async function admit(requestInput: HostEngineeringRequest, signal: AbortSignal, isAvailable: () => boolean = () => true) {

@@ -1,13 +1,15 @@
 /** Finite, operator-funded standing pool. No existing campaign is adopted and
- * no completed allocation is recycled. All enrollment shares the canonical
+ * terminal unused commitments are released only with durable cleanup proof. All enrollment shares the canonical
  * spend database's SQLite writer lock; model reservations remain SpendLedger's. */
 import { Database } from 'bun:sqlite';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { lstatSync, realpathSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { SpendLedger } from '../spend.ts';
 import { fingerprintJson } from './audit-trace.ts';
 import { ENGINEERING_STANDING_MIN_TASK_CAP_MICROS, engineeringStandingBudgetPolicySha256 } from './engineering-policy.ts';
+import { initializeStandingReconciliation, assertStandingReconciliationSchema, standingReconciliationAmounts,
+  retainStandingAuxiliaryCharges, reconcileStandingTerminal, withStandingTerminalJournal, STANDING_CHAT_TICKET, standingTaskConversationCharge } from './engineering-standing-reconciliation.ts';
 
 export interface StandingEngineeringBudgetAuthority {
   version: 1;
@@ -29,6 +31,7 @@ export interface StandingEngineeringTaskBudget {
   readonly poolCapMicros: number;
   readonly policySha256: string;
   assertCurrent(): void;
+  assertReservation(reservedMicros: number): void;
 }
 export interface StandingEngineeringBudgetStatus {
   readonly enrolled: boolean;
@@ -39,6 +42,9 @@ export interface StandingEngineeringBudgetStatus {
   readonly chargedMicros: number;
   readonly chargedHeadroomMicros: number;
   readonly canAllocate: boolean;
+  readonly grossCommittedCapMicros: number;
+  readonly releasedCapMicros: number;
+  readonly auxiliaryChargeMicros: number;
 }
 interface TaskRow { pool_id: string; request_id: string; request_hash: string; task_id: string; allocation_id: string; cap_micros: number }
 const minted = new WeakMap<object, { ledgerPath: string; assert(): void }>();
@@ -64,6 +70,8 @@ export function createStandingEngineeringBudget(options: {
   authority: StandingEngineeringBudgetAuthority;
   /** Rechecks pinned authority + distinct aggregate hold; synchronous and mandatory. */
   assertAuthority(): void;
+  /** Canonical host-selected journal; never supplied by a worker or model. */
+  terminalJournalPath?: string;
 }) {
   if (!(options.ledger instanceof SpendLedger) || typeof options.assertAuthority !== 'function'
       || !exact(options.authority, ['version','poolId','campaignId','capMicros','taskCapMicros','authoritySha256','holdReceiptSha256'])) fail('authority');
@@ -112,12 +120,15 @@ export function createStandingEngineeringBudget(options: {
   }
   function statusIn(db: Database): StandingEngineeringBudgetStatus {
     const exists = enrolled(db);
-    const committed = exists ? db.query<{n:number},[string]>('SELECT COALESCE(SUM(cap_micros),0) n FROM spend_tickets WHERE campaign_id=?').get(a.campaignId)!.n : 0;
-    const charged = exists ? db.query<{n:number},[string]>(`SELECT COALESCE(SUM(x.charged_micros),0) n FROM spend_attempts x
+    const gross = exists ? db.query<{n:number},[string]>('SELECT COALESCE(SUM(cap_micros),0) n FROM spend_tickets WHERE campaign_id=?').get(a.campaignId)!.n : 0;
+    const ownCharged = exists ? db.query<{n:number},[string]>(`SELECT COALESCE(SUM(x.charged_micros),0) n FROM spend_attempts x
       JOIN spend_tickets t ON t.ticket_id=x.ticket_id WHERE t.campaign_id=?`).get(a.campaignId)!.n : 0;
+    const reconciled=exists?standingReconciliationAmounts(db,a):{released:0,auxiliary:0};
+    const committed=gross-reconciled.released+reconciled.auxiliary,charged=ownCharged+reconciled.auxiliary;
     if (![committed,charged].every(n=>Number.isSafeInteger(n)&&n>=0) || committed > a.capMicros || charged > committed) fail('pool_accounting');
     return Object.freeze({enrolled:exists,poolCapMicros:a.capMicros,committedCapMicros:committed,
       uncommittedCapMicros:a.capMicros-committed,chargedMicros:charged,chargedHeadroomMicros:a.capMicros-charged,
+      grossCommittedCapMicros:gross,releasedCapMicros:reconciled.released,auxiliaryChargeMicros:reconciled.auxiliary,
       canAllocate:exists && a.capMicros-committed >= a.taskCapMicros});
   }
   const allocationIdFor = (requestId: string) => {
@@ -139,7 +150,12 @@ export function createStandingEngineeringBudget(options: {
     const expected = Object.freeze({...row});
     const assertCurrent = () => open(false, db=>assertRow(db,expected));
     const value = Object.freeze({requestId:row.request_id,requestHash:row.request_hash,taskId:row.task_id,allocationId:row.allocation_id,
-      campaignId:a.campaignId,taskCapMicros:a.taskCapMicros,poolCapMicros:a.capMicros,policySha256,assertCurrent});
+      campaignId:a.campaignId,taskCapMicros:a.taskCapMicros,poolCapMicros:a.capMicros,policySha256,assertCurrent,
+      assertReservation(reservedMicros:number) { open(false,db=>{
+        assertRow(db,expected);
+        const charge=(db.query('SELECT COALESCE(SUM(charged_micros),0) n FROM spend_attempts WHERE ticket_id=?').get(row.allocation_id) as {n:number}).n;
+        if(!Number.isSafeInteger(reservedMicros)||reservedMicros<0||charge+reservedMicros+standingTaskConversationCharge(db,row.allocation_id)>a.taskCapMicros)fail('task_conversation_cap');
+      }); }});
     minted.set(value,{ledgerPath,assert:assertCurrent}); return value;
   }
   return {
@@ -152,6 +168,7 @@ export function createStandingEngineeringBudget(options: {
           CREATE TABLE IF NOT EXISTS standing_engineering_allocations(pool_id TEXT NOT NULL REFERENCES standing_engineering_pools(pool_id),
           request_id TEXT NOT NULL,request_hash TEXT NOT NULL,task_id TEXT NOT NULL UNIQUE,allocation_id TEXT NOT NULL UNIQUE REFERENCES spend_tickets(ticket_id),
           cap_micros INTEGER NOT NULL CHECK(cap_micros>0),PRIMARY KEY(pool_id,request_id));`);
+        initializeStandingReconciliation(db);
         if (enrolled(db)) return;
         if (db.query('SELECT 1 FROM spend_campaigns WHERE id=?').get(a.campaignId)) fail('campaign_already_exists');
         db.query('INSERT INTO spend_campaigns(id,cap_micros) VALUES(?,?)').run(a.campaignId,a.capMicros);
@@ -161,6 +178,51 @@ export function createStandingEngineeringBudget(options: {
     },
     ready(): boolean { try { return open(false,db=>statusIn(db).canAllocate); } catch { return false; } },
     status: () => open(false,statusIn),
+    /** Explicit operator action. All releases and historical auxiliary charges
+     * commit together; no balance, allocation, charge or receipt is erased. */
+    reconcileTerminalTasks(input:{taskIds:readonly string[];historicalChatAttemptIds:readonly number[];operatorEvidenceSha256:string}) {
+      if(!options.terminalJournalPath||!exact(input,['taskIds','historicalChatAttemptIds','operatorEvidenceSha256'])
+        ||!Array.isArray(input.taskIds)||input.taskIds.length>1024||new Set(input.taskIds).size!==input.taskIds.length
+        ||input.taskIds.some(v=>!id(v))||!Array.isArray(input.historicalChatAttemptIds)||!sha(input.operatorEvidenceSha256))fail('reconciliation_input');
+      return open(true,db=>withStandingTerminalJournal(db,options.terminalJournalPath!,ledgerPath,journalIdentity=>db.transaction(()=>{
+        guard();if(!enrolled(db))fail('pool_not_enrolled');initializeStandingReconciliation(db);
+        if(input.historicalChatAttemptIds.length)retainStandingAuxiliaryCharges(db,a,input.historicalChatAttemptIds,input.operatorEvidenceSha256);
+        const receipts=input.taskIds.map(taskId=>reconcileStandingTerminal(db,a,taskId,journalIdentity,input.operatorEvidenceSha256));
+        const status=statusIn(db);guard();return Object.freeze({receipts:Object.freeze(receipts),status});
+      }).immediate()));
+    },
+    /** Host-owned coding conversations retain their physical API charges in the
+     * same pool. The existing chat ticket and its historical receipts stay intact. */
+    async withCodingConversation<T>(ticketId:string,run:()=>Promise<T>):Promise<T> {
+      if(ticketId!==STANDING_CHAT_TICKET||typeof run!=='function')fail('conversation_binding');
+      const lease=randomUUID();let ended=false;
+      open(true,db=>db.transaction(()=>{
+        guard();if(!enrolled(db))fail('pool_not_enrolled');assertStandingReconciliationSchema(db);
+        if(db.query('SELECT 1 FROM standing_engineering_conversation_leases WHERE pool_id=? AND end_attempt_id IS NULL').get(a.poolId))fail('conversation_busy');
+        const last=(db.query('SELECT COALESCE(MAX(id),0) n FROM spend_attempts').get() as any).n;
+        db.query('INSERT INTO standing_engineering_conversation_leases(lease_id,pool_id,ticket_id,start_attempt_id) VALUES(?,?,?,?)').run(lease,a.poolId,ticketId,last);
+        statusIn(db);
+      }).immediate());
+      const assertLease=()=>{
+        if(ended)fail('conversation_closed');
+        open(false,db=>{const row=db.query('SELECT * FROM standing_engineering_conversation_leases WHERE lease_id=?').get(lease) as any;
+          if(!row||row.pool_id!==a.poolId||row.ticket_id!==ticketId||row.end_attempt_id!==null)fail('conversation_binding');});
+      };
+      try { return await options.ledger.withPaidRequestGuard(()=>assertLease(),()=>options.ledger.withReservationGuard(request=>{
+        assertLease();if(request.ticketId!==ticketId)fail('conversation_foreign_request');
+        // SpendLedger invokes this while holding the canonical writer lock.
+        // Active lease ranges make its subsequent reservation immediately visible
+        // to competing allocators before any external send is permitted.
+        open(false,db=>{if(statusIn(db).uncommittedCapMicros<request.reservedMicros)fail('conversation_pool_exhausted');});
+      },run)); }
+      finally {
+        open(true,db=>db.transaction(()=>{
+          const last=(db.query('SELECT COALESCE(MAX(id),0) n FROM spend_attempts').get() as any).n;
+          const result=db.query('UPDATE standing_engineering_conversation_leases SET end_attempt_id=? WHERE lease_id=? AND end_attempt_id IS NULL').run(last,lease);
+          if(result.changes!==1)fail('conversation_binding');statusIn(db);guard();
+        }).immediate());ended=true;
+      }
+    },
     allocationIdFor,
     allocate(input: {requestId:string;requestHash:string;taskId:string}): StandingEngineeringTaskBudget {
       if (!exact(input,['requestId','requestHash','taskId']) || !id(input.requestId) || !id(input.taskId) || !sha(input.requestHash)) fail('request_binding');
@@ -173,6 +235,10 @@ export function createStandingEngineeringBudget(options: {
         if (!statusIn(db).canAllocate) fail('uncommitted_pool_exhausted');
         db.query('INSERT INTO spend_tickets(ticket_id,campaign_id,cap_micros,draft_pr) VALUES(?,?,?,0)').run(expected.allocation_id,a.campaignId,a.taskCapMicros);
         db.query('INSERT INTO standing_engineering_allocations VALUES(?,?,?,?,?,?)').run(a.poolId,input.requestId,input.requestHash,input.taskId,expected.allocation_id,a.taskCapMicros);
+        if(tables(db)&&db.query("SELECT 1 FROM sqlite_master WHERE name='standing_engineering_conversation_tasks'").get()) {
+          const lease=db.query('SELECT lease_id FROM standing_engineering_conversation_leases WHERE pool_id=? AND end_attempt_id IS NULL').get(a.poolId) as {lease_id:string}|null;
+          if(lease)db.query('INSERT INTO standing_engineering_conversation_tasks VALUES(?,?)').run(expected.allocation_id,lease.lease_id);
+        }
         assertRow(db,expected); guard(); return expected;
       }).immediate());
       return mint(saved);

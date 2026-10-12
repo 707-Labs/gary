@@ -205,7 +205,9 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
         projectReply=turn=>{if(!turn.authority)throw new DMReplyError('project_authority_required');return respond({...turn,authority:turn.authority});};
       }
       if(conversationConfig){
-        const base=createSlackConversation({config:conversationConfig,ledger:spend,reply:projectReply??createHermesDMResponder(responderDeps)});
+        const reply=projectReply??createHermesDMResponder(responderDeps);
+        const base=createSlackConversation({config:conversationConfig,ledger:spend,reply:turn=>standingBudget
+          ? standingBudget.withCodingConversation(conversationConfig!.allocationId,()=>reply(turn)) : reply(turn)});
         conversation={...base,async respond(...args){
           if(engineering?.busy())return;
           conversationDispatches++;try{await base.respond(...args);}finally{conversationDispatches--;flushEngineeringStarts();}
@@ -279,7 +281,7 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
           authority:pinned.funding,fundingAuthorityPath:pinned.fundingAuthorityPath,
           fundingHoldReceiptPath:pinned.fundingHoldReceiptPath,aggregatePath:pinned.aggregatePath,ledgerPath,
         });
-        standingBudget=createStandingEngineeringBudget({ledger:spend,authority:pinned.funding,
+        standingBudget=createStandingEngineeringBudget({ledger:spend,authority:pinned.funding,terminalJournalPath:join(pinned.root,'engineering.sqlite'),
           assertAuthority:()=>{assertPinned();assertFunding();}});
         // Startup observes explicit enrollment; it cannot create or borrow funds.
         const assertBudget=()=>{if(!standingBudget!.status().enrolled)throw new Error('standing_engineering_funding_not_enrolled');};

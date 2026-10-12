@@ -671,7 +671,10 @@ test('standing startup admits beyond closed ERT history and drains both preexist
       expect(()=>f.options!.assertExecutionReady!()).toThrow('standing_engineering_conversation_not_drained');
       expect(args.beginDispatch!()).toBeNull();await emit(3,'Another message while busy');expect(launches).toBe(2);
       secondRelease.resolve();await second;expect(f.counts()).toEqual({runtimeFactories:1,admissions:1,starts:1});
-      expect(f.options!.standing!.budget.status()).toMatchObject({committedCapMicros:3_000_000,uncommittedCapMicros:3_000_000});
+      const chatCharges=args.spend!.status('local:hermes-dm-20261008-tanner')!.chargedMicros;
+      expect(chatCharges).toBeGreaterThan(0);
+      expect(f.options!.standing!.budget.status()).toMatchObject({committedCapMicros:3_000_000+chatCharges,
+        uncommittedCapMicros:3_000_000-chatCharges,auxiliaryChargeMicros:chatCharges,chargedMicros:chatCharges});
       expect(args.spend!.status(issueId)?.terminalReason).toBe('historical_ert_closed');
       expect(args.spend!.status('allocation')?.terminalReason).toBe('historical_acceptance_closed');
     }});

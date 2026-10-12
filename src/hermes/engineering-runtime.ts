@@ -141,7 +141,10 @@ export function createEngineeringRuntime(options: EngineeringRuntimeOptions) {
   const guard = () => { if (stopped || fenced) fail('unavailable'); options.assertRuntime(); options.assertGrant(); assertResourceBinding(); routine?.assertCurrent(); };
   const host = createEngineeringHost({ db, grantId: config.grantId,
     allocationId: standing ? request => standing.budget.allocationIdFor(request.requestId) : acceptance!.allocationId,
-    ...(standing ? { singleActiveRequest: true as const } : {}), ...(routine ? { immutableRepositoryScope: true as const } : {}), now,
+    ...(standing ? { singleActiveRequest: true as const,
+      onTerminal(receipt: import('./engineering-host.ts').HostEngineeringReceipt) {
+        standing.budget.reconcileTerminalTasks({taskIds:[receipt.taskId],historicalChatAttemptIds:[],operatorEvidenceSha256:fingerprintJson(receipt).sha256});
+      } } : {}), ...(routine ? { immutableRepositoryScope: true as const } : {}), now,
     assertGrant: guard, assertBudget: options.assertBudget, deliver: options.deliver,
     ...(standing ? { assertAdmissionBudget() { options.assertBudget(); if (!standing.budget.ready()) fail('budget_unavailable'); } } : {}),
     async prepare(request, taskId, signal) {

@@ -101,6 +101,9 @@ class GaryProcessHandle:
                 break
         except BaseException as exc:
             self._fault = exc
+            observer = getattr(self.environment, "_fault_observer", None)
+            if observer is not None:
+                observer(exc)
             # The backend's cancel drains the entire owned session. No PID from
             # sandbox output is ever used for cleanup.
             try:

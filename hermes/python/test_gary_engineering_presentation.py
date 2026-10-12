@@ -104,6 +104,25 @@ class NativePresentationTests(NativeHandlerTests):
         self.assertEqual(presentations[1]["rawResultHash"], ends[1]["resultHash"])
         self.assertTrue(self.agent._tool_guardrail_halt_decision.should_halt)
 
+    def test_backend_root_fault_survives_native_error_conversion_and_batch_failure(self):
+        # An incomplete poll is terminal, even if native terminal handling turns
+        # the exception into a tool error and a later batch failure masks it.
+        original = self.session.environment_rpc
+        def broken(operation, arguments):
+            response = original(operation, arguments)
+            if operation == "poll":
+                response["outputTruncated"] = True
+            return response
+        self.session.environment._rpc = broken
+        try:
+            self._batch([("fault", "terminal", {"command": "printf synthetic"})])
+        except EngineeringFault:
+            pass
+        self.assertEqual(self.session._first_fault["causes"][0]["code"], "incomplete_process_output")
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(len(self.host.starts), 1)
+        self.assertTrue(self.session.environment._fenced)
+
     def test_repeated_ids_fail_before_any_environment_operation(self):
         with self.assertRaisesRegex(EngineeringFault, "session_fenced"):
             self._batch([("same", "read_file", {"path": "one"}), ("same", "read_file", {"path": "two"})])

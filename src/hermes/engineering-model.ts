@@ -238,6 +238,7 @@ export function createEngineeringModelAdapter(input: EngineeringModelOptions): E
         requestGuard(); signal.throwIfAborted();
         assertPrior();
         const current = reservation.status;
+        standing?.assertReservation(reservation.reservedMicros);
         if (reservation.ticketId !== allocationId || reservation.provider !== LIMITS.provider || reservation.model !== LIMITS.model
             || reservation.maxTokens !== maxTokens || current.attemptCount !== baselineCount + prior.length
             || current.chargedMicros !== before.chargedMicros || current.capMicros !== LIMITS.capMicros

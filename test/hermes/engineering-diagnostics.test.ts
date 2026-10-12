@@ -74,3 +74,12 @@ test('bounded error detail overflow survives private journal roundtrip within it
     }
   } finally { db.close(); }
 });
+
+test('maximum redacted worker cause chain fits the existing journal cap and rejects extra text',()=>{
+ const db=new Database(':memory:'),write=createEngineeringDiagnosticJournal(db,binding);
+ const workerFault={version:1 as const,causes:Array.from({length:4},()=>({code:'process_observation_failed',frames:Array.from({length:4},()=>({file:'gary_engineering_environment.py',line:99999}))}))};
+ const diagnostic={...engineeringFailure('native_turn',Error('engineering_worker:runtime_failed')),workerFault};
+ write(diagnostic);expect(readEngineeringDiagnostics(db,binding)).toEqual([diagnostic]);
+ expect(()=>write({...diagnostic,workerFault:{...workerFault,secret:'private'} as any})).toThrow('frame_shape');
+ db.close();
+});

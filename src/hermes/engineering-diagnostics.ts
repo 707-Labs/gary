@@ -114,6 +114,7 @@ const SAFE_ERRORS = new Set([
   'engineering_worker:native_schema_changed',
   'engineering_worker:partial_frame',
   'engineering_worker:request_shape',
+  'engineering_worker:runtime_failed',
   'engineering_worker:result_binding',
   'engineering_worker:rpc_rejected',
   'engineering_worker:snapshot_directory',
@@ -253,6 +254,7 @@ export interface EngineeringHostObserved {
 export interface EngineeringDiagnostic {
   version: 1; event: 'failure' | 'native_result'; phase: EngineeringPhase; code: string;
   hostObserved?: EngineeringHostObserved; workerReported?: EngineeringWorkerReported;
+  workerFault?: EngineeringWorkerFault;
   hostCommand?: { ordinal: number; exitCode: number | null };
 }
 export interface EngineeringDiagnosticBinding { taskId: string; requestId: string; sessionId: string | null; ownerEpoch: string | null }
@@ -286,16 +288,29 @@ export function parseEngineeringWorkerReported(v: unknown): EngineeringWorkerRep
   }
   return structuredClone(v) as unknown as EngineeringWorkerReported;
 }
+export interface EngineeringWorkerFault { version: 1; causes: readonly { code: string; frames: readonly {file: string; line: number}[] }[] }
+const WORKER_FAULT_CODES = new Set(["child_delegation_denied", "cleanup_unconfirmed", "close_during_native_tool", "code_cleanup_unconfirmed", "code_process_cleanup_unconfirmed", "code_requires_isolated_native_worker", "concurrent_environment_execution", "cross_profile_denied", "cross_profile_session_lookup_denied", "environment_fenced", "environment_operation_limit", "environment_operation_rejected", "expired_tool_admission", "foreign_native_module", "frame_limit", "host_rejected", "host_reply_limit", "host_system_prompt_changed", "incomplete_process_output", "inherited_call_limit", "inherited_process_mode_denied", "invalid_code_authorization", "invalid_command", "invalid_command_timeout", "invalid_deadline", "invalid_delegation_depth", "invalid_engineering_binding", "invalid_engineering_start", "invalid_host_system_prompt", "invalid_model_limits", "invalid_native_context", "invalid_native_context_tools", "invalid_native_history", "invalid_native_source", "invalid_native_tool_call", "invalid_process_start", "invalid_process_status", "invalid_result_presentation", "invalid_scoped_directory", "invalid_scoped_home", "invalid_scoped_session_path", "invalid_stdin", "invalid_task_operation", "invalid_task_result", "invalid_turn_frame", "local_process_denied", "missing_guarded_model_client_or_profile", "missing_process_exit_code", "missing_scoped_directory", "missing_scoped_session_db", "model_request_limit", "model_response_shape", "model_route_denied", "native_agent_session_mismatch", "native_batch_history_changed", "native_batch_overlap", "native_batch_result_mismatch", "native_call_identity_changed", "native_call_identity_replayed", "native_dotenv_present", "native_environment_collision", "native_file_cwd_unbound", "native_handler_changed", "native_identity_mismatch", "native_pin_mismatch", "native_presentation_limit", "native_process_action_not_implemented", "native_process_feature_not_implemented", "native_profile_changed", "native_profile_not_installed", "native_registry_mismatch", "native_result_count_invalid", "native_result_history_missing", "native_result_limit", "native_scope_mismatch", "parallel_native_tool_denied", "process_deadline_exceeded", "process_identity_mismatch", "process_observation_failed", "process_output_limit", "scoped_config_symlink", "scoped_directory_contains_symlink", "scoped_home_symlink", "scoped_memory_identity_changed", "scoped_session_checkpoint_busy", "scoped_session_checkpoint_incomplete", "scoped_session_identity_changed", "session_closed", "session_deadline", "session_fenced", "skill_roots_overlap", "stdio_frame_limit", "stdio_reply_mismatch", "stdio_transport_fenced", "tool_arguments_changed", "tool_arguments_limit", "tool_limit", "tool_not_allowed_or_replayed", "turn_replay_or_limit", "unapproved_native_tool", "unbound_background_start", "unbound_code_invocation", "unbound_environment_operation", "unbound_inherited_call", "unbound_native_environment", "unbound_task_operation", "unknown_environment_operation", "unknown_failure", "unknown_native_capability"]);
+const WORKER_FAULT_FILES = new Set(['gary_engineering_runtime.py','gary_engineering_environment.py','gary_runtime.py','tool_executor.py','terminal_tool.py','conversation_loop.py']);
+export function parseEngineeringWorkerFault(v: unknown): EngineeringWorkerFault {
+  const bad = () => { throw Error('engineering_worker:frame_shape'); };
+  if (!object(v) || !exact(v,['version','causes']) || v.version !== 1 || !Array.isArray(v.causes) || v.causes.length < 1 || v.causes.length > 4) return bad();
+  for (const c of v.causes) {
+    if (!object(c) || !exact(c,['code','frames']) || !WORKER_FAULT_CODES.has(String(c.code)) || !Array.isArray(c.frames) || c.frames.length > 4) return bad();
+    for (const f of c.frames) if (!object(f) || !exact(f,['file','line']) || !WORKER_FAULT_FILES.has(String(f.file)) || !Number.isSafeInteger(f.line) || Number(f.line) < 1 || Number(f.line) > 100000) return bad();
+  }
+  return structuredClone(v) as unknown as EngineeringWorkerFault;
+}
 export function engineeringFailure(phase: EngineeringPhase, error: unknown): EngineeringDiagnostic {
   const message = error instanceof Error ? error.message : '';
   return { version: 1, event: 'failure', phase, code: SAFE_ERRORS.has(message) ? message
     : error instanceof Error && error.name === 'AbortError' ? 'aborted' : 'unknown_failure' };
 }
 function validate(v: unknown): asserts v is EngineeringDiagnostic {
-  if (!object(v) || Object.keys(v).some(k => !['version','event','phase','code','hostObserved','workerReported','hostCommand'].includes(k))
+  if (!object(v) || Object.keys(v).some(k => !['version','event','phase','code','hostObserved','workerReported','hostCommand','workerFault'].includes(k))
       || v.version !== 1 || !ENGINEERING_PHASES.includes(v.phase as EngineeringPhase)
       || !['failure','native_result'].includes(String(v.event))
       || !(v.event === 'native_result' ? v.code === 'none' : ['unknown_failure','aborted'].includes(String(v.code)) || SAFE_ERRORS.has(String(v.code)))) throw Error('engineering_diagnostics:shape');
+  if (v.workerFault !== undefined) parseEngineeringWorkerFault(v.workerFault);
   if (v.workerReported !== undefined) parseEngineeringWorkerReported(v.workerReported);
   if (v.hostObserved !== undefined && (!object(v.hostObserved)
       || !exact(v.hostObserved, ['modelRequestsReceived','toolBegins','toolEnds','toolFailures','environmentOperations'])

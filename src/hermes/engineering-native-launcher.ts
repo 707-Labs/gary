@@ -7,7 +7,7 @@ import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { EngineeringProtocol, type EngineeringProtocolBinding } from './engineering-protocol.ts';
 import type { EngineeringModelAdapter } from './engineering-model.ts';
 import { fingerprintJson } from './audit-trace.ts';
-import { engineeringFailure, parseEngineeringWorkerReported, type EngineeringHostObserved, type EngineeringWorkerReported } from './engineering-diagnostics.ts';
+import { engineeringFailure, parseEngineeringWorkerReported, parseEngineeringWorkerFault, type EngineeringHostObserved, type EngineeringWorkerReported } from './engineering-diagnostics.ts';
 import type { ConversationMessage } from './conversation.ts';
 import { createEngineeringSessionGuardianFactory, type EngineeringSessionGuardian,
   type EngineeringSessionGuardianFactory } from '../executors/engineering-session-guardian.ts';
@@ -128,8 +128,9 @@ export function createEngineeringStdioLauncher(config: EngineeringStdioOptions):
     let ended = false, exitCode: number | null = null, busy = false, closing = false, stopped = false, operationPending = false;
     let cleanupConfirmed = false;
     const hostObserved: EngineeringHostObserved = { modelRequestsReceived: 0, toolBegins: 0, toolEnds: 0, toolFailures: 0, environmentOperations: 0 };
+    let workerFault: ReturnType<typeof parseEngineeringWorkerFault> | undefined;
     const failure = (phase: 'native_start' | 'native_turn' | 'native_close', error: unknown) => input.append(Object.freeze({
-      kind: 'native_diagnostic', ...binding, diagnostic: { ...engineeringFailure(phase, error), hostObserved: { ...hostObserved } } }));
+      kind: 'native_diagnostic', ...binding, diagnostic: { ...engineeringFailure(phase, error), hostObserved: { ...hostObserved }, ...(workerFault ? {workerFault} : {}) } }));
     const completion = new Promise<void>(resolve => {
       child.once('error', () => { cancellation.abort(); ended = true; resolve(); });
       child.once('exit', () => { if (operationPending) cancellation.abort(); });
@@ -175,6 +176,13 @@ export function createEngineeringStdioLauncher(config: EngineeringStdioOptions):
         guard(); const item = await reader.next(); guard();
         if (item.done) fail('unexpected_exit');
         const frame = item.value;
+        if (frame.type === 'engineering.error') {
+          if (!(exact(frame,['type','error','cleanupConfirmed']) || exact(frame,['type','error','cleanupConfirmed','diagnostic']))
+              || frame.error !== 'engineering_runtime_failed' || typeof frame.cleanupConfirmed !== 'boolean') fail('frame_shape');
+          if (frame.diagnostic !== undefined) workerFault = parseEngineeringWorkerFault(frame.diagnostic);
+          // Worker cleanup is only a report; exact supervisor cleanup remains mandatory.
+          fail('runtime_failed');
+        }
         if (frame.type === type) return frame;
         if (!exact(frame, ['type','id','kind','body']) || frame.type !== 'engineering.request'
             || frame.id !== nextRequest || nextRequest > 2048 || !['rpc','model'].includes(String(frame.kind))
