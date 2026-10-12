@@ -8,6 +8,7 @@ import { canonicalArguments, canonicalizeConversation, sameConversation, type Co
 import { DMReplyError, exactDMAllocation, type DMText, type DMTurn, type DMReplyDependencies } from './dm-conversation.ts';
 import type { GaryRuntimeManifest } from './gary-loop-adapter.ts';
 import type { ProjectAssistant, ProjectAudience, ProjectToolDefinition } from './project-assistant.ts';
+import { hasConversationEngineeringCapability, ordinaryEngineeringScope } from './conversation-engineering.ts';
 
 // Separate versioned policy: existing text-only DM admission/fingerprints are unchanged.
 export const PROJECT_CONVERSATION_POLICY = Object.freeze({
@@ -104,6 +105,8 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
     const authority = audience(input.authority);
     const turn = { ...input, authority, history: structuredClone(input.history) };
     const maxTokens = projectResponseTokens(turn.text, authority.surface);
+    const codingHandoff = hasConversationEngineeringCapability(turn.engineering, authority)
+      && ordinaryEngineeringScope(turn.text) !== null;
     if (typeof turn.requestId !== 'string' || turn.requestId.length > 120 || ![turn.requestId, turn.ownerId].every(v => typeof v === 'string' && ID.test(v))) fail('project_identity_rejected');
     const original = deps.ledger.status(turn.allocationId);
     if (!exactDMAllocation(original, turn.allocationId, turn.campaignId) || original.unknownAttempts !== 0) fail('project_budget_unavailable');
@@ -116,6 +119,7 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
     let hostFailure: ProjectReplyError | undefined, replacementUsed = false;
     let expected: ConversationMessage[] = [], preparedHistory: DMText[] = [];
     let historyCompacted = false, answerOnlyContext = false;
+    let engineeringAttempted = false;
     const pending = new Map<string, { name: string; arguments: string }>();
     let stage = 'prepare_history';
     const guard = () => {
@@ -180,7 +184,7 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
           deadlineMs, allowedToolNames: [...names], signal },
         assertOwner: (ticket, owner) => { if (ticket !== turn.allocationId || owner !== turn.ownerId) fail('project_owner_changed'); guard(); },
       });
-      const complete = async (messages: ConversationMessage[], offered: readonly ProjectToolDefinition[], tokenLimit: number) => {
+      const complete = async (messages: ConversationMessage[], offered: readonly ProjectToolDefinition[], tokenLimit: number, selectedTool?: string) => {
         guard();
         if (modelCalls >= p.maxRequestsPerMessage || inFlight) fail('project_model_request_rejected');
         modelCalls++; inFlight = true;
@@ -189,7 +193,8 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
           response = await route(new Request('http://127.0.0.1/v1/chat/completions', {
             method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + capability }, signal,
             body: JSON.stringify({ model: p.model, max_tokens: tokenLimit, temperature: p.temperature,
-              messages, ...(offered.length ? { tools: offered } : {}) }),
+              messages, ...(offered.length ? { tools: offered } : {}),
+              ...(selectedTool ? { tool_choice: { type: 'function', function: { name: selectedTool } }, parallel_tool_calls: false } : {}) }),
           }));
         } finally { inFlight = false; }
         guard(); if (!response.ok) fail('project_model_' + transportFailure);
@@ -261,6 +266,7 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
               || body.name !== call.name || canonicalArguments(body.arguments) !== call.arguments) fail('project_tool_call_rejected');
             // Consume before execution: cancellation, errors and repeats can never repeat a mutation.
             pending.delete(body.callId as string); toolCalls++;
+            if (call.name === 'engineering_submit') engineeringAttempted = true;
             const result = await deps.projects.execute({ audience: authority, requestId: turn.requestId + ':' + body.callId,
               toolName: call.name, args: freeze(JSON.parse(call.arguments)), signal,
               ...(turn.engineering ? { engineering: turn.engineering, assertActive: guard } : {}) });
@@ -295,9 +301,13 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
             const contextBytes = Buffer.byteLength(JSON.stringify([reference, ...expected]));
             const toolHeadroom = p.maxReplyBytes + 2048 * (p.maxToolsPerMessage - toolCalls);
             const contextAnswerOnly = p.maxContextBytes - contextBytes < toolHeadroom;
-            const offered = replacement || answerOnlyContext || contextAnswerOnly || modelCalls + 1 === p.maxRequestsPerMessage || toolCalls === p.maxToolsPerMessage ? [] : tools;
+            const answerOnly = replacement || answerOnlyContext || contextAnswerOnly || modelCalls + 1 === p.maxRequestsPerMessage || toolCalls === p.maxToolsPerMessage;
+            if (codingHandoff && !engineeringAttempted && (answerOnly || !names.has('engineering_submit'))) fail('project_handoff_unavailable');
+            const offered = codingHandoff ? engineeringAttempted ? [] : tools.filter(tool => tool.function.name === 'engineering_submit')
+              : answerOnly ? [] : tools;
             const system = replacement ? hostSystem + '\nThe previous answer reached its output limit. Give a shorter replacement answer, using at most three quarters of the available output tokens and only the evidence already present. Do not repeat actions or claim further research. State any remaining gaps explicitly.' : hostSystem;
-            return complete([{ role: 'system', content: system }, reference, ...expected], offered, maxTokens);
+            return complete([{ role: 'system', content: system }, reference, ...expected], offered, maxTokens,
+              codingHandoff && !engineeringAttempted ? 'engineering_submit' : undefined);
           };
           let value = await dispatch(false);
           if (value.choices[0].finish_reason === 'length') {
@@ -332,6 +342,7 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
             }
           } else {
             if (reason !== 'stop' || message.tool_calls !== undefined || typeof message.content !== 'string' || !message.content.trim()) fail('project_reply_rejected');
+            if (/<[|｜]+DSML[|｜]+(?:tool_calls|function_calls|invoke|parameter)\b/i.test(message.content)) fail('project_unexecuted_tool_markup');
             answer = message.content;
           }
           expected = next; if (!answer) checkContext(); return Response.json(value);
@@ -375,6 +386,7 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
       const admittedCodes = new Set(['source_unavailable', 'memory_unavailable', 'result_too_large',
         'path_denied', 'secret_like_content', 'audience_denied', 'assistant_closed', 'operation_cancelled',
         'dm_owner_changed', 'dm_worker_binding_rejected', 'dm_budget_unavailable', 'invalid_conversation_history',
+        'project_unexecuted_tool_markup', 'project_handoff_unavailable', 'project_model_unsupported_provider_response',
         'EACCES', 'EPERM', 'ENOENT', 'SQLITE_ERROR', 'SQLITE_BUSY', 'SQLITE_READONLY', 'SQLITE_CORRUPT']);
       const candidate = error instanceof DMReplyError ? error.code : error instanceof Error ? error.message : '';
       const code = admittedCodes.has(candidate) ? candidate : 'unclassified';

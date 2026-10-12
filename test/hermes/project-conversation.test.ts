@@ -140,6 +140,70 @@ test('native RPC carries only repository; the current host capability and active
   expect(JSON.stringify(requests)).not.toContain('host_conversation_engineering');
 });
 
+test('explicit authorized coding forces the existing structured handoff first, then only reports its receipt', async () => {
+  const f = fixture(), requests: any[] = [];
+  const engineering = createConversationEngineeringCapability(authority, async () => ({ ok: true, dataOnly: true, data: null }));
+  const submit = { type: 'function' as const, function: { name: 'engineering_submit', description: 'Submit current request',
+    parameters: { type: 'object', properties: { repository: { type: 'string' } }, required: ['repository'], additionalProperties: false } } };
+  f.projects.toolsFor = () => [...structuredClone(definitions), submit];
+  const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fixture-key', launch: native(), fetch: async req => {
+    requests.push(await req.json());
+    return requests.length === 1 ? provider([call('submit', 'engineering_submit', { repository: '707-Labs/new-app' })]) : provider();
+  } });
+  await reply(turn({ engineering, text: 'Gary, please fix the bug in 707-Labs/new-app.' }));
+  expect(requests).toHaveLength(2);
+  expect(requests[0].tools.map((tool: any) => tool.name)).toEqual(['engineering_submit']);
+  expect(requests[0].tool_choice).toEqual({ type: 'tool', name: 'engineering_submit', disable_parallel_tool_use: true });
+  expect(requests[1].tools).toBeUndefined(); expect(requests[1].tool_choice).toBeUndefined();
+  expect(f.executions.map(value => value.toolName)).toEqual(['engineering_submit']);
+});
+
+test('ordinary conversation, negated or quoted coding and absent host capability keep automatic tool selection', async () => {
+  for (const input of [
+    { text: 'What is the status of 707-Labs/new-app?', capability: true },
+    { text: 'Please do not fix the bug in 707-Labs/new-app.', capability: true },
+    { text: 'Explain this request: `Fix the bug in 707-Labs/new-app`.', capability: true },
+    { text: 'Fix the bug in 707-Labs/new-app.', capability: false },
+  ]) {
+    const f = fixture(), requests: any[] = [];
+    const engineering = createConversationEngineeringCapability(authority, async () => ({ ok: true, dataOnly: true, data: null }));
+    const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fixture-key', launch: native(), fetch: async req => {
+      requests.push(await req.json()); return provider();
+    } });
+    await reply(turn({ text: input.text, ...(input.capability ? { engineering } : {}) }));
+    expect(requests[0].tool_choice).toBeUndefined();
+    expect(requests[0].tools.map((tool: any) => tool.name)).toEqual(['current_work', 'remember_fact']);
+    expect(f.executions).toHaveLength(0);
+  }
+});
+
+test('observed sixth-call DSML text is rejected without executing its alleged repository reads', async () => {
+  const f = fixture(); let requests = 0;
+  const observed = 'Let me read the testing rules and tdd skill to match conventions.\n'
+    + '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="repository_read">'
+    + '<｜｜DSML｜｜parameter name="path" string="true">.claude/rules/testing.md</｜｜DSML｜｜parameter>'
+    + '</｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>';
+  const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fixture-key', launch: native(), fetch: async () => {
+    requests++; return requests < 6 ? provider([call('read_' + requests)]) : provider([{ type: 'text', text: observed }]);
+  } });
+  await expect(reply(turn())).rejects.toThrow('project_unexecuted_tool_markup');
+  expect(requests).toBe(6); expect(f.executions).toHaveLength(5);
+  expect(f.executions.some(value => value.toolName === 'repository_read')).toBeFalse();
+  expect(f.ledger.status(allocation)?.unknownAttempts).toBe(0);
+});
+
+test('coding provider text cannot replace the required structured handoff or trigger tool execution', async () => {
+  const f = fixture();
+  const engineering = createConversationEngineeringCapability(authority, async () => ({ ok: true, dataOnly: true, data: null }));
+  f.projects.toolsFor = () => [{ type: 'function', function: { name: 'engineering_submit', description: 'Submit',
+    parameters: { type: 'object', properties: { repository: { type: 'string' } }, required: ['repository'], additionalProperties: false } } }];
+  const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fixture-key', launch: native(), fetch: async () => provider([
+    { type: 'text', text: '<|DSML|tool_calls><|DSML|invoke name="engineering_submit">707-Labs/new-app</|DSML|invoke>' },
+  ]) });
+  await expect(reply(turn({ engineering, text: 'Fix the bug in 707-Labs/new-app.' }))).rejects.toThrow('project_model_unsupported_provider_response');
+  expect(f.executions).toHaveLength(0); expect(f.ledger.status(allocation)?.unknownAttempts).toBe(0);
+});
+
 test('six physical requests maximum; the sixth request is host-forced answer-only', async () => {
   const f = fixture(), requests: any[] = [];
   const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fake-secret', launch: native(), fetch: async req => {

@@ -2,6 +2,9 @@
 export function conversationFailureMessage(code: string, cleanupConfirmed: boolean, unknownSpend: boolean): string {
   if (!cleanupConfirmed) return "I couldn't confirm that the worker stopped. This thread is paused until its cleanup is verified; I won't start competing work or retry the request automatically.";
   if (unknownSpend) return "The provider's usage receipt is unresolved. This thread is paused until that request is reconciled; I won't make another paid request automatically.";
+  if (code === 'project_unexecuted_tool_markup') return "The provider returned tool-call markup instead of a verified answer. That markup was not executed. This thread is paused; recorded tool actions and any engineering admission need review before continuing.";
+  if (code === 'project_model_unsupported_provider_response') return "The provider returned a response I couldn't validate through its structured interface. Tool-call text was not executed. This thread is paused; recorded actions need review before continuing.";
+  if (code === 'project_handoff_unavailable') return "I couldn't submit this coding request within the current conversation limits. No engineering handoff was made for this turn; I won't retry it automatically.";
   if (code === 'dm_context_limit' || code === 'project_context_limit') {
     return "This thread is paused because the request no longer fits its context limit. Start a new thread with the question and the relevant details. This failed event and its tool actions won't be replayed automatically.";
   }
