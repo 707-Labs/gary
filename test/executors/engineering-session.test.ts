@@ -427,6 +427,9 @@ it('4 GiB commands use the proven bounded Node heap without expanding physical r
   expect(create.argv).toContain('--pids-limit=512');expect(create.argv.slice(create.argv.indexOf('--ulimit'),create.argv.indexOf('--ulimit')+2)).toEqual(['--ulimit','core=0:0']);
   const command=f.runner.calls.find(c=>c.argv[1]==='exec'&&c.argv.includes('CI=1 bun --no-env-file --no-install run check'))!;
   expect(command.argv).toContain('NODE_OPTIONS=--max-old-space-size=3072');
+  expect(command.argv).toContain('TMPDIR=/workspace/node_modules/.cache/gary-runtime-tmp');
+  expect(f.runner.calls.some(c=>c.argv.includes('mkdir')&&c.argv.includes('/workspace/node_modules/.cache/gary-runtime-tmp'))).toBeTrue();
+  expect(create.argv.join(' ')).not.toContain('/tmp:exec');
   expect(command.argv.at(-1)).toBe('CI=1 bun --no-env-file --no-install run check');await f.close();
   for(const memoryMiB of [2048,12288]) {const g=setup({resourceProfile:{cpus:1,memoryMiB}});await g.execute();
     expect(g.runner.calls.flatMap(c=>c.argv).some(v=>v.startsWith('NODE_OPTIONS='))).toBeFalse();await g.close();}

@@ -370,6 +370,14 @@ export class EngineeringSession {
         if (cache.exitCode !== 0 || cache.timedOut) fail('engineering_cache_prepare_failed');
         await this.guard();
       }
+      if (this.resourceProfile.memoryMiB === 4096) {
+        // Test fixtures may need executable temporary scripts. Keep /tmp
+        // noexec; use the already executable, ignored workspace cache instead.
+        const temporary = await this.control(['exec', id, '/usr/bin/env', '-i', 'PATH=/usr/bin:/bin',
+          'mkdir', '-p', '-m', '700', '/workspace/node_modules/.cache/gary-runtime-tmp']);
+        if (temporary.exitCode !== 0 || temporary.timedOut) fail('engineering_cache_prepare_failed');
+        await this.guard();
+      }
       this.options.journal.transaction(this.binding.taskId, state => { state.sessions[this.binding.sessionId]!.phase = 'active'; });
       this.receipt('session_started');
       this.armTimeout(Math.max(1, this.options.deadlineMs - this.now()));
@@ -426,7 +434,8 @@ export class EngineeringSession {
           // Node's automatic ~2 GiB heap aborts the baseline project check.
           // This reviewed setting fits the existing 4 GiB cgroup; smaller
           // and other profiles retain their native defaults.
-          ...(this.resourceProfile.memoryMiB === 4096 ? ['NODE_OPTIONS=--max-old-space-size=3072'] : []),
+          ...(this.resourceProfile.memoryMiB === 4096 ? ['NODE_OPTIONS=--max-old-space-size=3072',
+            'TMPDIR=/workspace/node_modules/.cache/gary-runtime-tmp'] : []),
           'bash', '--noprofile', '--norc', '-c', args.command], timeoutMs, args.stdin));
         this.processes.set(processId, { command, deadlineMs: commandDeadline, terminal: null });
         this.armTimeout(Math.max(1, commandDeadline - this.now()), processId);
