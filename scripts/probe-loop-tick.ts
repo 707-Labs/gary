@@ -10,6 +10,7 @@ import { GLMClient } from "../src/adapters/glm.ts";
 import { makeGitHubClient } from "../src/adapters/github.ts";
 import { LinearAdapter } from "../src/adapters/linear.ts";
 import { loadConfig } from "../src/config.ts";
+import { PAID_ROUTE } from "../src/model-route.ts";
 import { tick } from "../src/loop.ts";
 import { createProvider, createProviderChain } from "../src/providers.ts";
 import { closeDb, openDb } from "../src/state/db.ts";
@@ -23,7 +24,7 @@ const spend = openSpendLedger(resolve(cfg.gary.stateDir, "spend.db"));
 
 const linear = new LinearAdapter({ gary: cfg.gary, linear: cfg.linear });
 const github = makeGitHubClient(cfg.github);
-const chain = createProviderChain(cfg.providers.filter((p) => p.name === "deepseek")
+const chain = createProviderChain(cfg.providers.filter((p) => p.name === PAID_ROUTE.provider)
   .map((p) => createProvider(p, { fetch: spend.guardedFetch(p.name) })));
 const glm = new GLMClient(chain);
 const cloudflare = cfg.cloudflare ? new CloudflareClient(cfg.cloudflare) : null;

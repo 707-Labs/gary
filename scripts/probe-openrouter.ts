@@ -1,22 +1,24 @@
-// Smoke test for DeepSeek's Anthropic-compatible endpoint. Verifies that
-// the Anthropic SDK pointed at api.deepseek.com/anthropic can:
+// Smoke test for OpenRouter's Anthropic-compatible endpoint on Gary's paid
+// route (src/model-route.ts). Paid: two tiny requests. Verifies that the
+// Anthropic SDK pointed at openrouter.ai/api can:
 //   1. Complete a basic chat (text in / text out)
 //   2. Use tools (the agent loop relies on this)
 //
-// Run with: bun run scripts/probe-deepseek.ts
+// Run with: bun run scripts/probe-openrouter.ts
 
 import Anthropic from "@anthropic-ai/sdk";
+import { PAID_ROUTE } from "../src/model-route.ts";
 
-const apiKey = process.env.DEEPSEEK_API_KEY;
+const apiKey = process.env[PAID_ROUTE.apiKeyEnv];
 if (!apiKey) {
-  console.error("DEEPSEEK_API_KEY not set");
+  console.error(`${PAID_ROUTE.apiKeyEnv} not set`);
   process.exit(1);
 }
 
-const baseURL = process.env.DEEPSEEK_BASE_URL ?? "https://api.deepseek.com/anthropic";
-const model = process.env.DEEPSEEK_MODEL ?? "deepseek-v4-pro";
+const baseURL = PAID_ROUTE.baseUrl;
+const model = PAID_ROUTE.model;
 
-// DeepSeek uses Authorization: Bearer, not x-api-key.
+// Same Authorization: Bearer header Gary's provider chain sends.
 const client = new Anthropic({ authToken: apiKey, baseURL });
 
 console.log(`baseURL: ${baseURL}`);
@@ -75,7 +77,7 @@ for (const c of toolCalls) {
 
 if (toolCalls.length === 0) {
   console.error(
-    "\n!! DeepSeek did not emit a tool_use block. Tool support is required for the agent loop.",
+    "\n!! OpenRouter did not emit a tool_use block. Tool support is required for the agent loop.",
   );
   process.exit(1);
 }
