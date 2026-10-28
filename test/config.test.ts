@@ -1,4 +1,6 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { log } from "../src/logger.ts";
+import type { ProviderConfig } from "../src/providers.ts";
 import { PAID_ROUTE } from "../src/model-route.ts";
 import {
   loadProviderConfigs,
@@ -102,10 +104,11 @@ describe("loadReviewConfig", () => {
     expect(cfg.providerOrder).toEqual(["kimi", "openrouter"]);
   });
 
-  it("ignores unknown provider names, including the retired direct deepseek route", () => {
+  it("fails loudly on unknown provider names, including the retired direct deepseek route", () => {
     setEnv("GARY_REVIEWER_PROVIDER_ORDER", "deepseek,gpt5,kimi");
-    const cfg = loadReviewConfig();
-    expect(cfg.providerOrder).toEqual(["kimi"]);
+    expect(() => loadReviewConfig()).toThrow(/GARY_REVIEWER_PROVIDER_ORDER.*deepseek, gpt5/);
+    setEnv("GARY_REVIEWER_PROVIDER_ORDER", "deepseek");
+    expect(() => loadReviewConfig()).toThrow(/GARY_REVIEWER_PROVIDER_ORDER/);
   });
 
   it("respects integer overrides", () => {
@@ -180,17 +183,24 @@ describe("loadProviderConfigs without DEEPSEEK_API_KEY", () => {
     Object.assign(process.env, values);
   };
 
-  it("boots the paid route from OPENROUTER_API_KEY alone", () => {
+  it("boots the paid route from OPENROUTER_API_KEY alone, without warnings", () => {
     env({ Z_AI_API_KEY: "fake-zai", OPENROUTER_API_KEY: "fake-openrouter" });
+    const warn = spyOn(log, "warn").mockImplementation(() => {});
+    try { loadProviderConfigs(); expect(warn).not.toHaveBeenCalled(); } finally { warn.mockRestore(); }
     const providers = loadProviderConfigs();
     expect(providers.map((p) => p.name)).toEqual(["z.ai", "openrouter"]);
     expect(providers[1]).toMatchObject({ apiKey: "fake-openrouter", baseUrl: PAID_ROUTE.baseUrl, model: PAID_ROUTE.model });
   });
 
-  it("ignores a leftover DEEPSEEK_API_KEY and never builds a direct DeepSeek provider", () => {
+  it("ignores a leftover DEEPSEEK_API_KEY with a warning and never builds a direct DeepSeek provider", () => {
     env({ Z_AI_API_KEY: "fake-zai", OPENROUTER_API_KEY: "fake-openrouter", DEEPSEEK_API_KEY: "fake-deepseek",
       DEEPSEEK_BASE_URL: "https://api.deepseek.com/anthropic", DEEPSEEK_MODEL: "deepseek-v4-pro" });
-    const providers = loadProviderConfigs();
+    const warn = spyOn(log, "warn").mockImplementation(() => {});
+    let providers: readonly ProviderConfig[];
+    try { providers = loadProviderConfigs(); expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]![1]).toEqual({ variables: ["DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL"] });
+      expect(JSON.stringify(warn.mock.calls)).not.toContain("fake-deepseek");
+    } finally { warn.mockRestore(); }
     expect(providers.map((p) => p.name)).toEqual(["z.ai", "openrouter"]);
     expect(providers.some((p) => p.apiKey === "fake-deepseek" || p.baseUrl.includes("deepseek.com"))).toBe(false);
   });

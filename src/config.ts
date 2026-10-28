@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { log } from "./logger.ts";
 import { PAID_ROUTE } from "./model-route.ts";
 import {
   createProvider,
@@ -153,10 +154,13 @@ const KNOWN_PROVIDERS: ReadonlySet<string> = new Set(["z.ai", "kimi", "openroute
 
 export function loadReviewConfig(): ReviewConfig {
   const orderRaw = optionalString("GARY_REVIEWER_PROVIDER_ORDER");
-  const providerOrder = (orderRaw ?? "openrouter,z.ai,kimi")
-    .split(",")
-    .map((s) => s.trim())
-    .filter((s): s is ProviderName => KNOWN_PROVIDERS.has(s));
+  const names = (orderRaw ?? "openrouter,z.ai,kimi").split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+  // A stale name (e.g. the retired "deepseek") must stop boot, not silently shrink the reviewer chain.
+  const unknown = names.filter((s) => !KNOWN_PROVIDERS.has(s));
+  if (unknown.length > 0) {
+    throw new Error(`Invalid GARY_REVIEWER_PROVIDER_ORDER: unknown provider(s) ${unknown.join(", ")}; known: ${[...KNOWN_PROVIDERS].join(", ")}`);
+  }
+  const providerOrder = names as ProviderName[];
   return {
     providerOrder,
     maxRounds: intFromEnv("GARY_REVIEW_MAX_ROUNDS", 3),
@@ -356,6 +360,11 @@ function loadProviderConfig(name: ProviderName): ProviderConfig | null {
  * disable). The returned array is non-empty.
  */
 export function loadProviderConfigs(): readonly ProviderConfig[] {
+  // The direct DeepSeek route was retired 2026-10-28; its variables are ignored.
+  const staleDeepSeek = Object.keys(process.env).filter((key) => key.startsWith("DEEPSEEK_")).sort();
+  if (staleDeepSeek.length > 0) {
+    log.warn("ignoring retired DeepSeek provider variables; paid inference uses OpenRouter", { variables: staleDeepSeek });
+  }
   // Z.ai stays required so existing deployments keep working without
   // env changes. Kimi/OpenRouter are opt-in fallbacks.
   const zai = loadProviderConfig("z.ai");
