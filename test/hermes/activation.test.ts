@@ -73,7 +73,7 @@ async function runtimeFixture(configure?:(config:HermesActivationConfig,workspac
     const body=await request.json();expect(body.model).toBe('deepseek/deepseek-v4.1-flash');expect(body.thinking).toEqual({type:'disabled'});requests++;
     const steps=[['read_file',{path:'task.ts'}],['write_file',{path:'task.ts',content:'updated\n'}],['run_bash',{command:'bun run check'}],['run_bash',{command:CHECK}],['finish',{summary:'Verified fixture'}]] as const;
     const step=steps[(requests-1)%5]!;
-    return Response.json({id:'reply-'+requests,type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'tool_use',id:'call-'+requests,name:step[0],input:step[1]}],stop_reason:'tool_use',usage:{input_tokens:10,output_tokens:8,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+    return Response.json({id:'reply-'+requests,type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'tool_use',id:'call-'+requests,name:step[0],input:step[1]}],stop_reason:'tool_use',usage:{input_tokens:10,output_tokens:8,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});
   }};
   const deps={db,ledger,route,executorJobJournal:{directory:join(f.trace,'offline-jobs'),close(){}},launch:async(...args:Parameters<GaryRuntimeLauncher>)=>{launches++;return native(...args);}};
   const admissionActivation=createHermesActivation(loadHermesActivationConfig(f.path),deps);

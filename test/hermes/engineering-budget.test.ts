@@ -103,7 +103,7 @@ test('partial recovery binds exact authority, source, config, ledger identity an
 test('historical attempt, receipt and coding-policy changes during admission fail while retaining the full hold',()=>{
   for(const kind of ['attempt','receipt','coding-policy']){
     const {options:o}=fixture();expect(()=>run(o,s=>{if(s==='hold_durable'){
-      const db=new Database(o.ledgerPath);db.exec(kind==='attempt'?"UPDATE spend_attempts SET charged_micros=charged_micros+1 WHERE id=1":kind==='receipt'?"UPDATE spend_receipts SET details_json='changed' WHERE attempt_id=1":"DELETE FROM spend_coding_policies WHERE ticket_id='prior-ticket'");db.close();
+      const db=new Database(o.ledgerPath);db.exec(kind==='attempt'?"UPDATE spend_attempts SET charged_micros=charged_micros+1 WHERE id=1":kind==='receipt'?"UPDATE spend_receipts SET details_json='changed' WHERE attempt_id=1":"DELETE FROM spend_coding_policies_v2 WHERE ticket_id='prior-ticket'");db.close();
     }})).toThrow('historical_ledger_rows_changed');
     expect(budget(o).runtimeCommittedOrHeldUsd).toBe(55.952993006);expect(rows(o.ledgerPath)[0]).toHaveLength(1);
   }

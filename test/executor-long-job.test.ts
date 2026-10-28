@@ -318,7 +318,7 @@ for (const failure of ["cleanup", "spawn", "terminal_write"] as const) {
       const fetch = ledger.guardedFetch("openrouter", fakeFetch);
       const request = new Request("https://openrouter.ai/api/v1/messages", { method: "POST",
         headers: { "content-type": "application/json", authorization: "Bearer offline-not-a-secret" },
-        body: JSON.stringify({ model: "deepseek/deepseek-v4.1-flash", max_tokens: 8192, messages: [{ role: "user", content: "offline fixture" }] }) });
+        body: JSON.stringify({ model: "deepseek/deepseek-v4.1-flash", provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens: 8192, messages: [{ role: "user", content: "offline fixture" }] }) });
       await expect(ledger.withSpendScope("offline-ticket", () =>
         ledger.withPaidRequestGuard(() => guard.assertSafe(), () => fetch(request)))).rejects.toBe(error);
       expect(dispatches).toBe(0); expect(ledger.status("offline-ticket")!.attemptCount).toBe(0);

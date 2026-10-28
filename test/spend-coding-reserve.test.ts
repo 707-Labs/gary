@@ -15,9 +15,9 @@ function fixture(protectedCoding=true){
  const charge=(n:number)=>sql.query("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES('fresh','openrouter','deepseek/deepseek-v4.1-flash',8192,?,?,'settled')").run(n,n);
  return {path,ledger,sql,charge};
 }
-function response(input=SPEND_CONTEXT_TOKENS){return Response.json({id:'offline',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'offline'}],stop_reason:'end_turn',stop_sequence:null,usage:{input_tokens:input,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}});}
+function response(input=SPEND_CONTEXT_TOKENS){return Response.json({id:'offline',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'offline'}],stop_reason:'end_turn',stop_sequence:null,usage:{input_tokens:input,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});}
 function send(ledger:SpendLedger,max=8192,role?:CodingSpendRole,inner:typeof fetch=(async()=>response()) as unknown as typeof fetch){
- return ledger.withSpendScope('fresh',()=>ledger.guardedFetch('openrouter',inner)(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',max_tokens:max,messages:[{role:'user',content:'offline'}]})}),role?{codingRole:role}:{});
+ return ledger.withSpendScope('fresh',()=>ledger.guardedFetch('openrouter',inner)(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens:max,messages:[{role:'user',content:'offline'}]})}),role?{codingRole:role}:{});
 }
 test('fixed floors exactly fund next review and body/title at canonical tariff',()=>{
  const review=spendReservationMicros('openrouter',4096),body=spendReservationMicros('openrouter',1024),title=spendReservationMicros('openrouter',128);
@@ -45,4 +45,28 @@ test('unknown request blocks every protected role and never releases reservation
 test('parallel ALS scopes and nested omitted scope cannot leak reviewer authority',async()=>{const f=fixture();f.charge(P.capMicros-P.workFloorMicros);let release!:()=>void,entered!:()=>void;const waiting=new Promise<void>(r=>release=r),ready=new Promise<void>(r=>entered=r);const review=f.ledger.withSpendScope('fresh',async()=>{entered();await waiting;await send(f.ledger,4096);},{codingRole:'review'});await ready;await expect(send(f.ledger,128)).rejects.toThrow('protected coding reserve');release();await review;await expect(send(f.ledger,128)).rejects.toThrow('protected coding reserve');});
 for(const [role,max] of [['review',4097],['publication_body',1025],['publication_title',129]] as const)test('rejects excessive '+role+' output before HTTP',async()=>{const f=fixture();await expect(send(f.ledger,max,role)).rejects.toThrow('role output');expect(f.ledger.status('fresh')?.attemptCount).toBe(0);});
 test('legacy/DM allocation behavior and unknown history remain unaffected',async()=>{const f=fixture(false);f.charge(8_000_000);await send(f.ledger);expect(f.ledger.status('fresh')?.attemptCount).toBe(2);expect(f.ledger.hasCodingReviewReserve('fresh')).toBe(false);f.ledger.createCampaign('dm',5);f.ledger.enrollTicket('dm','local:dm',5);expect(f.ledger.hasCodingReviewReserve('local:dm')).toBe(false);});
-test('untrusted role HTTP field cannot select publication privilege',async()=>{const f=fixture();f.charge(P.capMicros-P.workFloorMicros);let calls=0;await expect(f.ledger.withSpendScope('fresh',()=>f.ledger.guardedFetch('openrouter',(async()=>{calls++;return response();}) as unknown as typeof fetch)(url,{method:'POST',body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',max_tokens:128,role:'publication_title',messages:[{role:'user',content:'offline'}]})}))).rejects.toThrow();expect(calls).toBe(0);});
+test('untrusted role HTTP field cannot select publication privilege',async()=>{const f=fixture();f.charge(P.capMicros-P.workFloorMicros);let calls=0;await expect(f.ledger.withSpendScope('fresh',()=>f.ledger.guardedFetch('openrouter',(async()=>{calls++;return response();}) as unknown as typeof fetch)(url,{method:'POST',body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens:128,role:'publication_title',messages:[{role:'user',content:'offline'}]})}))).rejects.toThrow();expect(calls).toBe(0);});
+test('policy v2 lives in its own table created on first protected enrollment; opening a ledger adds no schema',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'coding-v2-'));clean.push(()=>rmSync(dir,{recursive:true,force:true}));
+ const path=join(dir,'spend.db'),ledger=new SpendLedger(path);clean.push(()=>ledger.close());
+ const tables=()=>{const db=new Database(path,{readonly:true});try{return db.query("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'spend_coding%' ORDER BY name").all();}finally{db.close();}};
+ expect(tables()).toEqual([{name:'spend_coding_policies'}]);
+ ledger.createCampaign('coding',10);ledger.enrollTicket('coding','fresh',10,{draftPr:true,codingReviewReserve:true});
+ expect(P.version).toBe(2);expect(tables()).toEqual([{name:'spend_coding_policies'},{name:'spend_coding_policies_v2'}]);
+ const db=new Database(path,{readonly:true});clean.push(()=>db.close());
+ expect(db.query('SELECT * FROM spend_coding_policies').all()).toEqual([]);
+ expect(db.query('SELECT * FROM spend_coding_policies_v2').all()).toEqual([{ticket_id:'fresh',version:2}]);
+});
+test('v1 (DeepSeek floor) enrollments stay readable when closed but never reserve again under the new floors',async()=>{
+ const f=fixture(false);
+ // Shape of the three live v1 rows: written by the pre-cutover code into the CHECK(version=1) table.
+ f.ledger.createCampaign('old',10);f.ledger.enrollTicket('old','old-v1',10,{draftPr:true});
+ f.sql.query("INSERT INTO spend_coding_policies(ticket_id,version) VALUES('old-v1',1)").run();
+ expect(f.ledger.hasCodingReviewReserve('old-v1')).toBe(true);
+ expect(()=>f.ledger.enrollTicket('old','old-v1',10,{draftPr:true,codingReviewReserve:true})).not.toThrow();
+ let calls=0;
+ await expect(f.ledger.withSpendScope('old-v1',()=>f.ledger.guardedFetch('openrouter',(async()=>{calls++;return response();}) as unknown as typeof fetch)(url,{method:'POST',headers:{'content-type':'application/json'},
+  body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}},max_tokens:128,messages:[{role:'user',content:'offline'}]})}))).rejects.toThrow('unsupported coding reserve policy');
+ expect(calls).toBe(0);expect(f.ledger.status('old-v1')?.attemptCount).toBe(0);
+ f.ledger.markTerminal('old-v1','done');expect(f.ledger.hasCodingReviewReserve('old-v1')).toBe(true);
+});

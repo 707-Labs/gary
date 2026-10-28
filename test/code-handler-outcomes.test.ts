@@ -1112,8 +1112,8 @@ describe('canonical coding reserve role binding',()=>{
    const sql=new Database(path);sql.query("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES(?,'openrouter','deepseek/deepseek-v4.1-flash',8192,8099967,8099967,'settled')").run(issue.id);sql.close();
    f.deps.spend=ledger;
    const limits:number[]=[];
-   const fetch=ledger.guardedFetch('openrouter',(async(request:Request)=>{const body=await request.json();limits.push(body.max_tokens);return Response.json({id:'offline',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'offline'}],stop_reason:'end_turn',stop_sequence:null,usage:{input_tokens:1048576,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}});}) as unknown as typeof globalThis.fetch);
-   const call=(max:number)=>fetch('https://openrouter.ai/api/v1/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',max_tokens:max,messages:[{role:'user',content:'offline'}]})});
+   const fetch=ledger.guardedFetch('openrouter',(async(request:Request)=>{const body=await request.json();limits.push(body.max_tokens);return Response.json({id:'offline',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'offline'}],stop_reason:'end_turn',stop_sequence:null,usage:{input_tokens:1048576,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});}) as unknown as typeof globalThis.fetch);
+   const call=(max:number)=>fetch('https://openrouter.ai/api/v1/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens:max,messages:[{role:'user',content:'offline'}]})});
    f.review.mockImplementation(async()=>{await call(4096);return reviewResult();});
    f.complete.mockImplementation(async opts=>{await call(opts.maxTokens!);return 'offline PR text';});
    expect((await ledger.withSpendScope(issue.id,()=>f.invoke({draftPr:true}))).status).toBe('pr_opened');
@@ -1154,7 +1154,7 @@ describe('CODE ordinary executor cleanup fence through the real reviewer', () =>
           const command = {type:'tool_use',id:'command',name:'run_bash',input:{command:'reviewer-child-timeout',timeout_seconds:1}};
           return Response.json({id:'offline',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',
             content:physicalRequests === 1 ? [command,...(sameTurn ? [approve] : [])] : [approve],
-            stop_reason:'tool_use',stop_sequence:null,usage:{input_tokens:10,output_tokens:5,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+            stop_reason:'tool_use',stop_sequence:null,usage:{input_tokens:10,output_tokens:5,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});
         }) as unknown as typeof fetch);
         const provider = createProvider({name:'openrouter',apiKey:'offline-fixture-only',
           baseUrl:'https://openrouter.ai/api',model:'deepseek/deepseek-v4.1-flash',defaultBackoffMs:1000}, {fetch:physical});
@@ -1201,7 +1201,7 @@ describe('CODE ordinary executor cleanup fence through the real reviewer', () =>
         expect(args.signal?.aborted).toBe(true);
         // Deliberately omit signal: the existing physical request guard must stop it before reservation/send.
         await expect(physical('https://openrouter.ai/api/v1/messages',{method:'POST',headers:{'content-type':'application/json'},
-          body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',max_tokens:32,messages:[{role:'user',content:'offline'}]})})).rejects.toThrow('executor_cleanup_uncertain');
+          body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens:32,messages:[{role:'user',content:'offline'}]})})).rejects.toThrow('executor_cleanup_uncertain');
         return reviewResult('approve');
       });
       await expect(ledger.withSpendScope(issue.id,()=>f.invoke())).rejects.toThrow('executor_cleanup_uncertain');

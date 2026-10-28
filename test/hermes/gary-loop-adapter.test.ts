@@ -62,7 +62,7 @@ function fixture() {
       upstream.push(req);
       return Response.json({ id: "offline-receipt", type: "message", role: "assistant", model: "deepseek/deepseek-v4.1-flash",
         content: [{ type: "text", text: "Model prose says it is finished." }], stop_reason: "end_turn", stop_sequence: null,
-        usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } });
+        usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0 } });
     },
     executor, allowedTools: ["read_file", "write_file", "run_bash", "finish", "report_blocked"],
     finishGateCommand: "bun run check",

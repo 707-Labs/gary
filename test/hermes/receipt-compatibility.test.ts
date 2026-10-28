@@ -27,7 +27,7 @@ function enrolled(): SpendLedger {
 
 const standardUsage = {
   input_tokens: 887,
-  cache_creation_input_tokens: 0,
+  cache_creation_input_tokens: 0, cost: 0,
   cache_read_input_tokens: 0,
   output_tokens: 212,
   service_tier: "standard",
@@ -41,7 +41,7 @@ async function call(ledger: SpendLedger, usage: Record<string, unknown>, maxToke
   })) as unknown as typeof fetch);
   return ledger.withSpendScope(ticket, () => transport(new Request("https://openrouter.ai/api/v1/messages", {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: "deepseek/deepseek-v4.1-flash", max_tokens: maxTokens, messages: [{ role: "user", content: "offline fixture" }] }),
+    body: JSON.stringify({ model: "deepseek/deepseek-v4.1-flash", provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens: maxTokens, messages: [{ role: "user", content: "offline fixture" }] }),
   })));
 }
 
@@ -77,7 +77,7 @@ describe("standard service tier receipt compatibility", () => {
     { service_tier: 0 }, { service_tier: {} },
     { future_charge: 1 }, { reasoning_tokens: 50 }, { server_tool_use: { web_search_requests: 1 } },
     { input_tokens: undefined }, { output_tokens: undefined }, { cache_read_input_tokens: undefined },
-    { cache_creation_input_tokens: undefined }, { cache_creation_input_tokens: null },
+    { cache_creation_input_tokens: undefined }, { cache_creation_input_tokens: null, cost: undefined }, { cost: undefined },
     { input_tokens: "887" }, { input_tokens: -1 }, { output_tokens: 0.1 },
     { cache_read_input_tokens: Number.MAX_SAFE_INTEGER + 1 },
   ])("keeps the complete reservation for an ambiguous future receipt %#", async (overrides) => {

@@ -8,7 +8,7 @@ import { createStandingEngineeringTaskPolicy, createEngineeringTaskPolicy, resol
 
 const clean:Array<()=>void>=[];afterEach(()=>{for(const f of clean.splice(0))f();});
 const provider=()=>({id:'fixture',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'Done.'}],
-  stop_reason:'end_turn',usage:{input_tokens:10,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+  stop_reason:'end_turn',usage:{input_tokens:10,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});
 function fixture(fetch?:EngineeringModelOptions['fetch'],taskCap=4_000_000){
   const f=standingBudgetFixture(taskCap);f.allocator.enrollPool();const budget=f.allocator.allocate(f.input());
   const journalDb=new Database(join(f.root,'journal.sqlite')),spendDb=new Database(f.path,{readonly:true});

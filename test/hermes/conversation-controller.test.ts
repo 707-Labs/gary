@@ -106,7 +106,7 @@ test('unknown paid receipt remains charged and bars handoff without any provider
   let fakeCalls=0;
   const guarded=ledger.guardedFetch('openrouter',(async()=>{fakeCalls++;return Response.json({id:'mock',type:'message',model:'deepseek/deepseek-v4.1-flash',role:'assistant',content:[{type:'text',text:'offline'}],stop_reason:'end_turn'});}) as unknown as typeof fetch);
   await ledger.withSpendScope('admitted',()=>guarded('https://openrouter.ai/api/v1/messages',{
-    method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',max_tokens:32,messages:[{role:'user',content:'offline-only'}]})}));
+    method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens:32,messages:[{role:'user',content:'offline-only'}]})}));
   const spend=ledger.status('admitted');
   expect(await execute(request('handoff'))).toMatchObject({status:'blocked',reason:'unresolved_spend'});
   expect(ledger.status('admitted')).toEqual(spend);expect(fakeCalls).toBe(1);expect(wakes).toBe(0);

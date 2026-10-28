@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { log } from "./logger.ts";
 import { type RateLimitGate, createRateLimitGate } from "./rate-limit.ts";
+import { withOpenRouterPreferences } from "./spend.ts";
 
 /**
  * Identifiers for the LLM providers Gary speaks to. The order in
@@ -103,10 +104,13 @@ export function createProvider(
   // All three providers (Z.ai, Kimi Code, OpenRouter) accept
   // `Authorization: Bearer <key>` rather than the SDK default `x-api-key`.
   // Using `authToken` flips the header.
+  // Every OpenRouter request carries the guard-checked routing preferences
+  // (no prompt-retaining upstreams, max price = the spend policy).
+  const transport = cfg.name === "openrouter" ? withOpenRouterPreferences(opts.fetch ?? globalThis.fetch) : opts.fetch;
   const client = new Anthropic({
     authToken: cfg.apiKey,
     baseURL: cfg.baseUrl,
-    ...(opts.fetch ? { fetch: opts.fetch as unknown as typeof fetch } : {}),
+    ...(transport ? { fetch: transport as unknown as typeof fetch } : {}),
   });
   return {
     name: cfg.name,

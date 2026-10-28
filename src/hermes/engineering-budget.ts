@@ -11,7 +11,7 @@ import { constants, closeSync, fchmodSync, fchownSync, fsyncSync, fstatSync, lst
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { Database } from 'bun:sqlite';
-import { openSpendLedger, type SpendStatus } from '../spend.ts';
+import { codingReservePolicyVersion, openSpendLedger, type SpendStatus } from '../spend.ts';
 import { observeEngineeringLedgerBootIdentity, validateEngineeringLedgerRebootAttestation, type EngineeringLedgerMetadata,
   type EngineeringLedgerRebootReference } from './engineering-budget-reboot.ts';
 
@@ -113,13 +113,16 @@ function ledgerState(path:string,campaignId:string,allocationId:string):LedgerSt
       attempts:db.query('SELECT * FROM spend_attempts WHERE ticket_id<>? ORDER BY id').all(allocationId),
       receipts:db.query('SELECT r.* FROM spend_receipts r LEFT JOIN spend_attempts a ON a.id=r.attempt_id WHERE a.ticket_id IS NULL OR a.ticket_id<>? ORDER BY r.attempt_id').all(allocationId),
       codingPolicies:db.query('SELECT * FROM spend_coding_policies WHERE ticket_id<>? ORDER BY ticket_id').all(allocationId),
+      // Only present once a v2 coding enrollment exists, so earlier ledgers keep their exact prior hash.
+      ...(db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='spend_coding_policies_v2'").get()
+        ? {codingPoliciesV2:db.query('SELECT * FROM spend_coding_policies_v2 WHERE ticket_id<>? ORDER BY ticket_id').all(allocationId)} : {}),
       schema:db.query("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all()};
     const usage=db.query<{charged:number;attempts:number;unknowns:number},[string]>("SELECT COALESCE(SUM(charged_micros),0) AS charged,COUNT(*) AS attempts,COALESCE(SUM(CASE WHEN state!='settled' THEN 1 ELSE 0 END),0) AS unknowns FROM spend_attempts WHERE ticket_id=?").get(allocationId)!;
     const campaignCharged=db.query<{charged:number},[string]>('SELECT COALESCE(SUM(a.charged_micros),0) AS charged FROM spend_attempts a JOIN spend_tickets t ON t.ticket_id=a.ticket_id WHERE t.campaign_id=?').get(campaignId)!.charged;
     const terminal=db.query<{terminal_reason:string|null},[string]>('SELECT terminal_reason FROM spend_tickets WHERE ticket_id=?').get(allocationId);
     return {priorHash:sha(JSON.stringify(prior)),campaign,ticket,
       otherTickets:db.query<{n:number},[string,string]>('SELECT COUNT(*) AS n FROM spend_tickets WHERE campaign_id=? AND ticket_id<>?').get(campaignId,allocationId)!.n,
-      codingPolicy:db.query('SELECT * FROM spend_coding_policies WHERE ticket_id=?').get(allocationId)!==null,
+      codingPolicy:codingReservePolicyVersion(db,allocationId)!==null,
       candidateAttempts:usage.attempts,
       status:ticket&&campaign?{ticketId:allocationId,campaignId:ticket.campaign_id,state:ticket.state as SpendStatus['state'],terminalReason:terminal!.terminal_reason,
         draftPr:ticket.draft_pr===1,capMicros:ticket.cap_micros,chargedMicros:usage.charged,remainingMicros:ticket.cap_micros-usage.charged,

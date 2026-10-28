@@ -84,7 +84,7 @@ async function fixture(launch:GaryRuntimeLauncher=fakeNative){
     const step=body.tools.some((tool:any)=>tool.name==='dispatch_subagent') && !used.includes('dispatch_subagent')
       ? ['dispatch_subagent',{task:'Read task.ts and report the fixture baseline.'}] as const
       : used.includes('run_bash')?steps[3]:used.includes('write_file')?steps[2]:used.includes('read_file')?steps[1]:steps[0];
-    return Response.json({id:'reply-'+calls,type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:done?[{type:'text',text:'Verified fixture context.'}]:[{type:'tool_use',id:'call-'+calls,name:step[0],input:step[1]}],stop_reason:done?'end_turn':'tool_use',usage:{input_tokens:10,output_tokens:8,cache_creation_input_tokens:0,cache_read_input_tokens:0}});
+    return Response.json({id:'reply-'+calls,type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:done?[{type:'text',text:'Verified fixture context.'}]:[{type:'tool_use',id:'call-'+calls,name:step[0],input:step[1]}],stop_reason:done?'end_turn':'tool_use',usage:{input_tokens:10,output_tokens:8,cache_creation_input_tokens:0, cost: 0,cache_read_input_tokens:0}});
   }},launch,createTrace:binding=>{const path=join(traceRoot,binding.requestId+'.jsonl');traces.push(path);return createAuditTrace({path,binding});},
     taskPolicy:()=>{policies++;return{baseCommit,task:{allowedFiles:['task.ts'],criteria:[{id:'fix',description:'Update fixture and pass the exact check',requiredCommands:[CHECK]}]},
       progress:{maxModelRequests:20,maxModelRequestsWithoutProgress:10,maxSuccessfulToolCalls:50,toolRepeatWindow:10,maxRepeatedToolCalls:5},

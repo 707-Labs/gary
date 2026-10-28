@@ -12,7 +12,7 @@ const clean: (() => void)[] = []; afterEach(() => clean.splice(0).reverse().forE
 const TOOL = { type: 'function', function: { name: 'terminal', parameters: { type: 'object', properties: {} } } };
 const provider = () => ({ id: 'synthetic', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash',
   content: [{ type: 'text', text: 'Done.' }], stop_reason: 'end_turn',
-  usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } });
+  usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0 } });
 const signal = () => new AbortController().signal;
 function fixture(input: { fetch?: EngineeringModelOptions['fetch']; family?: false; cap?: number } = {}) {
   const f = standingBudgetFixture(input.cap ?? 4_000_000); f.allocator.enrollPool(); const budget = f.allocator.allocate(f.input());

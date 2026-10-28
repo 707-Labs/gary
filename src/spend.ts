@@ -25,6 +25,36 @@ const POLICIES = {
   [PAID_ROUTE.provider]: { model: PAID_ROUTE.model, url: PAID_ROUTE.url, input: 60, output: 240 },
 } as const;
 type PricedProvider = keyof typeof POLICIES;
+
+/**
+ * OpenRouter routing preferences every openrouter request must carry, and the
+ * only `provider` value the guard admits. max_price is USD per million tokens
+ * (accepted at 0.6/2.4 and enforced with a 404 "No endpoints found that satisfy
+ * the max price" below every endpoint's price, probed 2026-10-28 on /v1/messages),
+ * derived from the policy so the two cannot drift. data_collection "deny"
+ * excludes upstreams that store or train on prompts.
+ */
+export const OPENROUTER_PROVIDER_PREFERENCES = Object.freeze({
+  data_collection: "deny",
+  max_price: Object.freeze({ prompt: POLICIES[PAID_ROUTE.provider].input / 100, completion: POLICIES[PAID_ROUTE.provider].output / 100 }),
+} as const);
+/** Exactly the reviewed preferences: same keys and values, no extras, any key order. */
+function isOpenRouterPreferences(value: unknown): boolean {
+  const p = OPENROUTER_PROVIDER_PREFERENCES;
+  return record(value) && onlyKeys(value, ["data_collection", "max_price"]) && value.data_collection === p.data_collection
+    && record(value.max_price) && onlyKeys(value.max_price, ["prompt", "completion"])
+    && value.max_price.prompt === p.max_price.prompt && value.max_price.completion === p.max_price.completion;
+}
+
+/** Adds OPENROUTER_PROVIDER_PREFERENCES to each JSON POST body; wrap outside the spend guard. */
+export function withOpenRouterPreferences(inner: typeof fetch = globalThis.fetch): typeof fetch {
+  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    if (request.method !== "POST" || !/^application\/json(?:;|$)/i.test(request.headers.get("content-type") ?? "")) return inner(request);
+    const body = await request.clone().json() as Record<string, unknown>;
+    return inner(new Request(request, { body: JSON.stringify({ ...body, provider: OPENROUTER_PROVIDER_PREFERENCES }) }));
+  }) as typeof fetch;
+}
 type Policy = (typeof POLICIES)[PricedProvider];
 type TicketState = "active" | "exhausted" | "closed";
 
@@ -45,7 +75,8 @@ export type CodingSpendRole = "work" | "review" | "publication_body" | "publicat
  * test/spend-coding-reserve.test.ts recomputes these from spendReservationMicros.
  */
 export const CODING_SPEND_RESERVE_POLICY = Object.freeze({
-  version: 1,
+  /** v2: floors re-derived for openrouter. v1 (DeepSeek floors) rows are rejected, never re-priced. */
+  version: 2,
   capMicros: 10_000_000,
   provider: PAID_ROUTE.provider,
   workFloorMicros: 1_900_033,
@@ -184,8 +215,12 @@ async function validateRequest(provider: string, request: Request): Promise<{ po
   if (!/^application\/json(?:;|$)/i.test(request.headers.get("content-type") ?? "")) throw new SpendLimitError("non-JSON request");
   let body: unknown;
   try { body = await request.clone().json(); } catch { throw new SpendLimitError("invalid request JSON"); }
-  if (!record(body) || !onlyKeys(body, ["model", "max_tokens", "system", "messages", "tools", "tool_choice", "stream", "temperature", "top_p", "top_k", "stop_sequences", "metadata", "thinking", "output_config"])) {
+  if (!record(body) || !onlyKeys(body, ["model", "max_tokens", "system", "messages", "tools", "tool_choice", "stream", "temperature", "top_p", "top_k", "stop_sequences", "metadata", "thinking", "output_config", "provider"])) {
     throw new SpendLimitError("unpriced request fields");
+  }
+  // openrouter requests must carry exactly the reviewed routing preferences; no other route may send `provider`.
+  if (policy === POLICIES[PAID_ROUTE.provider] ? !isOpenRouterPreferences(body.provider) : body.provider !== undefined) {
+    throw new SpendLimitError("unreviewed provider routing preferences");
   }
   if (body.model !== policy.model || (body.stream !== undefined && body.stream !== false)) throw new SpendLimitError("unpriced model or streaming request");
   if (!tokenCount(body.max_tokens) || body.max_tokens < 1 || body.max_tokens > SPEND_MAX_OUTPUT_TOKENS) throw new SpendLimitError("unsupported output limit");
@@ -229,8 +264,8 @@ function receiptInput(body: unknown, policy: Policy, maxTokens: number): Receipt
 /**
  * OpenRouter usage observed 2026-10-28 on deepseek/deepseek-v4.1-flash:
  * cache_creation_input_tokens is null (no cache writes on this route) and the
- * body carries OpenRouter's own billed `cost` in USD. A null cache-write counter
- * counts as zero only together with a valid billed cost. Settlement keeps
+ * body carries OpenRouter's own billed `cost` in USD, which is required; a null
+ * cache-write counter then counts as zero. Settlement keeps
  * the larger of the policy price and that billed cost, so neither a missing
  * counter nor a pricier upstream than the policy can under-record spend.
  * Server tools, BYOK billing, non-standard tiers/speeds and unknown fields stay
@@ -244,11 +279,22 @@ function openRouterUsage(usage: Record<string, unknown>, maxTokens: number): Rec
   if (!["input_tokens", "output_tokens", "cache_read_input_tokens"].every((key) => tokenCount(usage[key]))
       || !(tokenCount(usage.cache_creation_input_tokens) || usage.cache_creation_input_tokens === null)) return { reason: "usage_counters" };
   const cost = usage.cost;
-  if (cost !== undefined && (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0 || cost > 1000)) return { reason: "provider_cost" };
-  if (usage.cache_creation_input_tokens === null && cost === undefined) return { reason: "usage_counters" };
+  // OpenRouter's billed cost is required: without it the upstream price is unknown, so keep the full reservation.
+  if (cost === undefined) return { reason: "usage_counters" };
+  if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0 || cost > 1000) return { reason: "provider_cost" };
   const input = (usage.input_tokens as number) + (usage.cache_read_input_tokens as number) + ((usage.cache_creation_input_tokens as number | null) ?? 0);
   if (input > SPEND_CONTEXT_TOKENS || (usage.output_tokens as number) > maxTokens) return { reason: "token_bounds" };
-  return { reason: "accepted", inputTokens: input, providerCostMicros: cost === undefined ? 0 : Math.ceil(cost * 1_000_000) };
+  return { reason: "accepted", inputTokens: input, providerCostMicros: Math.ceil(cost * 1_000_000) };
+}
+
+/** Coding reserve policy version for a ticket, from either policy table; null if unprotected. */
+export function codingReservePolicyVersion(db: Database, ticketId: string): number | null {
+  if (db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='spend_coding_policies_v2'").get()) {
+    const v2 = db.query<{ version: number }, [string]>("SELECT version FROM spend_coding_policies_v2 WHERE ticket_id=?").get(ticketId);
+    if (v2) return v2.version;
+  }
+  const v1 = db.query<{ version: number }, [string]>("SELECT version FROM spend_coding_policies WHERE ticket_id=?").get(ticketId);
+  return v1 ? v1.version : null;
 }
 
 export class SpendLedger {
@@ -302,14 +348,20 @@ export class SpendLedger {
       const allocated = this.db.query<{ n: number }, [string]>("SELECT COALESCE(SUM(cap_micros),0) AS n FROM spend_tickets WHERE campaign_id=?").get(campaignId)!.n;
       if (allocated + cap > campaign.cap_micros) throw new SpendLimitError("campaign allocation exceeded");
       this.db.query("INSERT INTO spend_tickets(ticket_id,campaign_id,cap_micros,draft_pr) VALUES(?,?,?,?)").run(ticketId, campaignId, cap, draft);
-      if (protectedCoding) this.db.query("INSERT INTO spend_coding_policies(ticket_id,version) VALUES(?,?)").run(ticketId, CODING_SPEND_RESERVE_POLICY.version);
+      if (protectedCoding) {
+        // v1 rows live in spend_coding_policies (CHECK version=1, never rewritten). v2 rows get their
+        // own table, created on the first v2 enrollment so opening a ledger never changes its schema.
+        this.db.exec("CREATE TABLE IF NOT EXISTS spend_coding_policies_v2 (ticket_id TEXT PRIMARY KEY REFERENCES spend_tickets(ticket_id), version INTEGER NOT NULL CHECK(version=2))");
+        this.db.query("INSERT INTO spend_coding_policies_v2(ticket_id,version) VALUES(?,?)").run(ticketId, CODING_SPEND_RESERVE_POLICY.version);
+      }
     }).immediate();
   }
 
+  /** Whether the ticket was enrolled with a protected coding reserve (v1 DeepSeek floors or v2). Spending separately requires v2. */
   hasCodingReviewReserve(ticketId: string): boolean {
-    const policy = this.db.query<{ version: number }, [string]>("SELECT version FROM spend_coding_policies WHERE ticket_id=?").get(ticketId);
-    if (policy && policy.version !== CODING_SPEND_RESERVE_POLICY.version) throw new SpendLimitError("unsupported coding reserve policy");
-    return policy !== null;
+    const version = codingReservePolicyVersion(this.db, ticketId);
+    if (version !== null && version !== 1 && version !== CODING_SPEND_RESERVE_POLICY.version) throw new SpendLimitError("unsupported coding reserve policy");
+    return version !== null;
   }
 
   status(ticketId: string): SpendStatus | null {
@@ -487,6 +539,8 @@ export class SpendLedger {
       }
       if (this.hasCodingReviewReserve(ticketId)) {
         const p = CODING_SPEND_RESERVE_POLICY;
+        // v1 floors were derived from DeepSeek prices; never re-price them onto this route.
+        if (codingReservePolicyVersion(this.db, ticketId) !== p.version) return new SpendLimitError("unsupported coding reserve policy");
         if (!status.draftPr || status.capMicros !== p.capMicros || status.campaignCapMicros !== p.capMicros || provider !== p.provider) {
           return new SpendLimitError("coding reserve allocation binding changed");
         }

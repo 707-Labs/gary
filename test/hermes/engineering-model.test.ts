@@ -15,7 +15,7 @@ export const TOOL = { type: 'function', function: { name: 'terminal', descriptio
   parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } };
 export function provider(content: unknown[] = [{ type: 'text', text: 'Done.' }], stop_reason = 'end_turn') {
   return { id: 'msg_fixture', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash', content, stop_reason,
-    usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } };
+    usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0 } };
 }
 const cleanup: (() => void)[] = [];
 afterEach(() => { for (const fn of cleanup.splice(0)) fn(); });
@@ -208,7 +208,7 @@ test('v2 adapter rejects missing, copied, mismatched and legacy continuation bas
 
 test('v2 worst-case physical receipts exhaust work headroom after seven and unknown usage never releases a reservation', async () => {
   const s=modelFixture(async()=>Response.json({...provider(),usage:{input_tokens:1048576,output_tokens:1,
-    cache_read_input_tokens:0,cache_creation_input_tokens:0}}),{acceptancePolicyVersion:2});
+    cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}}),{acceptancePolicyVersion:2});
   // 5_417_988 - 7*648_807 = 876_339 < 648_807 + protected review 638_962.
   for(let i=0;i<7;i++) {s.model.beginTurn({turnId:'max-'+i,prompt:'Work.'});
     await s.model.handle(s.body(),new AbortController().signal);s.model.finishTurn(s.model.history());}

@@ -295,7 +295,7 @@ test('actual startup routes an authenticated Slack question through canonical cu
   fetch:(async request=>{providerCalls++;const body:any=await (request as Request).json();
    const content=providerCalls===1?[{type:'tool_use',id:'work_call',name:'current_work',input:{project:'mulligan-labs'}}]:[{type:'text',text:'ERT-2990 is recorded in progress; that record alone does not prove live execution.'}];
    if(providerCalls===2){expect(JSON.stringify(body.messages)).toContain('ERT-2990');expect(JSON.stringify(body.messages)).toContain('recorded_in_progress');}
-   return Response.json({id:'msg_fixture',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content,stop_reason:providerCalls===1?'tool_use':'end_turn',usage:{input_tokens:30,output_tokens:10,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+   return Response.json({id:'msg_fixture',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content,stop_reason:providerCalls===1?'tool_use':'end_turn',usage:{input_tokens:30,output_tokens:10,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});
   }) as typeof fetch,
   launch:async(m,handle)=>{
    const history:any[]=[...(m.history??[]),{role:'user',content:m.prompt}];
@@ -373,7 +373,7 @@ test('actual startup exposes scoped ticket/repository/controller tools, wakes it
     content=[{type:'text',text:providerCalls===2?'Private fixture answer.':'Shared fixture answer.'}];
    }
    return Response.json({id:'fixture'+providerCalls,type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content,
-    stop_reason:providerCalls%2?'tool_use':'end_turn',usage:{input_tokens:80,output_tokens:30,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+    stop_reason:providerCalls%2?'tool_use':'end_turn',usage:{input_tokens:80,output_tokens:30,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});
   }) as typeof fetch,
   launch:async(m,handle)=>{
    launches++;const names=m.tools.map(t=>t.function.name);
@@ -639,7 +639,7 @@ test('standing startup admits beyond closed ERT history and drains both preexist
   const originalStart=f.transport.start;f.transport.start=async(handler,signal)=>{receive=handler;await originalStart(handler,signal);};
   f.transport.sendMessage=async input=>{posts.push(input.text);return{ok:true,channel:input.channel,ts:'1791452000.000010'};};
   const modelReply=(content:unknown[])=>Response.json({id:'standing-fixture-'+providerCalls,type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content,
-    stop_reason:providerCalls===1?'tool_use':'end_turn',usage:{input_tokens:30,output_tokens:10,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+    stop_reason:providerCalls===1?'tool_use':'end_turn',usage:{input_tokens:30,output_tokens:10,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});
   await main({...f.deps,fetch:(async()=>{providerCalls++;return modelReply(providerCalls===1
     ?[{type:'tool_use',id:'submit_task',name:'engineering_submit',input:{repository:'707-Labs/unregistered-app'}}]
     :[{type:'text',text:providerCalls===2?'Your task is queued.':'Second conversation complete.'}]);}) as unknown as typeof fetch,

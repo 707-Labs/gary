@@ -5,7 +5,7 @@ import { Database } from 'bun:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { lstatSync, realpathSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
-import { SpendLedger } from '../spend.ts';
+import { SpendLedger, codingReservePolicyVersion } from '../spend.ts';
 import { fingerprintJson } from './audit-trace.ts';
 import { ENGINEERING_STANDING_MIN_TASK_CAP_MICROS, engineeringStandingBudgetPolicySha256 } from './engineering-policy.ts';
 import { initializeStandingReconciliation, assertStandingReconciliationSchema, standingReconciliationAmounts,
@@ -143,7 +143,7 @@ export function createStandingEngineeringBudget(options: {
       'SELECT campaign_id,cap_micros,draft_pr,state,terminal_reason FROM spend_tickets WHERE ticket_id=?').get(row.allocation_id);
     if (!ticket || ticket.campaign_id !== a.campaignId || ticket.cap_micros !== a.taskCapMicros || ticket.draft_pr !== 0
         || ticket.state !== 'active' || ticket.terminal_reason !== null
-        || db.query('SELECT 1 FROM spend_coding_policies WHERE ticket_id=?').get(row.allocation_id)) fail('task_unavailable');
+        || codingReservePolicyVersion(db,row.allocation_id)!==null) fail('task_unavailable');
     statusIn(db);
   }
   function mint(row: TaskRow): StandingEngineeringTaskBudget {

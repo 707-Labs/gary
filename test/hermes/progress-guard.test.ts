@@ -166,7 +166,7 @@ describe('productive follow-through guard (trusted evidence fixtures; no filesys
       const fetch = ledger.guardedFetch('openrouter', (async () => { providerCalls++; return Response.json({}); }) as unknown as typeof globalThis.fetch);
       await expect(ledger.withSpendScope('ticket-1', () => fetch('https://openrouter.ai/api/v1/messages', {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ model: 'deepseek/deepseek-v4.1-flash', max_tokens: 128, messages: [{ role: 'user', content: 'offline fixture' }] }),
+        body: JSON.stringify({ model: 'deepseek/deepseek-v4.1-flash', provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens: 128, messages: [{ role: 'user', content: 'offline fixture' }] }),
       }))).rejects.toThrow();
       const before = ledger.status('ticket-1')!;
       expect(before.state).toBe('exhausted');

@@ -88,7 +88,7 @@ async function fixture(){
       const steps=[['read_file',{path:'task.ts'}],['write_file',{path:'task.ts',content:'updated\n'}],['run_bash',{command:'bun run check'}],['run_bash',{command:CHECK}],['finish',{summary:'Verified offline fixture'}]] as const;
       const step=steps[modelCalls-1]!;
       return Response.json({id:'reply-'+modelCalls,type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'tool_use',id:'tool-'+modelCalls,name:step[0],input:step[1]}],stop_reason:'tool_use',
-        usage:{input_tokens:10,output_tokens:8,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+        usage:{input_tokens:10,output_tokens:8,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});
     }) as typeof fetch,
     launch:async(...args)=>{launches++;return native(...args);},
     slackTransport:loaded=>{credentialLoads++;expect(loaded).toEqual(credentials);expect(Object.isFrozen(loaded)).toBe(true);
@@ -151,7 +151,7 @@ for(const mode of modes)test('actual startup Slack readiness: '+mode,async()=>{
       if(mode==='unknown-spend'){
         const guarded=args.spend!.guardedFetch('openrouter',(async()=>{throw new Error('offline_ambiguous_request');}) as unknown as typeof fetch);
         await expect(args.spend!.withSpendScope(ISSUE,()=>guarded('https://openrouter.ai/api/v1/messages',{method:'POST',headers:{'content-type':'application/json'},
-          body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',max_tokens:128,messages:[{role:'user',content:'offline'}]})}))).rejects.toThrow('offline_ambiguous_request');
+          body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens:128,messages:[{role:'user',content:'offline'}]})}))).rejects.toThrow('offline_ambiguous_request');
         expect(args.spend!.status(ISSUE)?.unknownAttempts).toBe(1);
       }
       if(mode==='ready')trial.complete(true,'pr_opened');

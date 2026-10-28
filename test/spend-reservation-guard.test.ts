@@ -11,8 +11,8 @@ function fixture(){
   cleanup.push(()=>rmSync(root,{recursive:true}),()=>ledger.close(),()=>other.close());
   ledger.createCampaign('campaign',5.65);ledger.enrollTicket('campaign','allocation',5.65,{draftPr:false});other.exec('PRAGMA busy_timeout=1');
   let physical=0;
-  const fetch=ledger.guardedFetch('openrouter',(async()=>{physical++;return Response.json({model:'deepseek/deepseek-v4.1-flash',usage:{input_tokens:10,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}});}) as unknown as typeof globalThis.fetch);
-  const run=()=>ledger.withSpendScope('allocation',()=>fetch(new Request('https://openrouter.ai/api/v1/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',max_tokens:8192,messages:[{role:'user',content:'synthetic'}]})})));
+  const fetch=ledger.guardedFetch('openrouter',(async()=>{physical++;return Response.json({model:'deepseek/deepseek-v4.1-flash',usage:{input_tokens:10,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});}) as unknown as typeof globalThis.fetch);
+  const run=()=>ledger.withSpendScope('allocation',()=>fetch(new Request('https://openrouter.ai/api/v1/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens:8192,messages:[{role:'user',content:'synthetic'}]})})));
   return{ledger,other,run,physical:()=>physical};
 }
 test('second-connection change after preflight is seen under reservation lock; denial writes nothing and leaves allocation active',async()=>{

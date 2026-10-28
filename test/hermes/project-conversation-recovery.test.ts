@@ -20,7 +20,7 @@ const tool = (id = 'work', name = 'current_work') => [{ type: 'tool_use', id, na
 function provider(blocks: any[], stop?: string, output = 20) {
   return Response.json({ id: 'offline', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash', content: blocks,
     stop_reason: stop ?? (blocks.some(block => block.type === 'tool_use') ? 'tool_use' : 'end_turn'),
-    usage: { input_tokens: 50, output_tokens: output, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } });
+    usage: { input_tokens: 50, output_tokens: output, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0 } });
 }
 function fixture(cleanupFails = false) {
   const ledger = new SpendLedger(':memory:'); disposers.push(() => ledger.close());
@@ -225,7 +225,7 @@ test('six-request policy at full-context usage stops at the request ceiling insi
   const reply = f.responder((_body, n) => {
     return Response.json({ id: 'large-offline-usage', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash',
       content: tool('expensive-' + n), stop_reason: 'tool_use',
-      usage: { input_tokens: 1_000_000, output_tokens: 8192, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } });
+      usage: { input_tokens: 1_000_000, output_tokens: 8192, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0 } });
   });
   await expect(reply(turn({ text: 'Give an exhaustive ticket review.' }))).rejects.toBeInstanceOf(ProjectReplyError);
   // At the openrouter price six maximum requests (648_807 reserved each) fit the cap,

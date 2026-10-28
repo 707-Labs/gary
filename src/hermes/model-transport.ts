@@ -1,6 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import { createDeadline, type Deadline } from "../deadline.ts";
-import { SpendLedger, SpendLimitError, SPEND_MAX_OUTPUT_TOKENS } from "../spend.ts";
+import { OPENROUTER_PROVIDER_PREFERENCES, SpendLedger, SpendLimitError, SPEND_MAX_OUTPUT_TOKENS } from "../spend.ts";
 import { PAID_ROUTE } from "../model-route.ts";
 
 /** Host-owned ceiling for one request, always clamped to the shared action deadline. */
@@ -350,9 +350,12 @@ function convertResponse(value: unknown, model: string, request: ConvertedReques
   // Do not invent zero cache counters or normalize an unknown receipt. The
   // original bytes have already passed through the actual SpendLedger.
   const counters = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"];
-  if (object(usage) && Object.keys(usage).every((key) => counters.includes(key)) && counters.every((key) => Number.isSafeInteger(usage[key]) && (usage[key] as number) >= 0)) {
-    const input = (usage.input_tokens as number) + (usage.cache_read_input_tokens as number) + (usage.cache_creation_input_tokens as number);
-    result.usage = { prompt_tokens: input, completion_tokens: usage.output_tokens, total_tokens: input + (usage.output_tokens as number) };
+  // OpenRouter adds billing metadata (cost, speed, ...) and reports no cache writes as null.
+  const metadata = ["output_tokens_details", "cache_creation", "inference_geo", "server_tool_use", "service_tier", "speed", "cost", "is_byok", "cost_details"];
+  const count = (key: string) => key === "cache_creation_input_tokens" && object(usage) && usage[key] === null && typeof usage.cost === "number" ? 0 : object(usage) ? usage[key] : undefined;
+  if (object(usage) && Object.keys(usage).every((key) => counters.includes(key) || metadata.includes(key)) && counters.every((key) => Number.isSafeInteger(count(key)) && (count(key) as number) >= 0)) {
+    const input = (count("input_tokens") as number) + (count("cache_read_input_tokens") as number) + (count("cache_creation_input_tokens") as number);
+    result.usage = { prompt_tokens: input, completion_tokens: count("output_tokens"), total_tokens: input + (count("output_tokens") as number) };
   }
   return result;
 }
@@ -419,6 +422,7 @@ export function createModelTransport(options: ModelTransportOptions): ModelTrans
       }
       const converted = convertRequest(body, capability.model, allowlist);
       if (thinking !== undefined) converted.body.thinking = { type: thinking };
+      if (capability.provider === PAID_ROUTE.provider) converted.body.provider = OPENROUTER_PROVIDER_PREFERENCES;
       await guard();
       if (beforeRequest) {
         try { await beforeRequest(currentDeadline.signal); } catch { throw new TransportError(409, "progress_guard_stopped"); }

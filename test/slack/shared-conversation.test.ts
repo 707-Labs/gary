@@ -32,11 +32,11 @@ test('known owned reservation preserves joined-thread routing and queues mention
   const transport=f.ledger.guardedFetch('openrouter',(async(_request:RequestInfo|URL,_init?:RequestInit)=>{
     if(turns.length===1){entered();await gate;}
     return Response.json({id:'msg_shared_queue',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'fixture'}],stop_reason:'end_turn',
-      usage:{input_tokens:30,output_tokens:5,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+      usage:{input_tokens:30,output_tokens:5,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});
   }) as typeof fetch);
   const shared=createSlackSharedConversation({...f,reply:async turn=>{
     turns.push(turn);await f.ledger.withSpendScope(f.config.allocationId,()=>transport(new Request('https://openrouter.ai/api/v1/messages',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer offline-fixture'},
-      body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',max_tokens:4096,messages:[{role:'user',content:'synthetic shared fixture'}]})})));return 'answer '+turns.length;
+      body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens:4096,messages:[{role:'user',content:'synthetic shared fixture'}]})})));return 'answer '+turns.length;
   }});
   const deliver=async(text:string,kind?:'answer'|'notice')=>{messages.push(kind+':'+text);return 'sent' as const;};
   const root=mention(1),first=shared.respond(root,deliver,signal);await started;
@@ -58,7 +58,7 @@ test('unowned shared reserved/unknown attempts do not mark existing threads join
   const root=mention(1);await shared.respond(root,sent,signal);
   const transport=f.ledger.guardedFetch('openrouter',(async(_request:RequestInfo|URL,_init?:RequestInit):Promise<Response>=>{entered();await gate;throw new Error('synthetic uncertain foreign request');}) as typeof fetch);
   const foreign=f.ledger.withSpendScope(f.config.allocationId,()=>transport(new Request('https://openrouter.ai/api/v1/messages',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer offline-fixture'},
-    body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',max_tokens:4096,messages:[{role:'user',content:'synthetic foreign fixture'}]})}))).catch(()=>{});
+    body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens:4096,messages:[{role:'user',content:'synthetic foreign fixture'}]})}))).catch(()=>{});
   await started;expect(shared.joined(root.channel,root.ts)).toBe(false);
   await shared.respond(mention(2,{threadTs:root.ts}),sent,signal);expect(calls).toBe(1);
   release();await foreign;expect(f.ledger.unresolvedAttempts(f.config.allocationId)[0]?.state).toBe('unknown');expect(shared.joined(root.channel,root.ts)).toBe(false);

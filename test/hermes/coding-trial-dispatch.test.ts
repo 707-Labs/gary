@@ -67,10 +67,10 @@ function makeFixture(){
     async fakeModel(known=true){
       const guarded=ledger.guardedFetch('openrouter',(async()=>{fakeRequests++;return Response.json({
         id:'offline-response',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'offline'}],stop_reason:'end_turn',
-        ...(known?{usage:{input_tokens:10,output_tokens:2,cache_read_input_tokens:0,cache_creation_input_tokens:0}}:{}),
+        ...(known?{usage:{input_tokens:10,output_tokens:2,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}}:{}),
       });}) as unknown as typeof fetch);
       return guarded('https://openrouter.ai/api/v1/messages',{method:'POST',headers:{'content-type':'application/json'},
-        body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',max_tokens:32,messages:[{role:'user',content:'offline'}]})});
+        body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens:32,messages:[{role:'user',content:'offline'}]})});
     },
     restart(fingerprint=policyFingerprint){db.close();ledger.close();db=openDb(dbPath);ledger=new SpendLedger(ledgerPath);
       deps.db=db;deps.spend=ledger;deps.codingTrial=controller(fingerprint);},
@@ -242,7 +242,7 @@ for (const stage of ['classifier', 'classification-comment'] as const) test('hos
     if (stage === 'classification-comment' && physicalRequests === 1) return Response.json({
       id: 'offline-classification', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash',
       content: [{ type: 'text', text: JSON.stringify(classification) }], stop_reason: 'end_turn',
-      usage: { input_tokens: 10, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      usage: { input_tokens: 10, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0 },
     });
     entered();
     await new Promise<void>(resolve => request.signal.addEventListener('abort', () => { sawAbort(); resolve(); }, { once: true }));

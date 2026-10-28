@@ -9,7 +9,7 @@ function fixture(){const ledger=new SpendLedger(':memory:');cleanups.push(()=>le
 const turn=(extra:Partial<DMTurn>={}):DMTurn=>({requestId:'fixture-request',ownerId:'fixture-owner',allocationId:'local:hermes-dm-20261008-tanner',campaignId:'hermes-dm-20261008',
   history:[],text:'Remember the fabricated phrase violet sparrow.',signal:new AbortController().signal,assertActive(){},recordWorker(){},...extra});
 const provider=(text='The phrase is violet sparrow.',extra:Record<string,unknown>={})=>Response.json({id:'msg_fixture',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',
-  content:[{type:'text',text}],stop_reason:'end_turn',usage:{input_tokens:30,output_tokens:9,cache_read_input_tokens:0,cache_creation_input_tokens:0},...extra});
+  content:[{type:'text',text}],stop_reason:'end_turn',usage:{input_tokens:30,output_tokens:9,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0},...extra});
 const native=(modify:(body:any)=>void=()=>{},after?: (handle:Parameters<GaryRuntimeLauncher>[1],manifest:Parameters<GaryRuntimeLauncher>[0])=>Promise<void>):GaryRuntimeLauncher=>async(manifest,handle)=>{
   expect(manifest.tools).toEqual([]);expect(manifest.maxIterations).toBe(1);expect(manifest.maxTokens).toBe(4096);
   const history=[...(manifest.history??[]),{role:'user',content:manifest.prompt}];

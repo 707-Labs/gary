@@ -13,7 +13,7 @@ const call = (id = "call_1", name = "read_file", args = '{"path":"README.md"}') 
 function providerBody(overrides: Body = {}): Body {
   return { id: "msg_test", type: "message", role: "assistant", model: "deepseek/deepseek-v4.1-flash",
     content: [{ type: "text", text: "Checked." }], stop_reason: "end_turn",
-    usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 }, ...overrides };
+    usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4, cost: 0 }, ...overrides };
 }
 function request(overrides: Body = {}, authorization = "Bearer " + TOKEN, path = "/v1/chat/completions"): Request {
   return new Request("http://localhost" + path, { method: "POST", headers: { authorization, "content-type": "application/json" },
@@ -74,6 +74,7 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
     expect(upstream.system).toEqual([{ type: "text", text: "Be precise." }]);
     expect(upstream.messages).toEqual([{ role: "user", content: [{ type: "text", text: "Inspect the task." }] }]);
     expect(upstream.max_tokens).toBe(128);
+    expect(upstream.provider).toEqual({ data_collection: "deny", max_price: { prompt: 0.6, completion: 2.4 } });
     expect(ledger.status("TICKET-1")!.attemptCount).toBe(1);
     expect(ledger.status("TICKET-1")!.unknownAttempts).toBe(0);
     expect(ledger.status("TICKET-1")!.chargedMicros).toBe(318); // ceil((17*60 + 128*240)/100): full requested output, not just two emitted tokens.
@@ -397,7 +398,7 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
   });
 
   test("missing or unknown receipt counters never become refunds or invented OAI usage", async () => {
-    for (const usage of [undefined, { input_tokens: 10, output_tokens: 2 }, { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, new_usage_field: 5 }]) {
+    for (const usage of [undefined, { input_tokens: 10, output_tokens: 2 }, { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0, new_usage_field: 5 }]) {
       const { handler } = setup({ fetch: async () => Response.json(providerBody({ usage })) });
       const response = await handler(request());
       expect(response.status).toBe(200);
@@ -522,7 +523,7 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
 
   test("numeric overflow in tool schemas and returned arguments never becomes executable null", async () => {
     const first = setup();
-    const raw = JSON.stringify({ model: "deepseek/deepseek-v4.1-flash", max_tokens: 128, messages: [{ role: "user", content: "read" }], tools: [TOOL] }).replace('"type":"object"', '"type":"object","minimum":1e309');
+    const raw = JSON.stringify({ model: "deepseek/deepseek-v4.1-flash", provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens: 128, messages: [{ role: "user", content: "read" }], tools: [TOOL] }).replace('"type":"object"', '"type":"object","minimum":1e309');
     const req = new Request("http://localhost/v1/chat/completions", { method: "POST", headers: { authorization: "Bearer " + TOKEN, "content-type": "application/json" }, body: raw });
     expect((await first.handler(req)).status).toBe(400);
     expect(first.sent).toHaveLength(0);

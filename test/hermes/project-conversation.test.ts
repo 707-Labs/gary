@@ -35,7 +35,7 @@ function fixture() {
 const provider = (content: any[] = [{ type: 'text', text: 'I inspected the current work.' }], extra: Record<string, unknown> = {}) => Response.json({
   id: 'fixture', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash', content,
   stop_reason: content.some(x => x.type === 'tool_use') ? 'tool_use' : 'end_turn',
-  usage: { input_tokens: 40, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, ...extra,
+  usage: { input_tokens: 40, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0 }, ...extra,
 });
 test('unexpected preparation diagnostics expose only a finite stage and exception category', async () => {
   const f = fixture(), diagnostics: unknown[] = []; let fetches = 0, launches = 0;

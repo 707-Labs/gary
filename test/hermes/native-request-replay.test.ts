@@ -50,7 +50,7 @@ function harness(checkExitCode = 0) {
         content: tool ? [{ type: 'tool_use', id: tool.callId, name: tool.name, input: tool.arguments }]
           : [{ type: 'text', text: capture.result.text }],
         stop_reason: tool ? 'tool_use' : 'end_turn', stop_sequence: null,
-        usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 2, cache_creation_input_tokens: 3 },
+        usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 2, cache_creation_input_tokens: 3, cost: 0 },
       });
     },
     executor, allowedTools: ['run_bash', 'finish'], finishGateCommand: 'bun run check',

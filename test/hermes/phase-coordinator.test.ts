@@ -55,7 +55,7 @@ function fixture() {
       const content = typeof script === "string" ? [{ type: "text", text: script }]
         : [{ type: "tool_use", id: script.id ?? "call_" + sent.length, name: script.name, input: script.input }];
       return Response.json({ id: "msg-" + sent.length, type: "message", role: "assistant", model: "deepseek/deepseek-v4.1-flash", content,
-        stop_reason: typeof script === "string" ? "end_turn" : "tool_use", usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } });
+        stop_reason: typeof script === "string" ? "end_turn" : "tool_use", usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0 } });
     } };
   const phases: PhaseSpec[] = [{ name: "investigate", maxIter: 8, allowedTools: new Set(["read_file", "todo_write", "report_blocked", "get_pr", "query_cloudflare_logs"]), nudgeMessage: "Wrap up exploration." },
     { name: "implement", maxIter: 20, entryMessage: "Implement, check and finish.", nudgeMessage: "Verify before finish." }];

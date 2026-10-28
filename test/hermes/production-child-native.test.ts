@@ -126,7 +126,7 @@ test.skipIf(!nativeImage || !readonlyImage)('native parent and read-only child s
         return Response.json({ id: `fixture-reply-${providerRequests.length}`, type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash',
           content: step ? [{ type: 'tool_use', id: `fixture-call-${providerRequests.length}`, name: step[0], input: step[1] }]
             : [{ type: 'text', text: child ? CHILD_PROSE : 'Parent verification complete.' }],
-          stop_reason: step ? 'tool_use' : 'end_turn', usage: { input_tokens: 10, output_tokens: 8, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } });
+          stop_reason: step ? 'tool_use' : 'end_turn', usage: { input_tokens: 10, output_tokens: 8, cache_creation_input_tokens: 0, cost: 0, cache_read_input_tokens: 0 } });
       } }, launch,
       readonlyChildren: { imageDigest: readonlyImage!, dockerHost },
       createTrace: admitted => {

@@ -6,7 +6,7 @@ import { join, resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import { GLMClient } from "../src/adapters/glm.ts";
 import { createProvider, createProviderChain } from "../src/providers.ts";
-import { openSpendLedger, SpendLimitError, type SpendLedger, spendReservationMicros, SPEND_CONTEXT_TOKENS } from "../src/spend.ts";
+import { openSpendLedger, SpendLimitError, type SpendLedger, spendReservationMicros, SPEND_CONTEXT_TOKENS , withOpenRouterPreferences } from '../src/spend.ts';
 
 const PAID_URL = "https://openrouter.ai/api/v1/messages";
 const ZAI_URL = "https://api.z.ai/api/anthropic/v1/messages";
@@ -29,10 +29,10 @@ function ledgerAt(path = ":memory:", cap = 4.849454): SpendLedger {
   return ledger;
 }
 function request(overrides: Record<string, unknown> = {}, url = PAID_URL): Request {
-  return new Request(url, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer fake-secret" }, body: JSON.stringify({ model: "deepseek/deepseek-v4.1-flash", max_tokens: 8192, messages: [{ role: "user", content: "PRIVATE PROMPT DO NOT PERSIST" }], ...overrides }) });
+  return new Request(url, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer fake-secret" }, body: JSON.stringify({ model: "deepseek/deepseek-v4.1-flash", provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens: 8192, messages: [{ role: "user", content: "PRIVATE PROMPT DO NOT PERSIST" }], ...overrides }) });
 }
 function receipt(usage: Record<string, unknown> = {}, model = "deepseek/deepseek-v4.1-flash"): Response {
-  return Response.json({ id: "msg_offline", type: "message", role: "assistant", model, content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 200, cache_creation_input_tokens: 300, ...usage } });
+  return Response.json({ id: "msg_offline", type: "message", role: "assistant", model, content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", stop_sequence: null, usage: { input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 200, cache_creation_input_tokens: 300, cost: 0, ...usage } });
 }
 function fakeFetch(fn: (request: Request) => Response | Promise<Response>): typeof fetch {
   return (async (input: RequestInfo | URL, init?: RequestInit) => fn(new Request(input, init))) as typeof fetch;
@@ -126,7 +126,8 @@ describe("durable spending allocation", () => {
 
   it.each([
     { cache_read_input_tokens: undefined },
-    { cache_creation_input_tokens: null },
+    { cache_creation_input_tokens: null, cost: undefined },
+    { cost: undefined }, // OpenRouter's billed cost is required even with every counter present.
     { input_tokens: -1 },
     { output_tokens: 0.1 },
     { cache_creation_input_tokens: "300" },
@@ -167,7 +168,7 @@ describe("durable spending allocation", () => {
     const childPath = join(dir, "crash.ts");
     writeFileSync(childPath, `import {openSpendLedger} from ${JSON.stringify(resolve("src/spend.ts"))};
       const l=openSpendLedger(${JSON.stringify(path)});
-      await l.withSpendScope('ERT-3189',()=>l.guardedFetch('openrouter',async()=>{process.exit(0)})(new Request(${JSON.stringify(PAID_URL)},{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer fake-secret'},body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',max_tokens:8192,messages:[{role:'user',content:'PRIVATE PROMPT DO NOT PERSIST'}]})})));`);
+      await l.withSpendScope('ERT-3189',()=>l.guardedFetch('openrouter',async()=>{process.exit(0)})(new Request(${JSON.stringify(PAID_URL)},{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer fake-secret'},body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens:8192,messages:[{role:'user',content:'PRIVATE PROMPT DO NOT PERSIST'}]})})));`);
     const child = Bun.spawnSync([process.execPath, childPath]);
     expect(child.exitCode).toBe(0);
     expect(ledger.status("ERT-3189")?.chargedMicros).toBe(648_807);
@@ -244,11 +245,11 @@ describe("guard at SDK transport boundary", () => {
   it("every SDK retry gets its own durable reservation, including rejected responses", async () => {
     const ledger = ledgerAt();
     let calls = 0;
-    const client = new Anthropic({ authToken: "not-a-secret", baseURL: "https://openrouter.ai/api", maxRetries: 2, fetch: ledger.guardedFetch("openrouter", fakeFetch(() => {
+    const client = new Anthropic({ authToken: "not-a-secret", baseURL: "https://openrouter.ai/api", maxRetries: 2, fetch: withOpenRouterPreferences(ledger.guardedFetch('openrouter', fakeFetch(() => {
       calls++;
       if (calls < 3) return Response.json({ type: "error", error: { type: "overloaded_error", message: "offline fake overload" } }, { status: 529, headers: { "retry-after-ms": "1" } });
       return receipt();
-    })) });
+    }))) });
     await ledger.withSpendScope("ERT-3189", () => client.messages.create({ model: "deepseek/deepseek-v4.1-flash", max_tokens: 8192, messages: [{ role: "user", content: "test" }] }));
     expect(calls).toBe(3);
     expect(ledger.status("ERT-3189")?.attemptCount).toBe(3);
@@ -264,7 +265,7 @@ describe("guard at SDK transport boundary", () => {
       zaiCalls++;
       return Response.json({ type: "error", error: { type: "rate_limit_error", message: "offline quota" } }, { status: 429, headers: { "x-should-retry": "false" } });
     })) });
-    const deepseek = createProvider({ name: "openrouter", apiKey: "fake", baseUrl: "https://openrouter.ai/api", model: "deepseek/deepseek-v4.1-flash", defaultBackoffMs: 60_000 }, { fetch: ledger.guardedFetch("openrouter", fakeFetch(() => { dsCalls++; return receipt(); })) });
+    const deepseek = createProvider({ name: "openrouter", apiKey: "fake", baseUrl: "https://openrouter.ai/api", model: "deepseek/deepseek-v4.1-flash", defaultBackoffMs: 60_000 }, { fetch: ledger.guardedFetch('openrouter', fakeFetch(() => { dsCalls++; return receipt(); })) });
     const glm = new GLMClient(createProviderChain([zai, deepseek]));
     await ledger.withSpendScope("ERT-3189", () => glm.complete({ system: "test", user: "test", maxTokens: 8192 }));
     expect([zaiCalls, dsCalls]).toEqual([1, 1]);
@@ -275,7 +276,7 @@ describe("guard at SDK transport boundary", () => {
   it("SDK retries cannot escape a rejected reservation even if SDK wraps the error", async () => {
     const ledger = ledgerAt(":memory:", 0.5);
     let calls = 0;
-    const client = new Anthropic({ authToken: "fake", baseURL: "https://openrouter.ai/api", maxRetries: 1, fetch: ledger.guardedFetch("openrouter", fakeFetch(() => { calls++; return receipt(); })) });
+    const client = new Anthropic({ authToken: "fake", baseURL: "https://openrouter.ai/api", maxRetries: 1, fetch: withOpenRouterPreferences(ledger.guardedFetch('openrouter', fakeFetch(() => { calls++; return receipt(); }))) });
     await expect(ledger.withSpendScope("ERT-3189", async () => await client.messages.create({ model: "deepseek/deepseek-v4.1-flash", max_tokens: 8192, messages: [{ role: "user", content: "test" }] }))).rejects.toThrow();
     expect(calls).toBe(0);
     expect(ledger.status("ERT-3189")?.state).toBe("exhausted");

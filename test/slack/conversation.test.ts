@@ -18,9 +18,9 @@ const input=(n:number,extra:Partial<SlackConversationInput>={}):SlackConversatio
 const sent=async()=> 'sent' as const;
 const deferred=()=>{let resolve!:()=>void;const promise=new Promise<void>(r=>resolve=r);return {promise,resolve};};
 const paidRequest=(maxTokens=4096)=>new Request('https://openrouter.ai/api/v1/messages',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer offline-fixture'},
-  body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',max_tokens:maxTokens,messages:[{role:'user',content:'synthetic queue fixture'}]})});
+  body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens:maxTokens,messages:[{role:'user',content:'synthetic queue fixture'}]})});
 const paidReceipt=(inputTokens=30)=>Response.json({id:'msg_queue_fixture',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'fixture reply'}],stop_reason:'end_turn',
-  usage:{input_tokens:inputTokens,output_tokens:9,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+  usage:{input_tokens:inputTokens,output_tokens:9,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});
 
 test('queued input retains original host engineering capability and text without serializing authority into history',async()=>{
   const f=fixture(),release=deferred(),started=deferred(),turns:DMTurn[]=[];

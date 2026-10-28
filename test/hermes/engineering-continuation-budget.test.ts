@@ -110,7 +110,7 @@ function model(s:ReturnType<typeof fixture>, fetch?: (r:Request)=>Promise<Respon
   const policy=createEngineeringTaskPolicy({taskId:binding.taskId,repository,baseCommit:'a'.repeat(40),allowedFiles:['file.ts'],requiredCommands:['bun test'],publication:'patch_only'});
   const protocol=new EngineeringProtocol({binding,transportCapability:'x'.repeat(48),allowedTools:['terminal'],assertOwner:()=>{},append:()=>{},fence:()=>{},execute:async()=>({}),close:async()=>({cleanupConfirmed:true})});
   let calls=0;
-  const options={binding,policy,allocationId:s.o.allocationId,ledger:s.ledger,journalDb:journal,spendDb:s.spend,continuationBaseline:baseline,protocol,tools:[],systemPrompt:'Host.',providerApiKey:'synthetic',assertOwner:()=>{},fence:()=>{},fetch:async(r:Request)=>{calls++;return fetch?fetch(r):Response.json({id:'synthetic',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'done'}],stop_reason:'end_turn',usage:{input_tokens:10,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}});}};
+  const options={binding,policy,allocationId:s.o.allocationId,ledger:s.ledger,journalDb:journal,spendDb:s.spend,continuationBaseline:baseline,protocol,tools:[],systemPrompt:'Host.',providerApiKey:'synthetic',assertOwner:()=>{},fence:()=>{},fetch:async(r:Request)=>{calls++;return fetch?fetch(r):Response.json({id:'synthetic',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'done'}],stop_reason:'end_turn',usage:{input_tokens:10,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});}};
   const adapter=createEngineeringModelAdapter(options);
   const body=()=>({model:'deepseek/deepseek-v4.1-flash',messages:[{role:'system',content:'Host.'},...adapter.history()],tools:[],max_tokens:8192,stream:false,temperature:0.3});
   return {adapter,body,journal,options,calls:()=>calls};
@@ -152,7 +152,7 @@ test('pre-admission ledger edits cannot be blessed by a new sidecar even with un
   }
 });
 test('cumulative remaining budget protects review after expensive new settlements',async()=>{
-  const s=fixture(), m=model(s,async()=>Response.json({id:'synthetic',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'done'}],stop_reason:'end_turn',usage:{input_tokens:1_048_576,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}}));
+  const s=fixture(), m=model(s,async()=>Response.json({id:'synthetic',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'done'}],stop_reason:'end_turn',usage:{input_tokens:1_048_576,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}}));
   // At the openrouter price three full-context work charges (648_807 each) fit the original cap;
   // the fourth work slot is refused and the protected review (638_962) stays funded.
   for(let i=0;i<3;i++){m.adapter.beginTurn({turnId:'expensive-'+i,prompt:'Work.'});await m.adapter.handle(m.body(),new AbortController().signal);m.adapter.finishTurn(m.adapter.history());}

@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openSpendLedger, SpendLimitError, type SpendLedger, spendReservationMicros } from "../src/spend.ts";
+import { OPENROUTER_PROVIDER_PREFERENCES, withOpenRouterPreferences, openSpendLedger, SpendLimitError, type SpendLedger, spendReservationMicros } from "../src/spend.ts";
 import saved from "./fixtures/openrouter-anthropic-usage-2026-10-28.json";
 
 const ledgers: SpendLedger[] = [];
@@ -41,7 +41,7 @@ function send(ledger: SpendLedger, body: unknown, headers: HeadersInit = {}, tic
   const transport = ledger.guardedFetch("openrouter", (async () => Response.json(body, { headers })) as unknown as typeof fetch);
   return ledger.withSpendScope(ticket, () => transport(saved.endpoint, {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: saved.requestedModel, max_tokens: saved.maxTokens, messages: [{ role: "user", content: "offline fixture" }] }),
+    body: JSON.stringify({ model: saved.requestedModel, provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens: saved.maxTokens, messages: [{ role: "user", content: "offline fixture" }] }),
   }));
 }
 function rows(path: string, sql: string) {
@@ -118,7 +118,7 @@ describe("OpenRouter receipt compatibility", () => {
     await ledger.withSpendScope("ticket", () => zai("https://api.z.ai/api/anthropic/v1/messages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "glm-5.3", max_tokens: 2048, messages: [{ role: "user", content: "offline" }] }) }));
     expect(rows(path, "SELECT reason FROM spend_receipts")).toEqual([{ reason: "usage_fields" }]);
     const deepseek = ledger.guardedFetch("openrouter", (async () => { calls++; return Response.json(responseBody()); }) as unknown as typeof fetch);
-    await expect(ledger.withSpendScope("ticket", () => deepseek(saved.endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: saved.requestedModel, max_tokens: 2048, service_tier: "standard", messages: [{ role: "user", content: "offline" }] }) }))).rejects.toThrow(SpendLimitError);
+    await expect(ledger.withSpendScope("ticket", () => deepseek(saved.endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: saved.requestedModel, provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens: 2048, service_tier: "standard", messages: [{ role: "user", content: "offline" }] }) }))).rejects.toThrow(SpendLimitError);
     expect(calls).toBe(1);
   });
 });
@@ -160,7 +160,7 @@ describe("receipt evidence without historical reconciliation", () => {
     try {
       await expect(ledger.withSpendScope("ticket", () => transport(saved.endpoint, {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: saved.requestedModel, max_tokens: saved.maxTokens, messages: [{ role: "user", content: "offline" }] }),
+        body: JSON.stringify({ model: saved.requestedModel, provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens: saved.maxTokens, messages: [{ role: "user", content: "offline" }] }),
       }))).rejects.toThrow("ticket closed while request was in flight");
       expect(await writer!.exited).toBe(0);
       expect(ledger.status("ticket")?.state).toBe(state);
@@ -241,7 +241,7 @@ describe("receipt evidence without historical reconciliation", () => {
 
 describe("OpenRouter cutover accounting", () => {
   const request = (model = saved.requestedModel) => ({ method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model, max_tokens: saved.maxTokens, messages: [{ role: "user", content: "offline" }] }) });
+    body: JSON.stringify({ model, provider: OPENROUTER_PROVIDER_PREFERENCES, max_tokens: saved.maxTokens, messages: [{ role: "user", content: "offline" }] }) });
 
   it("charges OpenRouter's billed cost when it exceeds the policy price for the same tokens", async () => {
     const { ledger } = setup();
@@ -259,6 +259,49 @@ describe("OpenRouter cutover accounting", () => {
     expect(ledger.status("ticket")?.chargedMicros).toBe(reservation + 1);
     expect(ledger.status("ticket")?.terminalReason).toBe("receipt_exceeds_bounds");
     expect(rows(path, "SELECT state FROM spend_attempts")).toEqual([{ state: "settled" }]);
+  });
+
+  it("admits only the reviewed OpenRouter routing preferences, derived from the 60/240 policy", async () => {
+    const { ledger } = setup();
+    expect(OPENROUTER_PROVIDER_PREFERENCES).toEqual({ data_collection: "deny", max_price: { prompt: 0.6, completion: 2.4 } });
+    let calls = 0;
+    const inner = (async () => { calls++; return Response.json(responseBody()); }) as unknown as typeof fetch;
+    const send = (provider: unknown) => ledger.withSpendScope("ticket", () => ledger.guardedFetch("openrouter", inner)(saved.endpoint, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: saved.requestedModel, ...(provider === undefined ? {} : { provider }), max_tokens: saved.maxTokens, messages: [{ role: "user", content: "x" }] }) }));
+    for (const provider of [undefined, {}, { data_collection: "allow", max_price: { prompt: 0.6, completion: 2.4 } },
+      { data_collection: "deny", max_price: { prompt: 0.61, completion: 2.4 } }, { data_collection: "deny", max_price: { prompt: 0.6, completion: 2.4, request: 1 } },
+      { data_collection: "deny", max_price: { prompt: 0.6, completion: 2.4 }, allow_fallbacks: true }, { data_collection: "deny" }])
+      await expect(send(provider)).rejects.toThrow("unreviewed provider routing preferences");
+    expect(calls).toBe(0);
+    // Key order does not matter; values and key sets do.
+    await send({ max_price: { completion: 2.4, prompt: 0.6 }, data_collection: "deny" });
+    expect(calls).toBe(1);
+    const zai = ledger.guardedFetch("z.ai", inner);
+    await expect(ledger.withSpendScope("ticket", () => zai("https://api.z.ai/api/anthropic/v1/messages", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "glm-5.3", provider: OPENROUTER_PROVIDER_PREFERENCES, max_tokens: 16, messages: [{ role: "user", content: "x" }] }) })))
+      .rejects.toThrow("unreviewed provider routing preferences");
+  });
+
+  it("withOpenRouterPreferences adds the preferences to each JSON request body", async () => {
+    const bodies: unknown[] = [];
+    const wrapped = withOpenRouterPreferences((async (input: RequestInfo | URL, init?: RequestInit) => { bodies.push(await new Request(input, init).json()); return new Response("{}"); }) as unknown as typeof fetch);
+    await wrapped(saved.endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: saved.requestedModel, max_tokens: 1 }) });
+    expect(bodies).toEqual([{ model: saved.requestedModel, max_tokens: 1, provider: { data_collection: "deny", max_price: { prompt: 0.6, completion: 2.4 } } }]);
+  });
+
+  it("requires OpenRouter's billed cost to settle even when every counter is an integer", async () => {
+    const { ledger, path } = setup();
+    const { cost: _, ...usage } = { ...saved.calls[0]!.usage, cache_creation_input_tokens: 0 };
+    await send(ledger, responseBody(usage));
+    expect(ledger.status("ticket")?.chargedMicros).toBe(spendReservationMicros("openrouter", saved.maxTokens));
+    expect(ledger.status("ticket")?.unknownAttempts).toBe(1);
+    expect(rows(path, "SELECT reason FROM spend_receipts")).toEqual([{ reason: "usage_counters" }]);
+  });
+
+  it("the saved probe returned the undated model slug that the receipt check requires", () => {
+    expect(saved.returnedModel).toBe("deepseek/deepseek-v4.1-flash");
+    expect(saved.returnedModel).toBe(saved.requestedModel);
   });
 
   it("rejects any new request on the retired direct DeepSeek route before HTTP", async () => {

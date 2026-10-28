@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from 'bun:test';
 import Anthropic from '@anthropic-ai/sdk';
-import { SpendLedger, spendReservationMicros, type PaidRequestGuardPhase } from '../src/spend.ts';
+import { SpendLedger, spendReservationMicros, type PaidRequestGuardPhase , withOpenRouterPreferences } from '../src/spend.ts';
 import { openDb } from '../src/state/db.ts';
 import { upsertTicket, recordActionStart } from '../src/state/queries.ts';
 import { bindCanonicalCodeAction } from '../src/hermes/canonical-admission.ts';
@@ -19,7 +19,7 @@ function ledgerFixture() {
   return ledger;
 }
 function body(overrides: Record<string, unknown> = {}) {
-  return { model: 'deepseek/deepseek-v4.1-flash', max_tokens: MAX_TOKENS, messages: [{ role: 'user', content: 'Offline fixture' }], ...overrides };
+  return { model: 'deepseek/deepseek-v4.1-flash', provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens: MAX_TOKENS, messages: [{ role: 'user', content: 'Offline fixture' }], ...overrides };
 }
 function request(overrides: Record<string, unknown> = {}) {
   return new Request(URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body(overrides)) });
@@ -27,7 +27,7 @@ function request(overrides: Record<string, unknown> = {}) {
 function receiptBody(overrides: Record<string, unknown> = {}) {
   return { id: 'offline-receipt', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash',
     content: [{ type: 'text', text: 'offline answer' }], stop_reason: 'end_turn',
-    usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, ...overrides };
+    usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0 }, ...overrides };
 }
 function fakeFetch(fn: (request: Request) => Response | Promise<Response>): typeof fetch {
   return (async (input: RequestInfo | URL, init?: RequestInit) => fn(new Request(input, init))) as typeof fetch;
@@ -110,7 +110,7 @@ for (const scenario of ['http_error', 'invalid_json', 'missing_usage', 'redirect
       if (scenario === 'invalid_json') return new Response('{broken', { headers: { 'content-type': 'application/json' } });
       if (scenario === 'redirect') return new Response(null, { status: 302, headers: { location: 'https://invalid.example/' } });
       return Response.json(receiptBody({ usage: scenario === 'missing_usage' ? {} : {
-        input_tokens: 10, output_tokens: MAX_TOKENS + 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+        input_tokens: 10, output_tokens: MAX_TOKENS + 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0,
       } }));
     }));
     await ledger.withPaidRequestGuard(phase => {
@@ -182,7 +182,7 @@ for (const first of ['http_error', 'missing_usage'] as const) {
       return first === 'http_error' ? Response.json({ type: 'error', error: { type: 'overloaded_error', message: 'offline' } }, { status: 529 })
         : Response.json(receiptBody({ usage: {} }));
     }));
-    const client = new Anthropic({ authToken: 'offline-only', baseURL: 'https://openrouter.ai/api', maxRetries: 1, fetch: transport });
+    const client = new Anthropic({ authToken: 'offline-only', baseURL: 'https://openrouter.ai/api', maxRetries: 1, fetch: withOpenRouterPreferences(transport) });
     await expect(ledger.withPaidRequestGuard(phase => {
       if (phase === 'before_request') admissions++;
       // The just-reserved send may have one pending attempt; every other edge requires settled usage.

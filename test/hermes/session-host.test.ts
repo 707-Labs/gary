@@ -22,7 +22,7 @@ function fixture(progress?: ProductiveProgressGuard, cap = 5, trace?:AuditTrace,
     capabilityToken:token,ledger,provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',providerApiKey:'fixture-provider-key',
     fetch:(async()=>{providerCalls++; return Response.json({id:'msg-fixture',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',
       content:[{type:'text',text:'completed in prose only'}],stop_reason:'end_turn',stop_sequence:null,
-      usage:{input_tokens:10,output_tokens:8,cache_read_input_tokens:0,cache_creation_input_tokens:0}});}),
+      usage:{input_tokens:10,output_tokens:8,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});}),
     executor,allowedTools:['read_file','run_bash','finish','report_blocked'],finishGateCommand:'bun run check',
     currentOwnerEpoch:()=>epoch,assertAdmission:()=>{if(!admitted)throw new Error('revoked');},
     ...(progress ? {progress} : {}),
@@ -181,7 +181,7 @@ const modelRequestBody={model:'deepseek/deepseek-v4.1-flash',messages:[{role:'us
 function rejectedProviderBody(){return {id:'private-response-id',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',
  content:[{type:'thinking',thinking:'private-reasoning',signature:'private-signature'},
   {type:'tool_use',id:'private-call-id',name:'read_file',input:{path:'private-path'}}],stop_reason:'tool_use',
- usage:{input_tokens:10,output_tokens:8,cache_read_input_tokens:0,cache_creation_input_tokens:0}};}
+ usage:{input_tokens:10,output_tokens:8,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}};}
 test('model trace preserves precise fixed rejection metadata without provider content',async()=>{
  const f=tracedFixture(5,{thinking:'disabled',fetch:async request=>{
   expect((await request.json()).thinking).toEqual({type:'disabled'});return Response.json(rejectedProviderBody());}});

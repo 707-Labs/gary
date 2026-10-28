@@ -29,7 +29,7 @@ const TOOL = { type: 'function', function: { name: 'terminal', description: 'Fix
 const sha = (v: string) => createHash('sha256').update(v).digest('hex');
 function provider(content: unknown[], stop_reason = 'end_turn') {
   return { id: 'msg_fixture', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash', content, stop_reason,
-    usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } };
+    usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0 } };
 }
 interface Flags {
   nativeLaunch?: 'unknown' | 'proven_absent';

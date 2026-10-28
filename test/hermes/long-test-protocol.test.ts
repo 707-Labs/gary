@@ -31,7 +31,7 @@ function fixture(overrides:Partial<SessionOptions>={}) {
  const options:SessionOptions={admission:{taskId:'task',requestId:'request',ticketId:'ticket',actionId:'action',fingerprint:'fingerprint',ownerEpoch:'owner',deadlineMs:Date.now()+120_000},capabilityToken:token,ledger,
   provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',providerApiKey:'fake',executor,allowedTools:['run_bash','read_file','finish','report_blocked'],finishGateCommand:'bun run ci:full',
   currentOwnerEpoch:()=>owner,assertAdmission:()=>{},longTestPolicy:CODING_VERIFICATION_POLICY,executorJobJournal:{} as ExecutorJobJournal,progress,
-  fetch:async()=>{providers++;return Response.json({id:'fake',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'done'}],stop_reason:'end_turn',usage:{input_tokens:1,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}});},...overrides};
+  fetch:async()=>{providers++;return Response.json({id:'fake',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'done'}],stop_reason:'end_turn',usage:{input_tokens:1,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});},...overrides};
  const host=createSessionHost(options);cleanup.push(async()=>{await host.drain();host.dispose();});
  const start=async(id='gate',command='bun run ci:full')=>{const reply=await host.handle(request('/tools/execute',execute(id,command)));expect(reply.status).toBe(202);return reply.json();};
  const poll=(pending:any,changes:Record<string,unknown>={})=>host.handle(request('/tools/jobs/poll',{taskId:'task',requestId:'request',ownerEpoch:'owner',callId:pending.callId,jobId:pending.jobId,...changes}));
@@ -124,7 +124,7 @@ test('phase coordinator preserves one completed tool message between model reque
  const f=fixture();f.host.dispose();let modelCalls=0;const histories:unknown[]=[];
  f.options.fetch=async()=>{const first=++modelCalls===1;return Response.json({id:'fake-'+modelCalls,type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',
   content:[{type:'tool_use',id:first?'gate':'finish',name:first?'run_bash':'finish',input:first?{command:'bun run ci:full'}:{summary:'verified'}}],stop_reason:'tool_use',
-  usage:{input_tokens:1,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}});};
+  usage:{input_tokens:1,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});};
  const run=createGaryPhaseCoordinator({hostOptions:f.options,baseUrl:'http://127.0.0.1/',launch:async(m,h)=>{
   let history=canonicalizeConversation([...(m.history??[]),{role:'user',content:m.prompt}]);
   for(let turn=0;turn<2;turn++){
@@ -183,7 +183,7 @@ test('late executor success after cancellation cannot restore finish or progress
 
 test('slow phase model body cannot overtake an admitted job or start provider spend',async()=>{
  const f=fixture();f.host.dispose();let providers=0;
- f.options.fetch=async()=>{providers++;return Response.json({id:'fake',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'tool_use',id:'gate',name:'run_bash',input:{command:'bun run ci:full'}}],stop_reason:'tool_use',usage:{input_tokens:1,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}});};
+ f.options.fetch=async()=>{providers++;return Response.json({id:'fake',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'tool_use',id:'gate',name:'run_bash',input:{command:'bun run ci:full'}}],stop_reason:'tool_use',usage:{input_tokens:1,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});};
  const run=createGaryPhaseCoordinator({hostOptions:f.options,baseUrl:'http://127.0.0.1/',launch:async(m,h)=>{
   const body={model:m.model,messages:[{role:'system',content:m.systemPrompt},{role:'user',content:m.prompt}],tools:m.tools,max_tokens:m.maxTokens,temperature:m.temperature,stream:false};
   const first=await h(request('/v1/chat/completions',body));expect(first.status).toBe(200);

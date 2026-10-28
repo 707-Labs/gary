@@ -52,7 +52,7 @@ function clone(root: string): string {
 }
 function provider(content: unknown[], stop_reason = 'end_turn') {
   return { id: 'fixture', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash', content, stop_reason,
-    usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } };
+    usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0 } };
 }
 interface Flags { replaceCheck?: boolean; unexpectedAfterTest?: boolean; mutateDuringReview?: boolean; releaseFails?: boolean; routine?: boolean;
   delegate?: boolean; parentCloseFails?: boolean; childCloseFails?: boolean; candidateDependencies?: boolean; changeDelegatedGoal?: boolean;

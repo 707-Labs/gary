@@ -113,7 +113,7 @@ function runtimeFixture(options: { mode?: Mode; campaignCap?: number; allocation
         content = [{ type: 'text', text: answerText }]; stopReason = 'end_turn';
       }
       return Response.json({ id: 'offline-reply-' + requests, type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash', content, stop_reason: stopReason,
-        ...(mode === 'unknown-usage' ? {} : { usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }) });
+        ...(mode === 'unknown-usage' ? {} : { usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0 } }) });
     } } };
   return { ...f, db, ledger, dbPath, ledgerPath, deps, hooks, challenge, challengePath, expected, upstreamThinking,
     counts: () => ({ requests, launches, executorCreations, reads, closes }) };
@@ -323,9 +323,9 @@ for (const unknown of [false, true]) test('preexisting ' + (unknown ? 'unknown' 
   const f = runtimeFixture();
   const guarded = f.ledger.guardedFetch('openrouter', (async () => Response.json({ id: 'prior-offline-attempt', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash',
     content: [{ type: 'text', text: 'Earlier independent fixture' }], stop_reason: 'end_turn',
-    ...(unknown ? {} : { usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }) })) as unknown as typeof fetch);
+    ...(unknown ? {} : { usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0 } }) })) as unknown as typeof fetch);
   await f.ledger.withSpendScope(f.config.allocationId, () => guarded('https://openrouter.ai/api/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'deepseek/deepseek-v4.1-flash', max_tokens: 128, messages: [{ role: 'user', content: 'Offline fixture' }] }) }));
+    body: JSON.stringify({ model: 'deepseek/deepseek-v4.1-flash', provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens: 128, messages: [{ role: 'user', content: 'Offline fixture' }] }) }));
   expect(f.ledger.status(f.config.allocationId)!.attemptCount).toBe(1);
   expect(f.ledger.status(f.config.allocationId)!.unknownAttempts).toBe(unknown ? 1 : 0);
   await failClosed(f); expect(f.counts()).toEqual({ requests: 0, launches: 0, executorCreations: 0, reads: 0, closes: 0 });
