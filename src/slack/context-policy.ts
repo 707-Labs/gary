@@ -22,7 +22,10 @@ export function migrateContextPolicy(db:Database,fromFingerprint:string,toFinger
     if(db.query('SELECT 1 FROM events WHERE cleanup<>1 LIMIT 1').get())throw new Error('dm_context_migration_not_drained');
     const receipt={fromFingerprint,toFingerprint,stateSha256:stateDigest(db),migratedAt:new Date().toISOString()};
     db.exec('CREATE TABLE IF NOT EXISTS policy_migrations (id INTEGER PRIMARY KEY,from_fingerprint TEXT NOT NULL,to_fingerprint TEXT NOT NULL,state_sha256 TEXT NOT NULL,migrated_at TEXT NOT NULL,rolled_back_at TEXT)');
-    if(db.query('SELECT 1 FROM policy_migrations WHERE rolled_back_at IS NULL LIMIT 1').get())throw new Error('dm_context_migration_active_receipt');
+    // Migrations chain: a new one may start only from the state the latest
+    // un-rolled-back receipt landed on (e.g. v1->v2 then v2->v3).
+    const latest=db.query('SELECT to_fingerprint FROM policy_migrations WHERE rolled_back_at IS NULL ORDER BY id DESC LIMIT 1').get() as {to_fingerprint:string}|null;
+    if(latest&&latest.to_fingerprint!==fromFingerprint)throw new Error('dm_context_migration_active_receipt');
     db.query('INSERT INTO policy_migrations(from_fingerprint,to_fingerprint,state_sha256,migrated_at) VALUES (?,?,?,?)').run(fromFingerprint,toFingerprint,receipt.stateSha256,receipt.migratedAt);
     db.query('UPDATE control SET fingerprint=? WHERE id=1 AND fingerprint=?').run(toFingerprint,fromFingerprint);
     if(stateDigest(db)!==receipt.stateSha256)throw new Error('dm_context_migration_changed_state');
