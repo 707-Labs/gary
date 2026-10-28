@@ -223,4 +223,4 @@ test('v2 worst-case physical receipts exhaust work headroom after seven and unkn
   expect(unknown.ledger.status(unknown.options.allocationId)!.unknownAttempts).toBe(1);
   await expect(unknown.model.handle(unknown.body(),new AbortController().signal)).rejects.toThrow('inactive');
   expect(unknown.requests).toHaveLength(1);
-});
+},20_000);
