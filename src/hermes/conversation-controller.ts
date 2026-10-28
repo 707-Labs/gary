@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import type { Database } from 'bun:sqlite';
 import { CODING_SPEND_RESERVE_POLICY, spendReservationMicros, type SpendLedger, type SpendStatus } from '../spend.ts';
 import { HERMES_CODING_RUNTIME_POLICY } from './coding-runtime-policy.ts';
+import { PAID_ROUTE } from '../model-route.ts';
 import { readRuntimeDiagnostic } from './runtime-diagnostics.ts';
 import type { ProjectIntegrationBinding } from './project-integrations.ts';
 import type { WorkProject } from './work-context.ts';
@@ -42,7 +43,7 @@ function diagnostic(raw: string | null) {
 function allocation(status: SpendStatus | null, ledger: ConversationControllerOptions['ledger'], issueId: string) {
   if (!status) return null;
   const codingReviewReserve = ledger.hasCodingReviewReserve(issueId);
-  const minimumCodingHeadroom = spendReservationMicros('deepseek') + CODING_SPEND_RESERVE_POLICY.workFloorMicros;
+  const minimumCodingHeadroom = spendReservationMicros(PAID_ROUTE.provider) + CODING_SPEND_RESERVE_POLICY.workFloorMicros;
   return { state: status.state, terminalReason: finite(status.terminalReason), capMicros: status.capMicros,
     chargedMicros: status.chargedMicros, remainingMicros: status.remainingMicros,
     unresolvedAttempts: status.unknownAttempts, attemptCount: status.attemptCount,

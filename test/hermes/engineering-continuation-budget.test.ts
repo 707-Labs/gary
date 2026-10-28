@@ -110,9 +110,9 @@ function model(s:ReturnType<typeof fixture>, fetch?: (r:Request)=>Promise<Respon
   const policy=createEngineeringTaskPolicy({taskId:binding.taskId,repository,baseCommit:'a'.repeat(40),allowedFiles:['file.ts'],requiredCommands:['bun test'],publication:'patch_only'});
   const protocol=new EngineeringProtocol({binding,transportCapability:'x'.repeat(48),allowedTools:['terminal'],assertOwner:()=>{},append:()=>{},fence:()=>{},execute:async()=>({}),close:async()=>({cleanupConfirmed:true})});
   let calls=0;
-  const options={binding,policy,allocationId:s.o.allocationId,ledger:s.ledger,journalDb:journal,spendDb:s.spend,continuationBaseline:baseline,protocol,tools:[],systemPrompt:'Host.',providerApiKey:'synthetic',assertOwner:()=>{},fence:()=>{},fetch:async(r:Request)=>{calls++;return fetch?fetch(r):Response.json({id:'synthetic',type:'message',role:'assistant',model:'deepseek-v4-pro',content:[{type:'text',text:'done'}],stop_reason:'end_turn',usage:{input_tokens:10,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}});}};
+  const options={binding,policy,allocationId:s.o.allocationId,ledger:s.ledger,journalDb:journal,spendDb:s.spend,continuationBaseline:baseline,protocol,tools:[],systemPrompt:'Host.',providerApiKey:'synthetic',assertOwner:()=>{},fence:()=>{},fetch:async(r:Request)=>{calls++;return fetch?fetch(r):Response.json({id:'synthetic',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'done'}],stop_reason:'end_turn',usage:{input_tokens:10,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}});}};
   const adapter=createEngineeringModelAdapter(options);
-  const body=()=>({model:'deepseek-v4-pro',messages:[{role:'system',content:'Host.'},...adapter.history()],tools:[],max_tokens:8192,stream:false,temperature:0.3});
+  const body=()=>({model:'deepseek/deepseek-v4.1-flash',messages:[{role:'system',content:'Host.'},...adapter.history()],tools:[],max_tokens:8192,stream:false,temperature:0.3});
   return {adapter,body,journal,options,calls:()=>calls};
 }
 test('three new work requests and review share the original cap and preserve exact settled prefix without replay',async()=>{
@@ -152,12 +152,14 @@ test('pre-admission ledger edits cannot be blessed by a new sidecar even with un
   }
 });
 test('cumulative remaining budget protects review after expensive new settlements',async()=>{
-  const s=fixture(), m=model(s,async()=>Response.json({id:'synthetic',type:'message',role:'assistant',model:'deepseek-v4-pro',content:[{type:'text',text:'done'}],stop_reason:'end_turn',usage:{input_tokens:1_048_576,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}}));
-  for(let i=0;i<2;i++){m.adapter.beginTurn({turnId:'expensive-'+i,prompt:'Work.'});await m.adapter.handle(m.body(),new AbortController().signal);m.adapter.finishTurn(m.adapter.history());}
-  m.adapter.beginTurn({turnId:'third',prompt:'More work.'});
+  const s=fixture(), m=model(s,async()=>Response.json({id:'synthetic',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'done'}],stop_reason:'end_turn',usage:{input_tokens:1_048_576,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}}));
+  // At the openrouter price three full-context work charges (648_807 each) fit the original cap;
+  // the fourth work slot is refused and the protected review (638_962) stays funded.
+  for(let i=0;i<3;i++){m.adapter.beginTurn({turnId:'expensive-'+i,prompt:'Work.'});await m.adapter.handle(m.body(),new AbortController().signal);m.adapter.finishTurn(m.adapter.history());}
+  m.adapter.beginTurn({turnId:'fourth',prompt:'More work.'});
   await expect(m.adapter.handle(m.body(),new AbortController().signal)).rejects.toThrow();
-  expect(m.calls()).toBe(2);expect(s.ledger.status(s.o.allocationId)).toMatchObject({attemptCount:5,chargedMicros:2_947_898,remainingMicros:2_702_102,unknownAttempts:0,state:'active'});
-  expect(s.ledger.status(s.o.allocationId)!.remainingMicros).toBeGreaterThan(1_400_317);
+  expect(m.calls()).toBe(3);expect(s.ledger.status(s.o.allocationId)).toMatchObject({attemptCount:6,chargedMicros:114_776+3*648_807,remainingMicros:5_650_000-114_776-3*648_807,unknownAttempts:0,state:'active'});
+  expect(s.ledger.status(s.o.allocationId)!.remainingMicros).toBeGreaterThan(638_962);
 });
 for(const phase of ['before_request','before_send'] as const)test('new receipt edit during '+phase+' is denied before physical dispatch',async()=>{
   const s=fixture(),m=model(s);m.adapter.beginTurn({turnId:'first',prompt:'Work.'});await m.adapter.handle(m.body(),new AbortController().signal);m.adapter.finishTurn(m.adapter.history());

@@ -19,7 +19,7 @@ interface FakeOpts {
 }
 
 function fakeProvider(
-  name: "z.ai" | "kimi" | "deepseek",
+  name: "z.ai" | "kimi" | "openrouter",
   opts: FakeOpts,
 ): LLMProvider & { calls: number } {
   let calls = 0;
@@ -191,7 +191,7 @@ describe("GLMClient.complete — provider fallback", () => {
     const a = fakeProvider("z.ai", { responses: [{ kind: "ok", text: "" }] });
     const b = fakeProvider("kimi", { responses: [] });
     b.gate.armUntil(reset);
-    const c = fakeProvider("deepseek", {
+    const c = fakeProvider("openrouter", {
       responses: [{ kind: "ok", text: "from-deepseek" }],
     });
     const glm = new GLMClient(createProviderChain([a, b, c]));

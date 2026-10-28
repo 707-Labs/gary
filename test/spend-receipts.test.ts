@@ -5,7 +5,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openSpendLedger, SpendLimitError, type SpendLedger, spendReservationMicros } from "../src/spend.ts";
-import saved from "./fixtures/deepseek-anthropic-usage-2026-10-07.json";
+import saved from "./fixtures/openrouter-anthropic-usage-2026-10-28.json";
 
 const ledgers: SpendLedger[] = [];
 const dirs: string[] = [];
@@ -27,11 +27,18 @@ function setup() {
   ledger.enrollTicket("test", "ticket", 5, { draftPr: true });
   return { ledger, path };
 }
-function responseBody(usage: Record<string, unknown> = saved.calls[0]!.usage) {
-  return { id: "offline-response", model: saved.requestedModel, type: "message", role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "offline fixture" }], usage };
+type SavedCall = (typeof saved.calls)[number];
+/** Rebuild the live content-block shapes (OpenRouter's citations/caller/empty signature) around saved usage. */
+function savedContent(call: SavedCall): unknown[] {
+  return call.contentBlocks.map((block, i) => block.type === "text" ? { ...block, text: "offline fixture" }
+    : block.type === "thinking" ? { ...block, thinking: "offline reasoning" }
+    : { ...block, id: `call_offline${i}`, input: {} });
+}
+function responseBody(usage: Record<string, unknown> = saved.calls[0]!.usage, call: SavedCall = saved.calls[0]!) {
+  return { id: "offline-response", model: saved.returnedModel, type: "message", role: "assistant", stop_reason: call.stopReason, content: savedContent(call), usage };
 }
 function send(ledger: SpendLedger, body: unknown, headers: HeadersInit = {}, ticket = "ticket") {
-  const transport = ledger.guardedFetch("deepseek", (async () => Response.json(body, { headers })) as unknown as typeof fetch);
+  const transport = ledger.guardedFetch("openrouter", (async () => Response.json(body, { headers })) as unknown as typeof fetch);
   return ledger.withSpendScope(ticket, () => transport(saved.endpoint, {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify({ model: saved.requestedModel, max_tokens: saved.maxTokens, messages: [{ role: "user", content: "offline fixture" }] }),
@@ -42,27 +49,34 @@ function rows(path: string, sql: string) {
   try { return db.query(sql).all() as Array<Record<string, unknown>>; } finally { db.close(); }
 }
 
-describe("DeepSeek standard receipt compatibility", () => {
+describe("OpenRouter receipt compatibility", () => {
   it.each(saved.calls)("settles preserved usage from local call $call without refunding output allowance", async (call) => {
     const { ledger, path } = setup();
-    await send(ledger, responseBody(call.usage));
+    await send(ledger, responseBody(call.usage, call));
     expect(ledger.status("ticket")?.chargedMicros).toBe(call.expectedChargedMicros);
     expect(ledger.status("ticket")?.unknownAttempts).toBe(0);
     expect(rows(path, "SELECT reason FROM spend_receipts")).toEqual([{ reason: "accepted" }]);
-    expect(rows(path, "SELECT input_tokens FROM spend_attempts")).toEqual([{ input_tokens: call.usage.input_tokens + call.usage.cache_read_input_tokens + call.usage.cache_creation_input_tokens }]);
+    expect(rows(path, "SELECT input_tokens FROM spend_attempts")).toEqual([{ input_tokens: call.usage.input_tokens + call.usage.cache_read_input_tokens + (call.usage.cache_creation_input_tokens ?? 0) }]);
   });
 
-  it.each(["priority", "batch", "standard_only", "", null, 0, false, {}])("retains reservation for unpriced response tier %#", async (tier) => {
+  it.each([
+    { service_tier: "priority" }, { service_tier: "batch" }, { service_tier: "standard_only" }, { service_tier: "" },
+    { service_tier: 0 }, { service_tier: false }, { service_tier: {} }, { speed: "fast" }, { speed: "" },
+  ])("retains reservation for unpriced response tier or speed %#", async (tier) => {
     const { ledger, path } = setup();
-    await send(ledger, responseBody({ ...saved.calls[0]!.usage, service_tier: tier }));
-    expect(ledger.status("ticket")?.chargedMicros).toBe(spendReservationMicros("deepseek", saved.maxTokens));
+    await send(ledger, responseBody({ ...saved.calls[0]!.usage, ...tier }));
+    expect(ledger.status("ticket")?.chargedMicros).toBe(spendReservationMicros("openrouter", saved.maxTokens));
     expect(ledger.status("ticket")?.unknownAttempts).toBe(1);
     expect(rows(path, "SELECT reason FROM spend_receipts")).toEqual([{ reason: "service_tier" }]);
   });
 
   it.each([
     { changes: { input_tokens: undefined }, reason: "usage_counters" },
-    { changes: { cache_creation_input_tokens: null }, reason: "usage_counters" },
+    { changes: { cache_creation_input_tokens: null, cost: undefined }, reason: "usage_counters" },
+    { changes: { cache_creation_input_tokens: undefined }, reason: "usage_counters" },
+    { changes: { cost: -1 }, reason: "provider_cost" },
+    { changes: { cost: "0.01" }, reason: "provider_cost" },
+    { changes: { is_byok: true }, reason: "usage_fields" },
     { changes: { cache_read_input_tokens: -1 }, reason: "usage_counters" },
     { changes: { output_tokens: 1.5 }, reason: "usage_counters" },
     { changes: { output_tokens: "12" }, reason: "usage_counters" },
@@ -72,7 +86,7 @@ describe("DeepSeek standard receipt compatibility", () => {
     const { ledger, path } = setup();
     await send(ledger, responseBody({ ...saved.calls[0]!.usage, ...changes }));
     expect(ledger.status("ticket")?.unknownAttempts).toBe(1);
-    expect(ledger.status("ticket")?.chargedMicros).toBe(spendReservationMicros("deepseek", saved.maxTokens));
+    expect(ledger.status("ticket")?.chargedMicros).toBe(spendReservationMicros("openrouter", saved.maxTokens));
     expect(rows(path, "SELECT reason FROM spend_receipts")).toEqual([{ reason }]);
   });
 
@@ -93,7 +107,7 @@ describe("DeepSeek standard receipt compatibility", () => {
     const { ledger, path } = setup();
     await expect(send(ledger, responseBody({ ...saved.calls[0]!.usage, output_tokens: saved.maxTokens + 1 }))).rejects.toThrow(SpendLimitError);
     expect(ledger.status("ticket")?.terminalReason).toBe("receipt_exceeds_bounds");
-    expect(ledger.status("ticket")?.chargedMicros).toBe(spendReservationMicros("deepseek", saved.maxTokens));
+    expect(ledger.status("ticket")?.chargedMicros).toBe(spendReservationMicros("openrouter", saved.maxTokens));
     expect(rows(path, "SELECT reason FROM spend_receipts")).toEqual([{ reason: "token_bounds" }]);
   });
 
@@ -103,7 +117,7 @@ describe("DeepSeek standard receipt compatibility", () => {
     const zai = ledger.guardedFetch("z.ai", (async () => { calls++; return Response.json({ ...responseBody(), model: "glm-5.3" }); }) as unknown as typeof fetch);
     await ledger.withSpendScope("ticket", () => zai("https://api.z.ai/api/anthropic/v1/messages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "glm-5.3", max_tokens: 2048, messages: [{ role: "user", content: "offline" }] }) }));
     expect(rows(path, "SELECT reason FROM spend_receipts")).toEqual([{ reason: "usage_fields" }]);
-    const deepseek = ledger.guardedFetch("deepseek", (async () => { calls++; return Response.json(responseBody()); }) as unknown as typeof fetch);
+    const deepseek = ledger.guardedFetch("openrouter", (async () => { calls++; return Response.json(responseBody()); }) as unknown as typeof fetch);
     await expect(ledger.withSpendScope("ticket", () => deepseek(saved.endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: saved.requestedModel, max_tokens: 2048, service_tier: "standard", messages: [{ role: "user", content: "offline" }] }) }))).rejects.toThrow(SpendLimitError);
     expect(calls).toBe(1);
   });
@@ -115,7 +129,7 @@ describe("receipt evidence without historical reconciliation", () => {
     const ready = `${path}.writer-ready`;
     let writer: ReturnType<typeof Bun.spawn> | undefined;
     const body = responseBody();
-    const transport = ledger.guardedFetch("deepseek", (async () => {
+    const transport = ledger.guardedFetch("openrouter", (async () => {
       const response = Response.json(body);
       const clone = response.clone.bind(response);
       response.clone = () => {
@@ -150,7 +164,7 @@ describe("receipt evidence without historical reconciliation", () => {
       }))).rejects.toThrow("ticket closed while request was in flight");
       expect(await writer!.exited).toBe(0);
       expect(ledger.status("ticket")?.state).toBe(state);
-      expect(ledger.status("ticket")?.chargedMicros).toBe(spendReservationMicros("deepseek", saved.maxTokens));
+      expect(ledger.status("ticket")?.chargedMicros).toBe(spendReservationMicros("openrouter", saved.maxTokens));
       expect(ledger.status("ticket")?.unknownAttempts).toBe(1);
       expect(rows(path, "SELECT reason FROM spend_receipts")).toEqual([{ reason: "ticket_closed" }]);
     } finally { writer?.kill(); }
@@ -197,7 +211,7 @@ describe("receipt evidence without historical reconciliation", () => {
     await send(ledger, responseBody());
     expect(rows(path, "SELECT * FROM spend_attempts WHERE id=1")).toEqual(before);
     expect(rows(path, "SELECT * FROM spend_receipts WHERE attempt_id=1")).toEqual(receiptBefore);
-    expect(ledger.status("ticket")?.chargedMicros).toBe(spendReservationMicros("deepseek", saved.maxTokens) + saved.calls[0]!.expectedChargedMicros);
+    expect(ledger.status("ticket")?.chargedMicros).toBe(spendReservationMicros("openrouter", saved.maxTokens) + saved.calls[0]!.expectedChargedMicros);
     expect(ledger.status("ticket")?.unknownAttempts).toBe(1);
   });
 
@@ -218,9 +232,84 @@ describe("receipt evidence without historical reconciliation", () => {
     expect(details.responseModelHash).toBe(expectedHash);
     expect(details.modelMatches).toBe(false);
     expect(details.unknownUsageFields).toBe(1);
-    expect(details.counters.input_tokens).toEqual({ state: "integer", value: 887 });
+    expect(details.counters.input_tokens).toEqual({ state: "integer", value: saved.calls[0]!.usage.input_tokens });
     expect(details.counters.cache_creation_input_tokens).toEqual({ state: "null" });
     expect(details.counters.cache_read_input_tokens).toEqual({ state: "missing" });
     expect(details.counters.output_tokens).toEqual({ state: "invalid" });
+  });
+});
+
+describe("OpenRouter cutover accounting", () => {
+  const request = (model = saved.requestedModel) => ({ method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model, max_tokens: saved.maxTokens, messages: [{ role: "user", content: "offline" }] }) });
+
+  it("charges OpenRouter's billed cost when it exceeds the policy price for the same tokens", async () => {
+    const { ledger } = setup();
+    // Policy price for these tokens: ceil((6*60 + 2048*240)/100) = 4919 micro-USD.
+    expect(saved.calls[0]!.expectedChargedMicros).toBe(4919);
+    await send(ledger, responseBody({ ...saved.calls[0]!.usage, cost: 0.006 }));
+    expect(ledger.status("ticket")?.chargedMicros).toBe(6000);
+    expect(ledger.status("ticket")?.state).toBe("active");
+  });
+
+  it("records a billed cost above the reservation and stops the ticket", async () => {
+    const { ledger, path } = setup();
+    const reservation = spendReservationMicros("openrouter", saved.maxTokens);
+    await expect(send(ledger, responseBody({ ...saved.calls[0]!.usage, cost: (reservation + 1) / 1_000_000 }))).rejects.toThrow("billed cost exceeds reservation");
+    expect(ledger.status("ticket")?.chargedMicros).toBe(reservation + 1);
+    expect(ledger.status("ticket")?.terminalReason).toBe("receipt_exceeds_bounds");
+    expect(rows(path, "SELECT state FROM spend_attempts")).toEqual([{ state: "settled" }]);
+  });
+
+  it("rejects any new request on the retired direct DeepSeek route before HTTP", async () => {
+    const { ledger } = setup();
+    let calls = 0;
+    const inner = (async () => { calls++; return Response.json(responseBody()); }) as unknown as typeof fetch;
+    await expect(ledger.withSpendScope("ticket", () => ledger.guardedFetch("deepseek", inner)("https://api.deepseek.com/anthropic/v1/messages", request("deepseek-v4-pro"))))
+      .rejects.toThrow("unpriced provider");
+    await expect(ledger.withSpendScope("ticket", () => ledger.guardedFetch("openrouter", inner)(saved.endpoint, request("deepseek-v4-pro"))))
+      .rejects.toThrow("unpriced model");
+    expect(calls).toBe(0);
+    expect(ledger.status("ticket")?.attemptCount).toBe(0);
+  });
+
+  it("an active coding ticket with settled historical DeepSeek attempts continues on OpenRouter without rewriting them", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gary-cutover-test-"));
+    dirs.push(dir);
+    const path = join(dir, "spend.db");
+    const ledger = ledgerAt(path);
+    ledger.createCampaign("coding", 10);
+    ledger.enrollTicket("coding", "ticket", 10, { draftPr: true, codingReviewReserve: true });
+    const sql = new Database(path);
+    // Shape of the live pre-cutover rows: full DeepSeek reservation, settled charge, accepted receipt.
+    for (const charged of [36_388, 37_438]) {
+      const id = Number(sql.query("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state,input_tokens,http_status,settled_at) VALUES('ticket','deepseek','deepseek-v4-pro',8192,1416561,?,'settled',1000,200,CURRENT_TIMESTAMP)").run(charged).lastInsertRowid);
+      sql.query("INSERT INTO spend_receipts(attempt_id,reason,details_json) VALUES(?,'accepted','{}')").run(id);
+    }
+    const before = sql.query("SELECT * FROM spend_attempts ORDER BY id").all();
+    sql.close();
+    await send(ledger, responseBody());
+    const after = rows(path, "SELECT * FROM spend_attempts ORDER BY id");
+    expect(after.slice(0, 2)).toEqual(before as Array<Record<string, unknown>>);
+    expect(after[2]).toMatchObject({ provider: "openrouter", model: "deepseek/deepseek-v4.1-flash", state: "settled",
+      reserved_micros: spendReservationMicros("openrouter", saved.maxTokens), charged_micros: saved.calls[0]!.expectedChargedMicros });
+    expect(ledger.status("ticket")?.chargedMicros).toBe(36_388 + 37_438 + saved.calls[0]!.expectedChargedMicros);
+    expect(ledger.canDispatch("ticket")).toBe(true);
+  });
+
+  it("an unresolved historical DeepSeek attempt still blocks the protected coding allocation", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "gary-cutover-test-"));
+    dirs.push(dir);
+    const path = join(dir, "spend.db");
+    const ledger = ledgerAt(path);
+    ledger.createCampaign("coding", 10);
+    ledger.enrollTicket("coding", "ticket", 10, { draftPr: true, codingReviewReserve: true });
+    const sql = new Database(path);
+    sql.query("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES('ticket','deepseek','deepseek-v4-pro',8192,1416561,1416561,'unknown')").run();
+    sql.close();
+    let calls = 0;
+    await expect(ledger.withSpendScope("ticket", () => ledger.guardedFetch("openrouter", (async () => { calls++; return Response.json(responseBody()); }) as unknown as typeof fetch)(saved.endpoint, request())))
+      .rejects.toThrow("unresolved request");
+    expect(calls).toBe(0);
   });
 });

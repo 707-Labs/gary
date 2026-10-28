@@ -3,9 +3,10 @@ import { fingerprintJson } from './audit-trace.ts';
 import { CODING_VERIFICATION_POLICY } from '../verification-policy.ts';
 import { MODEL_REQUEST_TIMEOUT_MS } from './model-transport.ts';
 import { CODING_SPEND_RESERVE_POLICY } from '../spend.ts';
+import { PAID_ROUTE } from '../model-route.ts';
 
 export const HERMES_CODING_RUNTIME_POLICY = Object.freeze({
-  version: 5,
+  version: 6,
   modelRequestTimeoutMs: MODEL_REQUEST_TIMEOUT_MS,
   spendReserve: CODING_SPEND_RESERVE_POLICY,
   /** Parent coding workspace only; native worker and read-only children keep their own pins. */
@@ -25,13 +26,13 @@ export const HERMES_CODING_RUNTIME_POLICY = Object.freeze({
       STORYBOOK_DISABLE_TELEMETRY: '1',
     }),
   }),
-  provider: 'deepseek',
-  model: 'deepseek-v4-pro',
+  provider: PAID_ROUTE.provider,
+  model: PAID_ROUTE.model,
   thinking: 'disabled',
   maxAllocationMicros: 10_000_000,
   actionTimeoutMs: 9_000_000,
   verification: CODING_VERIFICATION_POLICY,
-  review: Object.freeze({providerOrder:Object.freeze(['deepseek'] as const),maxRounds:1,iterationCap:6,timeoutMs:180_000}),
+  review: Object.freeze({providerOrder:Object.freeze([PAID_ROUTE.provider] as const),maxRounds:1,iterationCap:6,timeoutMs:180_000}),
 } as const);
 
 /** Call only after the activation's strict schema has validated the config.

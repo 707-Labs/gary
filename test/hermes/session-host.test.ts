@@ -19,8 +19,8 @@ function fixture(progress?: ProductiveProgressGuard, cap = 5, trace?:AuditTrace,
     run:async()=>{executorCalls++;return {stdout:'ok',stderr:'',exitCode:0,timedOut:false};} };
   const options: SessionOptions = {
     admission:{taskId:'task-1',requestId:'request-1',ticketId:'ticket-1',actionId:'action-1',fingerprint:'fp-1',ownerEpoch:'epoch-1',deadlineMs:Date.now()+60_000},
-    capabilityToken:token,ledger,provider:'deepseek',model:'deepseek-v4-pro',providerApiKey:'fixture-provider-key',
-    fetch:(async()=>{providerCalls++; return Response.json({id:'msg-fixture',type:'message',role:'assistant',model:'deepseek-v4-pro',
+    capabilityToken:token,ledger,provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',providerApiKey:'fixture-provider-key',
+    fetch:(async()=>{providerCalls++; return Response.json({id:'msg-fixture',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',
       content:[{type:'text',text:'completed in prose only'}],stop_reason:'end_turn',stop_sequence:null,
       usage:{input_tokens:10,output_tokens:8,cache_read_input_tokens:0,cache_creation_input_tokens:0}});}),
     executor,allowedTools:['read_file','run_bash','finish','report_blocked'],finishGateCommand:'bun run check',
@@ -40,7 +40,7 @@ test('unauthenticated and cross-task routes never expose state or execute',async
  expect(f.counts().executorCalls).toBe(0);expect(f.counts().providerCalls).toBe(0);
 });
 test('real ledger is shared by model endpoint; model prose cannot finish',async()=>{
- const f=fixture();const response=await f.host.handle(f.request('/v1/chat/completions',{model:'deepseek-v4-pro',messages:[{role:'user',content:'hello'}],max_tokens:32,stream:false}));
+ const f=fixture();const response=await f.host.handle(f.request('/v1/chat/completions',{model:'deepseek/deepseek-v4.1-flash',messages:[{role:'user',content:'hello'}],max_tokens:32,stream:false}));
  expect(response.status).toBe(200);expect(f.ledger.status('ticket-1')!.attemptCount).toBe(1);
  expect(f.host.result({status:'finished',iterations:1}).status).toBe('no_finish');expect(f.host.result({}).publicationApproved).toBe(false);
 });
@@ -95,7 +95,7 @@ function progressFixture(read?: (signal?: AbortSignal) => TrustedProgressSnapsho
   policy:{maxModelRequests:10,maxModelRequestsWithoutProgress:2,maxSuccessfulToolCalls:10,toolRepeatWindow:2,maxRepeatedToolCalls:2},
   readTrustedSnapshot:read ?? (()=>({...structuredClone(baseline),sequence:++sequence}))});
  const f=fixture(guard);
- const model=()=>f.host.handle(f.request('/v1/chat/completions',{model:'deepseek-v4-pro',messages:[{role:'user',content:'task'}],max_tokens:32,stream:false}));
+ const model=()=>f.host.handle(f.request('/v1/chat/completions',{model:'deepseek/deepseek-v4.1-flash',messages:[{role:'user',content:'task'}],max_tokens:32,stream:false}));
  return {...f,guard,model};
 }
 test('configured progress stop runs before spending and cannot release or reopen an allocation',async()=>{
@@ -116,21 +116,21 @@ test('successful repeated tool calls are observations, not progress evidence',as
 });
 test('invalid model schemas never consume progress allowance',async()=>{
  const f=progressFixture();
- expect((await f.host.handle(f.request('/v1/chat/completions',{model:'deepseek-v4-pro',messages:[],max_tokens:32}))).status).toBe(400);
+ expect((await f.host.handle(f.request('/v1/chat/completions',{model:'deepseek/deepseek-v4.1-flash',messages:[],max_tokens:32}))).status).toBe(400);
  expect(f.guard.state.counters.modelRequests).toBe(0);expect(f.ledger.status('ticket-1')!.attemptCount).toBe(0);
 });
 test('request cancellation releases a stalled progress snapshot without reserving spend',async()=>{
  let snapshotSignal:AbortSignal|undefined;
  const f=progressFixture(signal=>{snapshotSignal=signal;return new Promise(()=>{});});
  const cancellation=new AbortController();
- const request=new Request(f.request('/v1/chat/completions',{model:'deepseek-v4-pro',messages:[{role:'user',content:'task'}],max_tokens:32}),{signal:cancellation.signal});
+ const request=new Request(f.request('/v1/chat/completions',{model:'deepseek/deepseek-v4.1-flash',messages:[{role:'user',content:'task'}],max_tokens:32}),{signal:cancellation.signal});
  const pending=f.host.handle(request);await Bun.sleep(2);cancellation.abort();
  expect((await pending).status).toBe(408);expect(snapshotSignal?.aborted).toBe(true);
  expect(f.guard.state.stopReason).toBe('cancelled');expect(f.ledger.status('ticket-1')!.attemptCount).toBe(0);expect(f.counts().providerCalls).toBe(0);
 });
 test('budget refusal remains distinct from a native transport error',async()=>{
  const f=fixture(undefined,0.01);
- const response=await f.host.handle(f.request('/v1/chat/completions',{model:'deepseek-v4-pro',messages:[{role:'user',content:'task'}],max_tokens:32}));
+ const response=await f.host.handle(f.request('/v1/chat/completions',{model:'deepseek/deepseek-v4.1-flash',messages:[{role:'user',content:'task'}],max_tokens:32}));
  expect(response.status).toBe(402);expect(f.counts().providerCalls).toBe(0);
  const result=f.host.result({status:'error'});expect(result.status).toBe('error');expect(result.terminationReason).toBe('budget_exhausted');expect(result.errorMessage).toBe('budget_exhausted');
  expect(f.ledger.status('ticket-1')!.state).toBe('exhausted');expect(f.ledger.status('ticket-1')!.attemptCount).toBe(0);
@@ -165,20 +165,20 @@ test('executor exceptions are durably recorded without raw error text',async()=>
 });
 test('trace persistence failure prevents subsequent model spend and cannot become success',async()=>{
  const f=tracedFixture();chmodSync(f.path,0o640);
- const response=await f.host.handle(f.request('/v1/chat/completions',{model:'deepseek-v4-pro',messages:[{role:'user',content:'privateprompt'}],max_tokens:32}));
+ const response=await f.host.handle(f.request('/v1/chat/completions',{model:'deepseek/deepseek-v4.1-flash',messages:[{role:'user',content:'privateprompt'}],max_tokens:32}));
  expect(response.status).toBe(409);expect(f.trace.failed).toBe(true);expect(f.counts().providerCalls).toBe(0);expect(f.ledger.status('ticket-1')!.attemptCount).toBe(0);
  const result=f.host.result({status:'finished'});expect(result.status).toBe('error');expect(result.terminationReason).toBe('trace_failed');expect(f.host.finalizeTrace(result)).toBe(false);
 });
 test('durable terminal trace identifies budget exhaustion without a provider request',async()=>{
  const f=tracedFixture(0.01);
- expect((await f.host.handle(f.request('/v1/chat/completions',{model:'deepseek-v4-pro',messages:[{role:'user',content:'task'}],max_tokens:32}))).status).toBe(402);
+ expect((await f.host.handle(f.request('/v1/chat/completions',{model:'deepseek/deepseek-v4.1-flash',messages:[{role:'user',content:'task'}],max_tokens:32}))).status).toBe(402);
  const result=f.host.result({status:'error'});expect(f.host.finalizeTrace(result)).toBe(true);
  expect(f.events().at(-1).status).toBe('budget_exhausted');expect(f.events().at(-1).errorCode).toBe('reservation_exhausted');
  expect(f.counts().providerCalls).toBe(0);
 });
 
-const modelRequestBody={model:'deepseek-v4-pro',messages:[{role:'user',content:'private-prompt'}],max_tokens:32};
-function rejectedProviderBody(){return {id:'private-response-id',type:'message',role:'assistant',model:'deepseek-v4-pro',
+const modelRequestBody={model:'deepseek/deepseek-v4.1-flash',messages:[{role:'user',content:'private-prompt'}],max_tokens:32};
+function rejectedProviderBody(){return {id:'private-response-id',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',
  content:[{type:'thinking',thinking:'private-reasoning',signature:'private-signature'},
   {type:'tool_use',id:'private-call-id',name:'read_file',input:{path:'private-path'}}],stop_reason:'tool_use',
  usage:{input_tokens:10,output_tokens:8,cache_read_input_tokens:0,cache_creation_input_tokens:0}};}
@@ -237,7 +237,7 @@ test('session rejects non-DeepSeek or invalid trusted thinking policy before tra
 
 test('diagnostic does not override exhausted ledger or terminal persistence failure',async()=>{
  const f=tracedFixture(.01);
- await f.host.handle(f.request('/v1/chat/completions',{model:'deepseek-v4-pro',messages:[{role:'user',content:'task'}],max_tokens:32}));
+ await f.host.handle(f.request('/v1/chat/completions',{model:'deepseek/deepseek-v4.1-flash',messages:[{role:'user',content:'task'}],max_tokens:32}));
  const diagnostic={origin:'worker',code:'native_runtime_error',stage:'native_run',category:'type_error'} as const;
  const outcome=f.host.result({status:'error'});expect(outcome.terminationReason).toBe('budget_exhausted');
  expect(f.host.finalizeTrace({...outcome,diagnostic})).toBe(true);

@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { assertStandingEngineeringTaskBudget, type StandingEngineeringTaskBudget } from './engineering-standing-budget.ts';
 import type { Database } from 'bun:sqlite';
 import { SpendLedger, spendReservationMicros } from '../spend.ts';
+import { PAID_ROUTE } from '../model-route.ts';
 import { createModelTransport } from './model-transport.ts';
 import { assertEngineeringRequestAllowed, engineeringAcceptancePolicySha256,
   type EngineeringTaskPolicy, type EngineeringRequestAttempt, type EngineeringRequestRole } from './engineering-policy.ts';
@@ -43,7 +44,7 @@ export interface EngineeringModelOptions {
 }
 export interface EngineeringModelAdapter {
   /** Host-derived launcher limits; worker arguments never select a policy. */
-  readonly nativeLimits: Readonly<{ policyVersion: 1 | 2; model: 'deepseek-v4-pro'; maxIterations: number; maxTokens: number }>;
+  readonly nativeLimits: Readonly<{ policyVersion: 1 | 2; model: typeof PAID_ROUTE.model; maxIterations: number; maxTokens: number }>;
   beginTurn(turn: { turnId: string; prompt: string; history?: readonly ConversationMessage[] }): void;
   handle(body: unknown, signal: AbortSignal): Promise<{ status: number; body: Json }>;
   /** Called only AFTER EngineeringProtocol accepted the corresponding tool.end frame. */
@@ -210,7 +211,7 @@ export function createEngineeringModelAdapter(input: EngineeringModelOptions): E
     const token = randomUUID();
     try {
       const transport = createModelTransport({ ledger, capability: { ticketId: allocationId, ownerId: binding.ownerEpoch,
-        provider: 'deepseek', model: 'deepseek-v4-pro', deadlineMs: binding.deadlineMs,
+        provider: PAID_ROUTE.provider, model: PAID_ROUTE.model, deadlineMs: binding.deadlineMs,
         allowedToolNames: purpose === 'parent_work' || purpose === 'child_work' ? context.names : [], signal }, bearerToken: token,
         providerApiKey: options.providerApiKey, thinking: 'disabled', assertOwner: requestGuard,
         fetch: async request => {
@@ -219,8 +220,8 @@ export function createEngineeringModelAdapter(input: EngineeringModelOptions): E
           if (ledgerAttempt !== null || unresolved.length !== 1 || unresolved[0]!.state !== 'reserved') fail('physical_request_replay');
           ledgerAttempt = unresolved[0]!.id;
           const row = receipt(ledgerAttempt);
-          if (!row || row.ticket_id !== allocationId || row.provider !== 'deepseek' || row.model !== 'deepseek-v4-pro'
-              || row.max_tokens !== maxTokens || row.reserved_micros !== spendReservationMicros('deepseek', maxTokens)
+          if (!row || row.ticket_id !== allocationId || row.provider !== PAID_ROUTE.provider || row.model !== PAID_ROUTE.model
+              || row.max_tokens !== maxTokens || row.reserved_micros !== spendReservationMicros(PAID_ROUTE.provider, maxTokens)
               || row.state !== 'reserved' || row.reason !== null) fail('reservation_binding');
           const reservedStatus = ledger.status(allocationId)!;
           const reviewFloor = role !== 'review' && !prior.some(r => r.role === 'review') ? LIMITS.review.reservationMicros : 0;

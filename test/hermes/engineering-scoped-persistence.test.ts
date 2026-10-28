@@ -118,7 +118,7 @@ function promotionFixture(options: { badPurpose?: boolean; badHash?: boolean; hi
     // guarded transport is independently exercised in engineering-standing-model.
     const canonical = new Database(f.ledger.databasePath);
     try {
-      const id = Number(canonical.query("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES(?,'deepseek','deepseek-v4-pro',8192,1416561,100,'settled')").run(input.budget.allocationId).lastInsertRowid);
+      const id = Number(canonical.query("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES(?,'openrouter','deepseek/deepseek-v4.1-flash',8192,1416561,100,'settled')").run(input.budget.allocationId).lastInsertRowid);
       canonical.query("INSERT INTO spend_receipts(attempt_id,reason,details_json) VALUES(?,'accepted','{}')").run(id);
       const row = canonical.query('SELECT a.*,r.reason,r.details_json FROM spend_attempts a LEFT JOIN spend_receipts r ON r.attempt_id=a.id WHERE a.id=?').get(id);
       const rid = randomUUID();

@@ -14,7 +14,7 @@ import { admitEngineeringContinuation, assertEngineeringContinuationBudget } fro
 export const TOOL = { type: 'function', function: { name: 'terminal', description: 'Run foreground command.',
   parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } };
 export function provider(content: unknown[] = [{ type: 'text', text: 'Done.' }], stop_reason = 'end_turn') {
-  return { id: 'msg_fixture', type: 'message', role: 'assistant', model: 'deepseek-v4-pro', content, stop_reason,
+  return { id: 'msg_fixture', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash', content, stop_reason,
     usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } };
 }
 const cleanup: (() => void)[] = [];
@@ -61,7 +61,7 @@ export function modelFixture(fetch?: EngineeringModelOptions['fetch'], fixture: 
       return fetch ? fetch(request) : Response.json(provider());
     } };
   const model = createEngineeringModelAdapter(options);
-  const body = (messages: unknown[] = [...model.history()]) => ({ model: 'deepseek-v4-pro',
+  const body = (messages: unknown[] = [...model.history()]) => ({ model: 'deepseek/deepseek-v4.1-flash',
     messages: [{ role: 'system', content: options.systemPrompt }, ...messages], tools,
     max_tokens: 8192, stream: false, temperature: 0.3 });
   return { root, options, binding, token, protocol, model, body, requests, fences, ledger, journalDb, protocolReceipts,
@@ -172,20 +172,20 @@ test('v2 twelve physical work calls and protected review settle against genuine 
   const prefix=s.options.spendDb.query('SELECT a.*,r.reason,r.details_json FROM spend_attempts a LEFT JOIN spend_receipts r ON r.attempt_id=a.id ORDER BY a.id').all();
   const schema=s.options.spendDb.query("SELECT name,sql FROM sqlite_master WHERE name IN ('spend_attempts','spend_receipts') ORDER BY name").all();
   expect(prefix).toHaveLength(6);expect(s.ledger.status(allocation)!.chargedMicros).toBe(232012);
-  expect(s.model.nativeLimits).toEqual({policyVersion:2,model:'deepseek-v4-pro',maxIterations:12,maxTokens:8192});
+  expect(s.model.nativeLimits).toEqual({policyVersion:2,model:'deepseek/deepseek-v4.1-flash',maxIterations:12,maxTokens:8192});
   expect(Object.isFrozen(s.model.nativeLimits)).toBe(true);
   for(let i=0;i<12;i++) {
     s.model.beginTurn({turnId:'v2-'+i,prompt:'Work '+i});
     expect((await s.model.handle(s.body(),new AbortController().signal)).status).toBe(200);
     s.model.finishTurn(s.model.history());
     const latest=s.options.spendDb.query('SELECT reserved_micros,charged_micros,state FROM spend_attempts ORDER BY id DESC LIMIT 1').get();
-    expect(latest).toEqual({reserved_micros:1416561,charged_micros:32454,state:'settled'});
-    expect(s.ledger.status(allocation)!.remainingMicros).toBeGreaterThan(1400317);
+    expect(latest).toEqual({reserved_micros:648807,charged_micros:19667,state:'settled'});
+    expect(s.ledger.status(allocation)!.remainingMicros).toBeGreaterThan(638962);
   }
   await s.model.review({prompt:'Review exact result.',systemPrompt:'Independent.',signal:new AbortController().signal});
   expect(s.requests).toHaveLength(13);expect(s.model.attempts()).toHaveLength(13);
   const final=s.ledger.status(allocation)!;
-  expect(final.attemptCount).toBe(19);expect(final.chargedMicros).toBe(232012+12*32454+16210);
+  expect(final.attemptCount).toBe(19);expect(final.chargedMicros).toBe(232012+12*19667+9822);
   expect(final.unknownAttempts).toBe(0);
   expect(s.options.spendDb.query('SELECT a.*,r.reason,r.details_json FROM spend_attempts a LEFT JOIN spend_receipts r ON r.attempt_id=a.id WHERE a.id<=152 ORDER BY a.id').all()).toEqual(prefix);
   expect(s.options.spendDb.query("SELECT name,sql FROM sqlite_master WHERE name IN ('spend_attempts','spend_receipts') ORDER BY name").all()).toEqual(schema);
@@ -206,19 +206,20 @@ test('v2 adapter rejects missing, copied, mismatched and legacy continuation bas
   expect(() => createEngineeringModelAdapter({...s.options,policy:legacy.options.policy})).toThrow('policy_baseline_binding');
 });
 
-test('v2 worst-case physical receipts exhaust work headroom after two and unknown usage never releases a reservation', async () => {
+test('v2 worst-case physical receipts exhaust work headroom after seven and unknown usage never releases a reservation', async () => {
   const s=modelFixture(async()=>Response.json({...provider(),usage:{input_tokens:1048576,output_tokens:1,
     cache_read_input_tokens:0,cache_creation_input_tokens:0}}),{acceptancePolicyVersion:2});
-  for(let i=0;i<2;i++) {s.model.beginTurn({turnId:'max-'+i,prompt:'Work.'});
+  // 5_417_988 - 7*648_807 = 876_339 < 648_807 + protected review 638_962.
+  for(let i=0;i<7;i++) {s.model.beginTurn({turnId:'max-'+i,prompt:'Work.'});
     await s.model.handle(s.body(),new AbortController().signal);s.model.finishTurn(s.model.history());}
-  expect(s.ledger.status(s.options.allocationId)!.remainingMicros).toBe(2584866);
-  s.model.beginTurn({turnId:'max-third',prompt:'Work.'});
+  expect(s.ledger.status(s.options.allocationId)!.remainingMicros).toBe(876339);
+  s.model.beginTurn({turnId:'max-eighth',prompt:'Work.'});
   await expect(s.model.handle(s.body(),new AbortController().signal)).rejects.toThrow('headroom');
-  expect(s.requests).toHaveLength(2);expect(s.model.attempts()).toHaveLength(2);
+  expect(s.requests).toHaveLength(7);expect(s.model.attempts()).toHaveLength(7);
   const unknown=modelFixture(async()=>Response.json({...provider(),usage:{input_tokens:10}}),{acceptancePolicyVersion:2});
   unknown.model.beginTurn({turnId:'unknown',prompt:'Work.'});
   await expect(unknown.model.handle(unknown.body(),new AbortController().signal)).rejects.toThrow();
-  expect(unknown.ledger.status(unknown.options.allocationId)!.chargedMicros).toBe(232012+1416561);
+  expect(unknown.ledger.status(unknown.options.allocationId)!.chargedMicros).toBe(232012+648807);
   expect(unknown.ledger.status(unknown.options.allocationId)!.unknownAttempts).toBe(1);
   await expect(unknown.model.handle(unknown.body(),new AbortController().signal)).rejects.toThrow('inactive');
   expect(unknown.requests).toHaveLength(1);

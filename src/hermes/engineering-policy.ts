@@ -1,15 +1,18 @@
 /** Pure engineering policy. The host binds user approval; no enrollment, I/O or execution authority here. */
 import { createHash } from 'node:crypto';
+import { PAID_ROUTE } from '../model-route.ts';
+import { spendReservationMicros } from '../spend.ts';
 
 export const ENGINEERING_ACCEPTANCE_POLICY = Object.freeze({
   version: 1,
   approval: 'host_record_required',
-  provider: 'deepseek',
-  model: 'deepseek-v4-pro',
+  provider: PAID_ROUTE.provider,
+  model: PAID_ROUTE.model,
   capMicros: 5_650_000,
   maxPhysicalRequests: 4,
-  work: Object.freeze({ maxRequests: 3, maxTokens: 8192, reservationMicros: 1_416_561 }),
-  review: Object.freeze({ maxRequests: 1, maxTokens: 4090, reservationMicros: 1_400_317 }),
+  // Full-context reservations at the openrouter spend policy: 648_807 and 638_962.
+  work: Object.freeze({ maxRequests: 3, maxTokens: 8192, reservationMicros: spendReservationMicros(PAID_ROUTE.provider, 8192) }),
+  review: Object.freeze({ maxRequests: 1, maxTokens: 4090, reservationMicros: spendReservationMicros(PAID_ROUTE.provider, 4090) }),
   /** Every non-review request, including retries and auxiliary generation, consumes a work slot. */
   auxiliaryRequestsCountAsWork: true,
   publication: 'draft_pr_only',
@@ -30,7 +33,9 @@ export const ENGINEERING_ACCEPTANCE_POLICY_V2 = Object.freeze({
 } as const);
 export type EngineeringStandingAcceptancePolicy = Omit<typeof ENGINEERING_ACCEPTANCE_POLICY_V2, 'capMicros'> & { readonly capMicros: number };
 export type EngineeringAcceptancePolicy = typeof ENGINEERING_ACCEPTANCE_POLICY | typeof ENGINEERING_ACCEPTANCE_POLICY_V2 | EngineeringStandingAcceptancePolicy;
-export const ENGINEERING_STANDING_MIN_TASK_CAP_MICROS = 2_816_878;
+/** One full work request plus the protected review request (648_807 + 638_962). */
+export const ENGINEERING_STANDING_MIN_TASK_CAP_MICROS = ENGINEERING_ACCEPTANCE_POLICY.work.reservationMicros
+  + ENGINEERING_ACCEPTANCE_POLICY.review.reservationMicros;
 function standingAcceptance(capMicros: number): EngineeringStandingAcceptancePolicy {
   if (!Number.isSafeInteger(capMicros) || capMicros < ENGINEERING_STANDING_MIN_TASK_CAP_MICROS) {
     throw new Error('engineering_policy_rejected:standing_task_cap');

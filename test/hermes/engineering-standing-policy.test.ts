@@ -70,7 +70,7 @@ test('standing funding stays conservative and does not accept unfunded or malfor
   const request = { requestId: 'request-1', role: 'work' as const, maxTokens: 8192 };
   const usage = { attempts: [], allocationActive: true, taskRemainingMicros: ENGINEERING_STANDING_MIN_TASK_CAP_MICROS,
     campaignRemainingMicros: ENGINEERING_STANDING_MIN_TASK_CAP_MICROS, unresolvedAttempts: 0 };
-  expect(assertEngineeringRequestAllowed(p, request, usage).reservationMicros).toBe(1_416_561);
+  expect(assertEngineeringRequestAllowed(p, request, usage).reservationMicros).toBe(648_807);
   expect(() => assertEngineeringRequestAllowed(p, request, { ...usage, taskRemainingMicros: usage.taskRemainingMicros - 1 }))
     .toThrow('headroom');
   expect(() => assertEngineeringRequestAllowed(p, request, { ...usage, unresolvedAttempts: 1 })).toThrow('allocation_unavailable');

@@ -1,0 +1,124 @@
+{
+  "source": "Three live OpenRouter /v1/messages probes, 2026-10-28 (total billed cost under $0.0002)",
+  "note": "Exact usage objects and content-block key shapes as returned. Text, thinking and tool inputs were dropped. Tests build a valid envelope around them.",
+  "endpoint": "https://openrouter.ai/api/v1/messages",
+  "requestedModel": "deepseek/deepseek-v4.1-flash",
+  "returnedModel": "deepseek/deepseek-v4.1-flash",
+  "maxTokens": 2048,
+  "calls": [
+    {
+      "call": 1,
+      "shape": "plain text, thinking disabled",
+      "stopReason": "end_turn",
+      "contentBlocks": [
+        {
+          "type": "text",
+          "citations": []
+        }
+      ],
+      "usage": {
+        "input_tokens": 6,
+        "output_tokens": 13,
+        "output_tokens_details": {
+          "thinking_tokens": 0
+        },
+        "cache_creation_input_tokens": null,
+        "cache_read_input_tokens": 0,
+        "cache_creation": null,
+        "inference_geo": null,
+        "server_tool_use": null,
+        "service_tier": null,
+        "speed": "standard",
+        "cost": 9.59e-06,
+        "is_byok": false,
+        "cost_details": {
+          "upstream_inference_cost": 9.59e-06,
+          "upstream_inference_prompt_cost": 1.14e-06,
+          "upstream_inference_completions_cost": 8.45e-06
+        }
+      },
+      "expectedChargedMicros": 4919
+    },
+    {
+      "call": 2,
+      "shape": "tool_use with default thinking",
+      "stopReason": "tool_use",
+      "contentBlocks": [
+        {
+          "type": "thinking",
+          "signature": ""
+        },
+        {
+          "type": "text",
+          "citations": []
+        },
+        {
+          "type": "tool_use",
+          "caller": {
+            "type": "direct"
+          },
+          "name": "get_time"
+        }
+      ],
+      "usage": {
+        "input_tokens": 158,
+        "output_tokens": 51,
+        "output_tokens_details": {
+          "thinking_tokens": 42
+        },
+        "cache_creation_input_tokens": null,
+        "cache_read_input_tokens": 128,
+        "cache_creation": null,
+        "inference_geo": null,
+        "server_tool_use": null,
+        "service_tier": null,
+        "speed": "standard",
+        "cost": 6.4706e-05,
+        "is_byok": false,
+        "cost_details": {
+          "upstream_inference_cost": 6.4706e-05,
+          "upstream_inference_prompt_cost": 3.1556e-05,
+          "upstream_inference_completions_cost": 3.315e-05
+        }
+      },
+      "expectedChargedMicros": 5087
+    },
+    {
+      "call": 3,
+      "shape": "tool_result round trip with empty-signature thinking block",
+      "stopReason": "end_turn",
+      "contentBlocks": [
+        {
+          "type": "thinking",
+          "signature": ""
+        },
+        {
+          "type": "text",
+          "citations": []
+        }
+      ],
+      "usage": {
+        "input_tokens": 224,
+        "output_tokens": 26,
+        "output_tokens_details": {
+          "thinking_tokens": 17
+        },
+        "cache_creation_input_tokens": null,
+        "cache_read_input_tokens": 128,
+        "cache_creation": null,
+        "inference_geo": null,
+        "server_tool_use": null,
+        "service_tier": null,
+        "speed": "standard",
+        "cost": 6.0996e-05,
+        "is_byok": false,
+        "cost_details": {
+          "upstream_inference_cost": 6.0996e-05,
+          "upstream_inference_prompt_cost": 4.4096e-05,
+          "upstream_inference_completions_cost": 1.69e-05
+        }
+      },
+      "expectedChargedMicros": 5127
+    }
+  ]
+}

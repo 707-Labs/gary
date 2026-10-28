@@ -36,7 +36,7 @@ function makeFixture(){
   upsertTicket(db,{linearId:issue.id,identifier:issue.identifier});
   ledger.createCampaign('offline-trial',10);ledger.enrollTicket('offline-trial',issue.id,10,{draftPr:true,codingReviewReserve:true});
   let forbiddenNetwork=0,fakeRequests=0,publications=0,admission:CodeActionAdmission|undefined;
-  const provider=createProvider({name:'deepseek',model:'deepseek-v4-pro',apiKey:'fake-only',baseUrl:'https://provider.invalid',defaultBackoffMs:1000},
+  const provider=createProvider({name:'openrouter',model:'deepseek/deepseek-v4.1-flash',apiKey:'fake-only',baseUrl:'https://provider.invalid',defaultBackoffMs:1000},
     {fetch:(async()=>{forbiddenNetwork++;throw new Error('network forbidden in offline dispatcher test');}) as unknown as typeof fetch});
   const controller=(fingerprint=policyFingerprint)=>createCodingTrial({db,ledger,issueId:issue.id,repo,policyFingerprint:fingerprint});
   const deps:LoopDeps={db,spend:ledger,codingTrial:controller(),codingExecutorProfile:HERMES_CODING_RUNTIME_POLICY.executor,allowedIssueIds:new Set([issue.id]),allowedActionTypes:new Set(['classify','start_coding']),
@@ -45,7 +45,7 @@ function makeFixture(){
     github:{} as GitHubClient,glm:new GLMClient(createProviderChain([provider])),cloudflare:null,repoMap:new Map([['FIX',repo]]),
     allowlistedMentionUserIds:[],reposDir:'/offline/repos',workspacesDir:'/offline/workspaces',agentLoopMaxIterations:28,agentLoopTimeoutMs:1000,
     maxCiAttempts:3,maxAttemptsPerTicket:5,circuitBreakerWindowHours:6,stalePrAfterMs:1000,
-    review:{providerOrder:['deepseek'],maxRounds:1,iterationCap:1,timeoutMs:1000},
+    review:{providerOrder:['openrouter'],maxRounds:1,iterationCap:1,timeoutMs:1000},
     createAdmittedCodeLoop:action=>{admission=action;deps.codingTrial!.assertCodingAction(action);return async()=>{
       deps.codingTrial!.assertCodingAction(action);return result;
     };},
@@ -65,12 +65,12 @@ function makeFixture(){
     actions:()=>db.query<ActionRow,[]>('SELECT id,action_type,completed_at,success,outcome,state_fingerprint FROM actions ORDER BY id').all(),
     claim:()=>db.query<ClaimRow,[]>('SELECT phase,classify_action,code_action,policy_fingerprint,epoch FROM hermes_coding_trials').get(),
     async fakeModel(known=true){
-      const guarded=ledger.guardedFetch('deepseek',(async()=>{fakeRequests++;return Response.json({
-        id:'offline-response',type:'message',role:'assistant',model:'deepseek-v4-pro',content:[{type:'text',text:'offline'}],stop_reason:'end_turn',
+      const guarded=ledger.guardedFetch('openrouter',(async()=>{fakeRequests++;return Response.json({
+        id:'offline-response',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'offline'}],stop_reason:'end_turn',
         ...(known?{usage:{input_tokens:10,output_tokens:2,cache_read_input_tokens:0,cache_creation_input_tokens:0}}:{}),
       });}) as unknown as typeof fetch);
-      return guarded('https://api.deepseek.com/anthropic/v1/messages',{method:'POST',headers:{'content-type':'application/json'},
-        body:JSON.stringify({model:'deepseek-v4-pro',max_tokens:32,messages:[{role:'user',content:'offline'}]})});
+      return guarded('https://openrouter.ai/api/v1/messages',{method:'POST',headers:{'content-type':'application/json'},
+        body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',max_tokens:32,messages:[{role:'user',content:'offline'}]})});
     },
     restart(fingerprint=policyFingerprint){db.close();ledger.close();db=openDb(dbPath);ledger=new SpendLedger(ledgerPath);
       deps.db=db;deps.spend=ledger;deps.codingTrial=controller(fingerprint);},
@@ -237,10 +237,10 @@ for (const stage of ['classifier', 'classification-comment'] as const) test('hos
   const aborted = new Promise<void>(resolve => { sawAbort = resolve; });
   const drain = new Promise<void>(resolve => { release = resolve; });
   let physicalRequests = 0, cleaned = false, settled = false;
-  const transport = f.ledger().guardedFetch('deepseek', (async (input: RequestInfo | URL) => {
+  const transport = f.ledger().guardedFetch('openrouter', (async (input: RequestInfo | URL) => {
     const request = input as Request; physicalRequests++;
     if (stage === 'classification-comment' && physicalRequests === 1) return Response.json({
-      id: 'offline-classification', type: 'message', role: 'assistant', model: 'deepseek-v4-pro',
+      id: 'offline-classification', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash',
       content: [{ type: 'text', text: JSON.stringify(classification) }], stop_reason: 'end_turn',
       usage: { input_tokens: 10, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
     });
@@ -248,8 +248,8 @@ for (const stage of ['classifier', 'classification-comment'] as const) test('hos
     await new Promise<void>(resolve => request.signal.addEventListener('abort', () => { sawAbort(); resolve(); }, { once: true }));
     await drain; cleaned = true; throw new Error('offline transport aborted after cleanup');
   }) as typeof fetch);
-  const provider = createProvider({ name: 'deepseek', model: 'deepseek-v4-pro', apiKey: 'offline-only',
-    baseUrl: 'https://api.deepseek.com/anthropic', defaultBackoffMs: 1000 }, { fetch: transport });
+  const provider = createProvider({ name: 'openrouter', model: 'deepseek/deepseek-v4.1-flash', apiKey: 'offline-only',
+    baseUrl: 'https://openrouter.ai/api', defaultBackoffMs: 1000 }, { fetch: transport });
   f.deps.glm = new GLMClient(createProviderChain([provider]));
   const running = tick(f.deps).then(result => { settled = true; return result; });
   try {

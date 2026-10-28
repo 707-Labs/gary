@@ -45,7 +45,7 @@ function fixture() {
   command('init','-q'); command('config','user.email','fixture@example.invalid'); command('config','user.name','Fixture');
   command('config','core.hooksPath','/dev/null'); writeFileSync(join(workspace,'task.ts'),'baseline\n');
   command('add','task.ts'); command('commit','-qm','baseline');
-  const activation: HermesActivationConfig = { version:1, issueId, repo:'fixture/repo', provider:'deepseek', model:'deepseek-v4-pro',
+  const activation: HermesActivationConfig = { version:1, issueId, repo:'fixture/repo', provider:'openrouter', model:'deepseek/deepseek-v4.1-flash',
     workerImage:HERMES_CODING_WORKER_IMAGE, childImage:HERMES_CANARY_CHILD_IMAGE,
     dockerExecutable:'/usr/local/bin/docker', dockerHost:'unix:///Users/tanner/.colima/default/docker.sock', traceDirectory:traces,
     policy:{baseCommit:command('rev-parse','HEAD'),task:{allowedFiles:['task.ts'],criteria:[{id:'check',description:'Check allowed change',requiredCommands:['bun run check','bun run ci:full']}]},
@@ -58,9 +58,9 @@ function fixture() {
       dbPath:join(root,'state','gary.db'),repoMap:new Map([['ERT','fixture/repo']]),allowlistedMentionUserIds:[]},
     linear:{apiKey:'fake-linear',teamId:'fixture-team',inProgressStateId:'fixture-progress'},
     github:{kind:'pat',token:'fake-github',username:'fixture'},
-    providers:[{name:'deepseek',apiKey:'fixture-model-key',baseUrl:'https://api.deepseek.com/anthropic',model:'deepseek-v4-pro',defaultBackoffMs:1000}],
+    providers:[{name:'openrouter',apiKey:'fixture-model-key',baseUrl:'https://openrouter.ai/api',model:'deepseek/deepseek-v4.1-flash',defaultBackoffMs:1000}],
     cloudflare:null,runtime:{pollIntervalMs:1,maxAttemptsPerTicket:1,circuitBreakerWindowHours:6,maxCiAttempts:1,agentLoopMaxIterations:50,agentLoopTimeoutMs:30_000,stalePrAfterMs:1000},
-    review:{providerOrder:['deepseek'],maxRounds:1,iterationCap:5,timeoutMs:1000},
+    review:{providerOrder:['openrouter'],maxRounds:1,iterationCap:5,timeoutMs:1000},
   };
   const env={GARY_RUNTIME_MODE:'hermes-canary',GARY_HERMES_ACTIVATION_PATH:activationPath,GARY_EXECUTOR:'docker',GARY_EXECUTOR_NETWORK:'none',GARY_EXECUTOR_IMAGE:HERMES_CODING_RUNTIME_POLICY.executor.image,
       GARY_BUN_CACHE_VOLUME:HERMES_CODING_RUNTIME_POLICY.executor.bunCacheVolume,
@@ -79,17 +79,17 @@ test('actual main selects the real Hermes factory and an injected failure never 
       expect(typeof args.onCodePublication).toBe('function');expect(typeof args.createCodeVerification).toBe('function');expect(args.agentLoopTimeoutMs).toBe(9_000_000);
       expect(args.codingExecutorProfile).toBe(HERMES_CODING_RUNTIME_POLICY.executor);
       expect(args.codingBase).toEqual({branch:'main',commit:f.activation.policy.baseCommit});
-      expect(args.review).toEqual({providerOrder:['deepseek'],maxRounds:1,iterationCap:6,timeoutMs:180_000});
+      expect(args.review).toEqual({providerOrder:['openrouter'],maxRounds:1,iterationCap:6,timeoutMs:180_000});
       expect(f.config.review.iterationCap).toBe(5); // Legacy config cannot widen or shrink the fixed trial review contract.
       args.spend!.createCampaign('fixture',10);args.spend!.enrollTicket('fixture',issueId,10,{draftPr:true,codingReviewReserve:true});
       upsertTicket(args.db,{linearId:issueId,identifier:'ERT-1'});
       expect(args.codingTrial).toBeDefined();
-      const admitted={issueId,fingerprint:'fixture-fp',humanSignature:'fixture-human',provider:'deepseek',model:'deepseek-v4-pro',repo:'fixture/repo'};
+      const admitted={issueId,fingerprint:'fixture-fp',humanSignature:'fixture-human',provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',repo:'fixture/repo'};
       const classify=args.codingTrial!.admit({...admitted,actionType:'classify'});
       setClassification(args.db,{linearId:issueId,classification:'CODE',confidence:.99,scope:'S'});classify.complete(true,'handled');
       const trial=args.codingTrial!.admit({...admitted,actionType:'start_coding'}),actionId=trial.actionId;
       const issue={id:issueId,identifier:'ERT-1',teamId:'fixture-team',teamKey:'ERT'} as AssignedIssue;
-      const binding=bindCanonicalCodeAction({db:args.db,ledger:args.spend!,actionId,fingerprint:'fixture-fp',issue,repo:'fixture/repo',provider:'deepseek',model:'deepseek-v4-pro'});
+      const binding=bindCanonicalCodeAction({db:args.db,ledger:args.spend!,actionId,fingerprint:'fixture-fp',issue,repo:'fixture/repo',provider:'openrouter',model:'deepseek/deepseek-v4.1-flash'});
       try {
         const runner=args.createAdmittedCodeLoop!(binding.admission);
         const result=await runner({glm:args.glm,executor:new LocalExecutor(f.workspace),systemPrompt:'Offline Gary fixture',task:'Investigate fixture',
@@ -101,18 +101,20 @@ test('actual main selects the real Hermes factory and an injected failure never 
   expect({launched,polls,network:f.networkCalls()}).toEqual({launched:1,polls:1,network:0});
   expect(process.listenerCount('SIGTERM')).toBe(beforeSignals);
 });
-test('actual legacy main preserves the existing DeepSeek-only campaign and omits all canary hooks',async()=>{
+test('actual legacy main keeps coding on the single OpenRouter paid route and omits all canary hooks',async()=>{
   const f=fixture(); let polls=0;
   f.config.providers=[...f.config.providers,{name:'z.ai',apiKey:'fake-zai',baseUrl:'https://api.z.ai/api/anthropic',model:'glm-5.3',defaultBackoffMs:1000}];
   await main({...f.deps,env:{},runLoop:async args=>{polls++;expect(args.createAdmittedCodeLoop).toBeUndefined();expect(args.allowedIssueIds).toBeUndefined();expect(args.codingTrial).toBeUndefined();expect(args.codingExecutorProfile).toBeUndefined();expect(args.codingBase).toBeUndefined();
-    expect(args.glm.chain.providers.map(p=>p.name)).toEqual(['deepseek']);expect(args.review).toEqual(f.config.review);}});
+    expect(args.glm.chain.providers.map(p=>p.name)).toEqual(['openrouter']);expect(args.review).toEqual(f.config.review);}});
   expect(polls).toBe(1);expect(f.networkCalls()).toBe(0);
 });
 test('unsafe executor, missing activation and mismatched route stop before polling or network',async()=>{
-  for(const kind of ['executor','missing','route'] as const){const f=fixture();let polls=0;
+  for(const kind of ['executor','missing','route','no-openrouter-key'] as const){const f=fixture();let polls=0;
     if(kind==='executor')f.env.GARY_EXECUTOR='local';
     if(kind==='missing')f.env.GARY_HERMES_ACTIVATION_PATH=join(f.root,'missing.json');
     if(kind==='route')f.config.providers=[{...f.config.providers[0]!,baseUrl:'https://other.invalid'}];
+    // Without OPENROUTER_API_KEY no paid provider loads; the coding canary must refuse to start.
+    if(kind==='no-openrouter-key')f.config.providers=[{name:'z.ai',apiKey:'fake-zai',baseUrl:'https://api.z.ai/api/anthropic',model:'glm-5.3',defaultBackoffMs:1000}];
     await expect(main({...f.deps,runLoop:async()=>{polls++;}})).rejects.toThrow();expect(polls).toBe(0);expect(f.networkCalls()).toBe(0);
   }
 });
@@ -293,7 +295,7 @@ test('actual startup routes an authenticated Slack question through canonical cu
   fetch:(async request=>{providerCalls++;const body:any=await (request as Request).json();
    const content=providerCalls===1?[{type:'tool_use',id:'work_call',name:'current_work',input:{project:'mulligan-labs'}}]:[{type:'text',text:'ERT-2990 is recorded in progress; that record alone does not prove live execution.'}];
    if(providerCalls===2){expect(JSON.stringify(body.messages)).toContain('ERT-2990');expect(JSON.stringify(body.messages)).toContain('recorded_in_progress');}
-   return Response.json({id:'msg_fixture',type:'message',role:'assistant',model:'deepseek-v4-pro',content,stop_reason:providerCalls===1?'tool_use':'end_turn',usage:{input_tokens:30,output_tokens:10,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+   return Response.json({id:'msg_fixture',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content,stop_reason:providerCalls===1?'tool_use':'end_turn',usage:{input_tokens:30,output_tokens:10,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
   }) as typeof fetch,
   launch:async(m,handle)=>{
    const history:any[]=[...(m.history??[]),{role:'user',content:m.prompt}];
@@ -370,7 +372,7 @@ test('actual startup exposes scoped ticket/repository/controller tools, wakes it
     if(providerCalls===4)expect(JSON.stringify(body)).not.toContain('Owner-private fixture note alpha.');
     content=[{type:'text',text:providerCalls===2?'Private fixture answer.':'Shared fixture answer.'}];
    }
-   return Response.json({id:'fixture'+providerCalls,type:'message',role:'assistant',model:'deepseek-v4-pro',content,
+   return Response.json({id:'fixture'+providerCalls,type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content,
     stop_reason:providerCalls%2?'tool_use':'end_turn',usage:{input_tokens:80,output_tokens:30,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
   }) as typeof fetch,
   launch:async(m,handle)=>{
@@ -636,7 +638,7 @@ test('standing startup admits beyond closed ERT history and drains both preexist
   let receive:Parameters<SlackTransport['start']>[0]=()=>{},launches=0,providerCalls=0;const posts:string[]=[];
   const originalStart=f.transport.start;f.transport.start=async(handler,signal)=>{receive=handler;await originalStart(handler,signal);};
   f.transport.sendMessage=async input=>{posts.push(input.text);return{ok:true,channel:input.channel,ts:'1791452000.000010'};};
-  const modelReply=(content:unknown[])=>Response.json({id:'standing-fixture-'+providerCalls,type:'message',role:'assistant',model:'deepseek-v4-pro',content,
+  const modelReply=(content:unknown[])=>Response.json({id:'standing-fixture-'+providerCalls,type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content,
     stop_reason:providerCalls===1?'tool_use':'end_turn',usage:{input_tokens:30,output_tokens:10,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
   await main({...f.deps,fetch:(async()=>{providerCalls++;return modelReply(providerCalls===1
     ?[{type:'tool_use',id:'submit_task',name:'engineering_submit',input:{repository:'707-Labs/unregistered-app'}}]

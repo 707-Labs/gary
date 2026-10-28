@@ -8,6 +8,7 @@ import { GLMClient } from './adapters/glm.ts';
 import { makeGitHubClient } from './adapters/github.ts';
 import { LinearAdapter } from './adapters/linear.ts';
 import { loadConfig, type Config } from './config.ts';
+import { PAID_ROUTE } from './model-route.ts';
 import { loadHostStartupConfig } from './host-config.ts';
 import { createHermesActivation, loadHermesActivationConfig } from './hermes/activation.ts';
 import { HERMES_CODING_RUNTIME_POLICY, fingerprintHermesCodingActivation } from './hermes/coding-runtime-policy.ts';
@@ -113,11 +114,11 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
   if(conversationConfig&&sharedConfig&&conversationConfig.contextDirectory===sharedConfig.contextDirectory)throw new Error('conversation_contexts_must_be_separate');
   const activationConfig = host.activationPath ? loadHermesActivationConfig(host.activationPath) : undefined;
   const cfg = (deps.config ?? loadConfig)();
-  const providerConfigs = cfg.providers.filter(provider => provider.name === 'deepseek');
-  if((engineeringConfig||standingConfig)&&(cfg.github.kind!=='app'||providerConfigs.length!==1||providerConfigs[0]?.model!=='deepseek-v4-pro'
-    ||providerConfigs[0]?.baseUrl!=='https://api.deepseek.com/anthropic'||!providerConfigs[0]?.apiKey))throw new Error('engineering_host_route_rejected');
+  const providerConfigs = cfg.providers.filter(provider => provider.name === PAID_ROUTE.provider);
+  if((engineeringConfig||standingConfig)&&(cfg.github.kind!=='app'||providerConfigs.length!==1||providerConfigs[0]?.model!==PAID_ROUTE.model
+    ||providerConfigs[0]?.baseUrl!==PAID_ROUTE.baseUrl||!providerConfigs[0]?.apiKey))throw new Error('engineering_host_route_rejected');
   if (activationConfig && (providerConfigs.length !== 1 || providerConfigs[0]?.model !== activationConfig.model
-      || providerConfigs[0]?.baseUrl !== 'https://api.deepseek.com/anthropic'
+      || providerConfigs[0]?.baseUrl !== PAID_ROUTE.baseUrl
       || ![...cfg.gary.repoMap.values()].includes(activationConfig.repo))) throw new Error('hermes_host_route_or_repository_mismatch');
   const slackCredentials = host.slack ? await loadSlackCredentials(host.slack.credentialsPath) : undefined;
   for (const directory of [cfg.gary.home, cfg.gary.stateDir, cfg.gary.reposDir, cfg.gary.workspacesDir]) mkdirSync(directory, { recursive: true });

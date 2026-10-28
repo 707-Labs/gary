@@ -3,18 +3,26 @@ import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { Database } from "bun:sqlite";
+import { PAID_ROUTE } from "./model-route.ts";
 
-// Reviewed 2026-10-07. Peak, uncached USD / million tokens. One micro-USD
-// per token at $1/MTok. Use integer hundredths of a micro-USD throughout.
+// Peak, uncached USD / million tokens. One micro-USD per token at $1/MTok.
+// Use integer hundredths of a micro-USD throughout ($1/MTok = 100).
+// z.ai reviewed 2026-10-07:
 // https://docs.z.ai/guides/overview/pricing
 // https://docs.z.ai/guides/llm/glm-5.3
-// https://api-docs.deepseek.com/quick_start/pricing
-// https://api-docs.deepseek.com/guides/anthropic_api/
+// openrouter reviewed 2026-10-28. OpenRouter may route a request to any listed
+// upstream endpoint, so the policy uses the HIGHEST endpoint price on each axis,
+// rounded up: input $0.60/MTok (BaseTen "baseten/fast"), output $2.40/MTok
+// (BaseTen "baseten/fast"); the model page lists $0.045/$0.50 for the cheapest.
+// https://openrouter.ai/api/v1/models/deepseek/deepseek-v4.1-flash/endpoints
+// Re-check that list before trusting these numbers after any provider change.
+// The retired direct DeepSeek route (LEGACY_DEEPSEEK_ROUTE, 132/396) has no
+// policy: historical rows keep their stored charges and are never re-priced.
 export const SPEND_CONTEXT_TOKENS = 1_048_576;
 export const SPEND_MAX_OUTPUT_TOKENS = 8192;
 const POLICIES = {
   "z.ai": { model: "glm-5.3", url: "https://api.z.ai/api/anthropic/v1/messages", input: 140, output: 440 },
-  deepseek: { model: "deepseek-v4-pro", url: "https://api.deepseek.com/anthropic/v1/messages", input: 132, output: 396 },
+  [PAID_ROUTE.provider]: { model: PAID_ROUTE.model, url: PAID_ROUTE.url, input: 60, output: 240 },
 } as const;
 type PricedProvider = keyof typeof POLICIES;
 type Policy = (typeof POLICIES)[PricedProvider];
@@ -22,14 +30,27 @@ type TicketState = "active" | "exhausted" | "closed";
 
 /** Host-only request purpose. Never read from model messages or HTTP fields. */
 export type CodingSpendRole = "work" | "review" | "publication_body" | "publication_title";
-/** One next reviewer request and publication, not a promise to fund every review iteration. */
+/**
+ * One next reviewer request and publication, not a promise to fund every review iteration.
+ * Floors are the full reservations of the later requests that must stay fundable,
+ * at the openrouter policy (input 60, output 240, context 1_048_576 tokens):
+ *   reserve(n) = ceil((1_048_576*60 + n*240) / 100)
+ *   title  n=128:  ceil(62_945_280/100) =   629_453
+ *   body   n=1024: ceil(63_160_320/100) =   631_604
+ *   review n=4096: ceil(63_897_600/100) =   638_976
+ *   publicationTitleFloor = 0
+ *   publicationBodyFloor  = reserve(title)                        =   629_453
+ *   reviewFloor           = reserve(body) + publicationBodyFloor  = 1_261_057
+ *   workFloor             = reserve(review) + reviewFloor         = 1_900_033
+ * test/spend-coding-reserve.test.ts recomputes these from spendReservationMicros.
+ */
 export const CODING_SPEND_RESERVE_POLICY = Object.freeze({
   version: 1,
   capMicros: 10_000_000,
-  provider: "deepseek",
-  workFloorMicros: 4_173_145,
-  reviewFloorMicros: 2_772_804,
-  publicationBodyFloorMicros: 1_384_628,
+  provider: PAID_ROUTE.provider,
+  workFloorMicros: 1_900_033,
+  reviewFloorMicros: 1_261_057,
+  publicationBodyFloorMicros: 629_453,
   publicationTitleFloorMicros: 0,
   reviewMaxTokens: 4096,
   publicationBodyMaxTokens: 1024,
@@ -107,8 +128,10 @@ function tokenCount(value: unknown): value is number {
 }
 
 const USAGE_COUNTERS = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"] as const;
-type ReceiptReason = "accepted" | "envelope" | "model_mismatch" | "stop_reason" | "content" | "usage_missing" | "usage_fields" | "service_tier" | "usage_counters" | "token_bounds" | "transport_error" | "http_error" | "redirect" | "invalid_json" | "ticket_closed";
-type ReceiptCheck = { reason: "accepted"; inputTokens: number } | { reason: Exclude<ReceiptReason, "accepted"> };
+const OPENROUTER_USAGE_FIELDS = [...USAGE_COUNTERS, "output_tokens_details", "cache_creation", "inference_geo", "server_tool_use",
+  "service_tier", "speed", "cost", "is_byok", "cost_details"] as const;
+type ReceiptReason = "accepted" | "envelope" | "model_mismatch" | "stop_reason" | "content" | "usage_missing" | "usage_fields" | "service_tier" | "usage_counters" | "provider_cost" | "token_bounds" | "transport_error" | "http_error" | "redirect" | "invalid_json" | "ticket_closed";
+type ReceiptCheck = { reason: "accepted"; inputTokens: number; providerCostMicros: number } | { reason: Exclude<ReceiptReason, "accepted"> };
 
 // Correlate receipts without persisting arbitrary provider strings, response
 // content, or headers. Counter presence distinguishes null/omitted from zero.
@@ -122,7 +145,7 @@ function receiptDetails(body: unknown, policy: Policy, response?: Response): str
     responseModelHash: hash(envelope.model),
     modelMatches: envelope.model === policy.model,
     serviceTier: !Object.hasOwn(usage, "service_tier") ? "missing" : usage.service_tier === "standard" ? "standard" : "unrecognized",
-    unknownUsageFields: Object.keys(usage).filter((key) => ![...USAGE_COUNTERS, "service_tier"].includes(key)).length,
+    unknownUsageFields: Object.keys(usage).filter((key) => !(policy === POLICIES[PAID_ROUTE.provider] ? OPENROUTER_USAGE_FIELDS as readonly string[] : [...USAGE_COUNTERS, "service_tier"]).includes(key)).length,
     counters: Object.fromEntries(USAGE_COUNTERS.map((key) => [key,
       tokenCount(usage[key]) ? { state: "integer", value: usage[key] }
         : { state: !Object.hasOwn(usage, key) ? "missing" : usage[key] === null ? "null" : "invalid" },
@@ -139,9 +162,13 @@ function validateContent(content: unknown): boolean {
   return content.every((block) => {
     if (!record(block)) return false;
     switch (block.type) {
-      case "text": return typeof block.text === "string" && onlyKeys(block, ["type", "text", "cache_control"]);
+      // OpenRouter echoes `citations: []` on text and `caller: {type:"direct"}` on
+      // tool_use; both are inert metadata and round-trip back in later requests.
+      case "text": return typeof block.text === "string" && onlyKeys(block, ["type", "text", "cache_control", "citations"])
+        && (block.citations === undefined || block.citations === null || (Array.isArray(block.citations) && block.citations.length === 0));
       case "thinking": return typeof block.thinking === "string" && onlyKeys(block, ["type", "thinking", "signature"]);
-      case "tool_use": return typeof block.name === "string" && typeof block.id === "string" && record(block.input) && onlyKeys(block, ["type", "name", "id", "input", "cache_control"]);
+      case "tool_use": return typeof block.name === "string" && typeof block.id === "string" && record(block.input) && onlyKeys(block, ["type", "name", "id", "input", "cache_control", "caller"])
+        && (block.caller === undefined || (record(block.caller) && onlyKeys(block.caller, ["type"]) && block.caller.type === "direct"));
       case "tool_result": return typeof block.tool_use_id === "string" && validateContent(block.content) && onlyKeys(block, ["type", "tool_use_id", "content", "is_error", "cache_control"]);
       default: return false;
     }
@@ -191,16 +218,37 @@ function receiptInput(body: unknown, policy: Policy, maxTokens: number): Receipt
   if (!validateContent(body.content)) return { reason: "content" };
   if (!record(body.usage)) return { reason: "usage_missing" };
   const usage = body.usage;
-  // Same-route DeepSeek receipts preserved on 2026-10-07 include this response
-  // metadata. Only this known standard tier is priced; request service_tier,
-  // other tiers, and all other new usage fields remain ineligible.
-  const allowedFields = policy === POLICIES.deepseek ? [...USAGE_COUNTERS, "service_tier"] : USAGE_COUNTERS;
-  if (!onlyKeys(usage, allowedFields)) return { reason: "usage_fields" };
-  if (Object.hasOwn(usage, "service_tier") && usage.service_tier !== "standard") return { reason: "service_tier" };
+  if (policy === POLICIES[PAID_ROUTE.provider]) return openRouterUsage(usage, maxTokens);
+  if (!onlyKeys(usage, USAGE_COUNTERS)) return { reason: "usage_fields" };
   if (!USAGE_COUNTERS.every((key) => tokenCount(usage[key]))) return { reason: "usage_counters" };
   const input = (usage.input_tokens as number) + (usage.cache_read_input_tokens as number) + (usage.cache_creation_input_tokens as number);
   if (input > SPEND_CONTEXT_TOKENS || (usage.output_tokens as number) > maxTokens) return { reason: "token_bounds" };
-  return { reason: "accepted", inputTokens: input };
+  return { reason: "accepted", inputTokens: input, providerCostMicros: 0 };
+}
+
+/**
+ * OpenRouter usage observed 2026-10-28 on deepseek/deepseek-v4.1-flash:
+ * cache_creation_input_tokens is null (no cache writes on this route) and the
+ * body carries OpenRouter's own billed `cost` in USD. A null cache-write counter
+ * counts as zero only together with a valid billed cost. Settlement keeps
+ * the larger of the policy price and that billed cost, so neither a missing
+ * counter nor a pricier upstream than the policy can under-record spend.
+ * Server tools, BYOK billing, non-standard tiers/speeds and unknown fields stay
+ * ineligible and keep the full reservation.
+ */
+function openRouterUsage(usage: Record<string, unknown>, maxTokens: number): ReceiptCheck {
+  if (!onlyKeys(usage, OPENROUTER_USAGE_FIELDS)) return { reason: "usage_fields" };
+  if ((usage.server_tool_use ?? null) !== null || (usage.is_byok !== undefined && usage.is_byok !== false)) return { reason: "usage_fields" };
+  if ((usage.service_tier ?? null) !== null && usage.service_tier !== "standard") return { reason: "service_tier" };
+  if ((usage.speed ?? null) !== null && usage.speed !== "standard") return { reason: "service_tier" };
+  if (!["input_tokens", "output_tokens", "cache_read_input_tokens"].every((key) => tokenCount(usage[key]))
+      || !(tokenCount(usage.cache_creation_input_tokens) || usage.cache_creation_input_tokens === null)) return { reason: "usage_counters" };
+  const cost = usage.cost;
+  if (cost !== undefined && (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0 || cost > 1000)) return { reason: "provider_cost" };
+  if (usage.cache_creation_input_tokens === null && cost === undefined) return { reason: "usage_counters" };
+  const input = (usage.input_tokens as number) + (usage.cache_read_input_tokens as number) + ((usage.cache_creation_input_tokens as number | null) ?? 0);
+  if (input > SPEND_CONTEXT_TOKENS || (usage.output_tokens as number) > maxTokens) return { reason: "token_bounds" };
+  return { reason: "accepted", inputTokens: input, providerCostMicros: cost === undefined ? 0 : Math.ceil(cost * 1_000_000) };
 }
 
 export class SpendLedger {
@@ -396,8 +444,14 @@ export class SpendLedger {
           }
           if (receipt.reason !== "accepted") { this.unknown(attempt, receiptResponse.status); return null; }
           // Always keep full output cost; compatibility usage may omit reasoning.
-          const charged = costMicros(policy, receipt.inputTokens, maxTokens);
+          const charged = Math.max(costMicros(policy, receipt.inputTokens, maxTokens), receipt.providerCostMicros);
           this.db.query("UPDATE spend_attempts SET charged_micros=?, state='settled', input_tokens=?, http_status=?, settled_at=CURRENT_TIMESTAMP WHERE id=? AND state='reserved'").run(charged, receipt.inputTokens, receiptResponse.status, attempt);
+          // A billed cost above the reservation means the upstream price outran
+          // the policy. Record the true charge, then stop the ticket.
+          if (charged > costMicros(policy, SPEND_CONTEXT_TOKENS, maxTokens)) {
+            this.markTerminal(ticketId, "receipt_exceeds_bounds");
+            return new SpendLimitError("billed cost exceeds reservation");
+          }
           return null;
         }).immediate();
         if (settlementError) throw settlementError;

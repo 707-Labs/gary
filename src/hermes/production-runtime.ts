@@ -16,6 +16,7 @@ import type { AuditTrace, AuditTraceBinding } from './audit-trace.ts';
 import type { ScopedIntegrationBindings } from './scoped-integrations.ts';
 import { EXECUTOR_TOOL_NAMES } from './executor-bridge.ts';
 import { createReadonlyChildExecutor } from './readonly-child.ts';
+import { PAID_ROUTE } from '../model-route.ts';
 
 export interface ProductionTaskPolicy {
   /** Authoritative criteria and exact allowed files supplied by the host. */
@@ -33,7 +34,7 @@ export interface ProductionTaskPolicy {
 export interface ProductionRuntimeOptions {
   /** Explicit already-approved route; must equal the dispatch action's provider/model. */
   route: Pick<SessionOptions, 'provider' | 'model' | 'providerApiKey' | 'fetch'>;
-  /** Host-selected DeepSeek policy; never inferred from agent arguments or native messages. */
+  /** Host-selected thinking policy for the paid route; never inferred from agent arguments or native messages. */
   thinking?: 'disabled';
   /** Same action-owned instance supplied to the outer CODE handler, including repairs. */
   verificationForAction?: (action: CodeActionAdmission) => ActionVerification;
@@ -71,7 +72,7 @@ const boundActions = new WeakSet<CodeActionAdmission>();
 /** Plug into LoopDeps.createAdmittedCodeLoop. This factory never polls or enrolls tickets. */
 export function createHermesCodeLoopFactory(options: ProductionRuntimeOptions): (action: CodeActionAdmission) => AdmittedCodeLoopRunner {
   const thinking = options.thinking;
-  if (thinking !== undefined && (thinking !== 'disabled' || options.route.provider !== 'deepseek')) throw new Error('invalid_host_thinking_policy');
+  if (thinking !== undefined && (thinking !== 'disabled' || options.route.provider !== PAID_ROUTE.provider)) throw new Error('invalid_host_thinking_policy');
   options = {...options,route:Object.freeze({...options.route}),
     ...(options.readonlyChildren ? {readonlyChildren:Object.freeze({...options.readonlyChildren})} : {})};
   return action => {

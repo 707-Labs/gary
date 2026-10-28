@@ -63,8 +63,8 @@ async function fixture(launch:GaryRuntimeLauncher=fakeNative){
   const db=openDb(':memory:');dispose.push(()=>db.close());
   const ledger=new SpendLedger(':memory:');dispose.push(()=>ledger.close());ledger.createCampaign('offline',20);ledger.enrollTicket('offline',issue.id,10);
   upsertTicket(db,{linearId:issue.id,identifier:issue.identifier});
-  const actionId=recordActionStart(db,{ticketLinearId:issue.id,stateFingerprint:'fingerprint',actionType:'start_coding',provider:'deepseek',model:'deepseek-v4-pro'});
-  const binding=bindCanonicalCodeAction({db,ledger,actionId,fingerprint:'fingerprint',issue,provider:'deepseek',model:'deepseek-v4-pro',repo:'fixture/repo'});
+  const actionId=recordActionStart(db,{ticketLinearId:issue.id,stateFingerprint:'fingerprint',actionType:'start_coding',provider:'openrouter',model:'deepseek/deepseek-v4.1-flash'});
+  const binding=bindCanonicalCodeAction({db,ledger,actionId,fingerprint:'fingerprint',issue,provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',repo:'fixture/repo'});
   const env={PATH:'/opt/homebrew/bin:/Users/tanner/.bun/bin:/usr/bin:/bin',HOME:root,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null'};
   const run=(command:string)=>runProcess('/bin/bash',['-c',command],{cwd:root,env,timeoutMs:10_000});
   for(const command of ['git init -q','git config user.email fixture@example.invalid','git config user.name Fixture','git config core.hooksPath /dev/null'])expect((await run(command)).exitCode).toBe(0);
@@ -76,7 +76,7 @@ async function fixture(launch:GaryRuntimeLauncher=fakeNative){
   const traceRoot=realpathSync(mkdtempSync(join(tmpdir(),'gary-runtime-trace-')));dispose.push(()=>rmSync(traceRoot,{recursive:true,force:true}));rmSync(traceDir,{recursive:true});
   let calls=0,policies=0;const seen:any[]=[];
   const steps=[['read_file',{path:'task.ts'}],['write_file',{path:'task.ts',content:'updated\n'}],['run_bash',{command:CHECK}],['finish',{summary:'Verified fixture'}]] as const;
-  const options:ProductionRuntimeOptions={route:{provider:'deepseek',model:'deepseek-v4-pro',providerApiKey:'offline-only',fetch:async request=>{
+  const options:ProductionRuntimeOptions={route:{provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',providerApiKey:'offline-only',fetch:async request=>{
     const body=await request.json();seen.push(body);calls++;
     const used=body.messages.flatMap((message:any)=>Array.isArray(message.content)?message.content.filter((x:any)=>x.type==='tool_use').map((x:any)=>x.name):[]);
     const implementation=body.tools.some((tool:any)=>tool.name==='write_file');
@@ -84,7 +84,7 @@ async function fixture(launch:GaryRuntimeLauncher=fakeNative){
     const step=body.tools.some((tool:any)=>tool.name==='dispatch_subagent') && !used.includes('dispatch_subagent')
       ? ['dispatch_subagent',{task:'Read task.ts and report the fixture baseline.'}] as const
       : used.includes('run_bash')?steps[3]:used.includes('write_file')?steps[2]:used.includes('read_file')?steps[1]:steps[0];
-    return Response.json({id:'reply-'+calls,type:'message',role:'assistant',model:'deepseek-v4-pro',content:done?[{type:'text',text:'Verified fixture context.'}]:[{type:'tool_use',id:'call-'+calls,name:step[0],input:step[1]}],stop_reason:done?'end_turn':'tool_use',usage:{input_tokens:10,output_tokens:8,cache_creation_input_tokens:0,cache_read_input_tokens:0}});
+    return Response.json({id:'reply-'+calls,type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:done?[{type:'text',text:'Verified fixture context.'}]:[{type:'tool_use',id:'call-'+calls,name:step[0],input:step[1]}],stop_reason:done?'end_turn':'tool_use',usage:{input_tokens:10,output_tokens:8,cache_creation_input_tokens:0,cache_read_input_tokens:0}});
   }},launch,createTrace:binding=>{const path=join(traceRoot,binding.requestId+'.jsonl');traces.push(path);return createAuditTrace({path,binding});},
     taskPolicy:()=>{policies++;return{baseCommit,task:{allowedFiles:['task.ts'],criteria:[{id:'fix',description:'Update fixture and pass the exact check',requiredCommands:[CHECK]}]},
       progress:{maxModelRequests:20,maxModelRequestsWithoutProgress:10,maxSuccessfulToolCalls:50,toolRepeatWindow:10,maxRepeatedToolCalls:5},
@@ -104,7 +104,7 @@ test('completed, superseded and closed action bindings are revoked without spend
   for(const mode of ['completed','superseded','closed']){
     const f=await fixture();const runner=f.runner();
     if(mode==='completed')recordActionEnd(f.db,{id:f.actionId,success:true});
-    if(mode==='superseded')recordActionStart(f.db,{ticketLinearId:issue.id,stateFingerprint:'new',actionType:'start_coding',provider:'deepseek',model:'deepseek-v4-pro'});
+    if(mode==='superseded')recordActionStart(f.db,{ticketLinearId:issue.id,stateFingerprint:'new',actionType:'start_coding',provider:'openrouter',model:'deepseek/deepseek-v4.1-flash'});
     if(mode==='closed')f.binding.close();
     expect((await runner(f.args)).status).toBe('error');expect(f.counts().calls).toBe(0);expect(f.ledger.status(issue.id)?.attemptCount).toBe(0);
   }
@@ -130,7 +130,7 @@ test('failed deterministic preparation propagates pipeline status before any mod
 });
 
 test('one durable action owner cannot be claimed twice, including through a second binding',async()=>{
-  const f=await fixture();expect(()=>bindCanonicalCodeAction({db:f.db,ledger:f.ledger,actionId:f.actionId,fingerprint:'fingerprint',issue,provider:'deepseek',model:'deepseek-v4-pro',repo:'fixture/repo'})).toThrow('canonical_action_already_claimed');
+  const f=await fixture();expect(()=>bindCanonicalCodeAction({db:f.db,ledger:f.ledger,actionId:f.actionId,fingerprint:'fingerprint',issue,provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',repo:'fixture/repo'})).toThrow('canonical_action_already_claimed');
   f.binding.admission.assertActive();expect(f.ledger.status(issue.id)?.attemptCount).toBe(0);
 });
 test('current ticket and repository must match the canonical dispatch action',async()=>{
@@ -218,7 +218,7 @@ test('factory snapshots trusted thinking and provider before caller mutation',as
   expect({status:result.status,error:result.errorMessage}).toEqual({status:'finished',error:undefined});
   expect(f.seen).toHaveLength(4);
   expect(f.seen.map(body=>({model:body.model,thinking:body.thinking}))).toEqual(
-    Array.from({length:4},()=>({model:'deepseek-v4-pro',thinking:{type:'disabled'}})));
+    Array.from({length:4},()=>({model:'deepseek/deepseek-v4.1-flash',thinking:{type:'disabled'}})));
 });
 
 test('trusted disabled thinking reaches actual child host requests and parent resumes after cleanup',async()=>{
@@ -268,7 +268,7 @@ test.skipIf(!process.env.GARY_HERMES_NATIVE_TEST_IMAGE)('actual native stdio ret
     const body=await request.json();paidRequests++;
     expect(body.thinking).toEqual({type:'disabled'});
     // A valid read tool request must remain unavailable when its usage receipt is unpriced.
-    return Response.json({id:'offline-unknown-usage',type:'message',role:'assistant',model:'deepseek-v4-pro',
+    return Response.json({id:'offline-unknown-usage',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',
       content:[{type:'tool_use',id:'do-not-run',name:'read_file',input:{path:'task.ts'}}],stop_reason:'tool_use',usage:{}});
   };
   const result=await f.ledger.withPaidRequestGuard(phase=>{

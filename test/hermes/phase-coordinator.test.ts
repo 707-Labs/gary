@@ -48,13 +48,13 @@ function fixture() {
     writeFile: async path => { writes.push(path); }, listFiles: async () => [], grep: async () => [],
     run: async command => { commands.push(command); return { stdout: "passed", stderr: "", exitCode: 0, timedOut: false }; } };
   const host: SessionOptions = { admission: { taskId: "task-1", requestId: "request-1", ticketId: "TICKET-1", actionId: "action-1", fingerprint: "fp-1", ownerEpoch: epoch, deadlineMs: Date.now() + 5000 },
-    capabilityToken: TOKEN, ledger, provider: "deepseek", model: "deepseek-v4-pro", providerApiKey: "offline-provider", executor,
+    capabilityToken: TOKEN, ledger, provider: "openrouter", model: "deepseek/deepseek-v4.1-flash", providerApiKey: "offline-provider", executor,
     allowedTools: ["read_file", "write_file", "run_bash", "todo_write", "finish", "report_blocked"], finishGateCommand: "bun run check",
     currentOwnerEpoch: () => epoch, assertAdmission: () => {}, fetch: async request => {
       sent.push(await request.json()); const script = scripts.shift() ?? "Investigation complete.";
       const content = typeof script === "string" ? [{ type: "text", text: script }]
         : [{ type: "tool_use", id: script.id ?? "call_" + sent.length, name: script.name, input: script.input }];
-      return Response.json({ id: "msg-" + sent.length, type: "message", role: "assistant", model: "deepseek-v4-pro", content,
+      return Response.json({ id: "msg-" + sent.length, type: "message", role: "assistant", model: "deepseek/deepseek-v4.1-flash", content,
         stop_reason: typeof script === "string" ? "end_turn" : "tool_use", usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } });
     } };
   const phases: PhaseSpec[] = [{ name: "investigate", maxIter: 8, allowedTools: new Set(["read_file", "todo_write", "report_blocked", "get_pr", "query_cloudflare_logs"]), nudgeMessage: "Wrap up exploration." },

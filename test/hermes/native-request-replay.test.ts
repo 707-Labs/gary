@@ -33,20 +33,20 @@ function harness(checkExitCode = 0) {
       actionId: 'fixture-action', fingerprint: 'fixture-fingerprint', ownerEpoch: 'fixture-owner',
       deadlineMs: Date.now() + 60_000,
     },
-    capabilityToken: token, ledger, provider: 'deepseek', model: 'deepseek-v4-pro',
+    capabilityToken: token, ledger, provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash',
     providerApiKey: 'offline-provider-key',
     fetch: async request => {
       // This injected function never performs network I/O. The real ledger must
       // reserve before it is called, even though its response is a fixture.
       const status = ledger.status('fixture-ticket')!;
       reservations.push({ attemptCount: status.attemptCount, unknownAttempts: status.unknownAttempts, chargedMicros: status.chargedMicros });
-      expect(request.url).toBe('https://api.deepseek.com/anthropic/v1/messages');
+      expect(request.url).toBe('https://openrouter.ai/api/v1/messages');
       expect(request.headers.get('authorization')).toBe('Bearer offline-provider-key');
       expect(request.headers.get('authorization')).not.toContain(token);
       upstream.push(await request.json());
       const tool = capture.tool_calls[upstream.length - 1];
       return Response.json({
-        id: `offline-reply-${upstream.length}`, type: 'message', role: 'assistant', model: 'deepseek-v4-pro',
+        id: `offline-reply-${upstream.length}`, type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash',
         content: tool ? [{ type: 'tool_use', id: tool.callId, name: tool.name, input: tool.arguments }]
           : [{ type: 'text', text: capture.result.text }],
         stop_reason: tool ? 'tool_use' : 'end_turn', stop_sequence: null,
@@ -64,7 +64,8 @@ function harness(checkExitCode = 0) {
   async function replay() {
     const executions: Array<{ status: number; body: any }> = [];
     for (let index = 0; index < capture.model_requests.length; index++) {
-      const response = await host.handle(request('/v1/chat/completions', capture.model_requests[index]));
+      // Captured before the OpenRouter cutover; only the requested model name is re-pinned to the current route.
+      const response = await host.handle(request('/v1/chat/completions', { ...capture.model_requests[index], model: 'deepseek/deepseek-v4.1-flash' }));
       const body = await response.json();
       expect({ index, status: response.status, error: body.error }).toEqual({ index, status: 200, error: undefined });
       const message = body.choices[0].message;
@@ -118,14 +119,14 @@ describe('actual pinned Hermes request replay through trusted Gary components (o
       { type: 'tool_result', tool_use_id: 'fixture_call_1', content: [{ type: 'text', text: 'fixture operation acknowledged' }] },
     ] });
     expect(h.upstream[2]!.messages.at(-1).content[0].tool_use_id).toBe('fixture_call_2');
-    const reserved = spendReservationMicros('deepseek', 128);
+    const reserved = spendReservationMicros('openrouter', 128);
     expect(h.reservations).toEqual([0, 1, 2].map(index => ({
-      attemptCount: index + 1, unknownAttempts: 1, chargedMicros: index * 527 + reserved,
+      attemptCount: index + 1, unknownAttempts: 1, chargedMicros: index * 317 + reserved,
     })));
-    // Current tariff: ceil(15 * 1.32 + 128 * 3.96) = 527 micro-USD per
+    // Current tariff: ceil(15 * 0.60 + 128 * 2.40) = 317 micro-USD per
     // fixture receipt. Full requested output stays charged, not just 8 emitted.
     expect(h.ledger.status('fixture-ticket')).toMatchObject({
-      state: 'active', attemptCount: 3, unknownAttempts: 0, chargedMicros: 1581, campaignChargedMicros: 1581,
+      state: 'active', attemptCount: 3, unknownAttempts: 0, chargedMicros: 951, campaignChargedMicros: 951,
     });
     const result = h.host.result({ status: capture.result.status, iterations: capture.result.modelAttempts });
     expect(result).toMatchObject({ status: 'finished', summary: 'offline fixture verified', iterations: 3,
@@ -146,7 +147,7 @@ describe('actual pinned Hermes request replay through trusted Gary components (o
     expect(h.host.state.finishGateMet).toBe(false);
     expect(h.host.state.finishSummary).toBeNull();
     expect(h.host.result(capture.result)).toMatchObject({ status: 'no_finish', publicationApproved: false });
-    expect(h.ledger.status('fixture-ticket')).toMatchObject({ attemptCount: 3, unknownAttempts: 0, chargedMicros: 1581 });
+    expect(h.ledger.status('fixture-ticket')).toMatchObject({ attemptCount: 3, unknownAttempts: 0, chargedMicros: 951 });
   });
 
   test('native compatibility rejects meaningful reasoning, wrong tool names and unknown fields before reserving', async () => {

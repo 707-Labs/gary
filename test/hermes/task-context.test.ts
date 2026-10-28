@@ -188,7 +188,7 @@ describe('task context from host metadata; no filesystem, network or model', () 
 const manifest = (requestId = 'investigate'): GaryRuntimeManifest => ({
   taskId: 'ERT-2822', requestId, ownerEpoch: 'owner-1', capability: 'x'.repeat(40),
   modelBaseUrl: 'http://127.0.0.1/v1', executorUrl: 'http://127.0.0.1/tools/execute', stateUrl: 'http://127.0.0.1/tools/state',
-  model: 'deepseek-v4-pro', prompt: 'Implement the admitted ticket.', systemPrompt: 'Exact existing Gary persona.  \n',
+  model: 'deepseek/deepseek-v4.1-flash', prompt: 'Implement the admitted ticket.', systemPrompt: 'Exact existing Gary persona.  \n',
   tools: [], maxIterations: 3, maxTokens: 100, temperature: 0.3, deadlineMs: Date.now() + 60_000,
 });
 const handler = async () => Response.json({});

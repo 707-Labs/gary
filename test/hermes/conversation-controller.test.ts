@@ -104,9 +104,9 @@ test('current action and reserve policies are immutable handoff gates',async()=>
 
 test('unknown paid receipt remains charged and bars handoff without any provider retry',async()=>{
   let fakeCalls=0;
-  const guarded=ledger.guardedFetch('deepseek',(async()=>{fakeCalls++;return Response.json({id:'mock',type:'message',model:'deepseek-v4-pro',role:'assistant',content:[{type:'text',text:'offline'}],stop_reason:'end_turn'});}) as unknown as typeof fetch);
-  await ledger.withSpendScope('admitted',()=>guarded('https://api.deepseek.com/anthropic/v1/messages',{
-    method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek-v4-pro',max_tokens:32,messages:[{role:'user',content:'offline-only'}]})}));
+  const guarded=ledger.guardedFetch('openrouter',(async()=>{fakeCalls++;return Response.json({id:'mock',type:'message',model:'deepseek/deepseek-v4.1-flash',role:'assistant',content:[{type:'text',text:'offline'}],stop_reason:'end_turn'});}) as unknown as typeof fetch);
+  await ledger.withSpendScope('admitted',()=>guarded('https://openrouter.ai/api/v1/messages',{
+    method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',max_tokens:32,messages:[{role:'user',content:'offline-only'}]})}));
   const spend=ledger.status('admitted');
   expect(await execute(request('handoff'))).toMatchObject({status:'blocked',reason:'unresolved_spend'});
   expect(ledger.status('admitted')).toEqual(spend);expect(fakeCalls).toBe(1);expect(wakes).toBe(0);

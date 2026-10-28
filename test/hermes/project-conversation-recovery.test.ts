@@ -18,7 +18,7 @@ const worker = fileURLToPath(new URL('./fixtures/project-conversation-worker.py'
 const content = (text: string) => [{ type: 'text', text }];
 const tool = (id = 'work', name = 'current_work') => [{ type: 'tool_use', id, name, input: { project: 'fixture' } }];
 function provider(blocks: any[], stop?: string, output = 20) {
-  return Response.json({ id: 'offline', type: 'message', role: 'assistant', model: 'deepseek-v4-pro', content: blocks,
+  return Response.json({ id: 'offline', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash', content: blocks,
     stop_reason: stop ?? (blocks.some(block => block.type === 'tool_use') ? 'tool_use' : 'end_turn'),
     usage: { input_tokens: 50, output_tokens: output, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } });
 }
@@ -220,17 +220,20 @@ test('compression cannot call an offered tool or increase the selected response 
   expect(f.requests).toHaveLength(1); expect(f.executed).toEqual([]); expect(saved).toEqual([]); expect(f.launches).toBe(0);
 });
 
-test('six-request policy cannot borrow beyond the existing five-dollar allocation', async () => {
+test('six-request policy at full-context usage stops at the request ceiling inside the five-dollar allocation', async () => {
   const f = fixture();
   const reply = f.responder((_body, n) => {
-    return Response.json({ id: 'large-offline-usage', type: 'message', role: 'assistant', model: 'deepseek-v4-pro',
+    return Response.json({ id: 'large-offline-usage', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash',
       content: tool('expensive-' + n), stop_reason: 'tool_use',
       usage: { input_tokens: 1_000_000, output_tokens: 8192, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } });
   });
   await expect(reply(turn({ text: 'Give an exhaustive ticket review.' }))).rejects.toBeInstanceOf(ProjectReplyError);
-  expect(f.requests).toHaveLength(3); expect(f.executed).toHaveLength(3);
+  // At the openrouter price six maximum requests (648_807 reserved each) fit the cap,
+  // so the per-message request ceiling, not the allocation, ends the turn.
+  expect(f.requests).toHaveLength(6); expect(f.executed).toHaveLength(5);
   const status = f.ledger.status(allocation)!;
-  expect(status.attemptCount).toBe(3); expect(status.unknownAttempts).toBe(0);
+  expect(status.attemptCount).toBe(6); expect(status.unknownAttempts).toBe(0);
+  expect(status.chargedMicros).toBeLessThanOrEqual(6 * 648_807);
   expect(status.capMicros).toBe(5_000_000); expect(status.chargedMicros).toBeLessThanOrEqual(5_000_000);
 });
 

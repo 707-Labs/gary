@@ -16,7 +16,7 @@ test('coding activation binding is stable across JSON object order, but changes 
 
 test('the activation receipt binds the fixed thinking policy independently of task-state identity', () => {
   const config = { issueId: 'ticket', repo: 'fixture/repo' };
-  const absentThinking = { version: 1, provider: 'deepseek', model: 'deepseek-v4-pro' };
+  const absentThinking = { version: 1, provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash' };
   const providerDefault = { ...HERMES_CODING_RUNTIME_POLICY, thinking: 'unknown' };
   expect(fingerprintHermesCodingActivation(config)).not.toBe('sha256:' + fingerprintJson({ config, policy: absentThinking }).sha256);
   expect(fingerprintHermesCodingActivation(config)).not.toBe('sha256:' + fingerprintJson({ config, policy: providerDefault }).sha256);
@@ -37,7 +37,7 @@ test('unsafe non-JSON config cannot produce an admission fingerprint or evaluate
 test('fixed trial policy bounds every stage and freezes nested review settings',()=>{
   expect(HERMES_CODING_RUNTIME_POLICY.maxAllocationMicros).toBe(10_000_000);
   expect(HERMES_CODING_RUNTIME_POLICY.actionTimeoutMs).toBe(9_000_000);
-  expect(HERMES_CODING_RUNTIME_POLICY.review).toEqual({providerOrder:['deepseek'],maxRounds:1,iterationCap:6,timeoutMs:180_000});
+  expect(HERMES_CODING_RUNTIME_POLICY.review).toEqual({providerOrder:['openrouter'],maxRounds:1,iterationCap:6,timeoutMs:180_000});
   expect(Object.isFrozen(HERMES_CODING_RUNTIME_POLICY.review)).toBe(true);
   expect(Object.isFrozen(HERMES_CODING_RUNTIME_POLICY.review.providerOrder)).toBe(true);
 });
@@ -45,7 +45,7 @@ test('fixed trial policy bounds every stage and freezes nested review settings',
 
 test('fixed coding executor and environment are deeply frozen and included in admission identity', () => {
   const executor=HERMES_CODING_RUNTIME_POLICY.executor;
-  expect(HERMES_CODING_RUNTIME_POLICY.version).toBe(5);
+  expect(HERMES_CODING_RUNTIME_POLICY.version).toBe(6);
   expect(executor.image).toBe('sha256:0efb49a8f21794948395f7bec2c15557a78473acd760207613fe7714e7c47f8c');
   expect(executor.bunCacheVolume).toBe('gary-bun-cache-20261007-node24');
   expect({cpus:executor.cpus,memory:executor.memory,pidsLimit:executor.pidsLimit}).toEqual({cpus:'4',memory:'12g',pidsLimit:512});

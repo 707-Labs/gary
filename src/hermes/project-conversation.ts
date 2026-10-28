@@ -1,6 +1,7 @@
 /** Native Hermes project turns; tools, authority, transcript and spend stay on the host. */
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createModelTransport } from './model-transport.ts';
+import { PAID_ROUTE } from '../model-route.ts';
 import { createDockerRuntimeLauncher } from './docker-launcher.ts';
 import { createStdioLauncher } from './stdio-launcher.ts';
 import { HERMES_CANARY_WORKER_IMAGE } from './activation.ts';
@@ -12,7 +13,7 @@ import { hasConversationEngineeringCapability, ordinaryEngineeringScope } from '
 
 // Separate versioned policy: existing text-only DM admission/fingerprints are unchanged.
 export const PROJECT_CONVERSATION_POLICY = Object.freeze({
-  version: 2, provider: 'deepseek', model: 'deepseek-v4-pro', thinking: 'disabled',
+  version: 3, provider: PAID_ROUTE.provider, model: PAID_ROUTE.model, thinking: 'disabled',
   workerImage: HERMES_CANARY_WORKER_IMAGE, dockerExecutable: '/usr/local/bin/docker',
   dockerHost: 'unix:///Users/tanner/.colima/default/docker.sock',
   capMicros: 5_000_000, campaignCapMicros: 5_000_000,
@@ -180,7 +181,7 @@ export function createHermesProjectResponder(deps: ProjectReplyDependencies): (t
       stage = 'transport_setup';
       const route = createModelTransport({ ledger: deps.ledger, providerApiKey: deps.providerApiKey, fetch: deps.fetch,
         bearerToken: capability, thinking: 'disabled', onFailure: failure => { transportFailure = failure.errorCode; },
-        capability: { provider: 'deepseek', model: 'deepseek-v4-pro', ticketId: turn.allocationId, ownerId: turn.ownerId,
+        capability: { provider: PAID_ROUTE.provider, model: PAID_ROUTE.model, ticketId: turn.allocationId, ownerId: turn.ownerId,
           deadlineMs, allowedToolNames: [...names], signal },
         assertOwner: (ticket, owner) => { if (ticket !== turn.allocationId || owner !== turn.ownerId) fail('project_owner_changed'); guard(); },
       });

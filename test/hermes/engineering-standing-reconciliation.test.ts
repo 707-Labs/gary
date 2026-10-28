@@ -18,7 +18,7 @@ function fixture(){
  journal.query('INSERT INTO engineering_tasks VALUES(?,\'blocked\',1,?,?,\'session\',\'owner\')').run(input.taskId,JSON.stringify(spec),hash(spec));
  journal.query('INSERT INTO engineering_cleanup_proofs VALUES(?,?,\'session\',\'owner\')').run('cleanup-'+n,input.taskId);
  journal.query('INSERT INTO engineering_ingress_requests VALUES(?,?,\'blocked\')').run(input.requestId,JSON.stringify({...spec,phase:'final',status:'blocked'}));
- const attempt=f.db.query("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES(?,'deepseek','deepseek-v4-pro',128,1000000,?,'settled')").run(allocation.allocationId,charge);
+ const attempt=f.db.query("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES(?,'openrouter','deepseek/deepseek-v4.1-flash',128,1000000,?,'settled')").run(allocation.allocationId,charge);
  f.db.query("INSERT INTO spend_receipts(attempt_id,reason,details_json) VALUES(?,'accepted','{}')").run(attempt.lastInsertRowid);
  return allocation;}
  const reconcile=(taskIds:string[],historicalChatAttemptIds:number[]=[])=>pool.reconcileTerminalTasks({taskIds,historicalChatAttemptIds,operatorEvidenceSha256:'d'.repeat(64)});
@@ -47,7 +47,7 @@ test('future coding chats retain reservations and unknown charges; associated ta
  const f=fixture();f.ledger.createCampaign('chat',20);f.ledger.enrollTicket('chat','local:hermes-dm-20261008-tanner',20);
  let task:any;
  await f.pool.withCodingConversation('local:hermes-dm-20261008-tanner',async()=>{
-  f.db.exec("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES('local:hermes-dm-20261008-tanner','deepseek','deepseek-v4-pro',128,1000000,1000000,'unknown')");
+  f.db.exec("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES('local:hermes-dm-20261008-tanner','openrouter','deepseek/deepseek-v4.1-flash',128,1000000,1000000,'unknown')");
   task=f.pool.allocate(f.input(1));expect(()=>task.assertReservation(4_100_000)).toThrow('task_conversation_cap');task.assertReservation(4_000_000);
   expect(f.pool.status().auxiliaryChargeMicros).toBe(1_000_000);
   await expect(f.pool.withCodingConversation('local:hermes-dm-20261008-tanner',async()=>{})).rejects.toThrow('conversation_busy');
@@ -57,7 +57,7 @@ test('future coding chats retain reservations and unknown charges; associated ta
 });
 test('historical coding-chat receipts are added once, without adopting unrelated history',()=>{
  const f=fixture(),a=f.terminal(1);f.ledger.createCampaign('chat',20);f.ledger.enrollTicket('chat','local:hermes-dm-20261008-tanner',20);
- const id=Number(f.db.query("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES('local:hermes-dm-20261008-tanner','deepseek','deepseek-v4-pro',128,1000000,25000,'settled')").run().lastInsertRowid);
+ const id=Number(f.db.query("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES('local:hermes-dm-20261008-tanner','openrouter','deepseek/deepseek-v4.1-flash',128,1000000,25000,'settled')").run().lastInsertRowid);
  f.db.query("INSERT INTO spend_receipts(attempt_id,reason,details_json) VALUES(?,'accepted','{}')").run(id);
  f.reconcile([a.taskId],[id]);f.reconcile([a.taskId],[id]);expect(f.pool.status()).toMatchObject({committedCapMicros:125000,chargedMicros:125000,auxiliaryChargeMicros:25000});
 });

@@ -62,7 +62,7 @@ test('schema mismatch cleans up before reporting failure', async () => {
 test('native startup copies versioned limits from the guarded model adapter without granting a model call', async () => {
   for (const policyVersion of [1, 2] as const) {
     const s = modelFixture(); let cleaned = 0;
-    const limits = Object.freeze({ policyVersion, model: 'deepseek-v4-pro' as const,
+    const limits = Object.freeze({ policyVersion, model: 'deepseek/deepseek-v4.1-flash' as const,
       maxIterations: policyVersion === 1 ? 3 : 12, maxTokens: 8192 });
     const file = join(s.root, 'policy-limits.mjs');
     // This tests only the trusted serialization seam. The synthetic v2 adapter
@@ -103,7 +103,7 @@ test('invalid or mismatched legacy native limits fail before subprocess creation
   let cleaned = 0;
   const launch = createEngineeringStdioLauncher({ command: [process.execPath, file], cwd: s.root,
     env: {}, cleanup: async () => { cleaned++; } });
-  const valid = { policyVersion: 1, model: 'deepseek-v4-pro', maxIterations: 3, maxTokens: 8192 };
+  const valid = { policyVersion: 1, model: 'deepseek/deepseek-v4.1-flash', maxIterations: 3, maxTokens: 8192 };
   for (const delta of [{ policyVersion: 3 }, { model: 'other' }, { maxIterations: 8 }, { maxTokens: 4096 },
     { policyVersion: 2, maxIterations: 51 }, { policyVersion: 2, maxIterations: 0 },
     { policyVersion: 2, maxTokens: 8193 }, { policyVersion: 2, maxTokens: 1.5 }, { extra: true }]) {

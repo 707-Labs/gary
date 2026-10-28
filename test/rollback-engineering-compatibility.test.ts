@@ -200,6 +200,14 @@ test('e849a0d reopens nine candidate stores preserving every row, fingerprints, 
     writeFileSync(engineeringPath,'',{mode:0o600});const engineeringDb=new Database(engineeringPath);engineeringDb.exec('PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL');
     cleanup.push(()=>engineeringDb.close());
     const taskStore=new EngineeringTaskStore(engineeringDb,()=>CLOCK);let admissions=0;
+    // The OpenRouter policy changes both conversation fingerprints: the operator
+    // migrates drained contexts from the e849a0d (DeepSeek v2) fingerprint first.
+    const dmMigrationConfig=currentDm.loadSlackConversationConfig(join(dmRoot,'config.json'));
+    const sharedMigrationConfig=currentShared.loadSlackSharedConversationConfig(join(sharedRoot,'config.json'));
+    expect(currentDm.legacyFingerprintSlackConversationConfig(dmMigrationConfig)).toBe(oldDmFingerprint);
+    expect(currentShared.legacyFingerprintSlackSharedConversationConfig(sharedMigrationConfig)).toBe(oldSharedFingerprint);
+    expect(currentDm.migrateSlackConversationPolicy(dmMigrationConfig)?.fromFingerprint).toBe(oldDmFingerprint);
+    expect(currentShared.migrateSlackSharedConversationPolicy(sharedMigrationConfig)?.fromFingerprint).toBe(oldSharedFingerprint);
     const candidate=await open(current,{async admit(request){admissions++;taskStore.admit({taskId:'engineering-fixture-task',requestId:request.requestId,grantId:'fixture-grant',
       scope:{teamId:audience.teamId,surface:'private_dm',audienceId:audience.channelId,projectId:'fixture'},repositoryId:'3',repository:'707-Labs/fixture',baseCommit:'a'.repeat(40),
       policyHash:'sha256:'+'b'.repeat(64),allocationId:engineeringAllocation,deadlineMs:CLOCK+60000},()=>{});
@@ -224,9 +232,11 @@ test('e849a0d reopens nine candidate stores preserving every row, fingerprints, 
     expect(candidate.db.query('SELECT state,task_id FROM gary_slack_engineering_ingress').all()).toEqual([{state:'bound',task_id:'engineering-fixture-task'}]);
     currentQueries.recordEvent(candidate.db,{eventType:'boot',payload:{version:'synthetic-candidate',runtime:'offline'}});
     expect((await candidate.projects.execute({audience:{...audience,surface:'shared_channel',channelId:'C0FIXTURE1'},requestId:'candidate-note',toolName:'remember_fact',args:{project:'fixture',text:'Synthetic shared candidate fact'}})).ok).toBe(true);
-    expect(currentDm.fingerprintSlackConversationConfig(candidate.dmConfig)).toBe(oldDmFingerprint);
-    expect(currentShared.fingerprintSlackSharedConversationConfig(candidate.sharedConfig)).toBe(oldSharedFingerprint);
+    expect(currentDm.fingerprintSlackConversationConfig(candidate.dmConfig)).not.toBe(oldDmFingerprint);
+    expect(currentShared.fingerprintSlackSharedConversationConfig(candidate.sharedConfig)).not.toBe(oldSharedFingerprint);
     await candidate.close();closeSpendReader();
+    // Rolling back to e849a0d first reverses the unused policy migrations.
+    currentDm.rollbackSlackConversationPolicy(dmMigrationConfig);currentShared.rollbackSlackSharedConversationPolicy(sharedMigrationConfig);
     const postCandidate=allSnapshots(),engineeringBefore=snapshot(engineeringPath);
     const copies=privateDir(join(root,'preserved-post-candidate-copies'));
     for(const [name,path] of Object.entries(paths)){
@@ -247,7 +257,8 @@ test('e849a0d reopens nine candidate stores preserving every row, fingerprints, 
         additions.push({store:name,type:entry.type,name:entry.name,sqlSha256:sha(entry.sql!)});
       }
     }
-    expect(additions.map(({sqlSha256,...entry})=>entry)).toEqual([{store:'gary.db',type:'table',name:'gary_slack_engineering_ingress'}]);
+    expect(additions.map(({sqlSha256,...entry})=>entry)).toEqual([{store:'gary.db',type:'table',name:'gary_slack_engineering_ingress'},
+      {store:'dm/context.sqlite',type:'table',name:'policy_migrations'},{store:'shared/shared-context.sqlite',type:'table',name:'policy_migrations'}]);
     expect(engineeringBefore.schema.some(row=>row.name==='engineering_tasks')).toBe(true);
     expect(engineeringBefore.rows.engineering_tasks).toHaveLength(1);
     const rolledBack=await open(old);expect(rolledBack.sends()).toBe(0);

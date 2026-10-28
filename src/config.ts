@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { PAID_ROUTE } from "./model-route.ts";
 import {
   createProvider,
   createProviderChain,
@@ -148,11 +149,11 @@ export interface ReviewConfig {
   timeoutMs: number;
 }
 
-const KNOWN_PROVIDERS: ReadonlySet<string> = new Set(["z.ai", "kimi", "deepseek"]);
+const KNOWN_PROVIDERS: ReadonlySet<string> = new Set(["z.ai", "kimi", "openrouter"]);
 
 export function loadReviewConfig(): ReviewConfig {
   const orderRaw = optionalString("GARY_REVIEWER_PROVIDER_ORDER");
-  const providerOrder = (orderRaw ?? "deepseek,z.ai,kimi")
+  const providerOrder = (orderRaw ?? "openrouter,z.ai,kimi")
     .split(",")
     .map((s) => s.trim())
     .filter((s): s is ProviderName => KNOWN_PROVIDERS.has(s));
@@ -269,10 +270,10 @@ const PROVIDER_DEFAULTS: Record<
     model: "kimi-for-coding",
     defaultBackoffMs: DEFAULT_BACKOFF_MS,
   },
-  deepseek: {
-    apiKeyEnv: "DEEPSEEK_API_KEY",
-    baseUrl: "https://api.deepseek.com/anthropic",
-    model: "deepseek-v4-pro",
+  openrouter: {
+    apiKeyEnv: PAID_ROUTE.apiKeyEnv,
+    baseUrl: PAID_ROUTE.baseUrl,
+    model: PAID_ROUTE.model,
     defaultBackoffMs: DEFAULT_BACKOFF_MS,
   },
 };
@@ -280,7 +281,7 @@ const PROVIDER_DEFAULTS: Record<
 const PROVIDER_ENV_PREFIX: Record<ProviderName, string> = {
   "z.ai": "Z_AI",
   kimi: "KIMI",
-  deepseek: "DEEPSEEK",
+  openrouter: "OPENROUTER",
 };
 
 export const APPROVED_PROVIDER_ROUTES: Readonly<
@@ -294,9 +295,9 @@ export const APPROVED_PROVIDER_ROUTES: Readonly<
     hosts: new Set(["api.kimi.com"]),
     models: new Set(["k3", "kimi-for-coding"]),
   },
-  deepseek: {
-    hosts: new Set(["api.deepseek.com"]),
-    models: new Set(["deepseek-v4-flash", "deepseek-v4-pro"]),
+  openrouter: {
+    hosts: new Set([PAID_ROUTE.host]),
+    models: new Set([PAID_ROUTE.model]),
   },
 };
 
@@ -350,13 +351,13 @@ function loadProviderConfig(name: ProviderName): ProviderConfig | null {
 }
 
 /**
- * Load every configured provider, in priority order (Z.ai → Kimi → DeepSeek).
- * Z.ai is required; Kimi and DeepSeek are optional (omit their key to
+ * Load every configured provider, in priority order (Z.ai → Kimi → OpenRouter).
+ * Z.ai is required; Kimi and OpenRouter are optional (omit their key to
  * disable). The returned array is non-empty.
  */
 export function loadProviderConfigs(): readonly ProviderConfig[] {
   // Z.ai stays required so existing deployments keep working without
-  // env changes. Kimi/DeepSeek are opt-in fallbacks.
+  // env changes. Kimi/OpenRouter are opt-in fallbacks.
   const zai = loadProviderConfig("z.ai");
   if (!zai) {
     throw new Error("Missing required env var: Z_AI_API_KEY");
@@ -364,8 +365,8 @@ export function loadProviderConfigs(): readonly ProviderConfig[] {
   const out: ProviderConfig[] = [zai];
   const kimi = loadProviderConfig("kimi");
   if (kimi) out.push(kimi);
-  const deepseek = loadProviderConfig("deepseek");
-  if (deepseek) out.push(deepseek);
+  const openrouter = loadProviderConfig("openrouter");
+  if (openrouter) out.push(openrouter);
   return out;
 }
 

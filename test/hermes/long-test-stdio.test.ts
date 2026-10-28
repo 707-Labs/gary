@@ -16,7 +16,7 @@ print(json.dumps({'type':'result','result':{'taskId':p['taskId'],'requestId':p['
 function fixture(ordinary:number,polls:number,enabled=true,skip=false){
  let cleanups=0,calls=0;
  const launch=createStdioLauncher({command:['/usr/bin/python3','-I','-c',script,String(ordinary),String(polls),skip?'1':'0'],cwd:'/tmp',env:{PATH:'/usr/bin:/bin'},cleanup:async()=>{cleanups++;}});
- const manifest:GaryRuntimeManifest={taskId:'task',requestId:'request',ownerEpoch:'owner',capability:'x'.repeat(40),modelBaseUrl:'http://127.0.0.1/v1',executorUrl:'http://127.0.0.1/tools/execute',stateUrl:'http://127.0.0.1/tools/state',model:'deepseek-v4-pro',prompt:'offline',systemPrompt:'Gary',tools:[],maxIterations:1,maxTokens:32,temperature:0.3,deadlineMs:Date.now()+5000,
+ const manifest:GaryRuntimeManifest={taskId:'task',requestId:'request',ownerEpoch:'owner',capability:'x'.repeat(40),modelBaseUrl:'http://127.0.0.1/v1',executorUrl:'http://127.0.0.1/tools/execute',stateUrl:'http://127.0.0.1/tools/state',model:'deepseek/deepseek-v4.1-flash',prompt:'offline',systemPrompt:'Gary',tools:[],maxIterations:1,maxTokens:32,temperature:0.3,deadlineMs:Date.now()+5000,
   ...(enabled?{longTestPolicy:snapshotLongTestPolicy(CODING_VERIFICATION_POLICY)}:{})};
  return{run:()=>launch(manifest,async()=>{calls++;return Response.json({ok:true});},new AbortController().signal),stats:()=>({calls,cleanups})};
 }

@@ -38,10 +38,11 @@ function evidence(p: EngineeringTaskPolicy): EngineeringPublicationEvidence {
   };
 }
 
-test('exact $5.65 envelope matches current guarded reservations without enrolling any allocation', () => {
-  expect(spendReservationMicros('deepseek', 8192)).toBe(LIMITS.work.reservationMicros);
-  expect(spendReservationMicros('deepseek', 4090)).toBe(LIMITS.review.reservationMicros);
-  expect(3 * LIMITS.work.reservationMicros + LIMITS.review.reservationMicros).toBe(5_650_000);
+test('$5.65 envelope covers current guarded reservations without enrolling any allocation', () => {
+  expect(spendReservationMicros('openrouter', 8192)).toBe(LIMITS.work.reservationMicros);
+  expect(spendReservationMicros('openrouter', 4090)).toBe(LIMITS.review.reservationMicros);
+  // At the openrouter price the full v1 envelope (3 work + 1 review) is 2_585_383, inside the historical $5.65 cap.
+  expect(3 * LIMITS.work.reservationMicros + LIMITS.review.reservationMicros).toBe(2_585_383);
   expect(LIMITS.capMicros).toBe(5_650_000);
   expect(LIMITS.approval).toBe('host_record_required');
   expect(Object.isFrozen(LIMITS)).toBe(true); expect(Object.isFrozen(LIMITS.work)).toBe(true);
@@ -128,8 +129,8 @@ test('three work calls plus exactly one 4090-token review fit; settled cheap cal
   const p = policy();
   const history = [attempt('one'), attempt('two'), attempt('three')];
   const result = assertEngineeringRequestAllowed(p, { requestId: 'review', role: 'review', maxTokens: 4090 }, usage(history));
-  expect(result).toEqual({ reservationMicros: 1_400_317, preserveReviewMicros: 0,
-    physicalRequests: 4, reservedEnvelopeMicros: 5_650_000, executionAuthorized: false });
+  expect(result).toEqual({ reservationMicros: 638_962, preserveReviewMicros: 0,
+    physicalRequests: 4, reservedEnvelopeMicros: 2_585_383, executionAuthorized: false });
   expect(() => assertEngineeringRequestAllowed(p, { requestId: 'four', role: 'work', maxTokens: 1 }, usage(history))).toThrow('request_limit');
   expect(() => assertEngineeringRequestAllowed(p, { requestId: 'review', role: 'review', maxTokens: 4091 }, usage(history))).toThrow('token_limit');
   expect(() => assertEngineeringRequestAllowed(p, { requestId: 'another', role: 'review', maxTokens: 1 },
@@ -141,7 +142,7 @@ test.each(['classification', 'repair', 'retry', 'summary', 'compression', 'subag
   '%s consumes a physical work request and preserves the review reservation', role => {
     const p = policy();
     const result = assertEngineeringRequestAllowed(p, { requestId: 'aux', role, maxTokens: 32 }, usage());
-    expect(result.reservationMicros).toBe(1_416_561); expect(result.preserveReviewMicros).toBe(1_400_317);
+    expect(result.reservationMicros).toBe(648_807); expect(result.preserveReviewMicros).toBe(638_962);
     expect(() => assertEngineeringRequestAllowed(p, { requestId: 'aux', role, maxTokens: 32 },
       usage([attempt('one'), attempt('two'), attempt('three')]))).toThrow('request_limit');
   });
@@ -202,8 +203,8 @@ test('v2 is an explicit immutable host selection and preserves exact v1 default 
   expect(engineeringAcceptancePolicySha256(2)).toMatch(/^[a-f0-9]{64}$/);
   expect(Object.isFrozen(v2.acceptance)).toBe(true); expect(Object.isFrozen(v2.acceptance.work)).toBe(true);
   expect(v2.acceptance.capMicros).toBe(5_650_000);
-  expect(spendReservationMicros('deepseek',8192)).toBe(v2.acceptance.work.reservationMicros);
-  expect(spendReservationMicros('deepseek',4090)).toBe(v2.acceptance.review.reservationMicros);
+  expect(spendReservationMicros('openrouter',8192)).toBe(v2.acceptance.work.reservationMicros);
+  expect(spendReservationMicros('openrouter',4090)).toBe(v2.acceptance.review.reservationMicros);
   const input = {taskId:v1.taskId,repository:v1.repository,baseCommit:v1.baseCommit,
     allowedFiles:v1.allowedFiles,requiredCommands:v1.requiredCommands,publication:v1.publication};
   for (const version of [undefined, 1, 3, '2', null])
@@ -221,9 +222,9 @@ test('v2 admits twelve cheap settled work calls plus review while v1 still rejec
     const request = {requestId:'v2-work-'+i,role:'work' as const,maxTokens:8192};
     const allowed = assertEngineeringRequestAllowed(v2,request,{...usage(history),
       taskRemainingMicros:remaining,campaignRemainingMicros:remaining});
-    expect(allowed.reservationMicros).toBe(1_416_561); expect(allowed.preserveReviewMicros).toBe(1_400_317);
+    expect(allowed.reservationMicros).toBe(648_807); expect(allowed.preserveReviewMicros).toBe(638_962);
     expect(allowed.physicalRequests).toBe(i+1); history.push({...request,state:'settled'});
-    remaining -= 32_454; // 10 billed input tokens + full 8192 output allowance, rounded up.
+    remaining -= 19_667; // 10 billed input tokens + full 8192 output allowance at 60/240, rounded up.
   }
   expect(() => assertEngineeringRequestAllowed(v2,{requestId:'v2-work-13',role:'work',maxTokens:8192},usage(history))).toThrow('request_limit');
   const review=assertEngineeringRequestAllowed(v2,{requestId:'v2-review',role:'review',maxTokens:4090},
@@ -236,22 +237,22 @@ test('v2 admits twelve cheap settled work calls plus review while v1 still rejec
   expect(assertEngineeringPublicationAllowed(v2,{...e,requests:[...history,attempt('review-1','review')]}).executionAuthorized).toBe(false);
 });
 
-test('v2 full-context funding is conditional: two maximum charges fit, third protects review and rejects', () => {
+test('v2 full-context funding is conditional: seven maximum charges fit, the eighth protects review and rejects', () => {
   const p=policy('draft_pr',2), history: EngineeringRequestAttempt[]=[];
   let remaining=5_417_988;
-  for(let i=0;i<2;i++) {
+  for(let i=0;i<7;i++) {
     const request={requestId:'maximum-'+i,role:'work' as const,maxTokens:8192};
     expect(assertEngineeringRequestAllowed(p,request,{...usage(history),taskRemainingMicros:remaining,
-      campaignRemainingMicros:remaining}).reservationMicros).toBe(1_416_561);
-    history.push({...request,state:'settled'});remaining-=1_416_561;
+      campaignRemainingMicros:remaining}).reservationMicros).toBe(648_807);
+    history.push({...request,state:'settled'});remaining-=648_807;
   }
-  expect(remaining).toBe(2_584_866);
-  const request={requestId:'third',role:'work' as const,maxTokens:8192};
+  expect(remaining).toBe(876_339);
+  const request={requestId:'eighth',role:'work' as const,maxTokens:8192};
   expect(() => assertEngineeringRequestAllowed(p,request,{...usage(history),taskRemainingMicros:remaining,
     campaignRemainingMicros:remaining})).toThrow('headroom');
   expect(assertEngineeringRequestAllowed(p,{requestId:'review',role:'review',maxTokens:4090},
-    {...usage(history),taskRemainingMicros:remaining,campaignRemainingMicros:remaining}).reservationMicros).toBe(1_400_317);
-  for (const patch of [{taskRemainingMicros:2_816_877},{campaignRemainingMicros:2_816_877},
+    {...usage(history),taskRemainingMicros:remaining,campaignRemainingMicros:remaining}).reservationMicros).toBe(638_962);
+  for (const patch of [{taskRemainingMicros:1_287_768},{campaignRemainingMicros:1_287_768},
     {unresolvedAttempts:1},{attempts:[{...attempt('unknown'),state:'unknown' as const}]}])
     expect(() => assertEngineeringRequestAllowed(p,request,{...usage(),...patch})).toThrow();
 });

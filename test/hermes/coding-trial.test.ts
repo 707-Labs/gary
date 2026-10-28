@@ -19,7 +19,7 @@ function fixture(){
  upsertTicket(db,{linearId:'ticket',identifier:'ERT-1'});
  const options={db,ledger,issueId:'ticket',repo:'fixture/repo',policyFingerprint:'sha256:'+'a'.repeat(64)};
  const controller=createCodingTrial(options);
- const input={issueId:'ticket',actionType:'classify',fingerprint:'state1',humanSignature:'human1',provider:'deepseek',model:'deepseek-v4-pro',repo:'fixture/repo'};
+ const input={issueId:'ticket',actionType:'classify',fingerprint:'state1',humanSignature:'human1',provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',repo:'fixture/repo'};
  const classify=()=>{const a=controller.admit(input);setClassification(db,{linearId:'ticket',classification:'CODE',confidence:.99,scope:'S'});a.complete(true,'handled');return a;};
  const code=()=>controller.admit({...input,actionType:'start_coding',fingerprint:'state2'});
  const rows=()=>db.query('SELECT * FROM actions ORDER BY id').all();
@@ -31,7 +31,7 @@ test('durable classify -> code binds one allocation/policy, preserves 21 histori
  const before=f.rows();f.classify();const action=f.code();action.assertActive();
  expect(f.db.query<{synchronous:number},[]>('PRAGMA synchronous').get()?.synchronous).toBe(2);
  expect(f.db.query('SELECT phase,campaign_id,cap_micros,policy_fingerprint FROM hermes_coding_trials').get()).toEqual({phase:'coding',campaign_id:'trial',cap_micros:10_000_000,policy_fingerprint:f.options.policyFingerprint});
- const binding=bindCanonicalCodeAction({db:f.db,ledger:f.ledger,actionId:action.actionId,fingerprint:'state2',issue:{id:'ticket'} as AssignedIssue,provider:'deepseek',model:'deepseek-v4-pro',repo:'fixture/repo'});
+ const binding=bindCanonicalCodeAction({db:f.db,ledger:f.ledger,actionId:action.actionId,fingerprint:'state2',issue:{id:'ticket'} as AssignedIssue,provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',repo:'fixture/repo'});
  f.controller.assertCodingAction(binding.admission);action.complete(true,'pr_opened');binding.close();
  expect(f.ledger.status('ticket')?.terminalReason).toBe('pr_opened');expect(()=>action.assertActive()).toThrow();expect(()=>f.code()).toThrow();
  expect(f.rows().slice(0,21)).toEqual(before);expect(f.rows()).toHaveLength(23);
@@ -72,8 +72,8 @@ test('newer canonical action fences paid work and publication without rewriting 
  expect(()=>a.assertActive()).toThrow('superseded');a.complete(false,'error');expect(f.rows()).toHaveLength(3);
 });
 test('unclaimed action cannot call activated coding factory binding',()=>{
- const f=fixture();const id=recordActionStart(f.db,{ticketLinearId:'ticket',stateFingerprint:'state2',actionType:'start_coding',provider:'deepseek',model:'deepseek-v4-pro'});
- const b=bindCanonicalCodeAction({db:f.db,ledger:f.ledger,actionId:id,fingerprint:'state2',issue:{id:'ticket'} as AssignedIssue,provider:'deepseek',model:'deepseek-v4-pro',repo:'fixture/repo'});
+ const f=fixture();const id=recordActionStart(f.db,{ticketLinearId:'ticket',stateFingerprint:'state2',actionType:'start_coding',provider:'openrouter',model:'deepseek/deepseek-v4.1-flash'});
+ const b=bindCanonicalCodeAction({db:f.db,ledger:f.ledger,actionId:id,fingerprint:'state2',issue:{id:'ticket'} as AssignedIssue,provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',repo:'fixture/repo'});
  expect(()=>f.controller.assertCodingAction(b.admission)).toThrow('action_binding');b.close();
 });
 

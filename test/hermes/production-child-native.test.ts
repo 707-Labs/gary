@@ -53,9 +53,9 @@ test.skipIf(!nativeImage || !readonlyImage)('native parent and read-only child s
     ledger.createCampaign('offline-child-fixture', 20);
     ledger.enrollTicket('offline-child-fixture', issue.id, 10);
     upsertTicket(db, { linearId: issue.id, identifier: issue.identifier });
-    const actionId = recordActionStart(db, { ticketLinearId: issue.id, stateFingerprint: 'child-fixture-fingerprint', actionType: 'start_coding', provider: 'deepseek', model: 'deepseek-v4-pro' });
+    const actionId = recordActionStart(db, { ticketLinearId: issue.id, stateFingerprint: 'child-fixture-fingerprint', actionType: 'start_coding', provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash' });
     binding = bindCanonicalCodeAction({ db, ledger, actionId, fingerprint: 'child-fixture-fingerprint', issue,
-      provider: 'deepseek', model: 'deepseek-v4-pro', repo: 'fixture/repo' });
+      provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash', repo: 'fixture/repo' });
     const hostEnv = { PATH: '/opt/homebrew/bin:/Users/tanner/.bun/bin:/usr/bin:/bin', HOME: root,
       GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' };
     const setup = (command: string) => runProcess('/bin/bash', ['-c', command], { cwd: root, env: hostEnv, timeoutMs: 10_000 });
@@ -108,7 +108,7 @@ test.skipIf(!nativeImage || !readonlyImage)('native parent and read-only child s
       setStateByType: noAdapterCall, updateDescription: noAdapterCall } as unknown as LinearAdapter;
     const github = { getPullRequestDetail: noAdapterCall } as unknown as GitHubClient;
     const options: ProductionRuntimeOptions = {
-      route: { provider: 'deepseek', model: 'deepseek-v4-pro', providerApiKey: 'offline-fixture-only', fetch: async request => {
+      route: { provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash', providerApiKey: 'offline-fixture-only', fetch: async request => {
         const body = await request.json();
         const child = !body.tools.some((tool: any) => tool.name === 'dispatch_subagent');
         const attempt = ledger.status(issue.id)!.attemptCount;
@@ -123,7 +123,7 @@ test.skipIf(!nativeImage || !readonlyImage)('native parent and read-only child s
         else if (!used.includes('write_file')) step = ['write_file', { path: 'task.ts', content: 'updated\n' }];
         else if (!used.includes('run_bash')) step = ['run_bash', { command: CHECK }];
         else if (!used.includes('finish')) step = ['finish', { summary: 'Parent independently updated and checked task.ts.' }];
-        return Response.json({ id: `fixture-reply-${providerRequests.length}`, type: 'message', role: 'assistant', model: 'deepseek-v4-pro',
+        return Response.json({ id: `fixture-reply-${providerRequests.length}`, type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash',
           content: step ? [{ type: 'tool_use', id: `fixture-call-${providerRequests.length}`, name: step[0], input: step[1] }]
             : [{ type: 'text', text: child ? CHILD_PROSE : 'Parent verification complete.' }],
           stop_reason: step ? 'tool_use' : 'end_turn', usage: { input_tokens: 10, output_tokens: 8, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } });

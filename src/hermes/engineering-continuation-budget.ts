@@ -10,6 +10,8 @@ import { assertEngineeringBudgetAdmission, type EngineeringBudgetBinding } from 
 import { fingerprintJson } from './audit-trace.ts';
 import { ENGINEERING_ACCEPTANCE_POLICY_V2, engineeringAcceptancePolicySha256 } from './engineering-policy.ts';
 import type { EngineeringLedgerRebootReference } from './engineering-budget-reboot.ts';
+// The settled baseline prefixes below are historical rows written on the direct DeepSeek route.
+import { LEGACY_DEEPSEEK_ROUTE } from '../model-route.ts';
 
 export interface EngineeringContinuationConfig {
   version: 1 | 2;
@@ -138,7 +140,7 @@ function binding(input: EngineeringContinuationBinding, prospective = false): En
 }
 function prefix(db: Database, allocationId: string) {
   const attempts = db.query('SELECT * FROM spend_attempts WHERE ticket_id=? ORDER BY id LIMIT 3').all(allocationId) as Record<string, unknown>[];
-  if (attempts.length !== BASE_COUNT || attempts.some(a => a.state !== 'settled' || a.provider !== 'deepseek' || a.model !== 'deepseek-v4-pro'
+  if (attempts.length !== BASE_COUNT || attempts.some(a => a.state !== 'settled' || a.provider !== LEGACY_DEEPSEEK_ROUTE.provider || a.model !== LEGACY_DEEPSEEK_ROUTE.model
       || a.max_tokens !== 8192 || a.reserved_micros !== 1_416_561 || !Number.isSafeInteger(a.charged_micros) || Number(a.charged_micros) < 0)
       || attempts.reduce((n, a) => n + Number(a.charged_micros), 0) !== BASE_CHARGED) fail('baseline_attempts');
   const receipts = attempts.map(a => db.query('SELECT * FROM spend_receipts WHERE attempt_id=?').get(a.id as number) as Record<string, unknown> | null);
@@ -149,7 +151,7 @@ function settledPrefix(db: Database, allocationId: string) {
   const attempts = db.query('SELECT * FROM spend_attempts WHERE ticket_id=? ORDER BY id LIMIT 6').all(allocationId) as Record<string, unknown>[];
   const charges=[36_388,37_438,40_950,36_601,38_937,41_698];
   if (attempts.length !== FOUR_COUNT || attempts.some((a,i) => a.id !== 147+i || a.state !== 'settled'
-      || a.provider !== 'deepseek' || a.model !== 'deepseek-v4-pro' || a.max_tokens !== 8192
+      || a.provider !== LEGACY_DEEPSEEK_ROUTE.provider || a.model !== LEGACY_DEEPSEEK_ROUTE.model || a.max_tokens !== 8192
       || a.reserved_micros !== 1_416_561 || a.charged_micros !== charges[i])) fail('settled_baseline_attempts');
   const receipts=attempts.map(a=>db.query('SELECT * FROM spend_receipts WHERE attempt_id=?').get(a.id as number) as Record<string,unknown>|null);
   if (receipts.some(r=>!r || r.reason !== 'accepted' || typeof r.details_json !== 'string')) fail('settled_baseline_receipts');

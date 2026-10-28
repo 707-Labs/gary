@@ -10,7 +10,7 @@ import {
   type AnthropicClient,
   type LLMProvider,
   type ProviderName,
-  parseDeepSeek429,
+  parseOpenRouter429,
   parseKimi429,
   parseZAi429,
 } from "../src/providers.ts";
@@ -48,9 +48,9 @@ describe("parseKimi429", () => {
   });
 });
 
-describe("parseDeepSeek429", () => {
+describe("parseOpenRouter429", () => {
   it("always returns null (no documented usage cap)", () => {
-    expect(parseDeepSeek429("anything")).toBeNull();
+    expect(parseOpenRouter429("anything")).toBeNull();
   });
 });
 
@@ -66,7 +66,7 @@ describe("createProvider", () => {
     expect(zai.parse429("Usage limit reached. reset at 2026-04-25 15:43:26"))
       .not.toBeNull();
     const ds = createProvider({
-      name: "deepseek",
+      name: "openrouter",
       apiKey: "x",
       baseUrl: "https://example",
       model: "m",
@@ -77,7 +77,7 @@ describe("createProvider", () => {
 });
 
 describe("ProviderChain", () => {
-  function fakeProvider(name: "z.ai" | "kimi" | "deepseek"): LLMProvider {
+  function fakeProvider(name: "z.ai" | "kimi" | "openrouter"): LLMProvider {
     return createProvider({
       name,
       apiKey: "x",
@@ -90,13 +90,13 @@ describe("ProviderChain", () => {
   it("active() returns the first unarmed provider", () => {
     const a = fakeProvider("z.ai");
     const b = fakeProvider("kimi");
-    const c = fakeProvider("deepseek");
+    const c = fakeProvider("openrouter");
     const chain = createProviderChain([a, b, c]);
     expect(chain.active()?.name).toBe("z.ai");
     a.gate.armUntil(new Date(Date.now() + 60_000));
     expect(chain.active()?.name).toBe("kimi");
     b.gate.armUntil(new Date(Date.now() + 60_000));
-    expect(chain.active()?.name).toBe("deepseek");
+    expect(chain.active()?.name).toBe("openrouter");
   });
 
   it("active() returns null when all providers are armed", () => {
@@ -134,7 +134,7 @@ describe("ProviderChain", () => {
 });
 
 describe("chainStartingWith", () => {
-  function fakeProvider(name: "z.ai" | "kimi" | "deepseek"): LLMProvider {
+  function fakeProvider(name: "z.ai" | "kimi" | "openrouter"): LLMProvider {
     return createProvider({
       name,
       apiKey: "x",
@@ -147,24 +147,24 @@ describe("chainStartingWith", () => {
   it("rotates the canonical chain so primary leads", () => {
     const a = fakeProvider("z.ai");
     const b = fakeProvider("kimi");
-    const c = fakeProvider("deepseek");
+    const c = fakeProvider("openrouter");
     const canonical = createProviderChain([a, b, c]);
     const rotated = chainStartingWith(canonical, b);
     expect(rotated.providers.map((p) => p.name)).toEqual([
       "kimi",
       "z.ai",
-      "deepseek",
+      "openrouter",
     ]);
   });
 
   it("preserves canonical order for non-primary providers", () => {
     const a = fakeProvider("z.ai");
     const b = fakeProvider("kimi");
-    const c = fakeProvider("deepseek");
+    const c = fakeProvider("openrouter");
     const canonical = createProviderChain([a, b, c]);
     const rotated = chainStartingWith(canonical, c);
     expect(rotated.providers.map((p) => p.name)).toEqual([
-      "deepseek",
+      "openrouter",
       "z.ai",
       "kimi",
     ]);
@@ -244,7 +244,7 @@ describe("armOnRateLimit", () => {
 
   it("falls back to defaultBackoffMs when no parse", () => {
     const p = createProvider({
-      name: "deepseek",
+      name: "openrouter",
       apiKey: "x",
       baseUrl: "https://e",
       model: "m",
@@ -289,26 +289,26 @@ describe("chainWithOrder", () => {
   it("reorders providers to match the requested preference", () => {
     const zai = fakeProvider("z.ai");
     const kimi = fakeProvider("kimi");
-    const deepseek = fakeProvider("deepseek");
+    const deepseek = fakeProvider("openrouter");
     const canonical = createProviderChain([zai, kimi, deepseek]);
-    const reordered = chainWithOrder(canonical, ["deepseek", "z.ai", "kimi"]);
-    expect(reordered.providers.map((p) => p.name)).toEqual(["deepseek", "z.ai", "kimi"]);
+    const reordered = chainWithOrder(canonical, ["openrouter", "z.ai", "kimi"]);
+    expect(reordered.providers.map((p) => p.name)).toEqual(["openrouter", "z.ai", "kimi"]);
   });
 
   it("ignores names not present in the canonical chain", () => {
     const zai = fakeProvider("z.ai");
-    const deepseek = fakeProvider("deepseek");
+    const deepseek = fakeProvider("openrouter");
     const canonical = createProviderChain([zai, deepseek]);
-    const reordered = chainWithOrder(canonical, ["deepseek", "kimi", "z.ai"]);
-    expect(reordered.providers.map((p) => p.name)).toEqual(["deepseek", "z.ai"]);
+    const reordered = chainWithOrder(canonical, ["openrouter", "kimi", "z.ai"]);
+    expect(reordered.providers.map((p) => p.name)).toEqual(["openrouter", "z.ai"]);
   });
 
   it("appends unrequested providers at the end in canonical order", () => {
     const zai = fakeProvider("z.ai");
     const kimi = fakeProvider("kimi");
-    const deepseek = fakeProvider("deepseek");
+    const deepseek = fakeProvider("openrouter");
     const canonical = createProviderChain([zai, kimi, deepseek]);
-    const reordered = chainWithOrder(canonical, ["deepseek"]);
-    expect(reordered.providers.map((p) => p.name)).toEqual(["deepseek", "z.ai", "kimi"]);
+    const reordered = chainWithOrder(canonical, ["openrouter"]);
+    expect(reordered.providers.map((p) => p.name)).toEqual(["openrouter", "z.ai", "kimi"]);
   });
 });

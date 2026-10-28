@@ -34,7 +34,7 @@ describe("recordReviewPass", () => {
       verdict: "approve",
       findingCount: 0,
       advisoryCount: 2,
-      providerUsed: "deepseek",
+      providerUsed: "openrouter",
       inputTokens: 12_000,
       outputTokens: 800,
       durationMs: 4_500,
@@ -52,7 +52,7 @@ describe("recordReviewPass", () => {
       .get();
     expect(row!.issue_id).toBe("issue-1");
     expect(row!.verdict).toBe("approve");
-    expect(row!.provider_used).toBe("deepseek");
+    expect(row!.provider_used).toBe("openrouter");
     expect(row!.duration_ms).toBe(4_500);
     expect(row!.escalated).toBe(0);
   });

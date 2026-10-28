@@ -20,7 +20,7 @@ test('readiness is read-only and explicit enrollment creates only a distinct imm
 });
 test('existing acceptance/chat/history cannot be adopted even with a standing-shaped name',()=>{
   const f=fixture();f.ledger.createCampaign(f.authority.campaignId,8);f.ledger.enrollTicket(f.authority.campaignId,'prior-ticket',8);
-  f.db.exec("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES('prior-ticket','deepseek','deepseek-v4-pro',8192,1416561,1416561,'unknown')");
+  f.db.exec("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES('prior-ticket','openrouter','deepseek/deepseek-v4.1-flash',8192,1416561,1416561,'unknown')");
   const before=f.db.query('SELECT * FROM spend_attempts').all();
   expect(()=>f.allocator.enrollPool()).toThrow('campaign_already_exists');
   expect(f.db.query('SELECT * FROM spend_attempts').all()).toEqual(before);
@@ -72,7 +72,7 @@ test('closing capability neither closes shared ledger nor recycles committed tas
 });
 test('pool commits preserve unrelated settled receipts and unknown holds',()=>{
   const f=fixture();f.ledger.createCampaign('old-chat',5);f.ledger.enrollTicket('old-chat','old-chat-allocation',5);
-  f.db.exec("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES('old-chat-allocation','deepseek','deepseek-v4-pro',8192,1416561,1416561,'unknown'); INSERT INTO spend_receipts(attempt_id,reason,details_json) VALUES(1,'ambiguous','{}')");
+  f.db.exec("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES('old-chat-allocation','openrouter','deepseek/deepseek-v4.1-flash',8192,1416561,1416561,'unknown'); INSERT INTO spend_receipts(attempt_id,reason,details_json) VALUES(1,'ambiguous','{}')");
   const prior=[f.db.query('SELECT * FROM spend_attempts').all(),f.db.query('SELECT * FROM spend_receipts').all()];
   f.allocator.enrollPool();f.allocator.allocate(f.input());f.allocator.allocate(f.input(2));
   expect([f.db.query('SELECT * FROM spend_attempts').all(),f.db.query('SELECT * FROM spend_receipts').all()]).toEqual(prior);

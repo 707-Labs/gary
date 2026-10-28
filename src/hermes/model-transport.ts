@@ -1,6 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { createDeadline, type Deadline } from "../deadline.ts";
 import { SpendLedger, SpendLimitError, SPEND_MAX_OUTPUT_TOKENS } from "../spend.ts";
+import { PAID_ROUTE } from "../model-route.ts";
 
 /** Host-owned ceiling for one request, always clamped to the shared action deadline. */
 export const MODEL_REQUEST_TIMEOUT_MS = 120_000;
@@ -8,12 +9,12 @@ export const MODEL_REQUEST_TIMEOUT_MS = 120_000;
 /** These are Gary's existing priced Anthropic routes, not new pricing policies. */
 const ROUTES = {
   "z.ai": { model: "glm-5.3", url: "https://api.z.ai/api/anthropic/v1/messages" },
-  deepseek: { model: "deepseek-v4-pro", url: "https://api.deepseek.com/anthropic/v1/messages" },
+  [PAID_ROUTE.provider]: { model: PAID_ROUTE.model, url: PAID_ROUTE.url },
 } as const;
 
 type PricedRoute =
   | { readonly provider: "z.ai"; readonly model: "glm-5.3" }
-  | { readonly provider: "deepseek"; readonly model: "deepseek-v4-pro" };
+  | { readonly provider: typeof PAID_ROUTE.provider; readonly model: typeof PAID_ROUTE.model };
 
 export type ModelTransportCapability = PricedRoute & {
   readonly ticketId: string;
@@ -320,11 +321,14 @@ function convertResponse(value: unknown, model: string, request: ConvertedReques
     if (!object(block)) bad("content_shape");
     const part = block as JsonObject;
     if (part.type === "text") {
-      if (typeof part.text !== "string" || !Object.keys(part).every((key) => ["type", "text"].includes(key))) bad("invalid_text_block");
+      // OpenRouter adds inert `citations: []` to text and `caller: {type:"direct"}` to tool_use.
+      if (typeof part.text !== "string" || !Object.keys(part).every((key) => ["type", "text", "citations"].includes(key))
+        || !(part.citations === undefined || part.citations === null || (Array.isArray(part.citations) && part.citations.length === 0))) bad("invalid_text_block");
       texts.push(part.text as string);
     } else if (part.type === "tool_use") {
       if (typeof part.id !== "string" || !CALL_ID.test(part.id) || ids.has(part.id) || typeof part.name !== "string"
-        || !object(part.input) || !finiteJson(part.input) || !Object.keys(part).every((key) => ["type", "id", "name", "input"].includes(key))) bad("invalid_tool_block");
+        || !object(part.input) || !finiteJson(part.input) || !Object.keys(part).every((key) => ["type", "id", "name", "input", "caller"].includes(key))
+        || !(part.caller === undefined || (object(part.caller) && Object.keys(part.caller).length === 1 && part.caller.type === "direct"))) bad("invalid_tool_block");
       if (!request.offeredTools.has(part.name as string) || request.toolMode === "none"
         || (request.toolMode === "tool" && part.name !== request.selectedTool)) bad("tool_policy");
       ids.add(part.id as string);
@@ -369,7 +373,7 @@ export function createModelTransport(options: ModelTransportOptions): ModelTrans
   const issued = options.capability;
   if (!issued || !Object.hasOwn(ROUTES, issued.provider) || ROUTES[issued.provider].model !== issued.model || !Number.isFinite(issued.deadlineMs) || issued.deadlineMs <= 0 || typeof issued.ticketId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(issued.ticketId) || typeof issued.ownerId !== "string" || issued.ownerId.length === 0 || !Array.isArray(issued.allowedToolNames) || issued.allowedToolNames.some((name) => typeof name !== "string" || !TOOL_NAME.test(name))) throw new Error("invalid host capability");
   if (typeof options.bearerToken !== "string" || !/^[^\s]{1,4096}$/.test(options.bearerToken) || typeof options.providerApiKey !== "string" || !/^[^\s]{1,4096}$/.test(options.providerApiKey)) throw new Error("host credentials required");
-  if (options.thinking !== undefined && (options.thinking !== "disabled" || issued.provider !== "deepseek")) throw new Error("invalid host thinking policy");
+  if (options.thinking !== undefined && (options.thinking !== "disabled" || issued.provider !== PAID_ROUTE.provider)) throw new Error("invalid host thinking policy");
   if (options.onFailure !== undefined && typeof options.onFailure !== "function") throw new Error("invalid host failure callback");
   const capability = Object.freeze({ ...issued, allowedToolNames: Object.freeze([...issued.allowedToolNames]) });
   const allowlist = new Set(capability.allowedToolNames);

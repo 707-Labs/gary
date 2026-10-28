@@ -51,7 +51,7 @@ function clone(root: string): string {
   return git(root, ['rev-parse', '--verify', 'HEAD']);
 }
 function provider(content: unknown[], stop_reason = 'end_turn') {
-  return { id: 'fixture', type: 'message', role: 'assistant', model: 'deepseek-v4-pro', content, stop_reason,
+  return { id: 'fixture', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash', content, stop_reason,
     usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } };
 }
 interface Flags { replaceCheck?: boolean; unexpectedAfterTest?: boolean; mutateDuringReview?: boolean; releaseFails?: boolean; routine?: boolean;
@@ -95,7 +95,7 @@ function fixture(flags: Flags = {}) {
   const runner: EngineeringCommandRunner = { synthetic: true,
     async run(invocation) {
       const args = invocation.argv, op = args[1]; let output = '';
-      expect(invocation.env).not.toHaveProperty('DEEPSEEK_API_KEY');
+      expect(invocation.env).not.toHaveProperty('OPENROUTER_API_KEY');
       if (op === 'create') {
         expect(held).toBe(true); expect(args).toContain('--network=none');
         const mount = args.find(value => value.startsWith('type=bind,src='))!;
@@ -281,7 +281,7 @@ function fixture(flags: Flags = {}) {
           taskId: input.binding.taskId, sessionId: input.binding.sessionId, ownerEpoch: input.binding.ownerEpoch,
           turnId, sequence: ++sequence, kind, payload }, input.transportCapability);
         for (let n = 0; n < (flags.delegate && !child ? 3 : 2); n++) {
-          const response = await input.model.handle({ model: 'deepseek-v4-pro', messages: [{ role: 'system', content: input.systemPrompt }, ...history],
+          const response = await input.model.handle({ model: 'deepseek/deepseek-v4.1-flash', messages: [{ role: 'system', content: input.systemPrompt }, ...history],
             tools: input.tools, max_tokens: 8192, stream: false, temperature: 0.3 }, signal);
           expect(response.status).toBe(200); history = [...input.model.history()];
           const call = (response.body.choices as Json[])[0]!.message.tool_calls?.[0]; if (!call) break;

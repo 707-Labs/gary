@@ -43,7 +43,7 @@ const PATCH = `*** Begin Patch\n*** Update File: ${PARSER}\n@@\n-    if (!parsed
 const sha = (s: string | Buffer) => createHash('sha256').update(s).digest('hex');
 type Json = Record<string, any>;
 function provider(content: Json[], reason = 'tool_use') {
-  return { id: 'offline-fixture-response', type: 'message', role: 'assistant', model: 'deepseek-v4-pro', content, stop_reason: reason,
+  return { id: 'offline-fixture-response', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash', content, stop_reason: reason,
     usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } };
 }
 type ReplayMode = 'no-edit' | 'corrected' | 'repeated-read' | 'same-batch' | 'practical-policy';

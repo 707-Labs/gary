@@ -3,7 +3,7 @@ import { Database } from 'bun:sqlite';
 import { constants, openSync, closeSync, fstatSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, normalize } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { LEGACY_DM_CONVERSATION_POLICY, DM_CONVERSATION_POLICY as POLICY, DMReplyError, exactDMAllocation, type DMTurn, type DMText } from '../hermes/dm-conversation.ts';
+import { DEEPSEEK_DM_CONVERSATION_POLICY, DM_CONVERSATION_POLICY as POLICY, DMReplyError, exactDMAllocation, type DMTurn, type DMText } from '../hermes/dm-conversation.ts';
 import { spendReservationMicros, type SpendLedger } from '../spend.ts';
 import { conversationFailureMessage } from './conversation-error.ts';
 import { boundedHistory, replacedHistoryPrefix, recordHistoryCompaction, migrateContextPolicy, rollbackContextPolicy, type ContextMigrationReceipt } from './context-policy.ts';
@@ -32,7 +32,8 @@ function fingerprintConfig(config:SlackConversationConfig,policy:unknown):string
     contextDirectory:config.contextDirectory,policy}));
 }
 export function fingerprintSlackConversationConfig(config:SlackConversationConfig):string {return fingerprintConfig(config,POLICY);}
-export function legacyFingerprintSlackConversationConfig(config:SlackConversationConfig):string {return fingerprintConfig(config,LEGACY_DM_CONVERSATION_POLICY);}
+/** The immediate predecessor: v2 on the retired DeepSeek route. Migration moves a drained context from it to the current policy. */
+export function legacyFingerprintSlackConversationConfig(config:SlackConversationConfig):string {return fingerprintConfig(config,DEEPSEEK_DM_CONVERSATION_POLICY);}
 /** Operator-only: call after graceful drain, before starting the new runtime. */
 export function migrateSlackConversationPolicy(config:SlackConversationConfig):ContextMigrationReceipt|null {
   privatePath(config.contextDirectory,true);const file=join(config.contextDirectory,'context.sqlite');privatePath(file,false);

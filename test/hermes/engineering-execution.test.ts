@@ -28,7 +28,7 @@ const TOOL = { type: 'function', function: { name: 'terminal', description: 'Fix
   parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } };
 const sha = (v: string) => createHash('sha256').update(v).digest('hex');
 function provider(content: unknown[], stop_reason = 'end_turn') {
-  return { id: 'msg_fixture', type: 'message', role: 'assistant', model: 'deepseek-v4-pro', content, stop_reason,
+  return { id: 'msg_fixture', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash', content, stop_reason,
     usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } };
 }
 interface Flags {
@@ -90,7 +90,7 @@ function fixture(flags: Flags = {}) {
   const runner: EngineeringCommandRunner = { synthetic: true,
     async run(invocation) {
       const args = invocation.argv, op = args[1]; let output = '', exitCode = 0;
-      expect(invocation.env.HOME).toBe('/nonexistent'); expect(invocation.env).not.toHaveProperty('DEEPSEEK_API_KEY');
+      expect(invocation.env.HOME).toBe('/nonexistent'); expect(invocation.env).not.toHaveProperty('OPENROUTER_API_KEY');
       if (op === 'create') {
         expect(leaseHeld).toBe(true);
         expect(args).toContain('--network=none'); expect(args).toContain('--cpus=2'); expect(args).toContain('--memory=4096m');
@@ -181,7 +181,7 @@ function fixture(flags: Flags = {}) {
       expect(intent.state).toBe('in_flight'); expect(intent.ledger_attempt).toBeGreaterThan(0);
       const reservation = spendDb.query('SELECT state,reserved_micros FROM spend_attempts WHERE id=?').get(intent.ledger_attempt) as { state: string; reserved_micros: number };
       expect(reservation.state).toBe('reserved');
-      expect(reservation.reserved_micros).toBe(body.max_tokens === 4090 ? 1_400_317 : 1_416_561);
+      expect(reservation.reserved_micros).toBe(body.max_tokens === 4090 ? 638_962 : 648_807);
       if (flags.providerUnknown) return Response.json({ ...provider([{ type: 'text', text: 'unknown' }]), usage: { input_tokens: 1 } });
       if (body.max_tokens === 4090) {
         expect(nativeLive).toBe(false); expect(live(author)).toBe(false); expect(live(verifierRoot)).toBe(false);
@@ -214,7 +214,7 @@ function fixture(flags: Flags = {}) {
           turnId, sequence: ++sequence, kind, payload }, input.transportCapability);
         let history = [...input.model.history()];
         for (let n = 0; n < 3; n++) {
-          const response = await input.model.handle({ model: 'deepseek-v4-pro', messages: [{ role: 'system', content: input.systemPrompt }, ...history],
+          const response = await input.model.handle({ model: 'deepseek/deepseek-v4.1-flash', messages: [{ role: 'system', content: input.systemPrompt }, ...history],
             tools: input.tools, max_tokens: 8192, stream: false, temperature: 0.3 }, signal);
           expect(response.status).toBe(200); history = [...input.model.history()];
           const calls = (response.body.choices as { message: { tool_calls?: { id: string; function: { arguments: string } }[] } }[])[0]!.message.tool_calls;
@@ -269,11 +269,11 @@ test('real pipeline binds native tool receipts, cleans writers before capture, v
   expect(artifact.review).toEqual({ verdict: 'approved', blockingFindings: [] });
   expect(f.requests.map(r => r.max_tokens)).toEqual([8192, 8192, 8192, 4090]);
   expect(f.spendDb.query('SELECT max_tokens,reserved_micros,state FROM spend_attempts ORDER BY id').all()).toEqual([
-    { max_tokens: 8192, reserved_micros: 1416561, state: 'settled' }, { max_tokens: 8192, reserved_micros: 1416561, state: 'settled' },
-    { max_tokens: 8192, reserved_micros: 1416561, state: 'settled' }, { max_tokens: 4090, reserved_micros: 1400317, state: 'settled' },
+    { max_tokens: 8192, reserved_micros: 648807, state: 'settled' }, { max_tokens: 8192, reserved_micros: 648807, state: 'settled' },
+    { max_tokens: 8192, reserved_micros: 648807, state: 'settled' }, { max_tokens: 4090, reserved_micros: 638962, state: 'settled' },
   ]);
   expect(f.ledger.status('allocation')).toMatchObject({ capMicros: 5650000, campaignCapMicros: 5650000, attemptCount: 4, unknownAttempts: 0 });
-  expect(f.spendDb.query('SELECT sum(reserved_micros) total FROM spend_attempts').get()).toEqual({ total: 5650000 });
+  expect(f.spendDb.query('SELECT sum(reserved_micros) total FROM spend_attempts').get()).toEqual({ total: 3 * 648807 + 638962 });
   expect(f.journalDb.query("SELECT count(*) n FROM engineering_execution_receipts WHERE kind='operation_result'").get()).toEqual({ n: 4 });
   await expect(f.native().model.review({ prompt: 'duplicate', systemPrompt: 'Review.', signal: signal() })).rejects.toThrow();
   expect(f.requests).toHaveLength(4);

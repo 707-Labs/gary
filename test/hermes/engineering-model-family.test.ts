@@ -10,7 +10,7 @@ import { createStandingEngineeringTaskPolicy, resolveEngineeringRepository } fro
 
 const clean: (() => void)[] = []; afterEach(() => clean.splice(0).reverse().forEach(fn => fn()));
 const TOOL = { type: 'function', function: { name: 'terminal', parameters: { type: 'object', properties: {} } } };
-const provider = () => ({ id: 'synthetic', type: 'message', role: 'assistant', model: 'deepseek-v4-pro',
+const provider = () => ({ id: 'synthetic', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash',
   content: [{ type: 'text', text: 'Done.' }], stop_reason: 'end_turn',
   usage: { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } });
 const signal = () => new AbortController().signal;
@@ -42,7 +42,7 @@ function fixture(input: { fetch?: EngineeringModelOptions['fetch']; family?: fal
   };
   return { ...f, budget, binding, options, journalDb, spendDb, model, requests, fences, childOptions, protocol };
 }
-const body = (model: EngineeringModelAdapter, systemPrompt: string) => ({ model: 'deepseek-v4-pro',
+const body = (model: EngineeringModelAdapter, systemPrompt: string) => ({ model: 'deepseek/deepseek-v4.1-flash',
   messages: [{ role: 'system', content: systemPrompt }, ...model.history()], tools: [TOOL], max_tokens: 8192, stream: false, temperature: 0.3 });
 async function work(model: EngineeringModelAdapter, systemPrompt: string, turnId: string, prompt = 'Approved work.') {
   model.beginTurn({ turnId, prompt }); const result = await model.handle(body(model, systemPrompt), signal());
@@ -68,7 +68,7 @@ test('parent, two children and independent skill calls share twelve work slots a
   expect(f.requests).toHaveLength(12);
   await f.model.review({ prompt: 'Review final artifact.', systemPrompt: 'Final independent reviewer.', signal: signal() });
   expect(f.requests).toHaveLength(13);
-  expect(f.ledger.status(f.budget.allocationId)).toMatchObject({ attemptCount: 13, chargedMicros: 12 * 32454 + 16210, unknownAttempts: 0 });
+  expect(f.ledger.status(f.budget.allocationId)).toMatchObject({ attemptCount: 13, chargedMicros: 12 * 19667 + 9822, unknownAttempts: 0 });
   expect(f.journalDb.query('SELECT task_id,session_id FROM engineering_model_owners').all()).toEqual([{ task_id: f.binding.taskId, session_id: f.binding.sessionId }]);
   const origins = f.journalDb.query('SELECT * FROM engineering_model_request_origins ORDER BY rowid').all() as Record<string, unknown>[];
   expect(origins.map(row => row.purpose)).toEqual(['parent_work', 'child_work', 'child_work', 'skill_evaluation', 'skill_review',
@@ -125,7 +125,7 @@ test('unknown child usage fences the entire family and never creates a retry all
   const f = fixture({ fetch: async () => Response.json({ ...provider(), usage: { input_tokens: 10 } }) });
   const options = f.childOptions(), child = f.model.createChild!(options);
   await expect(work(child, options.systemPrompt, 'unknown')).rejects.toThrow('request_failed');
-  expect(f.ledger.status(f.budget.allocationId)).toMatchObject({ attemptCount: 1, unknownAttempts: 1, chargedMicros: 1416561 });
+  expect(f.ledger.status(f.budget.allocationId)).toMatchObject({ attemptCount: 1, unknownAttempts: 1, chargedMicros: 648807 });
   expect(() => f.model.beginTurn({ turnId: 'retry', prompt: 'Retry.' })).toThrow('inactive');
   await expect(f.model.auxiliary!({ purpose: 'skill_evaluation', prompt: 'Retry.', systemPrompt: 'Evaluator.', signal: signal() })).rejects.toThrow('inactive');
   expect(() => f.model.createChild!(f.childOptions('retry-child'))).toThrow('inactive');
@@ -133,7 +133,7 @@ test('unknown child usage fences the entire family and never creates a retry all
 });
 
 test('auxiliary work preserves the full final review reserve and cannot relabel previous work provenance', async () => {
-  const minimum = fixture({ cap: 2_816_878 });
+  const minimum = fixture({ cap: 1_287_769 });
   await minimum.model.auxiliary!({ purpose: 'skill_evaluation', prompt: 'Evaluate.', systemPrompt: 'Evaluator.', signal: signal() });
   await expect(minimum.model.auxiliary!({ purpose: 'skill_review', prompt: 'Review.', systemPrompt: 'Reviewer.', signal: signal() })).rejects.toThrow('headroom');
   expect(minimum.requests).toHaveLength(1);

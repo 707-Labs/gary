@@ -17,9 +17,9 @@ const signal=new AbortController().signal;
 const input=(n:number,extra:Partial<SlackConversationInput>={}):SlackConversationInput=>({eventId:'EvFixture'+n,channel:'D0FIXTURE1',ts:'1791417600.'+String(n).padStart(6,'0'),threadTs:'1791417600.'+String(n).padStart(6,'0'),text:'private fabricated phrase violet sparrow',...extra});
 const sent=async()=> 'sent' as const;
 const deferred=()=>{let resolve!:()=>void;const promise=new Promise<void>(r=>resolve=r);return {promise,resolve};};
-const paidRequest=(maxTokens=4096)=>new Request('https://api.deepseek.com/anthropic/v1/messages',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer offline-fixture'},
-  body:JSON.stringify({model:'deepseek-v4-pro',max_tokens:maxTokens,messages:[{role:'user',content:'synthetic queue fixture'}]})});
-const paidReceipt=(inputTokens=30)=>Response.json({id:'msg_queue_fixture',type:'message',role:'assistant',model:'deepseek-v4-pro',content:[{type:'text',text:'fixture reply'}],stop_reason:'end_turn',
+const paidRequest=(maxTokens=4096)=>new Request('https://openrouter.ai/api/v1/messages',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer offline-fixture'},
+  body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',max_tokens:maxTokens,messages:[{role:'user',content:'synthetic queue fixture'}]})});
+const paidReceipt=(inputTokens=30)=>Response.json({id:'msg_queue_fixture',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'fixture reply'}],stop_reason:'end_turn',
   usage:{input_tokens:inputTokens,output_tokens:9,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
 
 test('queued input retains original host engineering capability and text without serializing authority into history',async()=>{
@@ -37,7 +37,7 @@ test('queued input retains original host engineering capability and text without
 
 test('a real held guarded reservation queues a follow-up, settles, and executes it once with committed history',async()=>{
   const f=fixture(),started=deferred(),release=deferred(),turns:DMTurn[]=[],messages:Array<{text:string;kind?:string}>=[];
-  const transport=f.ledger.guardedFetch('deepseek',(async(_request:RequestInfo|URL,_init?:RequestInit)=>{if(turns.length===1){started.resolve();await release.promise;}return paidReceipt();}) as typeof fetch);
+  const transport=f.ledger.guardedFetch('openrouter',(async(_request:RequestInfo|URL,_init?:RequestInit)=>{if(turns.length===1){started.resolve();await release.promise;}return paidReceipt();}) as typeof fetch);
   const service=createSlackConversation({...f,reply:async turn=>{turns.push(turn);await f.ledger.withSpendScope(f.config.allocationId,()=>transport(paidRequest()));return 'answer '+turns.length;}});
   const deliver=async(text:string,kind?:'answer'|'notice')=>{messages.push({text,...(kind?{kind}:{})});return 'sent' as const;};
   const first=service.respond(input(1),deliver,signal);await started.promise;
@@ -74,7 +74,7 @@ test('same-ID unknown spend, changed owner, stale event and aborted owner cannot
   for(const failure of ['unknown','owner','stale','aborted','unavailable','restart'] as const){
     const f=fixture(true),started=deferred(),release=deferred(),controller=new AbortController();let calls=0,notices=0;
     let available=true;
-    const transport=f.ledger.guardedFetch('deepseek',(async(_request:RequestInfo|URL,_init?:RequestInit)=>{started.resolve();await release.promise;return paidReceipt();}) as typeof fetch);
+    const transport=f.ledger.guardedFetch('openrouter',(async(_request:RequestInfo|URL,_init?:RequestInit)=>{started.resolve();await release.promise;return paidReceipt();}) as typeof fetch);
     const service=createSlackConversation({...f,reply:async()=>{calls++;await f.ledger.withSpendScope(f.config.allocationId,()=>transport(paidRequest()));return 'must not deliver';}});
     const first=service.respond(input(1),sent,controller.signal,()=>available);await started.promise;
     const db=new Database(join(f.dir,'context.sqlite')),spend=new Database(f.ledgerPath);
@@ -92,8 +92,8 @@ test('same-ID unknown spend, changed owner, stale event and aborted owner cannot
 
 test('foreign same-allocation reservations remain fenced even while this owner has a known active request',async()=>{
   const f=fixture(),started=deferred(),release=deferred(),foreignStarted=deferred(),foreignRelease=deferred();let calls=0,notices=0;
-  const own=f.ledger.guardedFetch('deepseek',(async(_request:RequestInfo|URL,_init?:RequestInit)=>{started.resolve();await release.promise;return paidReceipt();}) as typeof fetch);
-  const foreign=f.ledger.guardedFetch('deepseek',(async(_request:RequestInfo|URL,_init?:RequestInit)=>{foreignStarted.resolve();await foreignRelease.promise;return paidReceipt();}) as typeof fetch);
+  const own=f.ledger.guardedFetch('openrouter',(async(_request:RequestInfo|URL,_init?:RequestInit)=>{started.resolve();await release.promise;return paidReceipt();}) as typeof fetch);
+  const foreign=f.ledger.guardedFetch('openrouter',(async(_request:RequestInfo|URL,_init?:RequestInit)=>{foreignStarted.resolve();await foreignRelease.promise;return paidReceipt();}) as typeof fetch);
   const service=createSlackConversation({...f,reply:async()=>{calls++;await f.ledger.withSpendScope(f.config.allocationId,()=>own(paidRequest()));return 'first';}});
   const first=service.respond(input(1),sent,signal);await started.promise;
   const competing=f.ledger.withSpendScope(f.config.allocationId,()=>foreign(paidRequest()));await foreignStarted.promise;
@@ -106,15 +106,16 @@ test('queued work rechecks actual settlement and never spends after unknown usag
   for(const failure of ['unknown','depleted'] as const){
     const f=fixture(),started=deferred(),release=deferred();let calls=0;
     if(failure==='depleted'){
-      const seed=f.ledger.guardedFetch('deepseek',(async(_request:RequestInfo|URL,_init?:RequestInit)=>paidReceipt(1_048_576)) as typeof fetch);
-      for(let n=0;n<2;n++)await f.ledger.withSpendScope(f.config.allocationId,()=>seed(paidRequest(8192)));
+      const seed=f.ledger.guardedFetch('openrouter',(async(_request:RequestInfo|URL,_init?:RequestInit)=>paidReceipt(1_048_576)) as typeof fetch);
+      // Six full-context 8192 seeds leave 5_000_000-6*648_807=1_107_158: one 4096 reply (638_976) fits, a second does not.
+      for(let n=0;n<6;n++)await f.ledger.withSpendScope(f.config.allocationId,()=>seed(paidRequest(8192)));
     }
-    const transport=f.ledger.guardedFetch('deepseek',(async(_request:RequestInfo|URL,_init?:RequestInit)=>{started.resolve();await release.promise;if(failure==='unknown')throw new Error('offline transport failure');return paidReceipt(1_048_576);}) as typeof fetch);
+    const transport=f.ledger.guardedFetch('openrouter',(async(_request:RequestInfo|URL,_init?:RequestInit)=>{started.resolve();await release.promise;if(failure==='unknown')throw new Error('offline transport failure');return paidReceipt(1_048_576);}) as typeof fetch);
     const service=createSlackConversation({...f,reply:async()=>{calls++;await f.ledger.withSpendScope(f.config.allocationId,()=>transport(paidRequest()));return 'last funded reply';}});
     const first=service.respond(input(1),sent,signal);await started.promise;const second=service.respond(input(2),sent,signal);
     const db=new Database(join(f.dir,'context.sqlite'));expect(db.query('SELECT state FROM events ORDER BY rowid').all()).toEqual([{state:'running'},{state:'queued'}]);
     release.resolve();await Promise.all([first,second]);expect(calls).toBe(1);
-    expect(f.ledger.status(f.config.allocationId)?.attemptCount).toBe(failure==='depleted'?3:1);
+    expect(f.ledger.status(f.config.allocationId)?.attemptCount).toBe(failure==='depleted'?7:1);
     expect(f.ledger.status(f.config.allocationId)?.unknownAttempts).toBe(failure==='depleted'?0:1);
     expect(db.query('SELECT state FROM events ORDER BY rowid').all()).toEqual([{state:failure==='depleted'?'sent':'failed'},{state:'failed'}]);db.close();service.close();
   }
@@ -122,7 +123,7 @@ test('queued work rechecks actual settlement and never spends after unknown usag
 
 test('a detached prior-event callback cannot reserve or borrow the next running event lease',async()=>{
   const f=fixture(),late=deferred(),started=deferred(),release=deferred();let calls=0,lateRequest!:Promise<Response>;
-  const transport=f.ledger.guardedFetch('deepseek',(async(_request:RequestInfo|URL,_init?:RequestInit)=>{started.resolve();await release.promise;return paidReceipt();}) as typeof fetch);
+  const transport=f.ledger.guardedFetch('openrouter',(async(_request:RequestInfo|URL,_init?:RequestInit)=>{started.resolve();await release.promise;return paidReceipt();}) as typeof fetch);
   const service=createSlackConversation({...f,reply:async()=>{
     if(++calls===1){lateRequest=late.promise.then(()=>f.ledger.withSpendScope(f.config.allocationId,()=>transport(paidRequest())));return 'first';}
     await f.ledger.withSpendScope(f.config.allocationId,()=>transport(paidRequest()));return 'second';
@@ -239,6 +240,33 @@ test('operator-only exact predecessor migration preserves stopped sessions/event
   rollbackSlackConversationPolicy(f.config);expect(state()).toEqual(before);
   // A different/unreviewed predecessor cannot be blessed by the migration.
   db.query('UPDATE control SET fingerprint=?').run('f'.repeat(64));expect(()=>migrateSlackConversationPolicy(f.config)).toThrow('dm_context_config_mismatch');expect(state()).toEqual(before);db.close();
+});
+
+test('OpenRouter cutover chains from the live v1->v2 migration receipt to v3 and only rolls back the newest step',()=>{
+  const f=fixture();createSlackConversation({...f,reply:async()=> 'never'}).close();
+  const db=new Database(join(f.dir,'context.sqlite'));
+  const deepseekV2=legacyFingerprintSlackConversationConfig(f.config),current=fingerprintSlackConversationConfig(f.config),v1='a'.repeat(64);
+  expect(deepseekV2).not.toBe(current);
+  // Production state: an un-rolled-back v1->v2 receipt and control at the DeepSeek v2 fingerprint.
+  db.exec('CREATE TABLE IF NOT EXISTS policy_migrations (id INTEGER PRIMARY KEY,from_fingerprint TEXT NOT NULL,to_fingerprint TEXT NOT NULL,state_sha256 TEXT NOT NULL,migrated_at TEXT NOT NULL,rolled_back_at TEXT)');
+  db.query("INSERT INTO policy_migrations(from_fingerprint,to_fingerprint,state_sha256,migrated_at) VALUES (?,?,?,'2026-10-08T00:00:00.000Z')").run(v1,deepseekV2,'b'.repeat(64));
+  db.query('UPDATE control SET fingerprint=?').run(deepseekV2);
+  const first=db.query('SELECT * FROM policy_migrations WHERE id=1').get();
+  expect(migrateSlackConversationPolicy(f.config)?.toFingerprint).toBe(current);
+  expect(db.query('SELECT fingerprint FROM control').get()).toEqual({fingerprint:current});
+  expect(db.query('SELECT * FROM policy_migrations WHERE id=1').get()).toEqual(first);
+  rollbackSlackConversationPolicy(f.config);
+  expect(db.query('SELECT fingerprint FROM control').get()).toEqual({fingerprint:deepseekV2});
+  expect(db.query('SELECT * FROM policy_migrations WHERE id=1').get()).toEqual(first);
+  expect(migrateSlackConversationPolicy(f.config)?.toFingerprint).toBe(current);
+  // A latest receipt that landed elsewhere cannot be chained from.
+  const g=fixture();createSlackConversation({...g,reply:async()=> 'never'}).close();
+  const other=new Database(join(g.dir,'context.sqlite'));
+  other.exec('CREATE TABLE IF NOT EXISTS policy_migrations (id INTEGER PRIMARY KEY,from_fingerprint TEXT NOT NULL,to_fingerprint TEXT NOT NULL,state_sha256 TEXT NOT NULL,migrated_at TEXT NOT NULL,rolled_back_at TEXT)');
+  other.query("INSERT INTO policy_migrations(from_fingerprint,to_fingerprint,state_sha256,migrated_at) VALUES (?,?,?,'2026-10-08T00:00:00.000Z')").run(v1,'c'.repeat(64),'b'.repeat(64));
+  other.query('UPDATE control SET fingerprint=?').run(legacyFingerprintSlackConversationConfig(g.config));
+  expect(()=>migrateSlackConversationPolicy(g.config)).toThrow('dm_context_migration_active_receipt');
+  other.close();db.close();
 });
 
 test('migration refuses unresolved cleanup without clearing a global stop, and rollback refuses any new conversation receipt',async()=>{

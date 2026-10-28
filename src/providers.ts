@@ -4,16 +4,16 @@ import { type RateLimitGate, createRateLimitGate } from "./rate-limit.ts";
 
 /**
  * Identifiers for the LLM providers Gary speaks to. The order in
- * `DEFAULT_CHAIN_ORDER` mirrors the fallback priority: Z.ai is the primary
- * (cheapest, default), Kimi Code is the first fallback (subscription cap),
- * DeepSeek is the final fallback (no usage cap as of 2026-04-25).
+ * `DEFAULT_CHAIN_ORDER` mirrors the fallback priority: Z.ai is the primary,
+ * Kimi Code is the first fallback (subscription cap), and OpenRouter
+ * (pay-as-you-go, see src/model-route.ts) is the final fallback.
  */
-export type ProviderName = "z.ai" | "kimi" | "deepseek";
+export type ProviderName = "z.ai" | "kimi" | "openrouter";
 
 export const DEFAULT_CHAIN_ORDER: readonly ProviderName[] = [
   "z.ai",
   "kimi",
-  "deepseek",
+  "openrouter",
 ];
 
 export interface ProviderConfig {
@@ -24,7 +24,7 @@ export interface ProviderConfig {
   /**
    * Default backoff applied when the provider 429s but `parse429` can't
    * extract a reset timestamp from the response body. Z.ai includes the
-   * timestamp inline; Kimi/DeepSeek shapes are TBD.
+   * timestamp inline; Kimi/OpenRouter shapes are TBD.
    */
   defaultBackoffMs: number;
 }
@@ -77,15 +77,15 @@ export function parseKimi429(message: string): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-/** DeepSeek has no usage cap as of 2026-04-25 — only per-minute limits. */
-export function parseDeepSeek429(_message: string): Date | null {
+/** OpenRouter 429s carry no documented reset timestamp in the body; use the default backoff. */
+export function parseOpenRouter429(_message: string): Date | null {
   return null;
 }
 
 const PARSERS: Record<ProviderName, (m: string) => Date | null> = {
   "z.ai": parseZAi429,
   kimi: parseKimi429,
-  deepseek: parseDeepSeek429,
+  openrouter: parseOpenRouter429,
 };
 
 export interface CreateProviderOpts {
@@ -100,7 +100,7 @@ export function createProvider(
   cfg: ProviderConfig,
   opts: CreateProviderOpts = {},
 ): LLMProvider {
-  // All three providers (Z.ai, Kimi Code, DeepSeek) want
+  // All three providers (Z.ai, Kimi Code, OpenRouter) accept
   // `Authorization: Bearer <key>` rather than the SDK default `x-api-key`.
   // Using `authToken` flips the header.
   const client = new Anthropic({

@@ -7,6 +7,7 @@ import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { EngineeringProtocol, type EngineeringProtocolBinding } from './engineering-protocol.ts';
 import type { EngineeringModelAdapter } from './engineering-model.ts';
 import { fingerprintJson } from './audit-trace.ts';
+import { PAID_ROUTE } from '../model-route.ts';
 import { engineeringFailure, parseEngineeringWorkerReported, parseEngineeringWorkerFault, type EngineeringHostObserved, type EngineeringWorkerReported } from './engineering-diagnostics.ts';
 import type { ConversationMessage } from './conversation.ts';
 import { createEngineeringSessionGuardianFactory, type EngineeringSessionGuardian,
@@ -110,7 +111,7 @@ export function createEngineeringStdioLauncher(config: EngineeringStdioOptions):
     // iteration/output limits. The worker never chooses a second allowance.
     const limits = Object.freeze({ ...input.model.nativeLimits });
     if (!exact(limits, ['policyVersion','model','maxIterations','maxTokens'])
-        || ![1, 2].includes(limits.policyVersion) || limits.model !== 'deepseek-v4-pro'
+        || ![1, 2].includes(limits.policyVersion) || limits.model !== PAID_ROUTE.model
         || !Number.isSafeInteger(limits.maxIterations) || limits.maxIterations < 1 || limits.maxIterations > 50
         || !Number.isSafeInteger(limits.maxTokens) || limits.maxTokens < 1 || limits.maxTokens > 8192
         || (limits.policyVersion === 1 && (limits.maxIterations !== 3 || limits.maxTokens !== 8192))) fail('model_limits');

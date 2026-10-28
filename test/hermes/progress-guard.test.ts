@@ -161,12 +161,12 @@ describe('productive follow-through guard (trusted evidence fixtures; no filesys
   test('recreating progress accounting cannot reopen a real exhausted ledger allocation', async () => {
     const ledger = new SpendLedger(':memory:');
     try {
-      ledger.createCampaign('fixture', 1); ledger.enrollTicket('fixture', 'ticket-1', 1);
+      ledger.createCampaign('fixture', 0.5); ledger.enrollTicket('fixture', 'ticket-1', 0.5);
       let providerCalls = 0;
-      const fetch = ledger.guardedFetch('deepseek', (async () => { providerCalls++; return Response.json({}); }) as unknown as typeof globalThis.fetch);
-      await expect(ledger.withSpendScope('ticket-1', () => fetch('https://api.deepseek.com/anthropic/v1/messages', {
+      const fetch = ledger.guardedFetch('openrouter', (async () => { providerCalls++; return Response.json({}); }) as unknown as typeof globalThis.fetch);
+      await expect(ledger.withSpendScope('ticket-1', () => fetch('https://openrouter.ai/api/v1/messages', {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ model: 'deepseek-v4-pro', max_tokens: 128, messages: [{ role: 'user', content: 'offline fixture' }] }),
+        body: JSON.stringify({ model: 'deepseek/deepseek-v4.1-flash', max_tokens: 128, messages: [{ role: 'user', content: 'offline fixture' }] }),
       }))).rejects.toThrow();
       const before = ledger.status('ticket-1')!;
       expect(before.state).toBe('exhausted');

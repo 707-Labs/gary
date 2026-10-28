@@ -315,10 +315,10 @@ for (const failure of ["cleanup", "spawn", "terminal_write"] as const) {
       ledger.createCampaign("offline-cleanup", 10); ledger.enrollTicket("offline-cleanup", "offline-ticket", 10);
       let dispatches = 0;
       const fakeFetch = (async () => { dispatches++; throw new Error("must not dispatch"); }) as unknown as typeof fetch;
-      const fetch = ledger.guardedFetch("deepseek", fakeFetch);
-      const request = new Request("https://api.deepseek.com/anthropic/v1/messages", { method: "POST",
+      const fetch = ledger.guardedFetch("openrouter", fakeFetch);
+      const request = new Request("https://openrouter.ai/api/v1/messages", { method: "POST",
         headers: { "content-type": "application/json", authorization: "Bearer offline-not-a-secret" },
-        body: JSON.stringify({ model: "deepseek-v4-pro", max_tokens: 8192, messages: [{ role: "user", content: "offline fixture" }] }) });
+        body: JSON.stringify({ model: "deepseek/deepseek-v4.1-flash", max_tokens: 8192, messages: [{ role: "user", content: "offline fixture" }] }) });
       await expect(ledger.withSpendScope("offline-ticket", () =>
         ledger.withPaidRequestGuard(() => guard.assertSafe(), () => fetch(request)))).rejects.toBe(error);
       expect(dispatches).toBe(0); expect(ledger.status("offline-ticket")!.attemptCount).toBe(0);

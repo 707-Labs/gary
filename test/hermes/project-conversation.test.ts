@@ -33,7 +33,7 @@ function fixture() {
   return { ledger, projects, executions, audiences };
 }
 const provider = (content: any[] = [{ type: 'text', text: 'I inspected the current work.' }], extra: Record<string, unknown> = {}) => Response.json({
-  id: 'fixture', type: 'message', role: 'assistant', model: 'deepseek-v4-pro', content,
+  id: 'fixture', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash', content,
   stop_reason: content.some(x => x.type === 'tool_use') ? 'tool_use' : 'end_turn',
   usage: { input_tokens: 40, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, ...extra,
 });
@@ -106,7 +106,7 @@ function native(hooks: NativeHooks = {}): GaryRuntimeLauncher {
 test('native project tool round trip uses host authority, exact transcript and two canonical paid reservations', async () => {
   const f = fixture(), requests: any[] = [];
   const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fake-secret', launch: native(), fetch: async req => {
-    expect(req.url).toBe('https://api.deepseek.com/anthropic/v1/messages'); expect(req.headers.get('authorization')).toBe('Bearer fake-secret');
+    expect(req.url).toBe('https://openrouter.ai/api/v1/messages'); expect(req.headers.get('authorization')).toBe('Bearer fake-secret');
     requests.push(await req.json()); return requests.length === 1 ? provider([call()]) : provider();
   } });
   expect(await reply(turn())).toBe('I inspected the current work.');
@@ -392,7 +392,7 @@ test('uncertain second physical request preserves first receipt and halts furthe
   } });
   await expect(reply(turn())).rejects.toBeInstanceOf(ProjectReplyError);
   const s = f.ledger.status(allocation)!;
-  expect(s.attemptCount).toBe(2); expect(s.unknownAttempts).toBe(1); expect(s.chargedMicros).toBeGreaterThan(1_000_000);
+  expect(s.attemptCount).toBe(2); expect(s.unknownAttempts).toBe(1); expect(s.chargedMicros).toBeGreaterThan(648_807);
   expect(f.executions).toHaveLength(1); expect(calls).toBe(2);
 });
 

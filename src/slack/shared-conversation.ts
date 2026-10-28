@@ -5,17 +5,18 @@ import { createSlackIngressEmitter, type SlackIngressObserver } from './ingress-
 import { constants, openSync, closeSync, fstatSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, normalize } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { LEGACY_DM_CONVERSATION_POLICY, DM_CONVERSATION_POLICY, DMReplyError, type DMTurn, type DMText } from '../hermes/dm-conversation.ts';
+import { DEEPSEEK_DM_CONVERSATION_POLICY, DM_CONVERSATION_POLICY, DMReplyError, type DMTurn, type DMText } from '../hermes/dm-conversation.ts';
 import { conversationFailureMessage } from './conversation-error.ts';
 import { createConversationQueueBudget } from './conversation.ts';
 import { boundedHistory, replacedHistoryPrefix, recordHistoryCompaction, migrateContextPolicy, rollbackContextPolicy, type ContextMigrationReceipt } from './context-policy.ts';
 import type { SlackMemberMetadata, SlackChannelMetadata } from './transport.ts';
 import type { SpendLedger } from '../spend.ts';
 
-export const SHARED_CONVERSATION_POLICY=Object.freeze({...DM_CONVERSATION_POLICY,version:1,profile:'workspace_channel',trigger:'explicit_mention',metadataMaxAgeMs:15_000,
+export const SHARED_CONVERSATION_POLICY=Object.freeze({...DM_CONVERSATION_POLICY,version:2,profile:'workspace_channel',trigger:'explicit_mention',metadataMaxAgeMs:15_000,
   appId:'A0C7QFW3PEG',teamId:'T0AA24R7VUZ',botUserId:'U0C7NPEUG1F',codingDispatch:'disabled',conversationRequesters:'active_internal_full_members'} as const);
 const POLICY=SHARED_CONVERSATION_POLICY;
-export const LEGACY_SHARED_CONVERSATION_POLICY=Object.freeze({...LEGACY_DM_CONVERSATION_POLICY,version:1,profile:'workspace_channel',trigger:'explicit_mention',metadataMaxAgeMs:15_000,
+/** The immediate predecessor (shared v1 on DM v2, retired DeepSeek route), reproduced key-for-key for its stored fingerprint. */
+export const LEGACY_SHARED_CONVERSATION_POLICY=Object.freeze({...DEEPSEEK_DM_CONVERSATION_POLICY,version:1,profile:'workspace_channel',trigger:'explicit_mention',metadataMaxAgeMs:15_000,
   appId:'A0C7QFW3PEG',teamId:'T0AA24R7VUZ',botUserId:'U0C7NPEUG1F',codingDispatch:'disabled',conversationRequesters:'active_internal_full_members'} as const);
 export interface SlackSharedConversationConfig { readonly version:1; readonly runId:string; readonly campaignId:string; readonly allocationId:string; readonly contextDirectory:string;
   readonly appId:string;readonly teamId:string;readonly botUserId:string;readonly trigger:'explicit_mention' }

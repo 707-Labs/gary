@@ -8,7 +8,7 @@ function fixture(){const ledger=new SpendLedger(':memory:');cleanups.push(()=>le
   return ledger;}
 const turn=(extra:Partial<DMTurn>={}):DMTurn=>({requestId:'fixture-request',ownerId:'fixture-owner',allocationId:'local:hermes-dm-20261008-tanner',campaignId:'hermes-dm-20261008',
   history:[],text:'Remember the fabricated phrase violet sparrow.',signal:new AbortController().signal,assertActive(){},recordWorker(){},...extra});
-const provider=(text='The phrase is violet sparrow.',extra:Record<string,unknown>={})=>Response.json({id:'msg_fixture',type:'message',role:'assistant',model:'deepseek-v4-pro',
+const provider=(text='The phrase is violet sparrow.',extra:Record<string,unknown>={})=>Response.json({id:'msg_fixture',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',
   content:[{type:'text',text}],stop_reason:'end_turn',usage:{input_tokens:30,output_tokens:9,cache_read_input_tokens:0,cache_creation_input_tokens:0},...extra});
 const native=(modify:(body:any)=>void=()=>{},after?: (handle:Parameters<GaryRuntimeLauncher>[1],manifest:Parameters<GaryRuntimeLauncher>[0])=>Promise<void>):GaryRuntimeLauncher=>async(manifest,handle)=>{
   expect(manifest.tools).toEqual([]);expect(manifest.maxIterations).toBe(1);expect(manifest.maxTokens).toBe(4096);
@@ -31,7 +31,7 @@ test('shared persona is host-selected, has no private context/coding authority, 
 test('one real canonical reservation per native turn, host-only destination/key, no tools, confirmed two-turn context',async()=>{
   const ledger=fixture(),requests:any[]=[];
   const reply=createHermesDMResponder({ledger,providerApiKey:'fake-provider-secret',launch:native(),fetch:async req=>{
-    expect(req.url).toBe('https://api.deepseek.com/anthropic/v1/messages');expect(req.headers.get('authorization')).toBe('Bearer fake-provider-secret');
+    expect(req.url).toBe('https://openrouter.ai/api/v1/messages');expect(req.headers.get('authorization')).toBe('Bearer fake-provider-secret');
     requests.push(await req.json());return provider();}});
   const first=await reply(turn());expect(first).toBe('The phrase is violet sparrow.');
   expect(await reply(turn({requestId:'followup',history:[{role:'user',content:turn().text},{role:'assistant',content:first}],text:'What phrase?'}))).toBe(first);

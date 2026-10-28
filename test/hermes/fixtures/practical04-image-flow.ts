@@ -128,7 +128,7 @@ async function main(){
   const task:EngineeringTaskView={taskId,spec:{taskId,requestId:'offline-combined-request',grantId:chain.o.grantId,scope:{teamId:authority.teamId,surface:'private_dm',audienceId:authority.requesterId,projectId:'707-labs:mulligan-labs'},repositoryId:'1117341295',repository:repository.repo,baseCommit:BASE,policyHash:policy.fingerprint,allocationId:chain.o.allocationId,deadlineMs:admission.deadlineEpochMs},scopeKey:'offline-combined',state:'running',ownerEpoch,sessionId,cleanupConfirmed:false,updatedAtMs:Date.now(),workerState:'not_observed'};
   const runtimeFiles=['gary_engineering_environment.py','gary_engineering_runtime.py'].map(name=>{const path=join(sourceRoot,'hermes/python',name);return {path,sha256:sha(regular(path))};});
   const config:EngineeringRuntimeConfig={version:1,acceptancePolicyVersion:2,grantId:chain.o.grantId,allocationId:chain.o.allocationId,campaignId:chain.o.campaignId,root:hostState,workspacesRoot:shared,repository:repository.repo,baseBranch:'main',baseCommit:BASE,allowedFiles:[TEST,PARSER],requiredCommands:CHECKS,deadlineMs:1200_000,workerImage:WORKER,executorImage:EXECUTOR,bunCacheVolume:CACHE,dockerExecutable:'/usr/local/bin/docker',dockerSocketPath:'/Users/tanner/.colima/default/docker.sock',runtimeFiles,sourceRevision:manifest.sourceRevision,publication:'patch_only',capMicros:5650000,budget:{aggregatePath:chain.o.aggregatePath,auditDir:chain.o.auditDir,runId:chain.o.runId,continuation:chain.o.continuation},resourceLock:{path:'/private/tmp/apple-release-xcode.lock',...lockPin,bootSessionUUID:'02D97A38-83D2-457D-967F-A01481D5EEFC',apfsVolumeUUID:'7CD7DC2C-1F22-4B7C-BB7A-525D8FF5B697'}};
-  const provider=(content:Json[],stop_reason='tool_use')=>Response.json({id:'fixed-'+work+'-'+review,type:'message',role:'assistant',model:'deepseek-v4-pro',content,stop_reason,usage:{input_tokens:10,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+  const provider=(content:Json[],stop_reason='tool_use')=>Response.json({id:'fixed-'+work+'-'+review,type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content,stop_reason,usage:{input_tokens:10,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
   const plan:Array<Array<[string,Json]>>=[
     [['read_file',{path:'CLAUDE.md'}]],[['read_file',{path:PARSER}]],[['read_file',{path:TEST}]],
     [['write_file',{path:TEST,content:TEST_SOURCE}]],[['terminal',{command:CHECKS[0]}]],
@@ -158,8 +158,8 @@ async function main(){
     assert.equal(Buffer.from(capture.files.find((item:Json)=>item.path===TEST).base64,'base64').toString(),TEST_SOURCE);
     assert.equal(Buffer.from(capture.files.find((item:Json)=>item.path===PARSER).base64,'base64').toString(),expectedParser);
     const settled=spend.query('SELECT state,reserved_micros,charged_micros FROM spend_attempts ORDER BY id').all() as Json[];
-    assert.equal(settled.length,15);assert(settled.every(row=>row.state==='settled'));assert.equal(settled.reduce((sum,row)=>sum+row.charged_micros,0),507854);
-    assert.deepEqual(settled.slice(6).map(row=>[row.reserved_micros,row.charged_micros]),[...Array.from({length:8},()=>[1416561,32454]),[1400317,16210]]);
+    assert.equal(settled.length,15);assert(settled.every(row=>row.state==='settled'));assert.equal(settled.reduce((sum,row)=>sum+row.charged_micros,0),232012+8*19667+9822);
+    assert.deepEqual(settled.slice(6).map(row=>[row.reserved_micros,row.charged_micros]),[...Array.from({length:8},()=>[648807,19667]),[638962,9822]]);
     const receipts=spend.query('SELECT reason FROM spend_receipts ORDER BY 1').all() as Json[];assert.equal(receipts.length,15);assert(receipts.every(row=>row.reason==='accepted'));
     for(const item of capture.files){assert.equal(item.kind,'file');assert.equal(sha(Buffer.from(item.base64,'base64')),item.sha256);assert.equal(readFileSync(join(verifier,item.path),'base64'),item.base64);}
     passed=true;
