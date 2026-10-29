@@ -18,8 +18,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { createStandingEngineeringFundingGuard } from "../src/hermes/engineering-standing-funding.ts";
 import { createStandingEngineeringBudget } from "../src/hermes/engineering-standing-budget.ts";
-import { applyStandingRelocation, assertGaryStopped, inspectStandingRelocation, planStandingRelocation } from "../src/hermes/engineering-standing-relocation.ts";
-import { execFileSync } from "node:child_process";
+import { applyStandingRelocation, assertGaryStopped, inspectStandingRelocation, launchctlGaryService, planStandingRelocation } from "../src/hermes/engineering-standing-relocation.ts";
 import { dockerLabelledContainerLister } from "../src/hermes/engineering-reboot-quiescence.ts";
 import { loadStandingEngineeringConfig } from "../src/hermes/standing-engineering-config.ts";
 import { SpendLedger } from "../src/spend.ts";
@@ -33,7 +32,7 @@ const config = loadStandingEngineeringConfig(required("--config"), required("--c
 const fundingGuard = (c: typeof config) => createStandingEngineeringFundingGuard({ authority: c.funding, fundingAuthorityPath: c.fundingAuthorityPath,
   fundingHoldReceiptPath: c.fundingHoldReceiptPath, aggregatePath: c.aggregatePath, ledgerPath });
 
-const garyStopped = () => assertGaryStopped(() => execFileSync("/bin/launchctl", ["print", `gui/${process.getuid!()}/com.707labs.gary`], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }));
+const garyStopped = () => assertGaryStopped(launchctlGaryService);
 
 if (flag("--enroll")) {
   garyStopped();

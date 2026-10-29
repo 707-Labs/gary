@@ -198,3 +198,16 @@ The approval evidence is a 0600 JSON file with exactly these keys:
 ```
 
 The dry run prints this template with the exact ids and amount filled in.
+
+### Settling an acceptance hold before relocation
+
+`scripts/reconcile-acceptance-hold.ts --aggregate <path> --hold-id <id>` (dry run;
+`--apply` with Gary stopped) settles one `held_for_engineering_acceptance` hold.
+It requires every attempt on the hold's single spend ticket settled, no open
+lease, and every engineering journal (v1..vN) terminal. Under the shared
+`<aggregate>.admission.lock` it writes immutable audits, closes the ticket
+(`acceptance_hold_reconciled`, so no continuation authority can spend again),
+rechecks the charges, and replaces the aggregate with that one entry settled:
+it keeps exactly the settled charge, retires the rest, records `originalState`
+and `reconciliation`, and moves the totals. The standing funding guard accepts
+exactly that transition on an audited entry; any other change still fails.

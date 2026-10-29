@@ -3,6 +3,7 @@
  * is edited) and never touches the spend ledger. Enrollment of the new pool is
  * a separate explicit step. */
 import type { Database } from 'bun:sqlite';
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
@@ -114,7 +115,13 @@ export function planStandingRelocation(i: StandingRelocationInput): StandingRelo
 /** --apply/--enroll require the LaunchAgent to have no running process. */
 export function assertGaryStopped(printService: () => string): void {
   let output: string;
-  try { output = printService(); } catch { return; } // not loaded: nothing running
+  try { output = printService(); }
+  catch (error) {
+    // Only launchctl's explicit "not loaded" answer means stopped; anything else is unknown.
+    const text = String((error as { stderr?: unknown })?.stderr ?? '') + String((error as Error)?.message ?? '');
+    if (/Could not find service/.test(text)) return;
+    throw error;
+  }
   if (/^\s*pid = \d+/m.test(output) || /^\s*state = running/m.test(output)) fail('gary_running');
 }
 
@@ -136,4 +143,9 @@ export function applyStandingRelocation(plan: StandingRelocationPlan, targetDire
   writeNew(plan.newConfigPath, plan.newConfigBytes); syncDirectory(dirname(plan.newConfigPath));
   mkdirSync(plan.tombstonePath, { mode: 0o700 });
   writeNew(join(plan.tombstonePath, 'transferred.json'), plan.tombstoneBytes); syncDirectory(dirname(plan.tombstonePath));
+}
+
+/** The production launchctl probe used by the operator scripts. */
+export function launchctlGaryService(): string {
+  return execFileSync('/bin/launchctl', ['print', `gui/${process.getuid!()}/com.707labs.gary`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 }

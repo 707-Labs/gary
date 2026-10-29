@@ -249,5 +249,24 @@ test('relocation inspection lists other open holds and planning refuses while an
 test('apply and enroll refuse while the LaunchAgent has a running process',()=>{
   expect(()=>assertGaryStopped(()=>'\tstate = running\n\tpid = 4242\n')).toThrow('gary_running');
   expect(()=>assertGaryStopped(()=>'\tstate = not running\n')).not.toThrow();
-  expect(()=>assertGaryStopped(()=>{throw new Error('Could not find service');})).not.toThrow();
+  expect(()=>assertGaryStopped(()=>{throw Object.assign(new Error('Command failed'),{stderr:'Bad request.\nCould not find service "com.707labs.gary" in domain for user gui: 501\n'});})).not.toThrow();
+  expect(()=>assertGaryStopped(()=>{throw Object.assign(new Error('Command failed'),{stderr:'Operation not permitted'});})).toThrow('Command failed');
+});
+
+test('the standing grant keeps verifying after the reconciler settles an audited acceptance hold, and only then',()=>{
+  const f=fixture();
+  for(const b of [f.before,f.after])Object.assign(b.runtimeAllocations[0],{state:'held_for_engineering_acceptance'});
+  f.repin();f.after.runtimeAllocations.at(-1).admission.aggregateBeforeSha256=f.receipt.before.sha256;f.repin();
+  const guard=createStandingEngineeringFundingGuard(f.o);guard();
+  const settle=(entryPatch:Record<string,unknown>,retiredTotal=5.025)=>{
+    const current=structuredClone(f.after),e=current.runtimeAllocations[0];
+    Object.assign(e,{state:'reconciled_retained_charge',retainedAmountUsd:0.625,retiredUnusedAuthorizationUsd:5.025,originalState:'held_for_engineering_acceptance',
+      reconciliation:{id:'acceptance-reconciliation',auditRecord:'/audit/intent.json',evidenceSha256:'f'.repeat(64),chargedMicros:625000,retiredMicros:5025000}},entryPatch);
+    current.runtimeCommittedOrHeldUsd=56-5.025;current.runtimeUnallocatedUsd=4+5.025;current.totalCommittedOrHeldUsd=96-5.025;current.runtimeAuthorizationRetiredUsd=retiredTotal;
+    writeFileSync(f.o.aggregatePath,JSON.stringify(current,null,2)+'\n',{mode:0o600});
+  };
+  settle({});guard();
+  settle({reconciliation:{id:'x',auditRecord:'/a',evidenceSha256:'f'.repeat(64),chargedMicros:600000,retiredMicros:5025000}});
+  expect(()=>guard()).toThrow('audited_hold_changed');
+  settle({amountUsd:5.66,retiredUnusedAuthorizationUsd:5.035});expect(()=>guard()).toThrow();
 });

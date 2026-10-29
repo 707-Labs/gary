@@ -180,8 +180,16 @@ export function createStandingEngineeringFundingGuard(input:StandingEngineeringF
       ||encode(expected)!==encode(after))fail('funding_transition');
     const current=parseAggregate(parseExact(safeFile(o.aggregatePath).bytes.toString('utf8')),newPool);
     const allocations=current.runtimeAllocations as Json[],sum=totals(current,newPool);
-    if(next.some(v=>!record(v)||encode(allocations.find(w=>record(w)&&w.id===v.id)??null)!==encode(v)))fail('audited_hold_changed');
-    if(sum.unknown<old.unknown||sum.retired!==old.retired)fail('protected_history_changed');
+    // Audited entries stay byte-identical, except an acceptance/canary hold settled by
+    // the reviewed reconciler, whose retirement is then the only change to retired totals.
+    let reconciledRetired=0n;
+    for(const v of next){
+      const w=record(v)?allocations.find(x=>record(x)&&x.id===v.id):undefined;
+      if(!record(v)||!record(w))fail('audited_hold_changed');
+      if(encode(w)===encode(v))continue;
+      const retired=reconciledHoldRetirement(v,w);if(retired===null)fail('audited_hold_changed');reconciledRetired+=retired;
+    }
+    if(sum.unknown<old.unknown||sum.retired!==old.retired+reconciledRetired)fail('protected_history_changed');
     if(allocations.some(v=>record(v)&&v.id!==holdId&&record(v.admission)
       &&(v.admission.poolId===a.poolId||v.admission.campaignId===a.campaignId||v.admission.authoritySha256===a.authoritySha256)))fail('funding_reuse');
   }
@@ -315,3 +323,29 @@ export function planStandingFundingTransfer(i:StandingFundingTransferInput):Stan
       authoritySha256:authorityFile.sha256,holdReceiptSha256:holdFile.sha256},
     fundingAuthorityPath:authorityFile.path,fundingHoldReceiptPath:holdFile.path,aggregatePath:i.aggregatePath};
 }
+
+/** Kinds whose holds the acceptance reconciler may settle. */
+export const RECONCILABLE_HOLD_STATES=['held_for_engineering_acceptance'] as const;
+export const RECONCILED_STATE='reconciled_retained_charge';
+/** The retired amount if `after` is exactly `before` settled by the reconciler, else null. */
+export function reconciledHoldRetirement(before:Json,after:Json):bigint|null {
+  if(!record(before)||!record(after)||!RECONCILABLE_HOLD_STATES.includes(before.state as never))return null;
+  const amount=money(before.amountUsd);
+  if(money(before.retainedAmountUsd)!==amount||money(before.retiredUnusedAuthorizationUsd)!==0n||money(before.retainedUnknownCostsUsd)!==0n)return null;
+  const keys=Object.keys(after);
+  if(keys.length!==Object.keys(before).length+2||Object.keys(before).some((k,i)=>keys[i]!==k)||keys.at(-2)!=='originalState'||keys.at(-1)!=='reconciliation')return null;
+  if(after.originalState!==before.state||after.state!==RECONCILED_STATE||!record(after.reconciliation))return null;
+  for(const k of Object.keys(before))if(!['state','retainedAmountUsd','retiredUnusedAuthorizationUsd'].includes(k)&&encode(before[k]!)!==encode(after[k]!))return null;
+  const retained=money(after.retainedAmountUsd),retired=money(after.retiredUnusedAuthorizationUsd);
+  if(retained<0n||retired<0n||retained+retired!==amount||money(after.retainedUnknownCostsUsd)!==0n)return null;
+  const r=after.reconciliation;
+  if(typeof r.id!=='string'||typeof r.auditRecord!=='string'||typeof r.evidenceSha256!=='string'||!HASH.test(r.evidenceSha256)
+    ||micros(r.chargedMicros)*1000!==Number(retained)||micros(r.retiredMicros)*1000!==Number(retired))return null;
+  return retired;
+}
+/** Exact-JSON helpers shared with the acceptance reconciler; no other use. */
+export const aggregateJson=Object.freeze({
+  parse:(text:string)=>parseExact(text), encode:(value:Json)=>encode(value), money, usdLexeme,
+  number:(literal:string)=>new JsonNumber(literal), isRecord:record, totals:(budget:RecordJson,pool:bigint)=>totals(budget,pool),
+});
+export type AggregateJson=Json; export type AggregateRecord=RecordJson;
