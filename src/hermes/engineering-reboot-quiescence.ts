@@ -7,7 +7,7 @@ import type { EngineeringQuiescenceEvidence } from '../executors/engineering-res
 export interface EngineeringRebootQuiescenceOptions {
   readonly journalDb: Database;
   readonly spendDb: Database;
-  /** IDs of every container (any state) carrying one of Gary's engineering labels. */
+  /** IDs of non-exited containers labelled gary.task (engineering sessions). */
   readonly listLabelledContainers: () => readonly string[];
 }
 
@@ -35,15 +35,20 @@ export function assertEngineeringRebootQuiescent(options: EngineeringRebootQuies
   }
   let containers: readonly string[];
   try { containers = options.listLabelledContainers(); } catch { return fail('container_observation'); }
-  if (!Array.isArray(containers) || containers.length) fail('container');
+  if (!Array.isArray(containers)) fail('container_observation');
+  if (containers.length) fail('container:' + String(containers[0]).slice(0, 64));
   evidence.labelledContainers = 0;
   return Object.freeze(evidence);
 }
 
-/** Lists containers in any state with Gary's engineering task or executor-job label. */
+/** Lists engineering session containers (label gary.task) that have not exited.
+ * Exited/dead ones hold no process or lock; dev.gary.executor-job is not used
+ * because ordinary coding jobs carry it too. Remove leftover exited engineering
+ * containers by their exact ID if you want them gone; they do not block. */
 export function dockerLabelledContainerLister(dockerExecutable: string, dockerSocketPath: string): () => readonly string[] {
-  return () => ['gary.task', 'dev.gary.executor-job'].flatMap(label => execFileSync(dockerExecutable,
-    ['--host', 'unix://' + dockerSocketPath, 'ps', '-a', '--no-trunc', '--filter', 'label=' + label, '--format', '{{.ID}}'],
+  return () => execFileSync(dockerExecutable,
+    ['--host', 'unix://' + dockerSocketPath, 'ps', '-a', '--no-trunc', '--filter', 'label=gary.task', '--format', '{{.ID}} {{.State}}'],
     { encoding: 'utf8', timeout: 15_000, maxBuffer: 1_048_576, env: { PATH: '/usr/bin:/bin', HOME: '/nonexistent' }, stdio: ['ignore', 'pipe', 'pipe'] })
-    .split('\n').map(line => line.trim()).filter(Boolean));
+    .split('\n').map(line => line.trim().split(/\s+/)).filter(([id]) => !!id)
+    .filter(([, state]) => state !== 'exited' && state !== 'dead').map(([id]) => id!);
 }

@@ -48,15 +48,27 @@ test('first start after a reboot proves quiescence, creates the lock 0644 and re
   expect(guard().ino).toBe(st.ino);
 });
 
-test('later starts in the same boot reuse the recorded pin without re-deriving it, so a replaced lock is still rejected', () => {
+test('later starts in the same boot reuse the recorded pin and never re-mint for a replaced or missing lock', () => {
   const f = fixture();
   const first = resolveEngineeringResourceLockForBoot(f.options());
-  rmSync(f.lockPath); writeFileSync(f.lockPath, '', { mode: 0o644 }); chmodSync(f.lockPath, 0o644);
-  const second = resolveEngineeringResourceLockForBoot(f.options());
-  expect(second).toEqual(first); expect(f.quiescentCalls()).toBe(1);
-  const guard = createEngineeringResourceBindingGuard(second, { observeBoot: () => ({ bootSessionUUID: NEW_BOOT, apfsVolumeUUID: VOLUME }),
-    inspection: { lstat: () => lstatSync(f.lockPath), realpath: p => p } });
-  if (lstatSync(f.lockPath).ino !== first.ino) expect(() => guard()).toThrow('engineering_resource_lock_identity_changed');
+  expect(resolveEngineeringResourceLockForBoot(f.options())).toEqual(first); expect(f.quiescentCalls()).toBe(1);
+  rmSync(f.lockPath);
+  expect(() => resolveEngineeringResourceLockForBoot(f.options())).toThrow('engineering_resource_lock_identity_changed');
+  const holder = join(f.root, 'keep-inode'); writeFileSync(holder, ''); // occupy the freed inode so the replacement differs
+  writeFileSync(f.lockPath, '', { mode: 0o644 }); chmodSync(f.lockPath, 0o644);
+  if (lstatSync(f.lockPath).ino !== first.ino) expect(() => resolveEngineeringResourceLockForBoot(f.options())).toThrow('engineering_resource_lock_identity_changed');
+  expect(f.quiescentCalls()).toBe(1); expect(readdirSync(f.receipts)).toEqual([NEW_BOOT + '.json']);
+});
+
+test('a receipt for another path, owner or mode is rejected even when its hash binding matches', () => {
+  const f = fixture();
+  const binding = resolveEngineeringResourceLockForBoot(f.options());
+  const receiptPath = join(f.receipts, NEW_BOOT + '.json');
+  const receipt = JSON.parse(readFileSync(receiptPath, 'utf8'));
+  for (const [uid, label] of [[process.getuid!() + 1, 'uid']] as const) {
+    expect(() => resolveEngineeringResourceLockForBoot(f.options({ uid }))).toThrow(label === 'uid' ? 'reboot_receipt' : '');
+  }
+  expect(receipt.binding).toEqual(binding);
 });
 
 test('refuses to rebind when anything is in flight, and leaves no lock or receipt behind', () => {
@@ -114,7 +126,7 @@ test('quiescence passes only with terminal cleaned-up tasks, closed runs, settle
     const t = stores(); (db === 'journal' ? t.journal : t.spend).exec(sql);
     expect(() => assertEngineeringRebootQuiescent({ journalDb: t.journal, spendDb: t.spend, listLabelledContainers: list })).toThrow('reboot_not_quiescent:' + reason);
   }
-  expect(() => assertEngineeringRebootQuiescent({ journalDb: s.journal, spendDb: s.spend, listLabelledContainers: () => ['abc'] })).toThrow('reboot_not_quiescent:container');
+  expect(() => assertEngineeringRebootQuiescent({ journalDb: s.journal, spendDb: s.spend, listLabelledContainers: () => ['abc'] })).toThrow('reboot_not_quiescent:container:abc');
   expect(() => assertEngineeringRebootQuiescent({ journalDb: s.journal, spendDb: s.spend, listLabelledContainers: () => { throw new Error('docker down'); } }))
     .toThrow('reboot_not_quiescent:container_observation');
 });

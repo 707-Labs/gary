@@ -283,7 +283,7 @@ test('after a reboot standing engineering re-binds the lock once when nothing is
   expect(readdirSync(join(ok.f.config.root, 'resource-boot-bindings'))).toEqual([NEW_BOOT + '.json']);
   await runtime.stop();
   const blocked = rebooted(['3f1c0ffee']);
-  expect(() => createEngineeringRuntime(blocked.options)).toThrow('reboot_not_quiescent:container');
+  expect(() => createEngineeringRuntime(blocked.options)).toThrow('reboot_not_quiescent:container:3f1c0ffee');
   expect(() => lstatSync(blocked.lockPath)).toThrow();
   expect(blocked.f.counts).toEqual({ observations: 0, baseResolutions: 0, clones: 0, executions: 0, leases: 0, releases: 0, provider: 0 });
 });

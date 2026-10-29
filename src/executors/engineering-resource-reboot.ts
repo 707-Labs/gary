@@ -41,7 +41,8 @@ const RECEIPT_KEYS = ['version', 'kind', 'configuredBindingSha256', 'binding', '
 const sha = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 function fail(reason: string): never { throw new Error(`engineering_resource_${reason}`); }
 
-function readReceipt(path: string, configuredSha: string, boot: EngineeringLedgerBootIdentity): Readonly<EngineeringResourceLockBinding> {
+function readReceipt(path: string, configuredSha: string, boot: EngineeringLedgerBootIdentity,
+  configured: EngineeringResourceLockBinding, lockPath: string, uid: number): Readonly<EngineeringResourceLockBinding> {
   const st = lstatSync(path);
   if (!st.isFile() || st.isSymbolicLink() || st.nlink !== 1 || (st.mode & 0o777) !== 0o600 || st.size > 16_384) fail('reboot_receipt_invalid');
   let value: Record<string, unknown>;
@@ -49,7 +50,15 @@ function readReceipt(path: string, configuredSha: string, boot: EngineeringLedge
   if (!value || typeof value !== 'object' || Object.keys(value).length !== RECEIPT_KEYS.length || RECEIPT_KEYS.some(k => !Object.hasOwn(value, k))
       || value.version !== 1 || value.kind !== 'engineering_resource_boot_rebind' || value.configuredBindingSha256 !== configuredSha) fail('reboot_receipt_invalid');
   const binding = parseEngineeringResourceLockBinding(value.binding);
-  if (binding.bootSessionUUID !== boot.bootSessionUUID || binding.apfsVolumeUUID !== boot.apfsVolumeUUID) fail('reboot_receipt_invalid');
+  if (binding.bootSessionUUID !== boot.bootSessionUUID || binding.apfsVolumeUUID !== boot.apfsVolumeUUID
+      || binding.path !== configured.path || binding.uid !== uid || binding.mode !== 0o644 || binding.nlink !== 1) fail('reboot_receipt_invalid');
+  // The recorded lock must still be the file on disk. Within a boot a replaced or
+  // missing lock is never re-minted: a detached holder from a crashed Gary can
+  // outlive it and still hold the old inode, which durable state cannot prove absent.
+  let lock;
+  try { lock = lstatSync(lockPath); } catch { return fail('lock_identity_changed'); }
+  if (!lock.isFile() || lock.isSymbolicLink() || lock.dev !== binding.dev || lock.ino !== binding.ino || lock.uid !== uid
+      || (lock.mode & 0o7777) !== 0o644 || lock.nlink !== 1) fail('lock_identity_changed');
   return binding;
 }
 
@@ -72,7 +81,7 @@ export function resolveEngineeringResourceLockForBoot(options: EngineeringResour
   const ds = lstatSync(dir);
   if (!ds.isDirectory() || ds.isSymbolicLink() || ds.uid !== uid || (ds.mode & 0o777) !== 0o700 || realpathSync(dir) !== dir) fail('reboot_receipt_directory');
   const receiptPath = join(dir, boot.bootSessionUUID + '.json');
-  try { lstatSync(receiptPath); return readReceipt(receiptPath, configuredSha, boot); }
+  try { lstatSync(receiptPath); return readReceipt(receiptPath, configuredSha, boot, configured, lockPath, uid); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 
   // First start in this boot: prove nothing from the previous boot survives.
@@ -97,7 +106,7 @@ export function resolveEngineeringResourceLockForBoot(options: EngineeringResour
   try { fd = openSync(receiptPath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600); }
   catch (error) {
     // A concurrent start in this boot recorded first; its pin is authoritative.
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return readReceipt(receiptPath, configuredSha, boot);
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return readReceipt(receiptPath, configuredSha, boot, configured, lockPath, uid);
     throw error;
   }
   try {
