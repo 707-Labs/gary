@@ -32,7 +32,7 @@ function fixture(){
     DOCKER_HOST:'unix:///Users/tanner/.colima/default/docker.sock',GARY_SLACK_ENABLED:'1',GARY_SLACK_CREDENTIALS_FILE:credentials},
     config:()=>{throw new Error('legacy_config_forbidden');},linear:()=>{throw new Error('linear_forbidden');},github:()=>{throw new Error('github_forbidden');},
     runLoop:async()=>{throw new Error('legacy_poll_forbidden');},fetch:(async()=>{throw new Error('unmocked_network_forbidden');}) as unknown as typeof fetch,
-    readonlySetup:()=>({stateDir:join(root,'state'),provider:{name:'deepseek',model:'deepseek-v4-pro',baseUrl:'https://api.deepseek.com/anthropic',apiKey:'fake-model-key',defaultBackoffMs:1000}}),
+    readonlySetup:()=>({stateDir:join(root,'state'),provider:{name:'openrouter',model:'deepseek/deepseek-v4.1-flash',baseUrl:'https://openrouter.ai/api',apiKey:'fake-model-key',defaultBackoffMs:1000}}),
     verifyReadonlyRelease:expected=>{revision++;expect(expected).toBe(config.releaseCommit);},
     slackTransport:loaded=>{expect(loaded.botToken).toBe('xoxb-offline-fixture-only');return transport;},
     readonlyCanary:()=>({async run(){runs++;ready=true;},check:()=>({kind:'readonly_runtime' as const,ready,readonlyCanarySucceeded:ready,receiptId:ready?'sha256:'+'b'.repeat(64):'pending'})}),

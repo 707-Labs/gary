@@ -10,13 +10,17 @@ function recordedStatus(row:Record<string,unknown>):string {
   if(row.action_id===null)return 'no_recorded_action';
   if(row.completed_at===null)return row.trial_phase==='closed'?'closed_outcome_unknown':'recorded_in_progress';
   if(row.success===0)return 'failed';
-  return ['delivered','escalated','handled'].includes(String(row.outcome))?String(row.outcome):'completed_outcome_unknown';
+  return ['delivered','handled','pr_opened','no_changes','agent_failed','blocked','timeout','check_failed',
+    'review_failed','escalated','rate_limited','budget_exhausted','error'].includes(String(row.outcome))?String(row.outcome):'completed_outcome_unknown';
 }
 export function createCurrentWorkReader(db:Database, projects:readonly WorkProject[]) {
   const registry=new Map(projects.map(project=>[project.id,Object.freeze({...project})]));
   if(registry.size!==projects.length||projects.some(p=>!/^707-Labs\/[a-z0-9-]+$/.test(p.repo)||! /^[A-Z][A-Z0-9]{1,15}$/.test(p.teamKey)))throw new Error('project_work_registry_rejected');
   return async (projectId:string):Promise<readonly ProjectWorkItem[]>=>{
     const project=registry.get(projectId);if(!project)throw new Error('project_not_available');
+    // This timestamps the local projection read. It does not refresh Linear,
+    // GitHub or a worker/controller, and must never be used as action freshness.
+    const observedAt=new Date().toISOString();
     // The team prefix is host configuration, never caller SQL or an issue description.
     const rows=db.query(`SELECT t.linear_id,t.identifier,t.terminal_state,a.id AS action_id,a.action_type,
       a.started_at,a.completed_at,a.success,a.outcome,c.phase AS trial_phase
@@ -28,6 +32,7 @@ export function createCurrentWorkReader(db:Database, projects:readonly WorkProje
       const review=db.query('SELECT verdict,finding_count,escalated,created_at FROM review_passes WHERE issue_id=? ORDER BY id DESC LIMIT 1').get(row.linear_id as string) as {verdict:string;finding_count:number;escalated:number;created_at:string}|null;
       const pr=prs.find(pr=>Number.isSafeInteger(pr.pr_number)&&pr.pr_number>0);
       return {ticket:String(row.identifier),status:recordedStatus(row),
+        source:'gary_canonical_database',observedAt,liveState:'unverified',
         ...(row.action_type?{action:String(row.action_type)}:{}),...(row.trial_phase?{phase:String(row.trial_phase)}:{}),
         ...(row.started_at?{startedAt:String(row.started_at)}:{}),...(row.completed_at?{completedAt:String(row.completed_at)}:{}),
         ...(pr?{pullRequestUrl:'https://github.com/'+project.repo+'/pull/'+pr.pr_number}:{}),

@@ -8,7 +8,7 @@ import { bindCanonicalCodeAction, type CodeActionAdmission } from '../../src/her
 import type { HermesActivationBinding, RuntimeHealthEvidence } from '../../src/hermes/activation.ts';
 import { SpendLedger, type SpendStatus } from '../../src/spend.ts';
 
-function fixture(legacyActions=0) {
+function fixture(legacyActions=0, route: { provider: string; model: string } = { provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash' }) {
   const db = openDb(':memory:');
   const issueId = '10000000-0000-4000-8000-000000000001', repo = 'fixture/repo', head = 'a'.repeat(40);
   for(let index=0;index<legacyActions;index++) {
@@ -17,7 +17,7 @@ function fixture(legacyActions=0) {
     recordActionStart(db,{ticketLinearId,stateFingerprint:'historical-'+index,actionType:index%2===0?'start_coding':'classify'});
   }
   upsertTicket(db, { linearId: issueId, identifier: 'ERT-1' });
-  const id = recordActionStart(db, { ticketLinearId: issueId, stateFingerprint: 'fp', actionType: 'start_coding', provider: 'deepseek', model: 'deepseek-v4-pro' });
+  const id = recordActionStart(db, { ticketLinearId: issueId, stateFingerprint: 'fp', actionType: 'start_coding', ...route });
   db.query('INSERT INTO hermes_action_owners(action_id,owner_epoch) VALUES(?,?)').run(id, 'owner');
   const allocation: SpendStatus = { ticketId: issueId, campaignId: 'fixture', state: 'closed', terminalReason: 'pr_opened', draftPr: true,
     capMicros: 10_000_000, chargedMicros: 1, remainingMicros: 9_999_999, attemptCount: 1, unknownAttempts: 0,
@@ -52,6 +52,18 @@ test('native finish alone and handled success do not claim whole-host readiness'
     expect(f.monitor.check().receiptId).toMatch(/^sha256:[0-9a-f]{64}$/);
   } finally { f.db.close(); }
 });
+test('a publication recorded on the retired DeepSeek route stays ready; any other route does not', () => {
+  for (const [route, ready] of [
+    [{ provider: 'deepseek', model: 'deepseek-v4-pro' }, true],
+    [{ provider: 'deepseek', model: 'deepseek/deepseek-v4.1-flash' }, false],
+    [{ provider: 'openrouter', model: 'deepseek-v4-pro' }, false],
+    [{ provider: 'z.ai', model: 'glm-5.3' }, false],
+  ] as const) {
+    const f = fixture(0, route);
+    try { f.complete(); f.monitor.recordPublication(f.admission, f.receipt); expect(f.monitor.check().ready).toBe(ready); }
+    finally { f.db.close(); }
+  }
+});
 test('ledger closure, native ownership, actual publication, and unchanged clean HEAD are required', () => {
   for (const mutation of [
     (f:ReturnType<typeof fixture>) => { f.allocation.state='active'; },
@@ -77,7 +89,7 @@ test('stale action, in-flight action, altered owner and mismatched receipt fail 
     f.db.query("UPDATE hermes_action_owners SET owner_epoch='other' WHERE action_id=?").run(f.id);
     expect(f.monitor.check().ready).toBe(false);
     f.db.query("UPDATE hermes_action_owners SET owner_epoch='owner' WHERE action_id=?").run(f.id);
-    recordActionStart(f.db,{ticketLinearId:f.issueId,stateFingerprint:'other',actionType:'start_coding',provider:'deepseek',model:'deepseek-v4-pro'});
+    recordActionStart(f.db,{ticketLinearId:f.issueId,stateFingerprint:'other',actionType:'start_coding',provider:'openrouter',model:'deepseek/deepseek-v4.1-flash'});
     expect(f.monitor.check().ready).toBe(false);
     expect(()=>f.monitor.recordPublication(f.admission,{...f.receipt,repo:'other/repo'})).toThrow('publication_readiness_binding_mismatch');
   } finally { f.db.close(); }
@@ -120,7 +132,7 @@ test('a separate currently claimed action blocks until canonical completion with
  try {
   f.complete();f.monitor.recordPublication(f.admission,f.receipt);
   upsertTicket(f.db,{linearId:'other-ticket',identifier:'OTHER-1'});
-  const current=recordActionStart(f.db,{ticketLinearId:'other-ticket',stateFingerprint:'other',actionType:'start_coding',provider:'deepseek',model:'deepseek-v4-pro'});
+  const current=recordActionStart(f.db,{ticketLinearId:'other-ticket',stateFingerprint:'other',actionType:'start_coding',provider:'openrouter',model:'deepseek/deepseek-v4.1-flash'});
   f.db.query('INSERT INTO hermes_action_owners(action_id,owner_epoch) VALUES(?,?)').run(current,'other-owner');
   expect(f.monitor.check().ready).toBe(false);
   recordActionEnd(f.db,{id:current,success:false,outcome:'error'});
@@ -138,8 +150,8 @@ test('closing a real admission in memory does not release an unfinished durable 
    creatorId:null,creatorName:null,teamId:'team',teamKey:'ERT',blockedBy:[]};
   upsertTicket(f.db,{linearId:issue.id,identifier:issue.identifier});
   ledger.createCampaign('offline',1);ledger.enrollTicket('offline',issue.id,1);
-  const actionId=recordActionStart(f.db,{ticketLinearId:issue.id,stateFingerprint:'active',actionType:'start_coding',provider:'deepseek',model:'deepseek-v4-pro'});
-  const binding=bindCanonicalCodeAction({db:f.db,ledger,actionId,fingerprint:'active',issue,provider:'deepseek',model:'deepseek-v4-pro',repo:'fixture/repo'});
+  const actionId=recordActionStart(f.db,{ticketLinearId:issue.id,stateFingerprint:'active',actionType:'start_coding',provider:'openrouter',model:'deepseek/deepseek-v4.1-flash'});
+  const binding=bindCanonicalCodeAction({db:f.db,ledger,actionId,fingerprint:'active',issue,provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',repo:'fixture/repo'});
   expect(()=>binding.admission.assertActive()).not.toThrow();expect(f.monitor.check().ready).toBe(false);
   binding.close();expect(()=>binding.admission.assertActive()).toThrow('canonical_action_inactive');
   expect(f.monitor.check().ready).toBe(false);

@@ -27,14 +27,14 @@ beforeEach(()=>{
   db=openDb(':memory:'); networkCalls=0;
   upsertTicket(db,{linearId:issue.id,identifier:issue.identifier});
   setClassification(db,{linearId:issue.id,classification:'CODE',confidence:0.99,scope:'S'});
-  const provider=createProvider({name:'deepseek',model:'deepseek-v4-pro',apiKey:'offline-only',baseUrl:'https://provider.invalid',defaultBackoffMs:1000},
+  const provider=createProvider({name:'openrouter',model:'deepseek/deepseek-v4.1-flash',apiKey:'offline-only',baseUrl:'https://provider.invalid',defaultBackoffMs:1000},
     {fetch:(async()=>{networkCalls++;throw new Error('network forbidden in dispatcher test');}) as unknown as typeof fetch});
   deps={db,linear:{linearUserId:'gary',fetchAssignedIssues:async()=>[issue],fetchCommentMeta:async()=>[],fetchComments:async()=>[],
     postComment:async()=>{},unassign:async()=>{}} as unknown as LinearAdapter,
     github:{} as GitHubClient,glm:new GLMClient(createProviderChain([provider])),cloudflare:null,
     repoMap:new Map([['ERT','707-Labs/fixture']]),allowlistedMentionUserIds:[],reposDir:'/offline/repos',workspacesDir:'/offline/workspaces',
     agentLoopMaxIterations:5,agentLoopTimeoutMs:1000,maxCiAttempts:3,maxAttemptsPerTicket:5,circuitBreakerWindowHours:6,stalePrAfterMs:1000,
-    review:{providerOrder:['deepseek'],maxRounds:1,iterationCap:1,timeoutMs:1000}};
+    review:{providerOrder:['openrouter'],maxRounds:1,iterationCap:1,timeoutMs:1000}};
   coding=spyOn(codeHandler,'runCodeHandler');
 });
 afterEach(()=>{
@@ -57,7 +57,7 @@ describe('optional Hermes factory at the actual Gary dispatcher boundary',()=>{
       expect(value.actionId).toBe(String(row.id));expect(value.ticketId).toBe(row.ticket_linear_id);
       expect(value.fingerprint).toBe(row.state_fingerprint);expect(value.fingerprint.length).toBeGreaterThan(0);
       expect(value.provider).toBe(row.provider);expect(value.model).toBe(row.model);
-      expect(value.provider).toBe('deepseek');expect(value.model).toBe('deepseek-v4-pro');expect(value.repo).toBe('707-Labs/fixture');
+      expect(value.provider).toBe('openrouter');expect(value.model).toBe('deepseek/deepseek-v4.1-flash');expect(value.repo).toBe('707-Labs/fixture');
       expect(value.ledger).toBe(spend);expect(value.issue).toEqual(issue);expect(value.issue).not.toBe(issue);
       expect(Object.isFrozen(value)).toBe(true);expect(Object.isFrozen(value.issue)).toBe(true);
       expect(row.action_type).toBe('start_coding');expect(row.completed_at).toBeNull();
@@ -106,7 +106,7 @@ describe('optional Hermes factory at the actual Gary dispatcher boundary',()=>{
     deps.createAdmittedCodeLoop=value=>{admission=value;return async()=>offlineResult;};
     coding.mockImplementation(async handler=>{
       expect(()=>handler.assertCanPublish!()).not.toThrow();
-      recordActionStart(db,{ticketLinearId:issue.id,stateFingerprint:'newer-fingerprint',actionType:'start_coding',provider:'deepseek',model:'deepseek-v4-pro'});
+      recordActionStart(db,{ticketLinearId:issue.id,stateFingerprint:'newer-fingerprint',actionType:'start_coding',provider:'openrouter',model:'deepseek/deepseek-v4.1-flash'});
       expect(spend.status(issue.id)?.state).toBe('active');expect(()=>admission!.assertActive()).toThrow('canonical_action_superseded');
       handler.assertCanPublish!();published=true;return {status:'pr_opened',branch:'fixture',summary:'must not reach'};
     });

@@ -1109,11 +1109,11 @@ describe('canonical coding reserve role binding',()=>{
   const dir=mkdtempSync(join(tmpdir(),'handler-floor-')),path=join(dir,'spend.db'),ledger=new SpendLedger(path);
   try {
    ledger.createCampaign('protected',10);ledger.enrollTicket('protected',issue.id,10,{draftPr:true,codingReviewReserve:true});
-   const sql=new Database(path);sql.query("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES(?,'deepseek','deepseek-v4-pro',8192,5826855,5826855,'settled')").run(issue.id);sql.close();
+   const sql=new Database(path);sql.query("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES(?,'openrouter','deepseek/deepseek-v4.1-flash',8192,8099967,8099967,'settled')").run(issue.id);sql.close();
    f.deps.spend=ledger;
    const limits:number[]=[];
-   const fetch=ledger.guardedFetch('deepseek',(async(request:Request)=>{const body=await request.json();limits.push(body.max_tokens);return Response.json({id:'offline',type:'message',role:'assistant',model:'deepseek-v4-pro',content:[{type:'text',text:'offline'}],stop_reason:'end_turn',stop_sequence:null,usage:{input_tokens:1048576,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0}});}) as unknown as typeof globalThis.fetch);
-   const call=(max:number)=>fetch('https://api.deepseek.com/anthropic/v1/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek-v4-pro',max_tokens:max,messages:[{role:'user',content:'offline'}]})});
+   const fetch=ledger.guardedFetch('openrouter',(async(request:Request)=>{const body=await request.json();limits.push(body.max_tokens);return Response.json({id:'offline',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'offline'}],stop_reason:'end_turn',stop_sequence:null,usage:{input_tokens:1048576,output_tokens:1,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});}) as unknown as typeof globalThis.fetch);
+   const call=(max:number)=>fetch('https://openrouter.ai/api/v1/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens:max,messages:[{role:'user',content:'offline'}]})});
    f.review.mockImplementation(async()=>{await call(4096);return reviewResult();});
    f.complete.mockImplementation(async opts=>{await call(opts.maxTokens!);return 'offline PR text';});
    expect((await ledger.withSpendScope(issue.id,()=>f.invoke({draftPr:true}))).status).toBe('pr_opened');
@@ -1149,15 +1149,15 @@ describe('CODE ordinary executor cleanup fence through the real reviewer', () =>
         const approve = {type:'tool_use',id:'approve',name:'submit_review',input:{
           verdict:'approve',findings:[],advisory_notes:[],verification_report:'offline fixture only',
         }};
-        const physical = ledger.guardedFetch('deepseek', (async () => {
+        const physical = ledger.guardedFetch('openrouter', (async () => {
           physicalRequests++;
           const command = {type:'tool_use',id:'command',name:'run_bash',input:{command:'reviewer-child-timeout',timeout_seconds:1}};
-          return Response.json({id:'offline',type:'message',role:'assistant',model:'deepseek-v4-pro',
+          return Response.json({id:'offline',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',
             content:physicalRequests === 1 ? [command,...(sameTurn ? [approve] : [])] : [approve],
-            stop_reason:'tool_use',stop_sequence:null,usage:{input_tokens:10,output_tokens:5,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+            stop_reason:'tool_use',stop_sequence:null,usage:{input_tokens:10,output_tokens:5,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});
         }) as unknown as typeof fetch);
-        const provider = createProvider({name:'deepseek',apiKey:'offline-fixture-only',
-          baseUrl:'https://api.deepseek.com/anthropic',model:'deepseek-v4-pro',defaultBackoffMs:1000}, {fetch:physical});
+        const provider = createProvider({name:'openrouter',apiKey:'offline-fixture-only',
+          baseUrl:'https://openrouter.ai/api',model:'deepseek/deepseek-v4.1-flash',defaultBackoffMs:1000}, {fetch:physical});
         const glm = new GLMClient(createProviderChain([provider]));
         f.review.mockImplementation(args => realRunReviewer({...args, glm}));
         const run = () => ledger.withSpendScope(issue.id, () => f.invoke());
@@ -1195,13 +1195,13 @@ describe('CODE ordinary executor cleanup fence through the real reviewer', () =>
       restoreAfter(spyOn(processSeam,'runProcess')).mockImplementation(async (_binary,args) =>
         args[0]==='rm' ? checkResult(1) : args.at(-1)==='reviewer-child-timeout' ? {...checkResult(124),timedOut:true} : checkResult());
       f.factory.mockImplementation((path,opts)=>new DockerExecutor(path,{image:'offline-fixture-image',cleanupGuard:opts!.cleanupGuard!}));
-      const physical=ledger.guardedFetch('deepseek',(async()=>{physicalRequests++;return Response.json({usage:{input_tokens:1,output_tokens:1}});}) as unknown as typeof fetch);
+      const physical=ledger.guardedFetch('openrouter',(async()=>{physicalRequests++;return Response.json({usage:{input_tokens:1,output_tokens:1}});}) as unknown as typeof fetch);
       f.review.mockImplementation(async args=>{
         try { await args.executor.run('reviewer-child-timeout',{timeoutMs:1}); } catch { /* Simulate existing tool conversion. */ }
         expect(args.signal?.aborted).toBe(true);
         // Deliberately omit signal: the existing physical request guard must stop it before reservation/send.
-        await expect(physical('https://api.deepseek.com/anthropic/v1/messages',{method:'POST',headers:{'content-type':'application/json'},
-          body:JSON.stringify({model:'deepseek-v4-pro',max_tokens:32,messages:[{role:'user',content:'offline'}]})})).rejects.toThrow('executor_cleanup_uncertain');
+        await expect(physical('https://openrouter.ai/api/v1/messages',{method:'POST',headers:{'content-type':'application/json'},
+          body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens:32,messages:[{role:'user',content:'offline'}]})})).rejects.toThrow('executor_cleanup_uncertain');
         return reviewResult('approve');
       });
       await expect(ledger.withSpendScope(issue.id,()=>f.invoke())).rejects.toThrow('executor_cleanup_uncertain');

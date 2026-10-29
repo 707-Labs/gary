@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { z } from 'zod';
 import type { DB } from '../state/db.ts';
 import type { SpendLedger, SpendStatus } from '../spend.ts';
+import { PAID_ROUTE } from '../model-route.ts';
 import type { Executor } from '../executors/index.ts';
 import type { AgentLoopArgs } from '../agent/loop.ts';
 import { createGaryLoopAdapter, type GaryRuntimeLauncher } from './gary-loop-adapter.ts';
@@ -15,7 +16,7 @@ import { createAuditTrace, type AuditTrace } from './audit-trace.ts';
 import { canonicalArguments, canonicalizeConversation, finiteJson, sameConversation, type ConversationMessage } from './conversation.ts';
 import { HERMES_CANARY_CHILD_IMAGE, HERMES_CANARY_WORKER_IMAGE } from './activation.ts';
 
-export const READONLY_CANARY_POLICY = Object.freeze({version:2,provider:'deepseek',model:'deepseek-v4-pro',thinking:'disabled',
+export const READONLY_CANARY_POLICY = Object.freeze({version:3,provider:PAID_ROUTE.provider,model:PAID_ROUTE.model,thinking:'disabled',
   workerImage:HERMES_CANARY_WORKER_IMAGE,executorImage:HERMES_CANARY_CHILD_IMAGE,
   dockerExecutable:'/usr/local/bin/docker',dockerHost:'unix:///Users/tanner/.colima/default/docker.sock',
   maxRequests:3,maxTokens:1024,timeoutMs:120_000,temperature:0,capMicros:5_000_000,
@@ -90,7 +91,7 @@ async function body(request:Request|Response,signal:AbortSignal,max:number):Prom
 export function createReadonlyCanary(input:ReadonlyCanaryConfig,deps:ReadonlyCanaryDependencies) {
   let config:ReadonlyCanaryConfig;try{config=validate(input);}catch{return configFault();}
   const route=Object.freeze({...deps.route});
-  if(route.provider!=='deepseek'||route.model!=='deepseek-v4-pro'||typeof route.fetch!=='function'||typeof route.providerApiKey!=='string'||!route.providerApiKey)configFault();
+  if(route.provider!==PAID_ROUTE.provider||route.model!==PAID_ROUTE.model||typeof route.fetch!=='function'||typeof route.providerApiKey!=='string'||!route.providerApiKey)configFault();
   const fingerprint=sha(JSON.stringify({config,policy:READONLY_CANARY_POLICY}));
   const leaf=join(config.fixtureDirectory,config.runId),fixture=join(leaf,READONLY_CANARY_POLICY.fixtureFile);
   const readRow=()=>deps.db.query<Row,[string]>('SELECT * FROM hermes_readonly_canaries WHERE run_id=?').get(config.runId);
@@ -206,7 +207,7 @@ export function createReadonlyCanary(input:ReadonlyCanaryConfig,deps:ReadonlyCan
     }catch(e){error=true;if(!claimed&&e instanceof Error&&e.message==='readonly_canary_already_attempted')throw e;}
     finally{
       try{await child?.close();}catch{error=true;}
-      if(trace&&!traceClosed&&!trace.failed){try{if(!traceTerminal)trace.append({kind:'terminal',status:'error',iteration:modelRequests,phase:'hermes',modelState:{provider:'deepseek',model:'deepseek-v4-pro',thinking:READONLY_CANARY_POLICY.thinking,effort:'unknown'}});trace.close();}catch{error=true;}}
+      if(trace&&!traceClosed&&!trace.failed){try{if(!traceTerminal)trace.append({kind:'terminal',status:'error',iteration:modelRequests,phase:'hermes',modelState:{provider:PAID_ROUTE.provider,model:PAID_ROUTE.model,thinking:READONLY_CANARY_POLICY.thinking,effort:'unknown'}});trace.close();}catch{error=true;}}
       clearTimeout(timer);deps.signal?.removeEventListener('abort',abort);
     }
     try{

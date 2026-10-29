@@ -93,10 +93,10 @@ function runtimeFixture(options: { mode?: Mode; campaignCap?: number; allocation
     return outcome('iteration_cap');
   };
   const deps: Dependencies = { db, ledger, createExecutor, launch,
-    route: { provider: 'deepseek', model: 'deepseek-v4-pro', providerApiKey: KEY, fetch: async request => {
-      verify(() => expect(request.url).toBe('https://api.deepseek.com/anthropic/v1/messages')); requests++;
+    route: { provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash', providerApiKey: KEY, fetch: async request => {
+      verify(() => expect(request.url).toBe('https://openrouter.ai/api/v1/messages')); requests++;
       const body = await request.json(); upstreamThinking.push(body.thinking);
-      verify(() => { expect(body.model).toBe('deepseek-v4-pro'); expect(body.max_tokens).toBeLessThanOrEqual(1024); expect(body.thinking).toEqual({ type: 'disabled' });
+      verify(() => { expect(body.model).toBe('deepseek/deepseek-v4.1-flash'); expect(body.max_tokens).toBeLessThanOrEqual(1024); expect(body.thinking).toEqual({ type: 'disabled' });
         if (hooks.nativeSystem) expect(JSON.stringify(body.system)).not.toContain(hooks.nativeSystem); });
       let content: unknown[], stopReason: string;
       if (requests === 1 && mode !== 'missing-read') {
@@ -112,8 +112,8 @@ function runtimeFixture(options: { mode?: Mode; campaignCap?: number; allocation
           : JSON.stringify(answer);
         content = [{ type: 'text', text: answerText }]; stopReason = 'end_turn';
       }
-      return Response.json({ id: 'offline-reply-' + requests, type: 'message', role: 'assistant', model: 'deepseek-v4-pro', content, stop_reason: stopReason,
-        ...(mode === 'unknown-usage' ? {} : { usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }) });
+      return Response.json({ id: 'offline-reply-' + requests, type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash', content, stop_reason: stopReason,
+        ...(mode === 'unknown-usage' ? {} : { usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0 } }) });
     } } };
   return { ...f, db, ledger, dbPath, ledgerPath, deps, hooks, challenge, challengePath, expected, upstreamThinking,
     counts: () => ({ requests, launches, executorCreations, reads, closes }) };
@@ -150,7 +150,7 @@ for (const mode of ['unknown-key', 'duplicate-key', 'public-file', 'public-paren
 }
 
 test('actual host RPC, settled spend, read receipt and final answer yield a separate runtime receipt', async () => {
-  expect(READONLY_CANARY_POLICY).toMatchObject({ version: 2, thinking: 'disabled', maxRequests: 3, maxTokens: 1024, timeoutMs: 120_000 });
+  expect(READONLY_CANARY_POLICY).toMatchObject({ version: 3, provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash', thinking: 'disabled', maxRequests: 3, maxTokens: 1024, timeoutMs: 120_000 });
   const f = runtimeFixture(), canary = createReadonlyCanary(loadReadonlyCanaryConfig(f.path), f.deps);
   expect(f.counts()).toEqual({ requests: 0, launches: 0, executorCreations: 0, reads: 0, closes: 0 });
   expect(existsSync(f.challengePath())).toBe(false); expect(readdirSync(f.config.traceDirectory)).toEqual([]);
@@ -194,7 +194,7 @@ for (const mode of ['unknown-usage', 'missing-read', 'invalid-path', 'extra-answ
   if (mode === 'unknown-usage') {
     expect(f.counts().requests).toBe(1); expect(f.counts().reads).toBe(0);
     expect(f.ledger.status(f.config.allocationId)).toMatchObject({ state: 'closed', attemptCount: 1, unknownAttempts: 1,
-      chargedMicros: spendReservationMicros('deepseek', 1024) });
+      chargedMicros: spendReservationMicros('openrouter', 1024) });
   }
   if (mode === 'missing-read') { expect(f.counts().requests).toBe(1); expect(f.counts().reads).toBe(0); }
   if (mode === 'invalid-path') { expect(f.counts().requests).toBe(1); expect(f.counts().reads).toBe(0); }
@@ -321,11 +321,11 @@ for (const mode of ['draft', 'large-campaign', 'small-allocation', 'closed', 'wr
 });
 for (const unknown of [false, true]) test('preexisting ' + (unknown ? 'unknown' : 'settled') + ' spend cannot acquire a fresh smoke run', async () => {
   const f = runtimeFixture();
-  const guarded = f.ledger.guardedFetch('deepseek', (async () => Response.json({ id: 'prior-offline-attempt', type: 'message', role: 'assistant', model: 'deepseek-v4-pro',
+  const guarded = f.ledger.guardedFetch('openrouter', (async () => Response.json({ id: 'prior-offline-attempt', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash',
     content: [{ type: 'text', text: 'Earlier independent fixture' }], stop_reason: 'end_turn',
-    ...(unknown ? {} : { usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }) })) as unknown as typeof fetch);
-  await f.ledger.withSpendScope(f.config.allocationId, () => guarded('https://api.deepseek.com/anthropic/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'deepseek-v4-pro', max_tokens: 128, messages: [{ role: 'user', content: 'Offline fixture' }] }) }));
+    ...(unknown ? {} : { usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0 } }) })) as unknown as typeof fetch);
+  await f.ledger.withSpendScope(f.config.allocationId, () => guarded('https://openrouter.ai/api/v1/messages', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'deepseek/deepseek-v4.1-flash', provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens: 128, messages: [{ role: 'user', content: 'Offline fixture' }] }) }));
   expect(f.ledger.status(f.config.allocationId)!.attemptCount).toBe(1);
   expect(f.ledger.status(f.config.allocationId)!.unknownAttempts).toBe(unknown ? 1 : 0);
   await failClosed(f); expect(f.counts()).toEqual({ requests: 0, launches: 0, executorCreations: 0, reads: 0, closes: 0 });

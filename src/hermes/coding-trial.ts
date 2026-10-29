@@ -1,6 +1,7 @@
 /** One durable classify -> code trial. Composition is inert; admission owns all writes. */
 import { randomUUID } from 'node:crypto';
 import { HERMES_CODING_RUNTIME_POLICY } from './coding-runtime-policy.ts';
+import { PAID_ROUTE } from '../model-route.ts';
 import type { DB } from '../state/db.ts';
 import type { SpendLedger } from '../spend.ts';
 import { recordActionStart, recordActionEnd, type ActionOutcome } from '../state/queries.ts';
@@ -34,7 +35,7 @@ export function createCodingTrial(options:{db:DB;ledger:SpendLedger;issueId:stri
   };
   return Object.freeze({
     admit(input:Parameters<CodingTrial['admit']>[0]){
-      if(input.issueId!==issueId||input.repo!==repo||input.provider!=='deepseek'||input.model!=='deepseek-v4-pro'
+      if(input.issueId!==issueId||input.repo!==repo||input.provider!==PAID_ROUTE.provider||input.model!==PAID_ROUTE.model
         ||!['classify','start_coding'].includes(input.actionType))return reject('scope');
       // Per-connection durability is established even when Slack is disabled.
       db.exec('PRAGMA synchronous = FULL');

@@ -3,8 +3,10 @@ import { Database } from 'bun:sqlite';
 import { constants, openSync, closeSync, fstatSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, normalize } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { DM_CONVERSATION_POLICY as POLICY, DMReplyError, exactDMAllocation, type DMTurn, type DMText } from '../hermes/dm-conversation.ts';
-import type { SpendLedger } from '../spend.ts';
+import { DEEPSEEK_DM_CONVERSATION_POLICY, DM_CONVERSATION_POLICY as POLICY, DMReplyError, exactDMAllocation, type DMTurn, type DMText } from '../hermes/dm-conversation.ts';
+import { spendReservationMicros, type SpendLedger } from '../spend.ts';
+import { conversationFailureMessage } from './conversation-error.ts';
+import { boundedHistory, replacedHistoryPrefix, recordHistoryCompaction, migrateContextPolicy, rollbackContextPolicy, type ContextMigrationReceipt } from './context-policy.ts';
 
 export interface SlackConversationConfig { readonly version:1; readonly runId:string; readonly campaignId:string; readonly allocationId:string; readonly contextDirectory:string }
 const hash=(value:string)=>createHash('sha256').update(value).digest('hex');
@@ -25,11 +27,28 @@ export function loadSlackConversationConfig(path:string):SlackConversationConfig
     ||value.runId!=='hermes-dm-20261008'||value.campaignId!==value.runId||value.allocationId!=='local:hermes-dm-20261008-tanner')throw new Error('dm_config_rejected');
   return Object.freeze({version:1,runId:value.runId,campaignId:value.campaignId,allocationId:value.allocationId,contextDirectory:dirname(path)});
 }
-export function fingerprintSlackConversationConfig(config:SlackConversationConfig):string {
+function fingerprintConfig(config:SlackConversationConfig,policy:unknown):string {
   return hash(JSON.stringify({version:config.version,runId:config.runId,campaignId:config.campaignId,allocationId:config.allocationId,
-    contextDirectory:config.contextDirectory,policy:POLICY}));
+    contextDirectory:config.contextDirectory,policy}));
 }
-export interface SlackConversationInput { eventId:string; channel:string; ts:string; threadTs:string; text:string }
+export function fingerprintSlackConversationConfig(config:SlackConversationConfig):string {return fingerprintConfig(config,POLICY);}
+/** The immediate predecessor: v2 on the retired DeepSeek route. Migration moves a drained context from it to the current policy. */
+export function legacyFingerprintSlackConversationConfig(config:SlackConversationConfig):string {return fingerprintConfig(config,DEEPSEEK_DM_CONVERSATION_POLICY);}
+/** Operator-only: call after graceful drain, before starting the new runtime. */
+export function migrateSlackConversationPolicy(config:SlackConversationConfig):ContextMigrationReceipt|null {
+  privatePath(config.contextDirectory,true);const file=join(config.contextDirectory,'context.sqlite');privatePath(file,false);
+  const db=new Database(file,{strict:true,create:false});
+  try {return migrateContextPolicy(db,legacyFingerprintSlackConversationConfig(config),fingerprintSlackConversationConfig(config));}finally{db.close();}
+}
+export function rollbackSlackConversationPolicy(config:SlackConversationConfig):void {
+  privatePath(config.contextDirectory,true);const file=join(config.contextDirectory,'context.sqlite');privatePath(file,false);
+  const db=new Database(file,{strict:true,create:false});
+  try {rollbackContextPolicy(db,legacyFingerprintSlackConversationConfig(config),fingerprintSlackConversationConfig(config));}finally{db.close();}
+}
+export interface SlackConversationInput { eventId:string; channel:string; ts:string; threadTs:string; text:string;
+  engineering?: import('../hermes/conversation-engineering.ts').ConversationEngineeringCapability;
+  /** Host-only post-commit evidence; never a model callback or part of conversation history. */
+  onEngineeringOutcome?(outcome:'reply_committed'|'failed_clean'|'cleanup_unknown'):void }
 export type DMDelivery=(text:string,kind?:'answer'|'notice')=>Promise<'sent'|'unknown'|'not_sent'>;
 export interface SlackConversation {
   respond(input:SlackConversationInput,deliver:DMDelivery,signal:AbortSignal,isAvailable?:()=>boolean):Promise<void>;
@@ -37,6 +56,52 @@ export interface SlackConversation {
   ready():boolean;
 }
 interface Session { history:string; turns:number; blocked:number }
+/** Queue admission may recognize this event's exact guarded reservation; execution and delivery still require settlement. */
+export function createConversationQueueBudget(ledger:SpendLedger,config:Pick<SlackConversationConfig,'allocationId'|'campaignId'>) {
+  type Lease={assertActive:()=>void;baseline:number|null;reservation:{id:number;attemptCount:number}|null};
+  let active:Lease|undefined;
+  const status=()=>ledger.status(config.allocationId);
+  const ready=()=>{const s=status();return exactDMAllocation(s,config.allocationId,config.campaignId)&&s.unknownAttempts===0;};
+  const canStart=()=>{const s=status(),minimum=spendReservationMicros(POLICY.provider,POLICY.maxTokens);
+    return exactDMAllocation(s,config.allocationId,config.campaignId)&&s.unknownAttempts===0
+      &&s.remainingMicros>=minimum&&s.campaignCapMicros-s.campaignChargedMicros>=minimum;};
+  const canQueue=()=>{
+    if(canStart())return true;
+    const lease=active,reservation=lease?.reservation,s=status();
+    if(!lease||!reservation||!exactDMAllocation(s,config.allocationId,config.campaignId)
+      ||s.unknownAttempts!==1||s.attemptCount!==reservation.attemptCount)return false;
+    try {lease.assertActive();}catch{return false;}
+    const unresolved=ledger.unresolvedAttempts(config.allocationId);
+    return unresolved.length===1&&unresolved[0]!.id===reservation.id&&unresolved[0]!.state==='reserved';
+  };
+  async function run<T>(assertActive:()=>void,reply:()=>Promise<T>):Promise<T> {
+    if(active)throw new DMReplyError('dm_owner_changed');
+    const lease:Lease={assertActive,baseline:null,reservation:null};active=lease;
+    try {
+      return await ledger.withPaidRequestGuard(phase=>{
+        // A late child callback cannot borrow a newer event's ownership.
+        if(active!==lease)throw new DMReplyError('dm_owner_changed');
+        if(phase==='after_response')lease.reservation=null;
+        assertActive();
+        const s=status();
+        if(phase==='before_request'){
+          // The ledger reserves the actual request size, including smaller internal requests.
+          if(lease.baseline!==null||!ready())throw new DMReplyError('dm_budget_unavailable');
+          lease.baseline=s!.attemptCount;
+        }else if(phase==='before_send'){
+          const unresolved=ledger.unresolvedAttempts(config.allocationId);
+          if(lease.baseline===null||lease.reservation||!exactDMAllocation(s,config.allocationId,config.campaignId)
+            ||s.attemptCount!==lease.baseline+1||s.unknownAttempts!==1||unresolved.length!==1||unresolved[0]!.state!=='reserved')throw new DMReplyError('dm_budget_unavailable');
+          lease.reservation={id:unresolved[0]!.id,attemptCount:s.attemptCount};
+        }else{
+          if(lease.baseline===null||!ready()||s!.attemptCount!==lease.baseline+1)throw new DMReplyError('dm_budget_unavailable');
+          lease.baseline=null;
+        }
+      },reply);
+    }finally{if(active===lease)active=undefined;}
+  }
+  return {ready,canStart,canQueue,run};
+}
 export function createSlackConversation(options:{config:SlackConversationConfig;ledger:SpendLedger;reply:(turn:DMTurn)=>Promise<string>}):SlackConversation {
   const {config,ledger}=options,owner=randomUUID(),fingerprint=fingerprintSlackConversationConfig(config),file=join(config.contextDirectory,'context.sqlite');
   privatePath(config.contextDirectory,true);
@@ -55,56 +120,74 @@ export function createSlackConversation(options:{config:SlackConversationConfig;
       state TEXT NOT NULL CHECK(state IN ('queued','running','sent','failed','unknown')),input_sha256 TEXT NOT NULL,worker_name TEXT,cleanup INTEGER NOT NULL DEFAULT 0,error_code TEXT);`);
     db.query('INSERT OR IGNORE INTO control VALUES (1,?,0)').run(fingerprint);
     if((db.query('SELECT fingerprint FROM control WHERE id=1').get() as any)?.fingerprint!==fingerprint)throw new Error('dm_context_config_mismatch');
+    db.exec('CREATE TABLE IF NOT EXISTS history_compactions (event_key TEXT PRIMARY KEY,session_key TEXT NOT NULL,dropped_messages INTEGER NOT NULL,before_sha256 TEXT NOT NULL,after_sha256 TEXT NOT NULL,archived_history TEXT NOT NULL,archived_bytes INTEGER NOT NULL,created_at TEXT NOT NULL)');
     privatePath(file,false);
   }catch(error){db.close();throw error;}
   const pending=()=>Number((db.query("SELECT count(*) AS n FROM events WHERE cleanup=0").get() as any).n);
   const blocked=()=>Boolean((db.query('SELECT blocked FROM control WHERE id=1').get() as any).blocked);
   // A prior owner may have left a native process or model dispatch in flight. Never take it over.
   if(pending())db.query('UPDATE control SET blocked=1 WHERE id=1').run();
-  const allocationReady=()=>{const s=ledger.status(config.allocationId);return exactDMAllocation(s,config.allocationId,config.campaignId)&&s.unknownAttempts===0;};
+  const budget=createConversationQueueBudget(ledger,config),allocationReady=budget.ready;
   if(!allocationReady()){db.close();throw new Error('dm_budget_unavailable');}
   async function execute(input:SlackConversationInput,key:string,sessionKey:string,deliver:DMDelivery,signal:AbortSignal,isAvailable:()=>boolean):Promise<void> {
     let cleanup=true,errorCode:string|null=null,reply:string|undefined;
     try {
       const session=db.query<Session,[string]>('SELECT history,turns,blocked FROM sessions WHERE session_key=?').get(sessionKey)!;
-      if(!isAvailable()||signal.aborted||blocked()||session.blocked||!allocationReady())throw new DMReplyError('dm_turn_unavailable');
+      if(!isAvailable()||signal.aborted||blocked()||session.blocked||!budget.canStart())throw new DMReplyError('dm_turn_unavailable');
       const history=JSON.parse(session.history) as DMText[];
-      if(session.turns>=POLICY.maxTurns||Buffer.byteLength(JSON.stringify([...history,{role:'user',content:input.text}]))+POLICY.maxReplyBytes+100>POLICY.maxContextBytes)throw new DMReplyError('dm_context_limit');
+      if(session.turns>=POLICY.maxTurns||Buffer.byteLength(JSON.stringify(history))>POLICY.maxContextBytes)throw new DMReplyError('dm_context_limit');
+      let candidateHistory=history;
+      const compactHistory=(compacted:readonly DMText[])=>{
+        // Validate structure locally; the responder owns summary verification and the original audience binding.
+        const checked=boundedHistory(compacted,'',POLICY.maxContextBytes,0);
+        if(checked.dropped.length)throw new DMReplyError('dm_context_limit');
+        candidateHistory=checked.history;
+      };
       db.query("UPDATE events SET state='running' WHERE event_key=? AND owner=? AND state='queued'").run(key,owner);
-      reply=await options.reply({requestId:randomUUID(),ownerId:owner,allocationId:config.allocationId,campaignId:config.campaignId,
+      const assertActive=()=>{
+        const event=db.query<{state:string;owner:string;cleanup:number},[string]>('SELECT state,owner,cleanup FROM events WHERE event_key=?').get(key);
+        if(closed||!isAvailable()||blocked()||signal.aborted||event?.owner!==owner||event.state!=='running'||event.cleanup!==0)throw new DMReplyError('dm_owner_changed');
+      };
+      reply=await budget.run(assertActive,()=>options.reply({requestId:randomUUID(),ownerId:owner,allocationId:config.allocationId,campaignId:config.campaignId,
         authority:Object.freeze({surface:'private_dm',requesterId:'U0A9M5W16F8',teamId:'T0AA24R7VUZ',channelId:input.channel,threadTs:input.threadTs}),
-        history,text:input.text,signal,
-        assertActive:()=>{
-          if(closed||!isAvailable()||blocked()||signal.aborted||(db.query('SELECT state,owner FROM events WHERE event_key=?').get(key) as any)?.owner!==owner
-            ||(db.query('SELECT state FROM events WHERE event_key=?').get(key) as any)?.state!=='running')throw new DMReplyError('dm_owner_changed');
-        },
+        history,text:input.text,signal,compactHistory,...(input.engineering ? {engineering:input.engineering} : {}),
+        assertActive,
         recordWorker:name=>{if(!/^gary-hermes-worker-[a-f0-9-]{36}$/.test(name))throw new DMReplyError('dm_worker_binding_rejected');
           const result=db.query("UPDATE events SET worker_name=? WHERE event_key=? AND owner=? AND state='running' AND worker_name IS NULL").run(name,key,owner);
           if(result.changes!==1)throw new DMReplyError('dm_worker_binding_rejected');}
-      });
+      }));
       if(!isAvailable()||signal.aborted||blocked()||!allocationReady())throw new DMReplyError('dm_turn_unavailable');
       if(typeof reply!=='string'||!reply.trim()||Buffer.byteLength(reply)>POLICY.maxReplyBytes)throw new DMReplyError('dm_reply_rejected');
-      const next=[...history,{role:'user',content:input.text},{role:'assistant',content:reply}];
+      const compacted=boundedHistory(candidateHistory,input.text,POLICY.maxContextBytes,Buffer.byteLength(JSON.stringify(reply))+64);
+      const next=[...compacted.history,{role:'user',content:input.text},{role:'assistant',content:reply}];
       if(Buffer.byteLength(JSON.stringify(next))>POLICY.maxContextBytes)throw new DMReplyError('dm_context_limit');
       let delivery:'sent'|'unknown'|'not_sent'='unknown';
       try {delivery=await deliver(reply,'answer');}catch{/* An ambiguous send is never retried. */}
       db.transaction(()=>{
-        if(delivery==='sent')db.query('UPDATE sessions SET history=?,turns=turns+1 WHERE session_key=?').run(JSON.stringify(next),sessionKey);
+        if(delivery==='sent'){
+          if(JSON.stringify(history)!==JSON.stringify(compacted.history))recordHistoryCompaction(db,key,sessionKey,history,compacted.history,replacedHistoryPrefix(history,compacted.history));
+          db.query('UPDATE sessions SET history=?,turns=turns+1 WHERE session_key=?').run(JSON.stringify(next),sessionKey);
+        }
         else db.query('UPDATE sessions SET blocked=1 WHERE session_key=?').run(sessionKey);
         db.query('UPDATE events SET state=?,cleanup=1,error_code=? WHERE event_key=? AND owner=?').run(delivery==='sent'?'sent':delivery==='unknown'?'unknown':'failed',delivery==='sent'?null:'dm_delivery_'+delivery,key,owner);
       }).immediate();
+      input.onEngineeringOutcome?.(delivery==='sent'?'reply_committed':'failed_clean');
       return;
     }catch(error){
       errorCode=error instanceof DMReplyError?error.code:'dm_turn_failed';cleanup=error instanceof DMReplyError?error.cleanupConfirmed:false;
+      const unknownSpend=Boolean(ledger.status(config.allocationId)?.unknownAttempts);
       db.transaction(()=>{
         db.query('UPDATE sessions SET blocked=1 WHERE session_key=?').run(sessionKey);
         db.query("UPDATE events SET state='failed',cleanup=?,error_code=? WHERE event_key=? AND owner=?").run(cleanup?1:0,errorCode,key,owner);
-        if(!cleanup||ledger.status(config.allocationId)?.unknownAttempts)db.query('UPDATE control SET blocked=1 WHERE id=1').run();
+        if(!cleanup||unknownSpend)db.query('UPDATE control SET blocked=1 WHERE id=1').run();
       }).immediate();
-      if(!signal.aborted&&isAvailable())try {await deliver("I couldn't complete that reply. This thread is paused, and I won't retry the message automatically.",'notice');}catch{/* No retry. */}
+      input.onEngineeringOutcome?.(cleanup&&!unknownSpend?'failed_clean':'cleanup_unknown');
+      if(!signal.aborted&&isAvailable())try {await deliver(conversationFailureMessage(errorCode,cleanup,unknownSpend),'notice');}catch{/* No retry. */}
     }
   }
   function respond(input:SlackConversationInput,deliver:DMDelivery,signal:AbortSignal,isAvailable:()=>boolean=()=>true):Promise<void> {
+    // Preserve the ingress snapshot while queued; an opaque host capability keeps its identity.
+    input=Object.freeze({...input});
     if(closed||!isAvailable()||signal.aborted||!input.text.trim()||!/^Ev[A-Za-z0-9]{1,80}$/.test(input.eventId)
       ||!/^D[A-Z0-9]{5,32}$/.test(input.channel)||!/^\d{10,16}\.\d{6}$/.test(input.ts)||!/^\d{10,16}\.\d{6}$/.test(input.threadTs))return Promise.resolve();
     const key=config.runId+':'+input.eventId,messageKey=input.channel+':'+input.ts,sessionKey=input.channel+':'+input.threadTs;
@@ -116,7 +199,7 @@ export function createSlackConversation(options:{config:SlackConversationConfig;
       return claimed?deliver("I can't answer this message within the current conversation limits. No model call was made.",'notice').then(()=>{},()=>{}):Promise.resolve();
     };
     if(duplicate())return Promise.resolve();
-    if(queued>=POLICY.maxQueued||blocked()||!allocationReady()||Buffer.byteLength(input.text)>POLICY.maxInputBytes)return notice('dm_admission_limit');
+    if(queued>=POLICY.maxQueued||blocked()||!budget.canQueue()||Buffer.byteLength(input.text)>POLICY.maxInputBytes)return notice('dm_admission_limit');
     const accepted=db.transaction(()=>{
       if(duplicate()||db.query("SELECT 1 FROM events WHERE cleanup=0 AND owner<>?").get(owner)
         ||Number((db.query('SELECT count(*) AS n FROM events').get() as any).n)>=POLICY.maxAcceptedEvents)return false;

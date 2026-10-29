@@ -1,10 +1,13 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { executorGuardianDeadlineDelay, snapshotStandingEngineeringSessionWindow, type StandingEngineeringSessionWindow } from './guardian-deadline.ts';
 
 export interface ExecutorJobGuardianBinding {
   dockerHost: string; dockerBinary: string; dockerConfig: string; directory: string;
   journalId: string; invocationId: string; containerName: string; deadlineMs: number;
   databasePath: string; expectedBinding: string; ownerToken: string; ownerPid: number;
+  /** Host-only original admission window; absent for legacy jobs. */
+  standingSession?: StandingEngineeringSessionWindow;
 }
 export interface ExecutorJobGuardianReceipt {
   journalId: string; invocationId: string; containerId: string | null; absenceVerified: true;
@@ -35,6 +38,10 @@ async function bounded<T>(promise: Promise<T>, ms: number): Promise<T> {
 /** The anonymous pipes are the sole control channel; no sockets or inherited secrets. */
 export async function armExecutorJobGuardian(binding: ExecutorJobGuardianBinding): Promise<ExecutorJobGuardian> {
   if (process.platform === "win32" || binding.ownerPid !== process.pid) throw new Error("executor_guardian_owner_invalid");
+  binding = { ...binding, ...(binding.standingSession === undefined ? {} : {
+    standingSession: snapshotStandingEngineeringSessionWindow(binding.standingSession),
+  }) };
+  executorGuardianDeadlineDelay(binding, Date.now());
   const child = spawn(process.execPath, ["--no-env-file", fileURLToPath(new URL("./job-guardian-process.ts", import.meta.url))], {
     detached: true, stdio: ["pipe", "pipe", "pipe"],
     cwd: binding.directory,

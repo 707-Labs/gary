@@ -62,7 +62,7 @@ describe("reviewer shared deadlines", () => {
     let sdkCalls = 0;
     let maxRetries: number | undefined;
     const provider: LLMProvider = {
-      name: "deepseek", model: "offline-model", gate: createRateLimitGate(),
+      name: "openrouter", model: "offline-model", gate: createRateLimitGate(),
       defaultBackoffMs: 1_000, parse429: () => null,
       client: { messages: { create: async (_body: unknown, options: { signal?: AbortSignal; maxRetries?: number }) => {
         sdkCalls++;
@@ -119,7 +119,7 @@ describe("reviewer shared deadlines", () => {
           else signal?.addEventListener("abort", onAbort, { once: true });
         });
       },
-      chain: { providers: [{ name: "deepseek", model: "offline-model" }] },
+      chain: { providers: [{ name: "openrouter", model: "offline-model" }] },
     } as unknown as GLMClient;
     try {
       const result = await runReviewer({ ...args(glm), timeoutMs: 50 });
@@ -152,7 +152,7 @@ describe("reviewer shared deadlines", () => {
           queueMicrotask(() => parent.abort(new Error("offline caller cancelled")));
         });
       },
-      chain: { providers: [{ name: "deepseek", model: "offline-model" }] },
+      chain: { providers: [{ name: "openrouter", model: "offline-model" }] },
     } as unknown as GLMClient;
     try {
       const result = await runReviewer({ ...args(glm), signal: parent.signal });

@@ -8,6 +8,7 @@ import { createModelTransport, type ModelTransportOptions, type ModelTransportFa
 import { snapshotLongTestPolicy, type LongTestPolicy, type LongTestCommand } from '../verification-policy.ts';
 import type { ExecutorJobJournal, RunOpts } from '../executors/index.ts';
 import type { SpendLedger } from '../spend.ts';
+import { PAID_ROUTE } from '../model-route.ts';
 import type { AgentLoopResult } from '../agent/loop.ts';
 import type { ProductiveProgressGuard } from './progress-guard.ts';
 import { auditErrorCode, fingerprintBytes, fingerprintJson, type AuditTrace, type AuditPhase, type AuditToolName } from './audit-trace.ts';
@@ -20,10 +21,10 @@ export interface SessionOptions {
   admission: AdmittedSession;
   capabilityToken: string;
   ledger: SpendLedger;
-  provider: 'z.ai' | 'deepseek';
-  model: 'glm-5.3' | 'deepseek-v4-pro';
+  provider: 'z.ai' | typeof PAID_ROUTE.provider;
+  model: 'glm-5.3' | typeof PAID_ROUTE.model;
   providerApiKey: string;
-  /** Trusted DeepSeek host policy; never read from native request JSON. */
+  /** Trusted host policy for the paid OpenRouter route; never read from native request JSON. */
   thinking?: 'disabled';
   /** Mandatory injection. Offline tests use a fake; only a reviewed host may supply real fetch. */
   fetch: ModelTransportOptions['fetch'];
@@ -65,9 +66,9 @@ export function createSessionHost(options: SessionOptions) {
       || (options.trace.binding.ticketId !== undefined && options.trace.binding.ticketId !== admission.ticketId))) throw new Error('trace admission mismatch');
   if (token.length < 32 || !admission.actionId || !admission.fingerprint || !admission.requestId
       || !Number.isFinite(admission.deadlineMs)) throw new Error('invalid admitted session');
-  if (options.model !== (options.provider === 'z.ai' ? 'glm-5.3' : 'deepseek-v4-pro')) throw new Error('unpriced provider/model pair');
+  if (options.model !== (options.provider === 'z.ai' ? 'glm-5.3' : PAID_ROUTE.model)) throw new Error('unpriced provider/model pair');
   const thinking=options.thinking;
-  if (thinking !== undefined && (thinking !== 'disabled' || options.provider !== 'deepseek')) throw new Error('invalid host thinking policy');
+  if (thinking !== undefined && (thinking !== 'disabled' || options.provider !== PAID_ROUTE.provider)) throw new Error('invalid host thinking policy');
   const longTestPolicy = options.longTestPolicy === undefined ? undefined : snapshotLongTestPolicy(options.longTestPolicy);
   if ((longTestPolicy !== undefined) !== (options.executorJobJournal !== undefined) || (longTestPolicy && options.readOnly)) throw new Error('invalid_long_test_binding');
   const cancellation = new AbortController();
@@ -155,7 +156,7 @@ export function createSessionHost(options: SessionOptions) {
     ledger: options.ledger,
     capability: { ticketId: admission.ticketId, ownerId: admission.ownerEpoch,
       ...(options.provider === 'z.ai' ? { provider: 'z.ai' as const, model: 'glm-5.3' as const }
-        : { provider: 'deepseek' as const, model: 'deepseek-v4-pro' as const }), deadlineMs: admission.deadlineMs,
+        : { provider: PAID_ROUTE.provider, model: PAID_ROUTE.model }), deadlineMs: admission.deadlineMs,
       allowedToolNames: bridge.definitions.map(t => t.function.name),
       signal: cancellation.signal,
     },

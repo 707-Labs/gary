@@ -1,0 +1,205 @@
+{
+  "version": 1,
+  "provenance": [
+    {
+      "path": "validation/offline04-control-evidence/offline04-no-edit-capture.json",
+      "sha256": "88b8ca718f0b6fc8e443891295a274b7e0373ac5b4242b6c4c2ec4335587a79b"
+    },
+    {
+      "path": "validation/offline04-control-evidence/offline04-corrected-capture.json",
+      "sha256": "4fcd82ef5f410190f221e82a2cb0b6fcb7cc0b36c0902e44bc206e60831dbb39"
+    }
+  ],
+  "commands": [
+    {
+      "phase": "author",
+      "command": "bun install --frozen-lockfile --offline --ignore-scripts",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'umask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) || exit 1\n{ ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\"\n__hermes_fns=$(declare -F | awk '\"'\"'{print $3}'\"'\"' | grep -vE '\"'\"'^_[^_]'\"'\"') || true\n[ -n \"$__hermes_fns\" ] && declare -f $__hermes_fns >> \"$__hermes_snap_tmp\" 2>/dev/null || true\nalias -p >> \"$__hermes_snap_tmp\"\necho '\"'\"'shopt -s expand_aliases'\"'\"' >> \"$__hermes_snap_tmp\"\necho '\"'\"'set +e'\"'\"' >> \"$__hermes_snap_tmp\"\necho '\"'\"'set +u'\"'\"' >> \"$__hermes_snap_tmp\"\nmv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh || rm -f \"$__hermes_snap_tmp\"\nbuiltin cd -- /workspace 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\n'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'if [ -f '\"'\"'\\'\"'\"''\"'\"'CLAUDE.md'\"'\"'\\'\"'\"''\"'\"' ]; then wc -c < '\"'\"'\\'\"'\"''\"'\"'CLAUDE.md'\"'\"'\\'\"'\"''\"'\"' 2>/dev/null; elif [ -e '\"'\"'\\'\"'\"''\"'\"'CLAUDE.md'\"'\"'\\'\"'\"''\"'\"' ]; then echo __hermes_not_regular__; else exit 1; fi'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'head -c 1000 '\"'\"'\\'\"'\"''\"'\"'CLAUDE.md'\"'\"'\\'\"'\"''\"'\"' 2>/dev/null | base64'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'sed -n '\"'\"'\\'\"'\"''\"'\"'1,500p'\"'\"'\\'\"'\"''\"'\"' '\"'\"'\\'\"'\"''\"'\"'CLAUDE.md'\"'\"'\\'\"'\"''\"'\"' | cut -b1-8001'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'wc -l < '\"'\"'\\'\"'\"''\"'\"'CLAUDE.md'\"'\"'\\'\"'\"''\"'\"''\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'tail -c 1 '\"'\"'\\'\"'\"''\"'\"'CLAUDE.md'\"'\"'\\'\"'\"''\"'\"' | wc -l'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'if [ -f '\"'\"'\\'\"'\"''\"'\"'src/lib/utils/scryfall-url.ts'\"'\"'\\'\"'\"''\"'\"' ]; then wc -c < '\"'\"'\\'\"'\"''\"'\"'src/lib/utils/scryfall-url.ts'\"'\"'\\'\"'\"''\"'\"' 2>/dev/null; elif [ -e '\"'\"'\\'\"'\"''\"'\"'src/lib/utils/scryfall-url.ts'\"'\"'\\'\"'\"''\"'\"' ]; then echo __hermes_not_regular__; else exit 1; fi'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'head -c 1000 '\"'\"'\\'\"'\"''\"'\"'src/lib/utils/scryfall-url.ts'\"'\"'\\'\"'\"''\"'\"' 2>/dev/null | base64'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'sed -n '\"'\"'\\'\"'\"''\"'\"'1,500p'\"'\"'\\'\"'\"''\"'\"' '\"'\"'\\'\"'\"''\"'\"'src/lib/utils/scryfall-url.ts'\"'\"'\\'\"'\"''\"'\"' | cut -b1-8001'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'wc -l < '\"'\"'\\'\"'\"''\"'\"'src/lib/utils/scryfall-url.ts'\"'\"'\\'\"'\"''\"'\"''\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'tail -c 1 '\"'\"'\\'\"'\"''\"'\"'src/lib/utils/scryfall-url.ts'\"'\"'\\'\"'\"''\"'\"' | wc -l'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'if [ -f '\"'\"'\\'\"'\"''\"'\"'src/lib/utils/scryfall-url.test.ts'\"'\"'\\'\"'\"''\"'\"' ]; then wc -c < '\"'\"'\\'\"'\"''\"'\"'src/lib/utils/scryfall-url.test.ts'\"'\"'\\'\"'\"''\"'\"' 2>/dev/null; elif [ -e '\"'\"'\\'\"'\"''\"'\"'src/lib/utils/scryfall-url.test.ts'\"'\"'\\'\"'\"''\"'\"' ]; then echo __hermes_not_regular__; else exit 1; fi'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'ls -1 '\"'\"'\\'\"'\"''\"'\"'src/lib/utils'\"'\"'\\'\"'\"''\"'\"' 2>/dev/null'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'ls -1 '\"'\"'\\'\"'\"''\"'\"'src/lib/utils'\"'\"'\\'\"'\"''\"'\"' 2>/dev/null | head -50'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'if [ -f '\"'\"'\\'\"'\"''\"'\"'package.json'\"'\"'\\'\"'\"''\"'\"' ]; then wc -c < '\"'\"'\\'\"'\"''\"'\"'package.json'\"'\"'\\'\"'\"''\"'\"' 2>/dev/null; elif [ -e '\"'\"'\\'\"'\"''\"'\"'package.json'\"'\"'\\'\"'\"''\"'\"' ]; then echo __hermes_not_regular__; else exit 1; fi'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'head -c 1000 '\"'\"'\\'\"'\"''\"'\"'package.json'\"'\"'\\'\"'\"''\"'\"' 2>/dev/null | base64'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'sed -n '\"'\"'\\'\"'\"''\"'\"'1,500p'\"'\"'\\'\"'\"''\"'\"' '\"'\"'\\'\"'\"''\"'\"'package.json'\"'\"'\\'\"'\"''\"'\"' | cut -b1-8001'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'wc -l < '\"'\"'\\'\"'\"''\"'\"'package.json'\"'\"'\\'\"'\"''\"'\"''\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'tail -c 1 '\"'\"'\\'\"'\"''\"'\"'package.json'\"'\"'\\'\"'\"''\"'\"' | wc -l'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'pwd'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'printf bounded-observation'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'test -f src/lib/utils/scryfall-url.ts'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "verifier",
+      "command": "set -euo pipefail\n# gary-hermes-git-evidence-v1\nnode -e '\nconst {spawnSync}=require('\\''node:child_process'\\'');\nconst {createHash}=require('\\''node:crypto'\\'');\nconst [base,allowedRaw]=process.argv.slice(1), allowed=JSON.parse(allowedRaw);\nconst hash=x=>createHash('\\''sha256'\\'').update(x).digest('\\''hex'\\'');\nfunction git(args, ok=[0]) {\n const r=spawnSync('\\''git'\\'',['\\''--no-optional-locks'\\'','\\''--literal-pathspecs'\\'','\\''-c'\\'','\\''core.fsmonitor=false'\\'','\\''-c'\\'','\\''core.untrackedCache=false'\\'',...args],\n  {encoding:'\\''utf8'\\'',maxBuffer:8*1024*1024,env:{...process.env,GIT_OPTIONAL_LOCKS:'\\''0'\\'',GIT_CONFIG_NOSYSTEM:'\\''1'\\'',GIT_CONFIG_GLOBAL:'\\''/dev/null'\\'',GIT_PAGER:'\\''cat'\\''}});\n if(r.error||r.signal||!ok.includes(r.status)) throw Error('\\''git_snapshot_failed'\\'');\n return r.stdout;\n}\nconst list=x=>x.split('\\''\\0'\\'').filter(Boolean);\nconst stable=x=>JSON.stringify(x);\ntry {\n if(git(['\\''rev-parse'\\'','\\''--verify'\\'',base+'\\''^{commit}'\\'']).trim()!==base) throw Error('\\''base_changed'\\'');\n const head=git(['\\''rev-parse'\\'','\\''--verify'\\'','\\''HEAD'\\'']).trim();\n const status=git(['\\''status'\\'','\\''--porcelain=v1'\\'','\\''-z'\\'','\\''--untracked-files=all'\\'']);\n const tracked=list(git(['\\''diff'\\'','\\''--no-ext-diff'\\'','\\''--no-textconv'\\'','\\''--no-renames'\\'','\\''--name-only'\\'','\\''-z'\\'',base,'\\''--'\\'']));\n const untracked=list(git(['\\''ls-files'\\'','\\''--others'\\'','\\''--exclude-standard'\\'','\\''-z'\\'']));\n const changedFiles=[...new Set([...tracked,...untracked])].sort();\n if(changedFiles.length>128||changedFiles.some(p=>p.length>512||/[\\\\\\r\\n*?\\[\\]:]/.test(p)||p.split('\\''/'\\'').some(s=>!s||s==='\\''.'\\''||s==='\\''..'\\''))) throw Error('\\''path_limit'\\'');\n const patches=changedFiles.filter(p=>allowed.includes(p)).map(path=>({path,sha256:hash(untracked.includes(path)\n  ?git(['\\''diff'\\'','\\''--no-index'\\'','\\''--no-ext-diff'\\'','\\''--no-textconv'\\'','\\''--binary'\\'','\\''--'\\'','\\''/dev/null'\\'',path],[0,1])\n  :git(['\\''diff'\\'','\\''--no-ext-diff'\\'','\\''--no-textconv'\\'','\\''--no-renames'\\'','\\''--binary'\\'',base,'\\''--'\\'',path]))}));\n if(head!==git(['\\''rev-parse'\\'','\\''--verify'\\'','\\''HEAD'\\'']).trim()||status!==git(['\\''status'\\'','\\''--porcelain=v1'\\'','\\''-z'\\'','\\''--untracked-files=all'\\''])) throw Error('\\''workspace_changed'\\'');\n const workspaceDigest=hash(stable({changedFiles,patches}));\n console.log(JSON.stringify({version:1,baseCommit:base,head,changedFiles,workspaceDigest,\n  taskDiffDigest:changedFiles.length&&changedFiles.every(p=>allowed.includes(p))?workspaceDigest:null,statusDigest:hash(status)}));\n} catch { console.error('\\''git_snapshot_failed'\\''); process.exit(1); }\n' -- '__BASE_COMMIT__' '[\"src/lib/utils/scryfall-url.test.ts\",\"src/lib/utils/scryfall-url.ts\"]'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'cat '\"'\"'\\'\"'\"''\"'\"'/workspace/src/lib/utils/scryfall-url.test.ts'\"'\"'\\'\"'\"''\"'\"' 2>/dev/null'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'head -c 4096 '\"'\"'\\'\"'\"''\"'\"'/workspace/src/lib/utils/scryfall-url.test.ts'\"'\"'\\'\"'\"''\"'\"' 2>/dev/null'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'head -c 3 '\"'\"'\\'\"'\"''\"'\"'/workspace/src/lib/utils/scryfall-url.test.ts'\"'\"'\\'\"'\"''\"'\"' 2>/dev/null'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'set -e; d='\"'\"'\\'\"'\"''\"'\"'/workspace/src/lib/utils'\"'\"'\\'\"'\"''\"'\"'; t='\"'\"'\\'\"'\"''\"'\"'/workspace/src/lib/utils/scryfall-url.test.ts'\"'\"'\\'\"'\"''\"'\"'; if [ -L \"$t\" ]; then rt=\"$(readlink -f \"$t\" 2>/dev/null || realpath \"$t\" 2>/dev/null || true)\"; [ -n \"$rt\" ] && { t=\"$rt\"; d=\"$(dirname \"$t\")\"; }; fi; mkdir -p \"$d\"; tmp=\"$(mktemp -p \"$d\" '\"'\"'\\'\"'\"''\"'\"'.hermes-tmp.XXXXXX'\"'\"'\\'\"'\"''\"'\"' 2>/dev/null || mktemp \"$d/.hermes-tmp.$$.XXXXXX\" 2>/dev/null || { tmp=\"$d/.hermes-tmp.$$\"; : > \"$tmp\" && echo \"$tmp\"; })\"; [ -n \"$tmp\" ] || { echo \"atomic write: could not create temp file\" >&2; exit 1; }; trap '\"'\"'\\'\"'\"''\"'\"'rm -f \\\"$tmp\\\"'\"'\"'\\'\"'\"''\"'\"' EXIT; if [ -e \"$t\" ]; then m=\"$(stat -c%a \"$t\" 2>/dev/null || stat -f%Lp \"$t\" 2>/dev/null || true)\"; [ -n \"$m\" ] && chmod \"$m\" \"$tmp\" 2>/dev/null || true; fi; cat > \"$tmp\"; if [ ! -e \"$t\" ]; then chmod \"=rw\" \"$tmp\" 2>/dev/null || true; fi; mv -f \"$tmp\" \"$t\"; trap - EXIT'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": "import { expect, test } from 'bun:test';\nimport { parseScryfallUrl } from './scryfall-url';\ntest('accepts exact Scryfall host', () => expect(parseScryfallUrl('https://scryfall.com/card/lea/1')).toEqual({set:'lea',number:'1'}));\ntest('rejects prefixed attacker hostname', () => expect(parseScryfallUrl('https://evilscryfall.com/card/lea/1')).toBeNull());\ntest('accepts real subdomain boundary', () => expect(parseScryfallUrl('https://www.scryfall.com/card/lea/1')).toEqual({set:'lea',number:'1'}));\n"
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'sha256sum '\"'\"'\\'\"'\"''\"'\"'/workspace/src/lib/utils/scryfall-url.test.ts'\"'\"'\\'\"'\"''\"'\"' 2>/dev/null'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'command -v npx >/dev/null 2>&1 && echo '\"'\"'\\'\"'\"''\"'\"'yes'\"'\"'\\'\"'\"''\"'\"''\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'bun --no-env-file --no-install test src/lib/utils/scryfall-url.test.ts'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'cat '\"'\"'\\'\"'\"''\"'\"'src/lib/utils/scryfall-url.ts'\"'\"'\\'\"'\"''\"'\"''\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'head -c 3 '\"'\"'\\'\"'\"''\"'\"'src/lib/utils/scryfall-url.ts'\"'\"'\\'\"'\"''\"'\"' 2>/dev/null'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'set -e; d='\"'\"'\\'\"'\"''\"'\"'src/lib/utils'\"'\"'\\'\"'\"''\"'\"'; t='\"'\"'\\'\"'\"''\"'\"'src/lib/utils/scryfall-url.ts'\"'\"'\\'\"'\"''\"'\"'; if [ -L \"$t\" ]; then rt=\"$(readlink -f \"$t\" 2>/dev/null || realpath \"$t\" 2>/dev/null || true)\"; [ -n \"$rt\" ] && { t=\"$rt\"; d=\"$(dirname \"$t\")\"; }; fi; mkdir -p \"$d\"; tmp=\"$(mktemp -p \"$d\" '\"'\"'\\'\"'\"''\"'\"'.hermes-tmp.XXXXXX'\"'\"'\\'\"'\"''\"'\"' 2>/dev/null || mktemp \"$d/.hermes-tmp.$$.XXXXXX\" 2>/dev/null || { tmp=\"$d/.hermes-tmp.$$\"; : > \"$tmp\" && echo \"$tmp\"; })\"; [ -n \"$tmp\" ] || { echo \"atomic write: could not create temp file\" >&2; exit 1; }; trap '\"'\"'\\'\"'\"''\"'\"'rm -f \\\"$tmp\\\"'\"'\"'\\'\"'\"''\"'\"' EXIT; if [ -e \"$t\" ]; then m=\"$(stat -c%a \"$t\" 2>/dev/null || stat -f%Lp \"$t\" 2>/dev/null || true)\"; [ -n \"$m\" ] && chmod \"$m\" \"$tmp\" 2>/dev/null || true; fi; cat > \"$tmp\"; if [ ! -e \"$t\" ]; then chmod \"=rw\" \"$tmp\" 2>/dev/null || true; fi; mv -f \"$tmp\" \"$t\"; trap - EXIT'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": "/**\n * Parse a Scryfall card page URL to extract set code and collector number.\n *\n * Supports formats:\n * - https://scryfall.com/card/{set}/{number}\n * - https://scryfall.com/card/{set}/{number}/{name}\n * - scryfall.com/card/{set}/{number}\n * - scryfall.com/card/{set}/{number}/{name}\n */\nexport function parseScryfallUrl(url: string): { set: string; number: string } | null {\n  // Normalize URL - add https:// if missing\n  let normalized = url.trim();\n  if (!normalized.startsWith('http://') && !normalized.startsWith('https://')) {\n    normalized = 'https://' + normalized;\n  }\n\n  try {\n    const parsed = new URL(normalized);\n\n    // Check it's actually scryfall.com\n    if (parsed.hostname !== 'scryfall.com' && !parsed.hostname.endsWith('.scryfall.com')) {\n      return null;\n    }\n\n    // Path should be /card/{set}/{number} or /card/{set}/{number}/{name}\n    const pathParts = parsed.pathname.split('/').filter(Boolean);\n\n    if (pathParts.length < 3 || pathParts[0] !== 'card') {\n      return null;\n    }\n\n    const set = pathParts[1];\n    const number = pathParts[2];\n\n    if (!set || !number) {\n      return null;\n    }\n\n    return { set, number };\n  } catch {\n    return null;\n  }\n}\n"
+    },
+    {
+      "phase": "author",
+      "command": "exec bash -c 'source /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh >/dev/null 2>&1 || true\nexport AI_AGENT=\"${AI_AGENT:-hermes-agent}\" HERMES_AGENT=\"${HERMES_AGENT:-true}\"\nbuiltin cd -- /workspace || exit 126\neval '\"'\"'sha256sum '\"'\"'\\'\"'\"''\"'\"'src/lib/utils/scryfall-url.ts'\"'\"'\\'\"'\"''\"'\"' 2>/dev/null'\"'\"'\n__hermes_ec=$?\numask 077\n__hermes_snap_tmp=$(mktemp /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh.tmp.XXXXXXXXXX) && { { ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} AI_AGENT HERMES_AGENT HERMES_UI_SESSION_ID 2>/dev/null; export -p; ) || true; } > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" /tmp/hermes-snap-__SNAPSHOT_NONCE__.sh; } 2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true\nprintf '\"'\"'\\n__HERMES_CWD___SNAPSHOT_NONCE____%s__HERMES_CWD___SNAPSHOT_NONCE____\\n'\"'\"' \"$(pwd -P)\"\nexit $__hermes_ec'",
+      "stdin": null
+    },
+    {
+      "phase": "verifier",
+      "command": "set -e\nif git --no-optional-locks --literal-pathspecs -c core.fsmonitor=false ls-files --error-unmatch -- 'src/lib/utils/scryfall-url.test.ts' >/dev/null 2>&1; then git --no-optional-locks --literal-pathspecs -c core.fsmonitor=false diff --no-ext-diff --no-textconv --no-renames --binary '__BASE_COMMIT__' -- 'src/lib/utils/scryfall-url.test.ts'; else git --no-optional-locks --literal-pathspecs -c core.fsmonitor=false diff --no-index --no-ext-diff --no-textconv --binary -- /dev/null 'src/lib/utils/scryfall-url.test.ts' || test \"$?\" = 1; fi\nif git --no-optional-locks --literal-pathspecs -c core.fsmonitor=false ls-files --error-unmatch -- 'src/lib/utils/scryfall-url.ts' >/dev/null 2>&1; then git --no-optional-locks --literal-pathspecs -c core.fsmonitor=false diff --no-ext-diff --no-textconv --no-renames --binary '__BASE_COMMIT__' -- 'src/lib/utils/scryfall-url.ts'; else git --no-optional-locks --literal-pathspecs -c core.fsmonitor=false diff --no-index --no-ext-diff --no-textconv --binary -- /dev/null 'src/lib/utils/scryfall-url.ts' || test \"$?\" = 1; fi",
+      "stdin": null
+    },
+    {
+      "phase": "verifier",
+      "command": "bun install --frozen-lockfile --offline --ignore-scripts",
+      "stdin": null
+    },
+    {
+      "phase": "verifier",
+      "command": "bun --no-env-file --no-install test src/lib/utils/scryfall-url.test.ts",
+      "stdin": null
+    }
+  ]
+}

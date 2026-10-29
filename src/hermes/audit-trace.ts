@@ -11,6 +11,7 @@
  */
 import { readRuntimeDiagnostic, type RuntimeDiagnostic } from "./runtime-diagnostics.ts";
 import { createHash } from "node:crypto";
+import { LEGACY_DEEPSEEK_ROUTE, PAID_ROUTE } from "../model-route.ts";
 import { constants, closeSync, fchmodSync, fstatSync, fsyncSync, lstatSync, openSync, realpathSync, writeSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 
@@ -20,8 +21,9 @@ export interface AuditTraceBinding {
 export interface AuditFingerprint { readonly bytes: number; readonly sha256: string }
 export type AuditPhase = "unknown" | "single" | "hermes" | "investigation" | "implementation" | "validation" | "review" | "publication";
 export interface AuditModelState {
-  provider: "unknown" | "deepseek" | "z.ai";
-  model: "unknown" | "deepseek-v4-pro" | "glm-5.3";
+  /** "deepseek" / "deepseek-v4-pro" appear only in traces written before the OpenRouter cutover. */
+  provider: "unknown" | typeof PAID_ROUTE.provider | typeof LEGACY_DEEPSEEK_ROUTE.provider | "z.ai";
+  model: "unknown" | typeof PAID_ROUTE.model | typeof LEGACY_DEEPSEEK_ROUTE.model | "glm-5.3";
   /** Only explicitly selected request settings. Provider defaults stay unknown. */
   thinking: "unknown" | "enabled" | "disabled" | "adaptive";
   effort: "unknown" | "low" | "medium" | "high" | "max";
@@ -101,10 +103,12 @@ function context(value: Record<string, unknown>): void {
   if ((value.iteration !== "unknown" && !natural(value.iteration, 1_000_000)) || !phases.has(value.phase as string) || !object(value.modelState)) throw new AuditTraceError("invalid_trace_event");
   const model = value.modelState;
   only(model, ["provider", "model", "thinking", "effort", "thinkingBudgetTokens"]);
-  if (!["unknown", "deepseek", "z.ai"].includes(model.provider as string) || !["unknown", "deepseek-v4-pro", "glm-5.3"].includes(model.model as string)
+  if (!["unknown", PAID_ROUTE.provider, LEGACY_DEEPSEEK_ROUTE.provider, "z.ai"].includes(model.provider as string)
+      || !["unknown", PAID_ROUTE.model, LEGACY_DEEPSEEK_ROUTE.model, "glm-5.3"].includes(model.model as string)
       || !["unknown", "enabled", "disabled", "adaptive"].includes(model.thinking as string)
       || !["unknown", "low", "medium", "high", "max"].includes(model.effort as string)
-      || (model.provider === "deepseek" && !["unknown", "deepseek-v4-pro"].includes(model.model as string))
+      || (model.provider === LEGACY_DEEPSEEK_ROUTE.provider && !["unknown", LEGACY_DEEPSEEK_ROUTE.model].includes(model.model as string))
+      || (model.provider === PAID_ROUTE.provider && !["unknown", PAID_ROUTE.model].includes(model.model as string))
       || (model.provider === "z.ai" && !["unknown", "glm-5.3"].includes(model.model as string))
       || (Object.hasOwn(model, "thinkingBudgetTokens") && (model.thinking !== "enabled" || !natural(model.thinkingBudgetTokens, 1_048_576)))) throw new AuditTraceError("invalid_trace_event");
 }

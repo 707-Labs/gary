@@ -1,5 +1,9 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { log } from "../src/logger.ts";
+import type { ProviderConfig } from "../src/providers.ts";
+import { PAID_ROUTE } from "../src/model-route.ts";
 import {
+  loadProviderConfigs,
   loadReviewConfig,
   parseRepoMap,
   validateProviderRoute,
@@ -88,22 +92,23 @@ describe("loadReviewConfig", () => {
     setEnv("GARY_REVIEW_ITERATION_CAP", undefined);
     setEnv("GARY_REVIEW_TIMEOUT_MS", undefined);
     const cfg = loadReviewConfig();
-    expect(cfg.providerOrder).toEqual(["deepseek", "z.ai", "kimi"]);
+    expect(cfg.providerOrder).toEqual(["openrouter", "z.ai", "kimi"]);
     expect(cfg.maxRounds).toBe(3);
     expect(cfg.iterationCap).toBe(15);
     expect(cfg.timeoutMs).toBe(300_000);
   });
 
   it("respects GARY_REVIEWER_PROVIDER_ORDER", () => {
-    setEnv("GARY_REVIEWER_PROVIDER_ORDER", "kimi,deepseek");
+    setEnv("GARY_REVIEWER_PROVIDER_ORDER", "kimi,openrouter");
     const cfg = loadReviewConfig();
-    expect(cfg.providerOrder).toEqual(["kimi", "deepseek"]);
+    expect(cfg.providerOrder).toEqual(["kimi", "openrouter"]);
   });
 
-  it("ignores unknown provider names", () => {
+  it("fails loudly on unknown provider names, including the retired direct deepseek route", () => {
     setEnv("GARY_REVIEWER_PROVIDER_ORDER", "deepseek,gpt5,kimi");
-    const cfg = loadReviewConfig();
-    expect(cfg.providerOrder).toEqual(["deepseek", "kimi"]);
+    expect(() => loadReviewConfig()).toThrow(/GARY_REVIEWER_PROVIDER_ORDER.*deepseek, gpt5/);
+    setEnv("GARY_REVIEWER_PROVIDER_ORDER", "deepseek");
+    expect(() => loadReviewConfig()).toThrow(/GARY_REVIEWER_PROVIDER_ORDER/);
   });
 
   it("respects integer overrides", () => {
@@ -132,20 +137,19 @@ describe("validateProviderRoute", () => {
     ).not.toThrow();
     expect(() =>
       validateProviderRoute(
-        "deepseek",
-        "https://api.deepseek.com/anthropic",
-        "deepseek-v4-pro",
+        "openrouter",
+        "https://openrouter.ai/api",
+        "deepseek/deepseek-v4.1-flash",
       ),
     ).not.toThrow();
   });
 
-  it("rejects OpenRouter and arbitrary proxy endpoints", () => {
+  it("rejects proxy endpoints outside each provider's approved host", () => {
     expect(() =>
-      validateProviderRoute(
-        "deepseek",
-        "https://openrouter.ai/api/v1",
-        "deepseek-v4-pro",
-      ),
+      validateProviderRoute("kimi", "https://openrouter.ai/api", "k3"),
+    ).toThrow(/disallowed.*host/i);
+    expect(() =>
+      validateProviderRoute("openrouter", "https://api.deepseek.com/anthropic", "deepseek/deepseek-v4.1-flash"),
     ).toThrow(/disallowed.*host/i);
     expect(() =>
       validateProviderRoute("kimi", "http://api.kimi.com/coding", "k3"),
@@ -156,5 +160,53 @@ describe("validateProviderRoute", () => {
     expect(() =>
       validateProviderRoute("z.ai", "https://api.z.ai/api/anthropic", "glm-premium"),
     ).toThrow(/disallowed.*model/i);
+    for (const model of ["deepseek-v4-pro", "deepseek/deepseek-v4-pro", "openrouter/auto"]) {
+      expect(() =>
+        validateProviderRoute("openrouter", "https://openrouter.ai/api", model),
+      ).toThrow(/disallowed.*model/i);
+    }
+  });
+});
+
+describe("loadProviderConfigs without DEEPSEEK_API_KEY", () => {
+  const keys = ["Z_AI_API_KEY", "KIMI_API_KEY", "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY",
+    "OPENROUTER_BASE_URL", "OPENROUTER_MODEL", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL"];
+  const saved: Record<string, string | undefined> = {};
+  afterEach(() => {
+    for (const key of keys) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  });
+  const env = (values: Record<string, string>) => {
+    for (const key of keys) { saved[key] = process.env[key]; delete process.env[key]; }
+    Object.assign(process.env, values);
+  };
+
+  it("boots the paid route from OPENROUTER_API_KEY alone, without warnings", () => {
+    env({ Z_AI_API_KEY: "fake-zai", OPENROUTER_API_KEY: "fake-openrouter" });
+    const warn = spyOn(log, "warn").mockImplementation(() => {});
+    try { loadProviderConfigs(); expect(warn).not.toHaveBeenCalled(); } finally { warn.mockRestore(); }
+    const providers = loadProviderConfigs();
+    expect(providers.map((p) => p.name)).toEqual(["z.ai", "openrouter"]);
+    expect(providers[1]).toMatchObject({ apiKey: "fake-openrouter", baseUrl: PAID_ROUTE.baseUrl, model: PAID_ROUTE.model });
+  });
+
+  it("ignores a leftover DEEPSEEK_API_KEY with a warning and never builds a direct DeepSeek provider", () => {
+    env({ Z_AI_API_KEY: "fake-zai", OPENROUTER_API_KEY: "fake-openrouter", DEEPSEEK_API_KEY: "fake-deepseek",
+      DEEPSEEK_BASE_URL: "https://api.deepseek.com/anthropic", DEEPSEEK_MODEL: "deepseek-v4-pro" });
+    const warn = spyOn(log, "warn").mockImplementation(() => {});
+    let providers: readonly ProviderConfig[];
+    try { providers = loadProviderConfigs(); expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]![1]).toEqual({ variables: ["DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL"] });
+      expect(JSON.stringify(warn.mock.calls)).not.toContain("fake-deepseek");
+    } finally { warn.mockRestore(); }
+    expect(providers.map((p) => p.name)).toEqual(["z.ai", "openrouter"]);
+    expect(providers.some((p) => p.apiKey === "fake-deepseek" || p.baseUrl.includes("deepseek.com"))).toBe(false);
+  });
+
+  it("rejects an OPENROUTER_MODEL override off the approved route", () => {
+    env({ Z_AI_API_KEY: "fake-zai", OPENROUTER_API_KEY: "fake-openrouter", OPENROUTER_MODEL: "deepseek-v4-pro" });
+    expect(() => loadProviderConfigs()).toThrow(/disallowed.*model/i);
   });
 });

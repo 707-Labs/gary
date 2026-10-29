@@ -93,7 +93,63 @@ export interface ViewerInfo {
   type: "Bot" | "User";
 }
 
+/** Host-only App credential capsule for engineering acquisition. Never expose to
+ * a model, workspace, receipt or persistent Git configuration. */
+export interface GitHubEngineeringInstallationCredential {
+  kind: "app";
+  appId: number;
+  installationId: number;
+  accountLogin: string;
+  token: string;
+  issuedAtMs: number;
+  expiresAtMs: number;
+  permissions: { contents: "read" | "write"; pullRequests: "none" | "read" | "write" };
+}
+
+export interface GitHubEngineeringInstallationApi {
+  getInstallation(input: { installation_id: number; request: { timeout: number } }): Promise<{ data: unknown }>;
+  createInstallationAccessToken(input: { installation_id: number; request: { timeout: number } }): Promise<{ data: unknown }>;
+}
+
+/** RFC 6750 section 2.1 bearer syntax, bounded independently of issuer format.
+ * Installation tokens may contain JWT/base64 punctuation; never accept header
+ * controls, whitespace, Unicode, or embedded padding. */
+export function isGitHubEngineeringToken(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= 20 && value.length <= 4096
+    && /^[A-Za-z0-9._~+/-]+=*(?![\s\S])/.test(value);
+}
+
+/** Forces a new App installation token; cached clone URLs cannot establish
+ * current numeric repository authority or current installation permissions. */
+export async function readGitHubEngineeringInstallationCredential(api: GitHubEngineeringInstallationApi,
+  binding: { appId: number; installationId: number }, now: () => number = Date.now): Promise<GitHubEngineeringInstallationCredential> {
+  const fail = (): never => { throw new Error("github_engineering_installation_unavailable"); };
+  const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value);
+  try {
+    if (![binding.appId, binding.installationId].every(id => Number.isSafeInteger(id) && id > 0)) return fail();
+    const observed = (await api.getInstallation({ installation_id: binding.installationId, request: { timeout: 15_000 } })).data;
+    if (!object(observed) || observed.id !== binding.installationId || observed.app_id !== binding.appId
+        || observed.suspended_at !== null || !object(observed.account) || typeof observed.account.login !== "string"
+        || !/^[A-Za-z0-9][A-Za-z0-9-]{0,99}$/.test(observed.account.login) || !object(observed.permissions)) return fail();
+    const issuedAtMs = now();
+    const issued = (await api.createInstallationAccessToken({ installation_id: binding.installationId, request: { timeout: 15_000 } })).data;
+    if (!object(issued) || !isGitHubEngineeringToken(issued.token)
+        || typeof issued.expires_at !== "string" || !object(issued.permissions)) return fail();
+    const expiresAtMs = Date.parse(issued.expires_at);
+    if (!Number.isSafeInteger(expiresAtMs) || expiresAtMs <= now() || now() - issuedAtMs > 60_000) return fail();
+    const contents = issued.permissions.contents;
+    const pullRequests = issued.permissions.pull_requests ?? "none";
+    if ((contents !== "read" && contents !== "write") || !["none", "read", "write"].includes(String(pullRequests))
+        || contents !== observed.permissions.contents || pullRequests !== (observed.permissions.pull_requests ?? "none")) return fail();
+    return Object.freeze({ kind: "app", ...binding, accountLogin: observed.account.login, token: issued.token,
+      issuedAtMs, expiresAtMs, permissions: Object.freeze({ contents, pullRequests: pullRequests as "none" | "read" | "write" }) });
+  } catch { return fail(); }
+}
+
 export interface GitHubClient {
+  /** App clients only. Fresh authenticated installation metadata and issuance;
+   * absent on PAT clients. This method is never a model-facing tool. */
+  engineeringInstallationCredential?(): Promise<GitHubEngineeringInstallationCredential>;
   /**
    * Returns the URL to use with `git clone` and `git push`. The URL embeds an
    * installation token (App auth) or PAT (user auth). Tokens are short-lived
@@ -175,6 +231,7 @@ export interface GitHubClient {
 
 class AppGitHubClient implements GitHubClient {
   private readonly app: Octokit;
+  private readonly appId: number;
   private readonly installationId: number;
   private readonly username: string;
 
@@ -188,6 +245,7 @@ class AppGitHubClient implements GitHubClient {
       },
     });
     this.installationId = Number(cfg.installationId);
+    this.appId = Number(cfg.appId);
     this.username = cfg.username;
   }
 
@@ -212,6 +270,10 @@ class AppGitHubClient implements GitHubClient {
       installationId: this.installationId,
     })) as { token: string };
     return `https://x-access-token:${token}@github.com/${owner}/${repo}.git`;
+  }
+
+  async engineeringInstallationCredential(): Promise<GitHubEngineeringInstallationCredential> {
+    return readGitHubEngineeringInstallationCredential(this.app.apps, { appId: this.appId, installationId: this.installationId });
   }
 
   async openPullRequest(args: {

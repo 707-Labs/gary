@@ -15,8 +15,8 @@ const DEFAULT_MAX_TOKENS = 8192;
 
 // SDK 0.32.1 doesn't carry `cache_control` in the GA Messages types — only
 // in the beta namespace. The wire format is identical though, and Z.ai /
-// Kimi / DeepSeek all honor it on their Anthropic-compatible endpoints
-// (verified via scripts/probe-cache.ts). We cast at the boundary instead
+// Kimi / direct DeepSeek honored it on their Anthropic-compatible endpoints
+// (verified via scripts/probe-cache.ts; OpenRouter not yet re-run). We cast at the boundary instead
 // of pulling in a major SDK upgrade.
 const EPHEMERAL = { type: "ephemeral" } as const;
 

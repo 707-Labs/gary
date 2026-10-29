@@ -65,7 +65,7 @@
     <key>DOCKER_CONTEXT</key>
     <string></string>
     <key>GARY_HERMES_ACTIVATION_PATH</key>
-    <string>/Users/tanner/Documents/Codex/2026-10-07/task-4/gary-enablement/coding-recovery/ert3336-continuation-20261008/runtime-activation/activation.json</string>
+    <string>/Users/tanner/.gary/runtime/activation/activation.json</string>
 
     <!-- Linear team key to repository. -->
     <key>GARY_REPO_MAP</key>
@@ -73,21 +73,21 @@
 
     <!-- Project assistant (shared-channel responder) config, pinned by content hash. -->
     <key>GARY_PROJECT_ASSISTANT_CONFIG</key>
-    <string>/Users/tanner/Documents/Codex/2026-10-07/task-4/gary-enablement/project-runtime-v3/config.json</string>
+    <string>/Users/tanner/.gary/runtime/project/config.json</string>
     <key>GARY_PROJECT_ASSISTANT_CONFIG_SHA256</key>
-    <string>f5aaecef062ba86a97a87a84219bff37109a8253eb234b5e8764fee33780c05a</string>
+    <string>d6d5f252c4b4490f276807037eb70b3bbf65ecc5d705f3123c274f5f1651fe62</string>
 
     <!-- Slack: socket-mode transport, Tanner DM, shared-channel threads, alert intake. -->
     <key>GARY_SLACK_ENABLED</key>
     <string>1</string>
     <key>GARY_SLACK_CREDENTIALS_FILE</key>
-    <string>/Users/tanner/Documents/Codex/2026-10-07/task-5/gary-slack-admin/.generated-secrets/gary-slack-alerts.env</string>
+    <string>/Users/tanner/.gary/runtime/slack/gary-slack-alerts.env</string>
     <key>GARY_SLACK_ALLOWED_CHANNEL_IDS</key>
     <string></string>
     <key>GARY_SLACK_TANNER_DM_ENABLED</key>
     <string>1</string>
     <key>GARY_SLACK_CONVERSATION_CONFIG</key>
-    <string>/Users/tanner/Documents/Codex/2026-10-07/task-4/gary-dm-conversation/deployment/conversation.json</string>
+    <string>/Users/tanner/.gary/runtime/dm/conversation.json</string>
     <key>GARY_SLACK_SHARED_CONVERSATION_CONFIG</key>
     <string>/Users/tanner/.gary/state/hermes-shared-20261008/conversation.json</string>
     <key>GARY_SLACK_ALERT_CONFIG</key>

@@ -11,13 +11,13 @@ const TOOL = { type: "function", function: { name: "read_file", description: "Re
 const call = (id = "call_1", name = "read_file", args = '{"path":"README.md"}') => ({ id, type: "function", function: { name, arguments: args } });
 
 function providerBody(overrides: Body = {}): Body {
-  return { id: "msg_test", type: "message", role: "assistant", model: "deepseek-v4-pro",
+  return { id: "msg_test", type: "message", role: "assistant", model: "deepseek/deepseek-v4.1-flash",
     content: [{ type: "text", text: "Checked." }], stop_reason: "end_turn",
-    usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 }, ...overrides };
+    usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4, cost: 0 }, ...overrides };
 }
 function request(overrides: Body = {}, authorization = "Bearer " + TOKEN, path = "/v1/chat/completions"): Request {
   return new Request("http://localhost" + path, { method: "POST", headers: { authorization, "content-type": "application/json" },
-    body: JSON.stringify({ model: "deepseek-v4-pro", messages: [{ role: "system", content: "Be precise." }, { role: "user", content: "Inspect the task." }], max_tokens: 128, stream: false, ...overrides }) });
+    body: JSON.stringify({ model: "deepseek/deepseek-v4.1-flash", messages: [{ role: "system", content: "Be precise." }, { role: "user", content: "Inspect the task." }], max_tokens: 128, stream: false, ...overrides }) });
 }
 
 describe("guarded Hermes model transport (offline fake provider only)", () => {
@@ -30,11 +30,33 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
   afterEach(() => ledger.close());
   function setup(overrides: Partial<ModelTransportOptions> = {}) {
     const sent: Request[] = [];
-    const capability: ModelTransportCapability = { ticketId: "TICKET-1", ownerId: "owner-1", provider: "deepseek", model: "deepseek-v4-pro", deadlineMs: Date.now() + 5000, allowedToolNames: ["read_file", "run_bash", "finish"] };
+    const capability: ModelTransportCapability = { ticketId: "TICKET-1", ownerId: "owner-1", provider: "openrouter", model: "deepseek/deepseek-v4.1-flash", deadlineMs: Date.now() + 5000, allowedToolNames: ["read_file", "run_bash", "finish"] };
     const options: ModelTransportOptions = { ledger, capability, bearerToken: TOKEN, providerApiKey: "fake-upstream-key",
       assertOwner: () => {}, fetch: async (req) => { sent.push(req); return Response.json(providerBody()); }, ...overrides };
     return { handler: createModelTransport(options), sent, options };
   }
+
+  test("accepts OpenRouter's inert citations/caller block metadata and its live usage shape", async () => {
+    // Shapes observed from openrouter.ai /v1/messages on 2026-10-28 (thinking disabled).
+    const usage = { input_tokens: 158, output_tokens: 51, output_tokens_details: { thinking_tokens: 0 }, cache_creation_input_tokens: null,
+      cache_read_input_tokens: 128, cache_creation: null, inference_geo: null, server_tool_use: null, service_tier: null, speed: "standard",
+      cost: 0.000064706, is_byok: false, cost_details: { upstream_inference_cost: 0.000064706 } };
+    const { handler } = setup({ fetch: async () => Response.json(providerBody({ stop_reason: "tool_use", usage,
+      container: null, stop_details: null, context_management: null, provider: "Wafer",
+      content: [{ type: "text", text: "Reading.", citations: [] },
+        { type: "tool_use", id: "call_bebbb5877b5b45739c2470cb3c05ec7a", caller: { type: "direct" }, name: "read_file", input: { path: "README.md" } }] })) });
+    const response = await handler(request({ tools: [TOOL] }));
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.choices[0].message.tool_calls).toEqual([call("call_bebbb5877b5b45739c2470cb3c05ec7a")]);
+    expect(ledger.status("TICKET-1")).toMatchObject({ attemptCount: 1, unknownAttempts: 0,
+      chargedMicros: Math.ceil(((158 + 128) * 60 + 128 * 240) / 100) });
+    for (const content of [[{ type: "text", text: "x", citations: [{ url: "https://example.com" }] }],
+      [{ type: "tool_use", id: "call_2", caller: { type: "server" }, name: "read_file", input: {} }]]) {
+      const rejected = setup({ fetch: async () => Response.json(providerBody({ content, stop_reason: content[0]!.type === "tool_use" ? "tool_use" : "end_turn" })) });
+      expect((await rejected.handler(request({ tools: [TOOL] }))).status).toBe(502);
+    }
+  });
 
   test("uses the exact existing priced route and actual ledger with host credentials", async () => {
     const { handler, sent } = setup();
@@ -44,7 +66,7 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
     expect(body.choices[0].message.content).toBe("Checked.");
     expect(body.usage).toEqual({ prompt_tokens: 17, completion_tokens: 2, total_tokens: 19 });
     expect(sent).toHaveLength(1);
-    expect(sent[0]!.url).toBe("https://api.deepseek.com/anthropic/v1/messages");
+    expect(sent[0]!.url).toBe("https://openrouter.ai/api/v1/messages");
     expect(sent[0]!.redirect).toBe("manual");
     expect(sent[0]!.headers.get("authorization")).toBe("Bearer fake-upstream-key");
     expect(sent[0]!.headers.get("authorization")).not.toContain(TOKEN);
@@ -52,9 +74,10 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
     expect(upstream.system).toEqual([{ type: "text", text: "Be precise." }]);
     expect(upstream.messages).toEqual([{ role: "user", content: [{ type: "text", text: "Inspect the task." }] }]);
     expect(upstream.max_tokens).toBe(128);
+    expect(upstream.provider).toEqual({ data_collection: "deny", max_price: { prompt: 0.6, completion: 2.4 } });
     expect(ledger.status("TICKET-1")!.attemptCount).toBe(1);
     expect(ledger.status("TICKET-1")!.unknownAttempts).toBe(0);
-    expect(ledger.status("TICKET-1")!.chargedMicros).toBe(530); // Full requested output, not just two emitted tokens.
+    expect(ledger.status("TICKET-1")!.chargedMicros).toBe(318); // ceil((17*60 + 128*240)/100): full requested output, not just two emitted tokens.
   });
 
   test("trusted DeepSeek disabled policy is sent on both tool and follow-up turns", async () => {
@@ -111,7 +134,7 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
     for (const secret of ["private-response-id", "private-reasoning", "private-signature", "private-call-id", "private-file", TOKEN, "fake-upstream-key"]) expect(output).not.toContain(secret);
     expect(ledger.status("TICKET-1")!.attemptCount).toBe(1);
     expect(ledger.status("TICKET-1")!.unknownAttempts).toBe(0);
-    expect(ledger.status("TICKET-1")!.chargedMicros).toBe(530);
+    expect(ledger.status("TICKET-1")!.chargedMicros).toBe(318);
   });
 
   test("response rejection categories preserve all strict checks without reflecting unknown values", async () => {
@@ -180,7 +203,7 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
     await expect(handler(request())).rejects.toBe(sinkFailure);
     expect(callbacks).toBe(1); expect(calls).toBe(1);
     expect(ledger.status("TICKET-1")!.attemptCount).toBe(1);
-    expect(ledger.status("TICKET-1")!.chargedMicros).toBe(530);
+    expect(ledger.status("TICKET-1")!.chargedMicros).toBe(318);
     expect((await handler(request())).status).toBe(200);
     expect(callbacks).toBe(1); expect(calls).toBe(2);
   });
@@ -252,7 +275,7 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
   test("rechecks ownership after request-body parsing and before reservation", async () => {
     let owner = true;
     const { handler, sent } = setup({ assertOwner: () => { if (!owner) throw new Error("revoked"); } });
-    const raw = JSON.stringify({ model: "deepseek-v4-pro", messages: [{ role: "user", content: "hi" }], max_tokens: 128 });
+    const raw = JSON.stringify({ model: "deepseek/deepseek-v4.1-flash", messages: [{ role: "user", content: "hi" }], max_tokens: 128 });
     const body = new ReadableStream<Uint8Array>({ pull(controller) { owner = false; controller.enqueue(new TextEncoder().encode(raw)); controller.close(); } });
     const req = new Request("http://localhost/v1/chat/completions", { method: "POST", headers: { authorization: "Bearer " + TOKEN, "content-type": "application/json" }, body });
     expect((await handler(req)).status).toBe(403);
@@ -275,7 +298,7 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
       fetch: async () => { owner = false; return Response.json(providerBody()); } });
     expect((await handler(request())).status).toBe(403);
     expect(ledger.status("TICKET-1")!.unknownAttempts).toBe(1);
-    expect(ledger.status("TICKET-1")!.chargedMicros).toBe(spendReservationMicros("deepseek", 128));
+    expect(ledger.status("TICKET-1")!.chargedMicros).toBe(spendReservationMicros("openrouter", 128));
   });
 
   test("deadline covers stalled response bodies and retains unknown spend", async () => {
@@ -286,7 +309,7 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
     expect((await handler(request())).status).toBe(408);
     expect(canceled).toBe(true);
     expect(ledger.status("TICKET-1")!.unknownAttempts).toBe(1);
-    expect(ledger.status("TICKET-1")!.chargedMicros).toBe(spendReservationMicros("deepseek", 128));
+    expect(ledger.status("TICKET-1")!.chargedMicros).toBe(spendReservationMicros("openrouter", 128));
   });
 
   test("responses past sixty seconds succeed but requests cannot extend the original action deadline", async () => {
@@ -337,7 +360,7 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
       release();expect((await pending).status).toBe(408);expect(transportCleaned).toBe(true);
       expect(calls).toBe(1);
       expect(ledger.status("TICKET-1")!.unknownAttempts).toBe(1);
-      expect(ledger.status("TICKET-1")!.chargedMicros).toBe(spendReservationMicros("deepseek",128));
+      expect(ledger.status("TICKET-1")!.chargedMicros).toBe(spendReservationMicros("openrouter",128));
       expect(ledger.status("TICKET-1")!.attemptCount).toBe(1);
     } finally {
       receivedAbort();release();if (pending) await pending;
@@ -362,8 +385,9 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
   test("budget exhaustion latches without fetch; new handlers cannot reset it", async () => {
     ledger.close();
     ledger = new SpendLedger(":memory:");
-    ledger.createCampaign("pilot", 1);
-    ledger.enrollTicket("pilot", "TICKET-1", 1);
+    // $0.50 is below one full-context reservation at the openrouter price (629_453 for 128 tokens).
+    ledger.createCampaign("pilot", 0.5);
+    ledger.enrollTicket("pilot", "TICKET-1", 0.5);
     const first = setup();
     expect((await first.handler(request())).status).toBe(402);
     expect(ledger.status("TICKET-1")!.state).toBe("exhausted");
@@ -374,14 +398,14 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
   });
 
   test("missing or unknown receipt counters never become refunds or invented OAI usage", async () => {
-    for (const usage of [undefined, { input_tokens: 10, output_tokens: 2 }, { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, new_usage_field: 5 }]) {
+    for (const usage of [undefined, { input_tokens: 10, output_tokens: 2 }, { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0, new_usage_field: 5 }]) {
       const { handler } = setup({ fetch: async () => Response.json(providerBody({ usage })) });
       const response = await handler(request());
       expect(response.status).toBe(200);
       expect((await response.json()).usage).toBeUndefined();
     }
     expect(ledger.status("TICKET-1")!.unknownAttempts).toBe(3);
-    expect(ledger.status("TICKET-1")!.chargedMicros).toBe(3 * spendReservationMicros("deepseek", 128));
+    expect(ledger.status("TICKET-1")!.chargedMicros).toBe(3 * spendReservationMicros("openrouter", 128));
   });
 
   test("every explicit retry reserves separately; transport never retries errors itself", async () => {
@@ -394,7 +418,7 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
     }
     expect(calls).toBe(2);
     expect(ledger.status("TICKET-1")!.attemptCount).toBe(2);
-    expect(ledger.status("TICKET-1")!.chargedMicros).toBe(2 * spendReservationMicros("deepseek", 128));
+    expect(ledger.status("TICKET-1")!.chargedMicros).toBe(2 * spendReservationMicros("openrouter", 128));
   });
 
   test("network errors and malformed provider JSON remain charged", async () => {
@@ -499,7 +523,7 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
 
   test("numeric overflow in tool schemas and returned arguments never becomes executable null", async () => {
     const first = setup();
-    const raw = JSON.stringify({ model: "deepseek-v4-pro", max_tokens: 128, messages: [{ role: "user", content: "read" }], tools: [TOOL] }).replace('"type":"object"', '"type":"object","minimum":1e309');
+    const raw = JSON.stringify({ model: "deepseek/deepseek-v4.1-flash", provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens: 128, messages: [{ role: "user", content: "read" }], tools: [TOOL] }).replace('"type":"object"', '"type":"object","minimum":1e309');
     const req = new Request("http://localhost/v1/chat/completions", { method: "POST", headers: { authorization: "Bearer " + TOKEN, "content-type": "application/json" }, body: raw });
     expect((await first.handler(req)).status).toBe(400);
     expect(first.sent).toHaveLength(0);

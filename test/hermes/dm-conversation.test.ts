@@ -8,12 +8,12 @@ function fixture(){const ledger=new SpendLedger(':memory:');cleanups.push(()=>le
   return ledger;}
 const turn=(extra:Partial<DMTurn>={}):DMTurn=>({requestId:'fixture-request',ownerId:'fixture-owner',allocationId:'local:hermes-dm-20261008-tanner',campaignId:'hermes-dm-20261008',
   history:[],text:'Remember the fabricated phrase violet sparrow.',signal:new AbortController().signal,assertActive(){},recordWorker(){},...extra});
-const provider=(text='The phrase is violet sparrow.',extra:Record<string,unknown>={})=>Response.json({id:'msg_fixture',type:'message',role:'assistant',model:'deepseek-v4-pro',
-  content:[{type:'text',text}],stop_reason:'end_turn',usage:{input_tokens:30,output_tokens:9,cache_read_input_tokens:0,cache_creation_input_tokens:0},...extra});
+const provider=(text='The phrase is violet sparrow.',extra:Record<string,unknown>={})=>Response.json({id:'msg_fixture',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',
+  content:[{type:'text',text}],stop_reason:'end_turn',usage:{input_tokens:30,output_tokens:9,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0},...extra});
 const native=(modify:(body:any)=>void=()=>{},after?: (handle:Parameters<GaryRuntimeLauncher>[1],manifest:Parameters<GaryRuntimeLauncher>[0])=>Promise<void>):GaryRuntimeLauncher=>async(manifest,handle)=>{
-  expect(manifest.tools).toEqual([]);expect(manifest.maxIterations).toBe(1);expect(manifest.maxTokens).toBe(1024);
+  expect(manifest.tools).toEqual([]);expect(manifest.maxIterations).toBe(1);expect(manifest.maxTokens).toBe(4096);
   const history=[...(manifest.history??[]),{role:'user',content:manifest.prompt}];
-  const body:any={model:manifest.model,messages:[{role:'system',content:'native default prompt MUST be replaced'},...history],max_tokens:1024,temperature:0.4,stream:false};modify(body);
+  const body:any={model:manifest.model,messages:[{role:'system',content:'native default prompt MUST be replaced'},...history],max_tokens:4096,temperature:0.4,stream:false};modify(body);
   const request=(path:string,value:unknown)=>new Request('http://127.0.0.1'+path,{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer '+manifest.capability},body:JSON.stringify(value)});
   const response=await handle(request('/v1/chat/completions',body));const result=await response.json();
   const state=await handle(request('/tools/state',{taskId:manifest.taskId,ownerEpoch:manifest.ownerEpoch}));
@@ -31,13 +31,13 @@ test('shared persona is host-selected, has no private context/coding authority, 
 test('one real canonical reservation per native turn, host-only destination/key, no tools, confirmed two-turn context',async()=>{
   const ledger=fixture(),requests:any[]=[];
   const reply=createHermesDMResponder({ledger,providerApiKey:'fake-provider-secret',launch:native(),fetch:async req=>{
-    expect(req.url).toBe('https://api.deepseek.com/anthropic/v1/messages');expect(req.headers.get('authorization')).toBe('Bearer fake-provider-secret');
+    expect(req.url).toBe('https://openrouter.ai/api/v1/messages');expect(req.headers.get('authorization')).toBe('Bearer fake-provider-secret');
     requests.push(await req.json());return provider();}});
   const first=await reply(turn());expect(first).toBe('The phrase is violet sparrow.');
   expect(await reply(turn({requestId:'followup',history:[{role:'user',content:turn().text},{role:'assistant',content:first}],text:'What phrase?'}))).toBe(first);
   expect(requests).toHaveLength(2);expect(requests[1].messages).toHaveLength(3);
   expect(JSON.stringify(requests)).not.toContain('native default prompt');expect(JSON.stringify(requests)).not.toContain('untrusted local prose');
-  expect(requests[0].thinking).toEqual({type:'disabled'});expect(requests[0].max_tokens).toBe(1024);expect(requests[0].tools).toBeUndefined();
+  expect(requests[0].thinking).toEqual({type:'disabled'});expect(requests[0].max_tokens).toBe(4096);expect(requests[0].tools).toBeUndefined();
   expect(ledger.status(turn().allocationId)).toMatchObject({attemptCount:2,unknownAttempts:0,state:'active'});
 });
 test('worker context changes, token enlargement, tool request, or second model dispatch never expand spend',async()=>{
@@ -72,7 +72,7 @@ test('native60s timeout outcome after HTTP200 cannot produce a reply; cleanup fa
     await expect(reply(turn())).rejects.toMatchObject({code:'dm_native_reply_unconfirmed',cleanupConfirmed:!cleanupFailure});
     expect(ledger.status(turn().allocationId)).toMatchObject({attemptCount:1,unknownAttempts:0});
   }
-  expect(DM_CONVERSATION_POLICY.timeoutMs).toBe(90000); // Unchanged native SDK independently caps a request at60s.
+  expect(DM_CONVERSATION_POLICY.timeoutMs).toBe(300000); // Unchanged native SDK independently caps a request at60s.
 });
 test('unexpected tools RPC or missing canonical budget cannot access work state or provider',async()=>{
   const ledger=fixture();let calls=0;
