@@ -24,7 +24,7 @@ function fixture(revision = RELEASE) {
 
 test('deploy re-applies exactly the four pinned standing variables when hashes and release match', () => {
   const f = fixture();
-  expect(loadStandingEngineeringEnv(f.env, RELEASE)).toEqual(Object.fromEntries(f.lines.map(l => l.split('=') as [string, string])));
+  expect(loadStandingEngineeringEnv(f.env, RELEASE) as Record<string, string>).toEqual(Object.fromEntries(f.lines.map(l => l.split('=') as [string, string])));
 });
 
 test('refuses stale release pins, hash drift, extra or missing keys and loose permissions', () => {
