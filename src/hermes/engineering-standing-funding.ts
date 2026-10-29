@@ -2,7 +2,8 @@
  * This module never creates a hold, enrolls SQL, releases history or authorizes a
  * provider call. The trusted operator supplies the approval evidence hash. */
 import { constants, closeSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync, type Stats } from 'node:fs';
-import { dirname, isAbsolute, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
 import type { StandingEngineeringBudgetAuthority } from './engineering-standing-budget.ts';
 import { ENGINEERING_STANDING_MIN_TASK_CAP_MICROS } from './engineering-policy.ts';
@@ -187,7 +188,8 @@ export function createStandingEngineeringFundingGuard(input:StandingEngineeringF
       const w=record(v)?allocations.find(x=>record(x)&&x.id===v.id):undefined;
       if(!record(v)||!record(w))fail('audited_hold_changed');
       if(encode(w)===encode(v))continue;
-      const retired=reconciledHoldRetirement(v,w);if(retired===null)fail('audited_hold_changed');reconciledRetired+=retired;
+      const retired=reconciledHoldRetirement(v,w);if(retired===null)fail('audited_hold_changed');
+      assertReconciliationEvidence(v,w,o.ledgerPath);reconciledRetired+=retired;
     }
     if(sum.unknown<old.unknown||sum.retired!==old.retired+reconciledRetired)fail('protected_history_changed');
     if(allocations.some(v=>record(v)&&v.id!==holdId&&record(v.admission)
@@ -349,3 +351,33 @@ export const aggregateJson=Object.freeze({
   number:(literal:string)=>new JsonNumber(literal), isRecord:record, totals:(budget:RecordJson,pool:bigint)=>totals(budget,pool),
 });
 export type AggregateJson=Json; export type AggregateRecord=RecordJson;
+
+/** Where the reconciler keeps its audits for this ledger: <ledger dir>/budget/reconciliations. */
+export function reconciliationAuditDir(ledgerPath:string):string {return join(dirname(ledgerPath),'budget','reconciliations');}
+/** A settled entry is accepted only with its real evidence: the ledger ticket closed by
+ * the reconciler with every attempt settled and charges equal to the retained amount,
+ * and the reconciler's own intent/after audits matching this exact entry. */
+export function assertReconciliationEvidence(before:RecordJson,after:RecordJson,ledgerPath:string):void {
+  const r=after.reconciliation as RecordJson,admission=before.admission;
+  const allocationId=record(admission)&&typeof admission.allocationId==='string'?admission.allocationId:fail('reconciliation_binding');
+  const retainedMicros=money(after.retainedAmountUsd)/1000n;
+  if(money(after.retainedAmountUsd)%1000n!==0n)fail('reconciliation_ledger');
+  const db=new Database(ledgerPath,{readonly:true,create:false,strict:true});
+  try {
+    const ticket=db.query('SELECT state,terminal_reason FROM spend_tickets WHERE ticket_id=?').get(allocationId) as {state:string;terminal_reason:string|null}|null;
+    const usage=db.query("SELECT COUNT(*) n,COALESCE(SUM(charged_micros),0) charged,COALESCE(SUM(CASE WHEN state<>'settled' THEN 1 ELSE 0 END),0) open FROM spend_attempts WHERE ticket_id=?")
+      .get(allocationId) as {n:number;charged:number;open:number};
+    if(!ticket||ticket.state!=='closed'||ticket.terminal_reason!=='acceptance_hold_reconciled'||usage.open!==0||BigInt(usage.charged)!==retainedMicros)fail('reconciliation_ledger');
+  } finally {db.close();}
+  const intentPath=typeof r.auditRecord==='string'?r.auditRecord:fail('reconciliation_audit');
+  if(dirname(intentPath)!==reconciliationAuditDir(ledgerPath)||!intentPath.endsWith('.intent.json'))fail('reconciliation_audit');
+  const intent=parseExact(safeFile(intentPath,true).bytes.toString('utf8'));
+  if(!record(intent)||intent.holdId!==before.id||intent.allocationId!==allocationId||intent.evidenceSha256!==r.evidenceSha256
+    ||typeof intent.afterSha256!=='string'||intent.chargedMicros instanceof JsonNumber===false||(intent.chargedMicros as JsonNumber).literal!==String(retainedMicros)
+    ||intent.operation!==r.id)fail('reconciliation_audit');
+  const afterFile=safeFile(intentPath.slice(0,-'.intent.json'.length)+'.after.json',true);
+  if(afterFile.hash!==intent.afterSha256)fail('reconciliation_audit');
+  const recorded=parseExact(afterFile.bytes.toString('utf8'));
+  const entry=record(recorded)&&Array.isArray(recorded.runtimeAllocations)?recorded.runtimeAllocations.find(v=>record(v)&&v.id===before.id):undefined;
+  if(!entry||encode(entry)!==encode(after))fail('reconciliation_audit');
+}

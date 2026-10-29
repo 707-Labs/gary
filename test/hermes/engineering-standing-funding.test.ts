@@ -253,7 +253,7 @@ test('apply and enroll refuse while the LaunchAgent has a running process',()=>{
   expect(()=>assertGaryStopped(()=>{throw Object.assign(new Error('Command failed'),{stderr:'Operation not permitted'});})).toThrow('Command failed');
 });
 
-test('the standing grant keeps verifying after the reconciler settles an audited acceptance hold, and only then',()=>{
+test('a settled audited acceptance hold without reconciler evidence fails the standing grant',()=>{
   const f=fixture();
   for(const b of [f.before,f.after])Object.assign(b.runtimeAllocations[0],{state:'held_for_engineering_acceptance'});
   f.repin();f.after.runtimeAllocations.at(-1).admission.aggregateBeforeSha256=f.receipt.before.sha256;f.repin();
@@ -265,7 +265,8 @@ test('the standing grant keeps verifying after the reconciler settles an audited
     current.runtimeCommittedOrHeldUsd=56-5.025;current.runtimeUnallocatedUsd=4+5.025;current.totalCommittedOrHeldUsd=96-5.025;current.runtimeAuthorizationRetiredUsd=retiredTotal;
     writeFileSync(f.o.aggregatePath,JSON.stringify(current,null,2)+'\n',{mode:0o600});
   };
-  settle({});guard();
+  // Arithmetic alone is not enough: without the reconciler's ledger and audit evidence it fails.
+  settle({});expect(()=>guard()).toThrow('reconciliation_binding');
   settle({reconciliation:{id:'x',auditRecord:'/a',evidenceSha256:'f'.repeat(64),chargedMicros:600000,retiredMicros:5025000}});
   expect(()=>guard()).toThrow('audited_hold_changed');
   settle({amountUsd:5.66,retiredUnusedAuthorizationUsd:5.035});expect(()=>guard()).toThrow();

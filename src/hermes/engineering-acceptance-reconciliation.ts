@@ -116,6 +116,22 @@ function writeOnce(path: string, bytes: string): void {
 }
 function syncDir(path: string): void { const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY); try { fsyncSync(fd); } finally { closeSync(fd); } }
 
+/** A lock left by a crashed run of THIS operation (same operation id, owner process
+ * gone) is resumed: the transition is deterministic and its audits are write-once. Any
+ * other lock is never stolen; the error tells the operator what to check first. */
+function adoptCrashedLock(lockPath: string, operationId: string, claim: string): void {
+  let owner: { operation?: unknown; pid?: unknown } | null = null;
+  try { owner = JSON.parse(readFileSync(join(lockPath, 'claim.json'), 'utf8')); } catch { owner = null; }
+  const alive = (pid: unknown) => { if (!Number.isSafeInteger(pid)) return true; try { process.kill(pid as number, 0); return true; }
+    catch (e) { return (e as NodeJS.ErrnoException).code !== 'ESRCH'; } };
+  if (!owner || owner.operation !== operationId || alive(owner.pid)) {
+    fail(`admission_lock_held:${lockPath}: another writer holds or crashed holding the shared aggregate lock. Before removing it, read `
+      + `${join(lockPath, 'claim.json')} (operation, pid), confirm that pid is not running, and compare the aggregate with any *.before/*.after/*.intent.json `
+      + 'audits that operation wrote: if its aggregate replacement happened, finish or record it with that operation, never by deleting the lock.');
+  }
+  unlinkSync(join(lockPath, 'claim.json')); writeNew(join(lockPath, 'claim.json'), claim);
+}
+
 export function reconcileEngineeringAcceptanceHold(o: AcceptanceReconciliationOptions): AcceptanceReconciliationResult {
   const before = readAggregate(o.aggregatePath);
   const allocations = before.parsed.runtimeAllocations as AggregateJson[];
@@ -156,8 +172,12 @@ export function reconcileEngineeringAcceptanceHold(o: AcceptanceReconciliationOp
   if (!o.apply || (alreadyReconciled && proof.ticketState === 'closed')) return { ...result, applied: alreadyReconciled };
 
   const lockPath = o.aggregatePath + '.admission.lock', claim = JSON.stringify({ version: 1, pid: process.pid, claim: randomUUID(), operation: operationId }) + '\n';
-  mkdirSync(lockPath, { mode: 0o700 }); const lockStat = lstatSync(lockPath); syncDir(dirname(lockPath));
-  writeNew(join(lockPath, 'claim.json'), claim);
+  try { mkdirSync(lockPath, { mode: 0o700 }); writeNew(join(lockPath, 'claim.json'), claim); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    adoptCrashedLock(lockPath, operationId, claim);
+  }
+  const lockStat = lstatSync(lockPath); syncDir(dirname(lockPath));
   try {
     try { mkdirSync(o.auditDir, { mode: 0o700 }); } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e; }
     const ad = lstatSync(o.auditDir);

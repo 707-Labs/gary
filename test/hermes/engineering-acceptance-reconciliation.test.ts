@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SpendLedger } from '../../src/spend.ts';
 import { reconcileEngineeringAcceptanceHold, ACCEPTANCE_RECONCILED_REASON } from '../../src/hermes/engineering-acceptance-reconciliation.ts';
-import { reconciledHoldRetirement, aggregateJson } from '../../src/hermes/engineering-standing-funding.ts';
+import { reconciledHoldRetirement, aggregateJson, assertReconciliationEvidence, reconciliationAuditDir } from '../../src/hermes/engineering-standing-funding.ts';
 
 const roots: string[] = []; afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
 const HOLD = 'hermes-engineering-acceptance:run-01';
@@ -72,7 +72,7 @@ test('refuses unsettled attempts, in-flight journals, extra tickets, a held lock
     ['unsettled', f => { const db = new Database(f.ledgerPath); db.exec("UPDATE spend_attempts SET state='unknown'"); db.close(); }, 'unsettled_attempt'],
     ['journal', f => { const db = new Database(f.journalPath); db.exec("INSERT INTO engineering_tasks VALUES('x','running',0)"); db.close(); }, 'journal_in_flight'],
     ['ticket', f => { const db = new Database(f.ledgerPath); db.exec("INSERT INTO spend_tickets(ticket_id,campaign_id,cap_micros,draft_pr) VALUES('run-01-second','run-01-campaign',1,0)"); db.close(); }, 'ledger_binding'],
-    ['lock', f => { mkdirSync(f.aggregatePath + '.admission.lock', { mode: 0o700 }); }, 'EEXIST'],
+    ['lock', f => { mkdirSync(f.aggregatePath + '.admission.lock', { mode: 0o700 }); }, 'admission_lock_held'],
   ];
   for (const [, mutate, error] of cases) {
     const f = fixture(); mutate(f); const before = readFileSync(f.aggregatePath);
@@ -82,4 +82,41 @@ test('refuses unsettled attempts, in-flight journals, extra tickets, a held lock
   const f = fixture();
   expect(() => reconcileEngineeringAcceptanceHold({ ...f.options(true), holdId: 'dm' })).toThrow();
   expect(ticket(f.ledgerPath)).toEqual({ state: 'active', terminal_reason: null });
+});
+
+function settled() {
+  const f = fixture(), original = JSON.parse(readFileSync(f.aggregatePath, 'utf8')).runtimeAllocations[1];
+  const auditDir = reconciliationAuditDir(f.ledgerPath); mkdirSync(join(f.root, 'budget'), { mode: 0o700 });
+  reconcileEngineeringAcceptanceHold({ ...f.options(true), auditDir });
+  const read = () => (aggregateJson.parse(readFileSync(f.aggregatePath, 'utf8')) as any).runtimeAllocations[1];
+  return { f, before: aggregateJson.parse(JSON.stringify(original)) as any, read, auditDir };
+}
+test('the standing guard accepts a settled hold only with matching ledger and audit evidence', () => {
+  const s = settled(), check = (entry: any) => () => assertReconciliationEvidence(s.before, entry, s.f.ledgerPath);
+  expect(check(s.read())).not.toThrow();
+  for (const [retained, retired] of [['0', '5.65'], ['0.3', '5.35']]) {
+    const e = s.read(); e.retainedAmountUsd = aggregateJson.number(retained); e.retiredUnusedAuthorizationUsd = aggregateJson.number(retired);
+    expect(check(e)).toThrow('reconciliation_ledger');
+  }
+  const ledger = (sql: string) => { const db = new Database(s.f.ledgerPath); db.exec(sql); db.close(); };
+  ledger("UPDATE spend_tickets SET terminal_reason='other' WHERE ticket_id='run-01-allocation'"); expect(check(s.read())).toThrow('reconciliation_ledger');
+  ledger("UPDATE spend_tickets SET state='active',terminal_reason=NULL WHERE ticket_id='run-01-allocation'"); expect(check(s.read())).toThrow('reconciliation_ledger');
+  ledger("UPDATE spend_tickets SET state='closed',terminal_reason='acceptance_hold_reconciled' WHERE ticket_id='run-01-allocation'"); expect(check(s.read())).not.toThrow();
+  const intent = join(s.auditDir, 'hermes-engineering-acceptance_run-01-reconciliation.intent.json'), text = readFileSync(intent, 'utf8');
+  writeFileSync(intent, text.replace('"chargedMicros": 624900', '"chargedMicros": 624901'), { mode: 0o600 }); expect(check(s.read())).toThrow('reconciliation_audit');
+  rmSync(intent); expect(check(s.read())).toThrow();
+  writeFileSync(intent, text, { mode: 0o600 }); expect(check(s.read())).not.toThrow();
+  const afterPath = intent.replace('.intent.json', '.after.json'); writeFileSync(afterPath, readFileSync(afterPath, 'utf8') + ' ', { mode: 0o600 });
+  expect(check(s.read())).toThrow('reconciliation_audit');
+});
+test('a rerun resumes a lock left by a crashed run of the same operation, never another one', () => {
+  const f = fixture(), lock = f.aggregatePath + '.admission.lock';
+  mkdirSync(lock, { mode: 0o700 });
+  writeFileSync(join(lock, 'claim.json'), JSON.stringify({ version: 1, pid: 999_999_999, claim: 'x', operation: 'other-operation' }) + '\n', { mode: 0o600 });
+  expect(() => reconcileEngineeringAcceptanceHold(f.options(true))).toThrow('admission_lock_held');
+  writeFileSync(join(lock, 'claim.json'), JSON.stringify({ version: 1, pid: process.pid, claim: 'x', operation: 'hermes-engineering-acceptance_run-01-reconciliation' }) + '\n', { mode: 0o600 });
+  expect(() => reconcileEngineeringAcceptanceHold(f.options(true))).toThrow('admission_lock_held'); // owner still alive
+  writeFileSync(join(lock, 'claim.json'), JSON.stringify({ version: 1, pid: 999_999_999, claim: 'x', operation: 'hermes-engineering-acceptance_run-01-reconciliation' }) + '\n', { mode: 0o600 });
+  expect(reconcileEngineeringAcceptanceHold(f.options(true))).toMatchObject({ applied: true });
+  expect(existsSync(lock)).toBe(false);
 });
