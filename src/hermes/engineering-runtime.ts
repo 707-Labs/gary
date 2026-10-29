@@ -13,6 +13,8 @@ import { createSqliteEngineeringSessionJournal } from '../executors/engineering-
 import { createEngineeringSessionGuardianFactory } from '../executors/engineering-session-guardian.ts';
 import { acquireEngineeringResourceLease, type EngineeringResourceLeaseOptions } from '../executors/engineering-resource-lease.ts';
 import { createEngineeringResourceBindingGuard, type EngineeringResourceBindingDependencies } from '../executors/engineering-resource-binding.ts';
+import { resolveEngineeringResourceLockForBoot } from '../executors/engineering-resource-reboot.ts';
+import { assertEngineeringRebootQuiescent, dockerLabelledContainerLister } from './engineering-reboot-quiescence.ts';
 import type { EngineeringRuntimeConfig } from './engineering-config.ts';
 import { ENGINEERING_ROUTINE_TOOLS_SHA256, type StandingEngineeringRuntimeConfig } from './standing-engineering-config.ts';
 import type { openEngineeringRoutineServices } from './engineering-routine-composition.ts';
@@ -57,6 +59,7 @@ export interface EngineeringRuntimeOptions {
     createExecution?: (options: EngineeringExecutionOptions) => Execution;
     acquireLease?: (options: EngineeringResourceLeaseOptions) => ReturnType<typeof acquireEngineeringResourceLease>;
     resourceBinding?: EngineeringResourceBindingDependencies;
+    resourceReboot?: { dataVolumeDev?: () => number; lockPath?: string; listLabelledContainers?: () => readonly string[] };
     resourceLease?: Pick<EngineeringResourceLeaseOptions, 'inspection' | 'spawn'>;
     readHeadroom?: ReturnType<typeof createEngineeringHeadroomReader>;
   };
@@ -116,9 +119,23 @@ export function createEngineeringRuntime(options: EngineeringRuntimeOptions) {
   if (!!standing !== !acceptance || (standing && options.continuationBaseline)) fail('mode_binding');
   if (acceptance && !!acceptance.budget.continuation !== !!options.continuationBaseline) fail('continuation_binding');
   options.assertRuntime(); options.assertGrant();
-  const assertResourceBinding = createEngineeringResourceBindingGuard(config.resourceLock, options.dependencies?.resourceBinding);
-  assertResourceBinding();
   privateDirectory(config.root); privateDirectory(config.workspacesRoot); privateJournal(db, config.root);
+  // Standing engineering survives macOS reboots: in a new boot the lock pin is
+  // re-minted once, only after proving nothing from the old boot is in flight.
+  let resourceLock = config.resourceLock;
+  if (standing) {
+    const receiptDirectory = join(config.root, 'resource-boot-bindings');
+    privateDirectory(receiptDirectory, true);
+    const reboot = options.dependencies?.resourceReboot;
+    resourceLock = resolveEngineeringResourceLockForBoot({ configured: config.resourceLock, receiptDirectory,
+      ...(reboot?.dataVolumeDev ? { dataVolumeDev: reboot.dataVolumeDev } : {}),
+      ...(options.dependencies?.resourceBinding?.observeBoot ? { observeBoot: options.dependencies.resourceBinding.observeBoot } : {}),
+      ...(reboot?.lockPath ? { lockPath: reboot.lockPath } : {}),
+      assertQuiescent: () => assertEngineeringRebootQuiescent({ journalDb: db, spendDb: options.spendDb,
+        listLabelledContainers: reboot?.listLabelledContainers ?? dockerLabelledContainerLister(config.dockerExecutable, config.dockerSocketPath) }) });
+  }
+  const assertResourceBinding = createEngineeringResourceBindingGuard(resourceLock, options.dependencies?.resourceBinding);
+  assertResourceBinding();
   const contains = (base: string, path: string) => { const rel = relative(base, path); return !isAbsolute(rel) && rel !== '..' && !rel.startsWith('..' + sep); };
   if (contains(config.root, config.workspacesRoot) || contains(config.workspacesRoot, config.root)) fail('workspace_state_overlap');
   if (db.filename === options.spendDb.filename) fail('journal_must_be_private');

@@ -2,7 +2,7 @@
 import { Database } from 'bun:sqlite';
 import { afterEach, expect, test } from 'bun:test';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { SpendLedger } from '../../src/spend.ts';
@@ -261,4 +261,29 @@ test('routine missing services and durable deadline tampering fail before execut
   f.db.query('UPDATE engineering_runtime_windows SET deadline_ms=deadline_ms+1 WHERE task_id=?').run(ack.taskId);
   runtime.ingress.start!(ack); expect((await f.finished(ack.taskId)).status).toBe('blocked');
   expect(f.counts.executions).toBe(0); expect(f.counts.provider).toBe(0); await runtime.stop();
+});
+
+test('after a reboot standing engineering re-binds the lock once when nothing is in flight, and refuses when a container survives', async () => {
+  const NEW_BOOT = '2C2DEAF4-4608-4037-97F1-6E3E007AEBA7';
+  const rebooted = (containers: string[]) => {
+    const f = fixture();
+    const tmp = realpathSync(mkdtempSync(join(tmpdir(), 'standing-reboot-lock-'))); cleanup.push(() => rmSync(tmp, { recursive: true, force: true }));
+    const lockPath = join(tmp, 'apple-release-xcode.lock');
+    const deps = f.options.dependencies!;
+    const options: EngineeringRuntimeOptions = { ...f.options, dependencies: { ...deps,
+      resourceBinding: { observeBoot: () => ({ bootSessionUUID: NEW_BOOT, apfsVolumeUUID: lock.apfsVolumeUUID }),
+        inspection: { lstat: () => lstatSync(lockPath), realpath: path => path } },
+      resourceReboot: { lockPath, dataVolumeDev: () => 1, listLabelledContainers: () => containers } } };
+    return { f, options, lockPath };
+  };
+  const ok = rebooted([]);
+  const runtime = createEngineeringRuntime(ok.options);
+  expect(runtime.ready()).toBe(true);
+  expect(lstatSync(ok.lockPath).mode & 0o7777).toBe(0o644);
+  expect(readdirSync(join(ok.f.config.root, 'resource-boot-bindings'))).toEqual([NEW_BOOT + '.json']);
+  await runtime.stop();
+  const blocked = rebooted(['3f1c0ffee']);
+  expect(() => createEngineeringRuntime(blocked.options)).toThrow('reboot_not_quiescent:container');
+  expect(() => lstatSync(blocked.lockPath)).toThrow();
+  expect(blocked.f.counts).toEqual({ observations: 0, baseResolutions: 0, clones: 0, executions: 0, leases: 0, releases: 0, provider: 0 });
 });
