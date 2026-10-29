@@ -135,13 +135,22 @@ export function createStandingEngineeringFundingGuard(input:StandingEngineeringF
     if(oldPoolMicros<60_000_000||oldPoolMicros+additionMicros>1_000_000_000)fail('funding_envelope');
     const oldPool=BigInt(oldPoolMicros)*1000n,newPool=BigInt(oldPoolMicros+additionMicros)*1000n;
     const receipt=readPinned(o.fundingHoldReceiptPath,a.holdReceiptSha256);
-    exact(receipt,['version','kind','poolId','campaignId','capMicros','taskCapMicros','authoritySha256','aggregatePath','ledgerPath','before','after','aggregateBeforeRuntimePoolMicros','additionalRuntimePoolMicros']);
+    const transferred=record(receipt)&&Object.hasOwn(receipt,'transfer');
+    exact(receipt,['version','kind','poolId','campaignId','capMicros','taskCapMicros','authoritySha256','aggregatePath','ledgerPath','before','after','aggregateBeforeRuntimePoolMicros','additionalRuntimePoolMicros',
+      ...(transferred?['transfer']:[])]);
     if(!matches(receipt,{...bound,version:1,kind:'standing_engineering_hold',authoritySha256:a.authoritySha256,
       aggregateBeforeRuntimePoolMicros:oldPoolMicros,additionalRuntimePoolMicros:additionMicros}))fail('hold_receipt_binding');
     const beforeRef=reference(receipt.before),afterRef=reference(receipt.after);
-    const paths=[o.aggregatePath,o.ledgerPath,o.fundingAuthorityPath,o.fundingHoldReceiptPath,beforeRef.path,afterRef.path];
+    const transferRef=transferred?reference(receipt.transfer):undefined;
+    const paths=[o.aggregatePath,o.ledgerPath,o.fundingAuthorityPath,o.fundingHoldReceiptPath,beforeRef.path,afterRef.path,...(transferRef?[transferRef.path]:[])];
     if(new Set(paths).size!==paths.length)fail('aliased_proof_paths');
     const before=parseAggregate(readPinned(beforeRef.path,beforeRef.sha256),oldPool),after=parseAggregate(readPinned(afterRef.path,afterRef.sha256),newPool);
+    // A relocated grant's `before` is not a raw snapshot: it is the frozen source
+    // aggregate with exactly one earlier standing hold retired to fund this one.
+    if(transferRef){
+      if(additionMicros!==0)fail('transfer_binding');
+      verifyTransfer(transferRef,before,beforeRef.sha256,{poolId:a.poolId,capMicros:a.capMicros,ledgerPath:o.ledgerPath},oldPool);
+    }
     const old=totals(before,oldPool);if(old.remaining+(newPool-oldPool)-COMMONFIELD_EARMARK<cap)fail('unearmarked_funding_insufficient');
     const prior=before.runtimeAllocations as Json[],next=after.runtimeAllocations as Json[];
     if(next.length!==prior.length+1||prior.some((v,i)=>encode(v)!==encode(next[i]!)))fail('prior_holds_changed');
@@ -169,4 +178,111 @@ export function createStandingEngineeringFundingGuard(input:StandingEngineeringF
     if(allocations.some(v=>record(v)&&v.id!==holdId&&record(v.admission)
       &&(v.admission.poolId===a.poolId||v.admission.campaignId===a.campaignId||v.admission.authoritySha256===a.authoritySha256)))fail('funding_reuse');
   };
+}
+
+const TRANSFER_KEYS=['version','kind','sourceAggregatePath','source','retiredHoldId','retiredAuthoritySha256','retainedMicros','transferredMicros','poolId','ledgerPath','beforeSha256','retiredState'];
+const RETIRED_STATE='retired_for_standing_transfer';
+/** Minimal decimal USD lexeme (at most nine places) for exact JSON numbers. */
+function usdLexeme(nano:bigint):string {
+  if(nano<0n)fail('negative_usd');const whole=nano/1_000_000_000n,frac=String(nano%1_000_000_000n).padStart(9,'0').replace(/0+$/,'');
+  return frac?`${whole}.${frac}`:String(whole);
+}
+/** The exact `before` a transfer must produce from its frozen source. */
+function retiredBefore(source:RecordJson,holdIndex:number,retainedNano:bigint,transferredNano:bigint,updatedAt:Json):RecordJson {
+  const allocations=(source.runtimeAllocations as Json[]).slice(),hold=allocations[holdIndex] as RecordJson;
+  allocations[holdIndex]={...hold,state:RETIRED_STATE,retainedAmountUsd:new JsonNumber(usdLexeme(retainedNano)),
+    retiredUnusedAuthorizationUsd:new JsonNumber(usdLexeme(transferredNano))};
+  return {...source,runtimeAllocations:allocations,
+    runtimeCommittedOrHeldUsd:new JsonNumber(usdLexeme(money(source.runtimeCommittedOrHeldUsd)-transferredNano)),
+    runtimeUnallocatedUsd:new JsonNumber(usdLexeme(money(source.runtimeUnallocatedUsd)+transferredNano)),
+    totalCommittedOrHeldUsd:new JsonNumber(usdLexeme(money(source.totalCommittedOrHeldUsd)-transferredNano)),
+    runtimeAuthorizationRetiredUsd:new JsonNumber(usdLexeme(money(source.runtimeAuthorizationRetiredUsd)+transferredNano)),
+    bookkeepingUpdatedAt:updatedAt};
+}
+function findStandingHold(source:RecordJson,holdId:string,authoritySha256:string):number {
+  const allocations=source.runtimeAllocations as Json[];
+  const index=allocations.findIndex(v=>record(v)&&v.id===holdId);const hold=allocations[index];
+  if(index<0||allocations.findIndex((v,i)=>i!==index&&record(v)&&v.id===holdId)>=0||!record(hold)||hold.state!=='held_for_standing_engineering'
+    ||money(hold.retainedAmountUsd)!==money(hold.amountUsd)||money(hold.retiredUnusedAuthorizationUsd)!==0n||money(hold.retainedUnknownCostsUsd)!==0n
+    ||!record(hold.admission)||hold.admission.kind!=='standing_engineering'||hold.admission.authoritySha256!==authoritySha256)fail('transfer_source_hold');
+  return index;
+}
+function verifyTransfer(ref:{path:string;sha256:string},before:RecordJson,beforeSha256:string,
+  next:{poolId:string;capMicros:number;ledgerPath:string},pool:bigint):void {
+  const t=readPinned(ref.path,ref.sha256);exact(t,TRANSFER_KEYS);
+  if(t.version instanceof JsonNumber?t.version.literal!=='1':true)fail('transfer_binding');
+  if(t.kind!=='standing_engineering_funding_transfer'||t.poolId!==next.poolId||t.ledgerPath!==next.ledgerPath||t.beforeSha256!==beforeSha256
+    ||t.retiredState!==RETIRED_STATE||typeof t.sourceAggregatePath!=='string'||typeof t.retiredHoldId!=='string'
+    ||typeof t.retiredAuthoritySha256!=='string'||!HASH.test(t.retiredAuthoritySha256))fail('transfer_binding');
+  const retained=BigInt(micros(t.retainedMicros))*1000n,transferred=BigInt(micros(t.transferredMicros))*1000n;
+  if(transferred!==BigInt(next.capMicros)*1000n)fail('transfer_amount');
+  const sourceRef=reference(t.source);const source=parseAggregate(readPinned(sourceRef.path,sourceRef.sha256),pool);
+  const index=findStandingHold(source,t.retiredHoldId,t.retiredAuthoritySha256);
+  // Conservation: what the old hold keeps plus what moves equals the old hold exactly.
+  if(retained+transferred!==money((source.runtimeAllocations as RecordJson[])[index]!.amountUsd))fail('transfer_amount');
+  if(typeof before.bookkeepingUpdatedAt!=='string'||!Number.isFinite(Date.parse(before.bookkeepingUpdatedAt))
+    ||encode(retiredBefore(source,index,retained,transferred,before.bookkeepingUpdatedAt))!==encode(before))fail('transfer_transition');
+}
+
+export interface StandingFundingTransferInput {
+  /** Exact current bytes of the old aggregate (copied, never edited). */
+  sourceAggregateBytes:Buffer; sourceAggregatePath:string;
+  retired:{poolId:string;authoritySha256:string;capMicros:number};
+  /** Old pool commitments that stay held: committed task caps plus pool charges, settled and quiescent. */
+  retainedMicros:number;
+  next:{poolId:string;campaignId:string;taskCapMicros:number};
+  ledgerPath:string; approvalEvidenceSha256:string; directory:string; aggregatePath:string; now:Date;
+}
+export interface StandingFundingTransferPlan {
+  files:readonly {path:string;bytes:Buffer;sha256:string}[];
+  authority:StandingEngineeringBudgetAuthority;
+  fundingAuthorityPath:string; fundingHoldReceiptPath:string; aggregatePath:string;
+}
+/** Pure: computes every new file for relocating a standing grant. Writes nothing. */
+export function planStandingFundingTransfer(i:StandingFundingTransferInput):StandingFundingTransferPlan {
+  if(!HASH.test(i.approvalEvidenceSha256)||!Number.isSafeInteger(i.retainedMicros)||i.retainedMicros<0||i.retainedMicros>i.retired.capMicros)fail('transfer_input');
+  const parsed=parseExact(i.sourceAggregateBytes.toString('utf8'));if(!record(parsed))fail('aggregate');
+  const pool=money(parsed.runtimePoolUsd);const source=parseAggregate(parsed,pool);
+  const holdId='standing-engineering:'+i.retired.poolId,index=findStandingHold(source,holdId,i.retired.authoritySha256);
+  if(money((source.runtimeAllocations as RecordJson[])[index]!.amountUsd)!==BigInt(i.retired.capMicros)*1000n)fail('transfer_source_hold');
+  const transferredMicros=i.retired.capMicros-i.retainedMicros;
+  if(transferredMicros<i.next.taskCapMicros||transferredMicros<ENGINEERING_STANDING_MIN_TASK_CAP_MICROS)fail('transfer_insufficient');
+  const path=(name:string)=>i.directory+'/'+name;
+  const file=(name:string,text:string)=>{const bytes=Buffer.from(text+'\n');return {path:path(name),bytes,sha256:sha(bytes)};};
+  const sourceFile={path:path('source-aggregate.json'),bytes:i.sourceAggregateBytes,sha256:sha(i.sourceAggregateBytes)};
+  const stamp=i.now.toISOString();
+  const before=retiredBefore(source,index,BigInt(i.retainedMicros)*1000n,BigInt(transferredMicros)*1000n,stamp);
+  totals(before,pool);const beforeFile=file('before-aggregate.json',encode(before));
+  const transfer=file('transfer-receipt.json',encode({version:new JsonNumber('1'),kind:'standing_engineering_funding_transfer',
+    sourceAggregatePath:i.sourceAggregatePath,source:{path:sourceFile.path,sha256:sourceFile.sha256},retiredHoldId:holdId,
+    retiredAuthoritySha256:i.retired.authoritySha256,retainedMicros:new JsonNumber(String(i.retainedMicros)),
+    transferredMicros:new JsonNumber(String(transferredMicros)),poolId:i.next.poolId,ledgerPath:i.ledgerPath,
+    beforeSha256:beforeFile.sha256,retiredState:RETIRED_STATE}));
+  const poolMicros=Number(pool/1000n);
+  const authorityFile=file('funding-authority.json',encode({version:new JsonNumber('1'),kind:'standing_engineering_funding',approved:true,
+    poolId:i.next.poolId,campaignId:i.next.campaignId,capMicros:new JsonNumber(String(transferredMicros)),taskCapMicros:new JsonNumber(String(i.next.taskCapMicros)),
+    aggregatePath:i.aggregatePath,ledgerPath:i.ledgerPath,approvalEvidenceSha256:i.approvalEvidenceSha256,
+    aggregateBeforeRuntimePoolMicros:new JsonNumber(String(poolMicros)),additionalRuntimePoolMicros:new JsonNumber('0')}));
+  const holdReceiptPath=path('hold-receipt.json');
+  const hold={id:'standing-engineering:'+i.next.poolId,amountUsd:new JsonNumber(usdLexeme(BigInt(transferredMicros)*1000n)),
+    state:'held_for_standing_engineering',retainedAmountUsd:new JsonNumber(usdLexeme(BigInt(transferredMicros)*1000n)),
+    retiredUnusedAuthorizationUsd:new JsonNumber('0'),retainedUnknownCostsUsd:new JsonNumber('0'),
+    admission:{kind:'standing_engineering',poolId:i.next.poolId,campaignId:i.next.campaignId,capMicros:new JsonNumber(String(transferredMicros)),
+      taskCapMicros:new JsonNumber(String(i.next.taskCapMicros)),authoritySha256:authorityFile.sha256,ledgerPath:i.ledgerPath,
+      auditRecord:holdReceiptPath,aggregateBeforeSha256:beforeFile.sha256}};
+  const held=money(before.runtimeCommittedOrHeldUsd)+BigInt(transferredMicros)*1000n;
+  const after={...before,runtimeAllocations:[...(before.runtimeAllocations as Json[]),hold],
+    runtimeCommittedOrHeldUsd:new JsonNumber(usdLexeme(held)),runtimeUnallocatedUsd:new JsonNumber(usdLexeme(pool-held)),
+    totalCommittedOrHeldUsd:new JsonNumber(usdLexeme(held+40_000_000_000n)),bookkeepingUpdatedAt:stamp};
+  totals(after,pool);const afterText=encode(after);const afterFile=file('after-aggregate.json',afterText);
+  const holdFile=file('hold-receipt.json',encode({version:new JsonNumber('1'),kind:'standing_engineering_hold',poolId:i.next.poolId,campaignId:i.next.campaignId,
+    capMicros:new JsonNumber(String(transferredMicros)),taskCapMicros:new JsonNumber(String(i.next.taskCapMicros)),authoritySha256:authorityFile.sha256,
+    aggregatePath:i.aggregatePath,ledgerPath:i.ledgerPath,before:{path:beforeFile.path,sha256:beforeFile.sha256},after:{path:afterFile.path,sha256:afterFile.sha256},
+    aggregateBeforeRuntimePoolMicros:new JsonNumber(String(poolMicros)),additionalRuntimePoolMicros:new JsonNumber('0'),
+    transfer:{path:transfer.path,sha256:transfer.sha256}}));
+  const aggregateFile={path:i.aggregatePath,bytes:Buffer.from(afterText+'\n'),sha256:sha(afterText+'\n')};
+  return {files:[sourceFile,beforeFile,transfer,authorityFile,afterFile,holdFile,aggregateFile],
+    authority:{version:1,poolId:i.next.poolId,campaignId:i.next.campaignId,capMicros:transferredMicros,taskCapMicros:i.next.taskCapMicros,
+      authoritySha256:authorityFile.sha256,holdReceiptSha256:holdFile.sha256},
+    fundingAuthorityPath:authorityFile.path,fundingHoldReceiptPath:holdFile.path,aggregatePath:i.aggregatePath};
 }

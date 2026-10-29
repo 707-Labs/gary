@@ -113,3 +113,73 @@ test('only an explicitly approved finite addition increases runtime and total en
   const missing=fixture();missing.after.runtimePoolUsd=80;missing.after.totalCeilingUsd=120;missing.after.runtimeUnallocatedUsd=24;missing.repin();
   expect(()=>createStandingEngineeringFundingGuard(missing.o)()).toThrow('aggregate_cap_mismatch');
 });
+
+// Relocating a standing grant: the old aggregate is copied (never edited), its
+// standing hold is retired in the copy, and the unused balance funds a new hold.
+import { mkdirSync } from 'node:fs';
+import { planStandingFundingTransfer } from '../../src/hermes/engineering-standing-funding.ts';
+function relocated(retainedMicros=1_000_000) {
+  const f=fixture(),dir=join(f.root,'budget');mkdirSync(dir,{mode:0o700});chmodSync(dir,0o700);
+  const sourceBytes=readFileSync(f.o.aggregatePath);
+  const plan=planStandingFundingTransfer({sourceAggregateBytes:sourceBytes,sourceAggregatePath:f.o.aggregatePath,
+    retired:{poolId:f.o.authority.poolId,authoritySha256:f.o.authority.authoritySha256,capMicros:f.o.authority.capMicros},retainedMicros,
+    next:{poolId:'standing-engineering-moved',campaignId:'standing-engineering-moved-campaign',taskCapMicros:3_000_000},
+    ledgerPath:f.o.ledgerPath,approvalEvidenceSha256:'c'.repeat(64),directory:dir,aggregatePath:join(dir,'aggregate.json'),now:new Date('2026-10-28T00:00:00Z')});
+  for(const file of plan.files){writeFileSync(file.path,file.bytes,{mode:0o600});chmodSync(file.path,0o600);}
+  const o:StandingEngineeringFundingOptions={authority:plan.authority,aggregatePath:plan.aggregatePath,ledgerPath:f.o.ledgerPath,
+    fundingAuthorityPath:plan.fundingAuthorityPath,fundingHoldReceiptPath:plan.fundingHoldReceiptPath};
+  return {f,dir,plan,o,sourceBytes};
+}
+test('relocated grant verifies, conserves the old hold exactly and enrolls a new pool without touching the old aggregate',()=>{
+  const r=relocated();
+  createStandingEngineeringFundingGuard(r.o)();
+  expect(readFileSync(r.f.o.aggregatePath)).toEqual(r.sourceBytes);
+  expect(r.plan.authority.capMicros).toBe(5_000_000);
+  const after=JSON.parse(readFileSync(r.o.aggregatePath,'utf8'));
+  const old=after.runtimeAllocations.find((v:any)=>v.id==='standing-engineering:'+r.f.o.authority.poolId);
+  expect(old).toMatchObject({state:'retired_for_standing_transfer',amountUsd:6,retainedAmountUsd:1,retiredUnusedAuthorizationUsd:5});
+  expect(after.runtimeAllocations.at(-1)).toMatchObject({id:'standing-engineering:standing-engineering-moved',amountUsd:5,retainedAmountUsd:5});
+  // Totals: held unchanged (6 -> 1 + 5), retirement recorded, pool unchanged.
+  expect([after.runtimeCommittedOrHeldUsd,after.runtimeUnallocatedUsd,after.runtimeAuthorizationRetiredUsd,after.runtimePoolUsd]).toEqual([56,4,5,60]);
+  const ledger=new SpendLedger(r.o.ledgerPath);
+  try {const allocator=createStandingEngineeringBudget({ledger,authority:r.o.authority,assertAuthority:createStandingEngineeringFundingGuard(r.o)});
+    allocator.enrollPool();expect(allocator.status()).toMatchObject({enrolled:true,poolCapMicros:5_000_000});
+  } finally {ledger.close();}
+});
+test('relocation cannot create money, change the source, alter other history or reuse a retired hold',()=>{
+  expect(()=>relocated(7_000_000)).toThrow('transfer_input');
+  expect(()=>relocated(4_000_000)).toThrow('transfer_insufficient'); // 2 left < 3 task cap
+  for(const fault of ['source','before','transfer-amount','other-history']){
+    const r=relocated(),pinned=(p:string)=>JSON.parse(readFileSync(p,'utf8'));
+    const write=(p:string,v:unknown)=>{writeFileSync(p,JSON.stringify(v,null,2)+'\n',{mode:0o600});return hash(readFileSync(p));};
+    const receipt=pinned(r.o.fundingHoldReceiptPath),transferPath=receipt.transfer.path,transfer=pinned(transferPath);
+    if(fault==='source'){const s=pinned(transfer.source.path);s.runtimeAllocations[0].retainedAmountUsd=5.64;transfer.source.sha256=write(transfer.source.path,s);}
+    if(fault==='before'||fault==='other-history'){
+      const b=pinned(receipt.before.path);
+      if(fault==='before'){const h=b.runtimeAllocations.find((v:any)=>v.state==='retired_for_standing_transfer');h.retainedAmountUsd=0.5;h.retiredUnusedAuthorizationUsd=5.5;}
+      else b.runtimeAllocations[1].retiredUnusedAuthorizationUsd=1,b.runtimeAllocations[1].retainedAmountUsd=4;
+      receipt.before.sha256=write(receipt.before.path,b);transfer.beforeSha256=receipt.before.sha256;
+    }
+    if(fault==='transfer-amount'){transfer.transferredMicros=6_000_000;transfer.retainedMicros=0;}
+    receipt.transfer.sha256=write(transferPath,transfer);r.o.authority.holdReceiptSha256=write(r.o.fundingHoldReceiptPath,receipt);
+    expect(()=>createStandingEngineeringFundingGuard(r.o)()).toThrow();
+  }
+});
+
+import { Database } from 'bun:sqlite';
+import { standingPoolRetainedMicros } from '../../src/hermes/engineering-standing-relocation.ts';
+test('relocation keeps every committed old-pool cap and refuses open conversation leases or unsettled attempts',()=>{
+  const f=fixture(),ledger=new SpendLedger(f.o.ledgerPath);
+  try {
+    const budget=createStandingEngineeringBudget({ledger,authority:f.o.authority,assertAuthority:createStandingEngineeringFundingGuard(f.o)});
+    budget.enrollPool();const task=budget.allocate({requestId:'r1',requestHash:'b'.repeat(64),taskId:'t1'});
+    const config={funding:f.o.authority} as any,read=()=>{const db=new Database(f.o.ledgerPath,{readonly:true});try{return standingPoolRetainedMicros(db,config);}finally{db.close();}};
+    expect(read()).toBe(3_000_000); // one committed task cap, nothing released
+    const db=new Database(f.o.ledgerPath);
+    db.query("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES(?,'openrouter','deepseek/deepseek-v4.1-flash',8192,648807,648807,'unknown')").run(task.allocationId);
+    expect(read).toThrow('unsettled_attempt');
+    db.exec("UPDATE spend_attempts SET state='settled'");
+    db.query("INSERT INTO standing_engineering_conversation_leases(lease_id,pool_id,ticket_id,start_attempt_id) VALUES('l',?,'local:hermes-dm-20261008-tanner',0)").run(f.o.authority.poolId);
+    expect(read).toThrow('conversation_lease_open');db.close();
+  } finally {ledger.close();}
+});
