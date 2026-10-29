@@ -143,3 +143,24 @@ inside that sandbox. Actual image and installer parity still requires validation
 These limits must remain visible in rollout claims. Passing the offline suite
 does not establish a paid native acceptance, a live deployment, or full Hermes
 enablement.
+
+## Reboots and deploys
+
+The resource lock `/private/tmp/apple-release-xcode.lock` is pinned by identity
+(dev/ino) together with the boot session it was observed in. macOS empties
+`/private/tmp` at boot. On the first standing start in a new boot,
+`resolveEngineeringResourceLockForBoot` mints a new pin only after
+`assertEngineeringRebootQuiescent` shows every engineering task terminal with
+confirmed cleanup, every ingress request and runtime run closed, no reserved or
+unknown spend attempt on any standing allocation, and no container carrying
+`gary.task` or `dev.gary.executor-job`. It creates the lock (0644, never
+replacing or fixing an existing file) and records the pin once in
+`<root>/resource-boot-bindings/<bootSessionUUID>.json`. Later starts in the
+same boot reuse that receipt, so replacing the lock within a boot still fails.
+A different APFS volume is never re-bound. The config file is never edited.
+
+`scripts/deploy.sh` re-applies the four standing pins from the private file
+`~/.gary/runtime/standing-engineering.env` (0600, `KEY=value` lines). It refuses
+to deploy if either pinned file no longer matches its hash or if the standing
+config's `sourceRevision` is not the release being deployed. Move the file aside
+to deploy with standing engineering disabled.
