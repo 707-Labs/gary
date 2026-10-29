@@ -94,7 +94,7 @@ function settled() {
 test('the standing guard accepts a settled hold only with matching ledger and audit evidence', () => {
   const s = settled(), check = (entry: any) => () => assertReconciliationEvidence(s.before, entry, s.f.ledgerPath);
   expect(check(s.read())).not.toThrow();
-  for (const [retained, retired] of [['0', '5.65'], ['0.3', '5.35']]) {
+  for (const [retained, retired] of [['0', '5.65'], ['0.3', '5.35']] as const) {
     const e = s.read(); e.retainedAmountUsd = aggregateJson.number(retained); e.retiredUnusedAuthorizationUsd = aggregateJson.number(retired);
     expect(check(e)).toThrow('reconciliation_ledger');
   }
