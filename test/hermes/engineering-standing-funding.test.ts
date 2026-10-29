@@ -118,13 +118,18 @@ test('only an explicitly approved finite addition increases runtime and total en
 // standing hold is retired in the copy, and the unused balance funds a new hold.
 import { mkdirSync } from 'node:fs';
 import { planStandingFundingTransfer } from '../../src/hermes/engineering-standing-funding.ts';
+function approval(f:ReturnType<typeof fixture>,retainedMicros:number,overrides:Record<string,unknown>={}) {
+  return Buffer.from(JSON.stringify({version:1,kind:'standing_engineering_relocation_approval',approver:'Tanner Vass',approvedAt:'2026-10-28',
+    approvalText:'Move the standing engineering budget out of ~/Documents.',sourceHoldId:'standing-engineering:'+f.o.authority.poolId,
+    retiredPoolId:f.o.authority.poolId,transferredMicros:f.o.authority.capMicros-retainedMicros,newPoolId:'standing-engineering-moved',...overrides},null,2)+'\n');
+}
 function relocated(retainedMicros=1_000_000) {
   const f=fixture(),dir=join(f.root,'budget');mkdirSync(dir,{mode:0o700});chmodSync(dir,0o700);
   const sourceBytes=readFileSync(f.o.aggregatePath);
   const plan=planStandingFundingTransfer({sourceAggregateBytes:sourceBytes,sourceAggregatePath:f.o.aggregatePath,
     retired:{poolId:f.o.authority.poolId,authoritySha256:f.o.authority.authoritySha256,capMicros:f.o.authority.capMicros},retainedMicros,
     next:{poolId:'standing-engineering-moved',campaignId:'standing-engineering-moved-campaign',taskCapMicros:3_000_000},
-    ledgerPath:f.o.ledgerPath,approvalEvidenceSha256:'c'.repeat(64),directory:dir,aggregatePath:join(dir,'aggregate.json'),now:new Date('2026-10-28T00:00:00Z')});
+    ledgerPath:f.o.ledgerPath,approvalEvidenceBytes:approval(f,retainedMicros),directory:dir,aggregatePath:join(dir,'aggregate.json'),now:new Date('2026-10-28T00:00:00Z')});
   for(const file of plan.files){writeFileSync(file.path,file.bytes,{mode:0o600});chmodSync(file.path,0o600);}
   const o:StandingEngineeringFundingOptions={authority:plan.authority,aggregatePath:plan.aggregatePath,ledgerPath:f.o.ledgerPath,
     fundingAuthorityPath:plan.fundingAuthorityPath,fundingHoldReceiptPath:plan.fundingHoldReceiptPath};
@@ -182,4 +187,67 @@ test('relocation keeps every committed old-pool cap and refuses open conversatio
     db.query("INSERT INTO standing_engineering_conversation_leases(lease_id,pool_id,ticket_id,start_attempt_id) VALUES('l',?,'local:hermes-dm-20261008-tanner',0)").run(f.o.authority.poolId);
     expect(read).toThrow('conversation_lease_open');db.close();
   } finally {ledger.close();}
+});
+
+import { assertGaryStopped, inspectStandingRelocation, planStandingRelocation } from '../../src/hermes/engineering-standing-relocation.ts';
+test('after a transfer the OLD grant refuses on both the funding guard and the ledger, and the new one spends',()=>{
+  const r=relocated(),oldGuard=createStandingEngineeringFundingGuard(r.f.o);
+  const ledger=new SpendLedger(r.f.o.ledgerPath);
+  try {
+    const old=createStandingEngineeringBudget({ledger,authority:r.f.o.authority,assertAuthority:oldGuard});old.enrollPool();
+    old.allocate({requestId:'old-1',requestHash:'b'.repeat(64),taskId:'old-task-1'});
+    // Tombstone beside the old aggregate (what --apply writes): the old funding guard now refuses.
+    mkdirSync(r.f.o.aggregatePath+'.admission.lock',{mode:0o700});writeFileSync(r.f.o.aggregatePath+'.admission.lock/transferred.json','{}',{mode:0o600});
+    expect(()=>oldGuard()).toThrow('aggregate_transferred');expect(old.ready()).toBe(false);
+    // Independently of the file, --enroll retires the old pool in the same ledger transaction.
+    const next=createStandingEngineeringBudget({ledger,authority:r.o.authority,assertAuthority:createStandingEngineeringFundingGuard(r.o)});
+    expect(()=>next.enrollPoolReplacing({retired:r.f.o.authority,retainedMicros:999_999,transferReceiptSha256:'e'.repeat(64)})).toThrow('retirement_input');
+    expect(()=>next.enrollPoolReplacing({retired:r.f.o.authority,retainedMicros:1_000_000,transferReceiptSha256:'e'.repeat(64)})).toThrow('retired_pool_commitment_changed');
+    expect(next.ready()).toBe(false); // the failed transaction enrolled nothing
+  } finally {ledger.close();}
+});
+test('enrollPoolReplacing retires the old pool at its exact commitment atomically with the new enrollment',()=>{
+  const r=relocated(3_000_000),ledger=new SpendLedger(r.f.o.ledgerPath);
+  try {
+    const old=createStandingEngineeringBudget({ledger,authority:r.f.o.authority,assertAuthority:()=>{}});old.enrollPool();
+    old.allocate({requestId:'old-1',requestHash:'b'.repeat(64),taskId:'old-task-1'}); // commits 3_000_000
+    const next=createStandingEngineeringBudget({ledger,authority:r.o.authority,assertAuthority:createStandingEngineeringFundingGuard(r.o)});
+    next.enrollPoolReplacing({retired:r.f.o.authority,retainedMicros:3_000_000,transferReceiptSha256:'e'.repeat(64)});
+    expect(next.status()).toMatchObject({enrolled:true,poolCapMicros:3_000_000});
+    expect(()=>old.status()).toThrow('pool_retired');expect(old.ready()).toBe(false);
+    expect(()=>old.allocate({requestId:'old-2',requestHash:'c'.repeat(64),taskId:'old-task-2'})).toThrow('pool_retired');
+    expect(()=>next.enrollPoolReplacing({retired:r.f.o.authority,retainedMicros:3_000_000,transferReceiptSha256:'e'.repeat(64)})).toThrow('already_retired');
+  } finally {ledger.close();}
+});
+test('approval evidence must name the exact hold, pools and amount',()=>{
+  for(const override of [{transferredMicros:5_000_001},{newPoolId:'standing-engineering-other'},{retiredPoolId:'x'},{sourceHoldId:'x'},{approvalText:''},{approvedAt:'soon'},{extra:true}]){
+    const f=fixture(),dir=join(f.root,'budget');mkdirSync(dir,{mode:0o700});
+    expect(()=>planStandingFundingTransfer({sourceAggregateBytes:readFileSync(f.o.aggregatePath),sourceAggregatePath:f.o.aggregatePath,
+      retired:{poolId:f.o.authority.poolId,authoritySha256:f.o.authority.authoritySha256,capMicros:f.o.authority.capMicros},retainedMicros:1_000_000,
+      next:{poolId:'standing-engineering-moved',campaignId:'standing-engineering-moved-campaign',taskCapMicros:3_000_000},ledgerPath:f.o.ledgerPath,
+      approvalEvidenceBytes:approval(f,1_000_000,override),directory:dir,aggregatePath:join(dir,'aggregate.json'),now:new Date()})).toThrow('approval_evidence');
+  }
+  const r=relocated(),receipt=JSON.parse(readFileSync(r.o.fundingHoldReceiptPath,'utf8')),t=JSON.parse(readFileSync(receipt.transfer.path,'utf8'));
+  writeFileSync(t.approvalEvidence.path,approval(r.f,1_000_000,{transferredMicros:4_000_000}),{mode:0o600});
+  expect(()=>createStandingEngineeringFundingGuard(r.o)()).toThrow();
+});
+test('relocation inspection lists other open holds and planning refuses while any exist',()=>{
+  const f=fixture();f.after.runtimeAllocations[0].state='held_for_engineering_acceptance';f.after.runtimeAllocations[1].state='held_for_dm_conversation';f.repin();
+  const ledger=new SpendLedger(f.o.ledgerPath);
+  try {createStandingEngineeringBudget({ledger,authority:f.o.authority,assertAuthority:()=>{}}).enrollPool();} finally {ledger.close();}
+  const journalDb=new Database(':memory:'),spendDb=new Database(f.o.ledgerPath,{readonly:true});
+  try {
+    const config={funding:f.o.authority,aggregatePath:f.o.aggregatePath} as any,next={poolId:'standing-engineering-moved',campaignId:'standing-engineering-moved-campaign'};
+    const inspection=inspectStandingRelocation({config,journalDb,spendDb,listLabelledContainers:()=>[],next});
+    expect(inspection.openHolds).toEqual([{id:'acceptance',state:'held_for_engineering_acceptance',retainedAmountUsd:5.65}]);
+    expect(inspection.carriedHolds).toEqual([{id:'dm',state:'held_for_dm_conversation',retainedAmountUsd:5}]);
+    expect(inspection).toMatchObject({retainedMicros:0,transferredMicros:6_000_000,sourceHoldId:'standing-engineering:'+f.o.authority.poolId});
+    expect(()=>planStandingRelocation({config,journalDb,spendDb,listLabelledContainers:()=>[],next,configPath:'/unused',ledgerPath:f.o.ledgerPath,
+      approvalEvidenceBytes:Buffer.from('{}'),targetDirectory:join(f.root,'t'),now:new Date()})).toThrow('open_holds:acceptance');
+  } finally {journalDb.close();spendDb.close();}
+});
+test('apply and enroll refuse while the LaunchAgent has a running process',()=>{
+  expect(()=>assertGaryStopped(()=>'\tstate = running\n\tpid = 4242\n')).toThrow('gary_running');
+  expect(()=>assertGaryStopped(()=>'\tstate = not running\n')).not.toThrow();
+  expect(()=>assertGaryStopped(()=>{throw new Error('Could not find service');})).not.toThrow();
 });

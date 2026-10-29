@@ -164,3 +164,37 @@ A different APFS volume is never re-bound. The config file is never edited.
 to deploy if either pinned file no longer matches its hash or if the standing
 config's `sourceRevision` is not the release being deployed. Move the file aside
 to deploy with standing engineering disabled.
+
+## Relocating a standing grant's aggregate
+
+`scripts/relocate-standing-funding.ts` moves a standing grant to a new aggregate
+by transfer: the old aggregate is copied byte-for-byte, the old standing hold is
+retired in the copy at exactly its committed amount, and the rest funds a new
+hold. Nothing in the old file is edited. `--apply` also writes
+`<old aggregate>.admission.lock/transferred.json`; the standing funding guard
+refuses any grant whose aggregate has that file. `--enroll` retires the old pool
+in `standing_engineering_pool_retirements` and enrolls the new pool in one
+spend-ledger transaction; a retired pool can never allocate, converse or spend.
+Both refuse while the LaunchAgent has a running process.
+
+Relocation refuses while the old aggregate holds an acceptance or readonly-canary
+allocation, because those are reconciled by code that writes the old path.
+Other held entries are copied verbatim.
+
+The approval evidence is a 0600 JSON file with exactly these keys:
+
+```json
+{
+  "version": 1,
+  "kind": "standing_engineering_relocation_approval",
+  "approver": "Tanner Vass",
+  "approvedAt": "2026-10-28",
+  "approvalText": "<verbatim approval>",
+  "sourceHoldId": "standing-engineering:<old pool id>",
+  "retiredPoolId": "<old pool id>",
+  "transferredMicros": 16305670,
+  "newPoolId": "<new pool id>"
+}
+```
+
+The dry run prints this template with the exact ids and amount filled in.

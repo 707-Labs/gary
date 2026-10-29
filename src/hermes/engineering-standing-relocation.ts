@@ -33,12 +33,44 @@ export function standingPoolRetainedMicros(spendDb: Database, config: StandingEn
   return retained;
 }
 
-export interface StandingRelocationInput {
-  config: StandingEngineeringRuntimeConfig; configPath: string;
-  journalDb: Database; spendDb: Database; ledgerPath: string;
+export interface StandingRelocationInspectInput {
+  config: StandingEngineeringRuntimeConfig;
+  journalDb: Database; spendDb: Database;
   listLabelledContainers: () => readonly string[];
-  approvalEvidenceSha256: string;
-  targetDirectory: string; next: { poolId: string; campaignId: string; taskCapMicros?: number };
+  next: { poolId: string; campaignId: string; taskCapMicros?: number };
+}
+export interface StandingRelocationInspection {
+  quiescence: Readonly<Record<string, number>>;
+  retainedMicros: number; transferredMicros: number; sourceHoldId: string;
+  /** Held allocations whose reconciliation code (engineering-budget, readonly-canary-budget)
+   * writes the OLD aggregate path. The tombstone would block that, so these must be closed first. */
+  openHolds: readonly { id: string; state: string; retainedAmountUsd: unknown }[];
+  /** Other held allocations (hand-maintained bookkeeping, no Gary writer): copied verbatim. */
+  carriedHolds: readonly { id: string; state: string; retainedAmountUsd: unknown }[];
+  /** Fill approver/approvedAt/approvalText, have Tanner confirm, save 0600, pass via --approval-evidence. */
+  approvalTemplate: Record<string, unknown>;
+}
+
+/** Read-only: quiescence, the amounts that would move, and any blocking holds. */
+export function inspectStandingRelocation(i: StandingRelocationInspectInput): StandingRelocationInspection {
+  const quiescence = assertEngineeringRebootQuiescent({ journalDb: i.journalDb, spendDb: i.spendDb, listLabelledContainers: i.listLabelledContainers });
+  const retainedMicros = standingPoolRetainedMicros(i.spendDb, i.config);
+  const sourceHoldId = 'standing-engineering:' + i.config.funding.poolId;
+  const source = JSON.parse(readFileSync(i.config.aggregatePath, 'utf8')) as { runtimeAllocations?: { id?: unknown; state?: unknown; retainedAmountUsd?: unknown }[] };
+  const held = (source.runtimeAllocations ?? []).filter(v => typeof v.state === 'string' && v.state.startsWith('held_for_') && v.id !== sourceHoldId)
+    .map(v => ({ id: String(v.id), state: String(v.state), retainedAmountUsd: v.retainedAmountUsd }));
+  const reconciledByGary = new Set(['held_for_engineering_acceptance', 'held_for_readonly_canary']);
+  const openHolds = held.filter(h => reconciledByGary.has(h.state)), carriedHolds = held.filter(h => !reconciledByGary.has(h.state));
+  const transferredMicros = i.config.funding.capMicros - retainedMicros;
+  return { quiescence, retainedMicros, transferredMicros, sourceHoldId, openHolds, carriedHolds,
+    approvalTemplate: { version: 1, kind: 'standing_engineering_relocation_approval', approver: '<name>', approvedAt: '<YYYY-MM-DD>',
+      approvalText: '<verbatim approval>', sourceHoldId, retiredPoolId: i.config.funding.poolId, transferredMicros, newPoolId: i.next.poolId } };
+}
+
+export interface StandingRelocationInput extends StandingRelocationInspectInput {
+  configPath: string; ledgerPath: string;
+  approvalEvidenceBytes: Buffer;
+  targetDirectory: string;
   now: Date;
 }
 export interface StandingRelocationPlan extends StandingFundingTransferPlan {
@@ -48,10 +80,11 @@ export interface StandingRelocationPlan extends StandingFundingTransferPlan {
   quiescence: Readonly<Record<string, number>>;
 }
 
-/** Read-only. Proves nothing is in flight, then computes every new file. */
+/** Read-only. Refuses while anything is in flight or any other hold is open. */
 export function planStandingRelocation(i: StandingRelocationInput): StandingRelocationPlan {
-  const quiescence = assertEngineeringRebootQuiescent({ journalDb: i.journalDb, spendDb: i.spendDb, listLabelledContainers: i.listLabelledContainers });
-  const retainedMicros = standingPoolRetainedMicros(i.spendDb, i.config);
+  const inspection = inspectStandingRelocation(i);
+  if (inspection.openHolds.length) fail('open_holds:' + inspection.openHolds.map(h => h.id).join(','));
+  const { quiescence, retainedMicros } = inspection;
   // No symlinked ancestors: the nearest existing ancestor must already be canonical.
   let ancestor = dirname(i.targetDirectory);
   for (;;) { try { lstatSync(ancestor); break; } catch { ancestor = dirname(ancestor); } }
@@ -61,7 +94,7 @@ export function planStandingRelocation(i: StandingRelocationInput): StandingRelo
   const plan = planStandingFundingTransfer({ sourceAggregateBytes, sourceAggregatePath: i.config.aggregatePath,
     retired: { poolId: i.config.funding.poolId, authoritySha256: i.config.funding.authoritySha256, capMicros: i.config.funding.capMicros },
     retainedMicros, next: { poolId: i.next.poolId, campaignId: i.next.campaignId, taskCapMicros: i.next.taskCapMicros ?? i.config.funding.taskCapMicros },
-    ledgerPath: i.ledgerPath, approvalEvidenceSha256: i.approvalEvidenceSha256, directory: i.targetDirectory,
+    ledgerPath: i.ledgerPath, approvalEvidenceBytes: i.approvalEvidenceBytes, directory: i.targetDirectory,
     aggregatePath: join(i.targetDirectory, 'aggregate.json'), now: i.now });
   const raw = JSON.parse(readFileSync(i.configPath, 'utf8'));
   const next = { ...raw, funding: plan.authority, fundingAuthorityPath: plan.fundingAuthorityPath,
@@ -72,10 +105,17 @@ export function planStandingRelocation(i: StandingRelocationInput): StandingRelo
   const tombstonePath = i.config.aggregatePath + '.admission.lock';
   const tombstoneBytes = Buffer.from(JSON.stringify({ version: 1, kind: 'standing_engineering_aggregate_transferred',
     transferredTo: plan.aggregatePath, retiredPoolId: i.config.funding.poolId, sourceSha256: sha(sourceAggregateBytes),
-    note: 'Gary budget writers create this lock directory exclusively; its presence stops further admissions against this file.' }, null, 2) + '\n');
+    note: 'Gary budget writers create this lock directory exclusively, and the standing funding guard refuses any grant whose aggregate has this file.' }, null, 2) + '\n');
   return { ...plan, retainedMicros, quiescence,
     newConfigPath: join(dirname(i.configPath), basename(i.configPath, '.json') + '-relocated-' + stamp + '.json'),
     newConfigBytes, newConfigSha256: sha(newConfigBytes), tombstonePath, tombstoneBytes };
+}
+
+/** --apply/--enroll require the LaunchAgent to have no running process. */
+export function assertGaryStopped(printService: () => string): void {
+  let output: string;
+  try { output = printService(); } catch { return; } // not loaded: nothing running
+  if (/^\s*pid = \d+/m.test(output) || /^\s*state = running/m.test(output)) fail('gary_running');
 }
 
 function writeNew(path: string, bytes: Buffer): void {

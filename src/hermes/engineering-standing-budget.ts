@@ -102,8 +102,12 @@ export function createStandingEngineeringBudget(options: {
       return fn(db);
     } finally { db.close(); }
   }
+  const retiredPool = (db: Database, poolId: string) => !!db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='standing_engineering_pool_retirements'").get()
+    && !!db.query('SELECT 1 FROM standing_engineering_pool_retirements WHERE pool_id=?').get(poolId);
   function enrolled(db: Database): boolean {
     if (!tables(db)) return false;
+    // A pool retired by a funding transfer can never allocate, converse or spend again.
+    if (retiredPool(db, a.poolId)) fail('pool_retired');
     const row = db.query<{authority_hash:string;authority_json:string;ledger_identity_json:string;campaign_id:string},[string]>(
       'SELECT authority_hash,authority_json,ledger_identity_json,campaign_id FROM standing_engineering_pools WHERE pool_id=?').get(a.poolId);
     if (!row) return false;
@@ -130,6 +134,20 @@ export function createStandingEngineeringBudget(options: {
       uncommittedCapMicros:a.capMicros-committed,chargedMicros:charged,chargedHeadroomMicros:a.capMicros-charged,
       grossCommittedCapMicros:gross,releasedCapMicros:reconciled.released,auxiliaryChargeMicros:reconciled.auxiliary,
       canAllocate:exists && a.capMicros-committed >= a.taskCapMicros});
+  }
+  function enrollIn(db: Database): void {
+        guard();
+        db.exec(`CREATE TABLE IF NOT EXISTS standing_engineering_pools(pool_id TEXT PRIMARY KEY,campaign_id TEXT NOT NULL UNIQUE,
+          authority_hash TEXT NOT NULL,authority_json TEXT NOT NULL,ledger_identity_json TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS standing_engineering_allocations(pool_id TEXT NOT NULL REFERENCES standing_engineering_pools(pool_id),
+          request_id TEXT NOT NULL,request_hash TEXT NOT NULL,task_id TEXT NOT NULL UNIQUE,allocation_id TEXT NOT NULL UNIQUE REFERENCES spend_tickets(ticket_id),
+          cap_micros INTEGER NOT NULL CHECK(cap_micros>0),PRIMARY KEY(pool_id,request_id));`);
+        initializeStandingReconciliation(db);
+        if (enrolled(db)) return;
+        if (db.query('SELECT 1 FROM spend_campaigns WHERE id=?').get(a.campaignId)) fail('campaign_already_exists');
+        db.query('INSERT INTO spend_campaigns(id,cap_micros) VALUES(?,?)').run(a.campaignId,a.capMicros);
+        db.query('INSERT INTO standing_engineering_pools VALUES(?,?,?,?,?)').run(a.poolId,a.campaignId,authorityHash,JSON.stringify(a),JSON.stringify(ledgerIdentity));
+        guard();
   }
   const allocationIdFor = (requestId: string) => {
     if (!id(requestId)) fail('request_id');
@@ -160,22 +178,34 @@ export function createStandingEngineeringBudget(options: {
   }
   return {
     /** Operator-only activation after distinct funding is verified; never startup auto-enrollment. */
-    enrollPool(): void {
+    enrollPool(): void { open(true, db=>db.transaction(()=>enrollIn(db)).immediate()); },
+    /** Operator-only: in ONE ledger transaction, retire the transferred-from pool at
+     * exactly its committed amount and enroll this pool. Refuses if the old pool
+     * has an unsettled attempt, an open conversation lease, or a different commitment. */
+    enrollPoolReplacing(input: { retired: StandingEngineeringBudgetAuthority; retainedMicros: number; transferReceiptSha256: string }): void {
+      const r = input.retired;
+      if (!exact(r, ['version','poolId','campaignId','capMicros','taskCapMicros','authoritySha256','holdReceiptSha256']) || r.poolId === a.poolId
+          || r.campaignId === a.campaignId || !sha(input.transferReceiptSha256) || !Number.isSafeInteger(input.retainedMicros)
+          || input.retainedMicros < 0 || input.retainedMicros + a.capMicros !== r.capMicros) fail('retirement_input');
       open(true, db=>db.transaction(()=>{
         guard();
-        db.exec(`CREATE TABLE IF NOT EXISTS standing_engineering_pools(pool_id TEXT PRIMARY KEY,campaign_id TEXT NOT NULL UNIQUE,
-          authority_hash TEXT NOT NULL,authority_json TEXT NOT NULL,ledger_identity_json TEXT NOT NULL);
-          CREATE TABLE IF NOT EXISTS standing_engineering_allocations(pool_id TEXT NOT NULL REFERENCES standing_engineering_pools(pool_id),
-          request_id TEXT NOT NULL,request_hash TEXT NOT NULL,task_id TEXT NOT NULL UNIQUE,allocation_id TEXT NOT NULL UNIQUE REFERENCES spend_tickets(ticket_id),
-          cap_micros INTEGER NOT NULL CHECK(cap_micros>0),PRIMARY KEY(pool_id,request_id));`);
-        initializeStandingReconciliation(db);
-        if (enrolled(db)) return;
-        if (db.query('SELECT 1 FROM spend_campaigns WHERE id=?').get(a.campaignId)) fail('campaign_already_exists');
-        db.query('INSERT INTO spend_campaigns(id,cap_micros) VALUES(?,?)').run(a.campaignId,a.capMicros);
-        db.query('INSERT INTO standing_engineering_pools VALUES(?,?,?,?,?)').run(a.poolId,a.campaignId,authorityHash,JSON.stringify(a),JSON.stringify(ledgerIdentity));
-        guard();
+        db.exec(`CREATE TABLE IF NOT EXISTS standing_engineering_pool_retirements(pool_id TEXT PRIMARY KEY REFERENCES standing_engineering_pools(pool_id),
+          campaign_id TEXT NOT NULL,retained_micros INTEGER NOT NULL CHECK(retained_micros>=0),successor_pool_id TEXT NOT NULL,
+          transfer_receipt_sha256 TEXT NOT NULL,retired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);`);
+        if (retiredPool(db, r.poolId)) fail('already_retired');
+        const row = db.query<{authority_hash:string;campaign_id:string},[string]>('SELECT authority_hash,campaign_id FROM standing_engineering_pools WHERE pool_id=?').get(r.poolId);
+        if (!row || row.authority_hash !== digest(r) || row.campaign_id !== r.campaignId) fail('retired_pool_binding');
+        if (db.query('SELECT 1 FROM standing_engineering_conversation_leases WHERE pool_id=? AND end_attempt_id IS NULL').get(r.poolId)) fail('retired_pool_conversation_open');
+        if (db.query(`SELECT 1 FROM spend_attempts x JOIN spend_tickets t ON t.ticket_id=x.ticket_id WHERE t.campaign_id=? AND x.state<>'settled'`).get(r.campaignId)) fail('retired_pool_unsettled');
+        const gross = db.query<{n:number},[string]>('SELECT COALESCE(SUM(cap_micros),0) n FROM spend_tickets WHERE campaign_id=?').get(r.campaignId)!.n;
+        const amounts = standingReconciliationAmounts(db, r);
+        if (gross - amounts.released + amounts.auxiliary !== input.retainedMicros) fail('retired_pool_commitment_changed');
+        db.query('INSERT INTO standing_engineering_pool_retirements(pool_id,campaign_id,retained_micros,successor_pool_id,transfer_receipt_sha256) VALUES(?,?,?,?,?)')
+          .run(r.poolId, r.campaignId, input.retainedMicros, a.poolId, input.transferReceiptSha256);
+        enrollIn(db);
       }).immediate());
     },
+
     ready(): boolean { try { return open(false,db=>statusIn(db).canAllocate); } catch { return false; } },
     status: () => open(false,statusIn),
     /** Explicit operator action. All releases and historical auxiliary charges

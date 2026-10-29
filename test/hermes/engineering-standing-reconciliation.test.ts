@@ -61,3 +61,26 @@ test('historical coding-chat receipts are added once, without adopting unrelated
  f.db.query("INSERT INTO spend_receipts(attempt_id,reason,details_json) VALUES(?,'accepted','{}')").run(id);
  f.reconcile([a.taskId],[id]);f.reconcile([a.taskId],[id]);expect(f.pool.status()).toMatchObject({committedCapMicros:125000,chargedMicros:125000,auxiliaryChargeMicros:25000});
 });
+
+import {standingPoolRetainedMicros} from '../../src/hermes/engineering-standing-relocation.ts';
+const retained=(f:ReturnType<typeof fixture>)=>standingPoolRetainedMicros(f.db,{funding:f.authority} as any);
+test('relocation retains task caps net of reviewed releases and equals the pool status commitment',()=>{
+ const f=fixture(),tasks=[1,2].map(n=>f.terminal(n,250_000));
+ expect(retained(f)).toBe(10_000_000);expect(retained(f)).toBe(f.pool.status().committedCapMicros);
+ f.reconcile(tasks.map(t=>t.taskId)); // releases 4_750_000 per task, keeps the 250_000 charged
+ expect(retained(f)).toBe(500_000);expect(retained(f)).toBe(f.pool.status().committedCapMicros);
+});
+test('coding-chat charges on the separate chat ticket are added once; a chat-funded task keeps its full cap (conservative)',async()=>{
+ const f=fixture();f.ledger.createCampaign('chat',20);f.ledger.enrollTicket('chat','local:hermes-dm-20261008-tanner',20);
+ await f.pool.withCodingConversation('local:hermes-dm-20261008-tanner',async()=>{
+  expect(()=>retained(f)).toThrow('conversation_lease_open');
+  f.db.exec("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES('local:hermes-dm-20261008-tanner','openrouter','deepseek/deepseek-v4.1-flash',128,1000000,300000,'settled')");
+  f.pool.allocate(f.input(1));
+ });
+ // Gross 5_000_000 task cap + 300_000 chat charge. The chat charge also counts against
+ // that task's own 5M ceiling, so this retains up to 300_000 more than strictly needed:
+ // the same over-retention the live pool status already applies, never less.
+ expect(retained(f)).toBe(5_300_000);expect(retained(f)).toBe(f.pool.status().committedCapMicros);
+ f.db.exec("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state) VALUES('other-ticket','openrouter','deepseek/deepseek-v4.1-flash',128,1,1,'settled')");
+ expect(retained(f)).toBe(5_300_000); // charges outside the pool's tickets and leases are ignored
+});
