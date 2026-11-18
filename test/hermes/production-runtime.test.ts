@@ -110,7 +110,7 @@ test('completed, superseded and closed action bindings are revoked without spend
   }
 });
 test('wrong provider and absent canonical criteria never launch or open new spend authority',async()=>{
-  const f=await fixture();expect(()=>createHermesCodeLoopFactory({...f.options,route:{...f.options.route,provider:'z.ai',model:'glm-5.3'}})(f.binding.admission)).toThrow('admitted_model_route_mismatch');
+  const f=await fixture();expect(()=>createHermesCodeLoopFactory({...f.options,route:{...f.options.route,provider:'z.ai',model:'glm-5.3'} as unknown as typeof f.options.route})(f.binding.admission)).toThrow('admitted_model_route_mismatch');
   const original=f.options.taskPolicy;f.options.taskPolicy=async(...args)=>({...await original(...args),task:{allowedFiles:['task.ts'],criteria:[{id:'wrong',description:'Wrong check',requiredCommands:['true']}]}});
   expect((await f.runner()(f.args)).status).toBe('error');expect(f.counts().calls).toBe(0);
 });
@@ -200,7 +200,7 @@ test('invalid trusted thinking and non-DeepSeek thinking fail before binding or 
     expect(()=>createHermesCodeLoopFactory({...f.options,thinking} as unknown as ProductionRuntimeOptions))
       .toThrow('invalid_host_thinking_policy');
   }
-  expect(()=>createHermesCodeLoopFactory({...f.options,thinking:'disabled',route:{...f.options.route,provider:'z.ai',model:'glm-5.3'}}))
+  expect(()=>createHermesCodeLoopFactory({...f.options,thinking:'disabled',route:{...f.options.route,provider:'z.ai',model:'glm-5.3'} as unknown as typeof f.options.route}))
     .toThrow('invalid_host_thinking_policy');
   expect({launches,...f.counts(),traces:f.traces.length}).toEqual({launches:0,calls:0,policies:0,traces:0});
   expect(f.ledger.status(issue.id)?.attemptCount).toBe(0);
@@ -212,7 +212,7 @@ test('invalid trusted thinking and non-DeepSeek thinking fail before binding or 
 test('factory snapshots trusted thinking and provider before caller mutation',async()=>{
   const f=await fixture();f.options.thinking='disabled';
   const factory=createHermesCodeLoopFactory(f.options);
-  delete f.options.thinking;f.options.route.provider='z.ai';f.options.route.model='glm-5.3';
+  delete f.options.thinking;(f.options.route as unknown as {provider:string;model:string}).provider='z.ai';(f.options.route as unknown as {provider:string;model:string}).model='glm-5.3';
   f.options.route.fetch=async()=>{throw new Error('mutated caller transport must not run');};
   const result=await factory(f.binding.admission)(f.args);
   expect({status:result.status,error:result.errorMessage}).toEqual({status:'finished',error:undefined});

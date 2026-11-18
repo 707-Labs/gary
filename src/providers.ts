@@ -4,18 +4,14 @@ import { type RateLimitGate, createRateLimitGate } from "./rate-limit.ts";
 import { withOpenRouterPreferences } from "./spend.ts";
 
 /**
- * Identifiers for the LLM providers Gary speaks to. The order in
- * `DEFAULT_CHAIN_ORDER` mirrors the fallback priority: Z.ai is the primary,
- * Kimi Code is the first fallback (subscription cap), and OpenRouter
- * (pay-as-you-go, see src/model-route.ts) is the final fallback.
+ * Identifiers for the LLM providers Gary speaks to. OpenRouter (pay-per-token,
+ * see src/model-route.ts) is the only one; the Z.ai GLM and Kimi for Coding
+ * subscription routes were retired 2026-11-18. The chain machinery below stays
+ * generic over providers.
  */
-export type ProviderName = "z.ai" | "kimi" | "openrouter";
+export type ProviderName = "openrouter";
 
-export const DEFAULT_CHAIN_ORDER: readonly ProviderName[] = [
-  "z.ai",
-  "kimi",
-  "openrouter",
-];
+export const DEFAULT_CHAIN_ORDER: readonly ProviderName[] = ["openrouter"];
 
 export interface ProviderConfig {
   name: ProviderName;
@@ -24,8 +20,7 @@ export interface ProviderConfig {
   model: string;
   /**
    * Default backoff applied when the provider 429s but `parse429` can't
-   * extract a reset timestamp from the response body. Z.ai includes the
-   * timestamp inline; Kimi/OpenRouter shapes are TBD.
+   * extract a reset timestamp from the response body.
    */
   defaultBackoffMs: number;
 }
@@ -43,49 +38,12 @@ export interface LLMProvider {
   parse429(message: string): Date | null;
 }
 
-/**
- * Z.ai's 5-hour cap returns:
- *   429 {"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-04-25 15:43:26"}}
- * The reset timestamp is server time. Z.ai's docs and observed behavior treat
- * it as UTC. If they're ever off by a timezone we wait too long (safe).
- */
-const ZAI_USAGE_LIMIT_PATTERN =
-  /Usage limit reached[^"]*?reset at\s+(\d{4}-\d{2}-\d{2})[\sT](\d{2}:\d{2}:\d{2})/i;
-
-export function parseZAi429(message: string): Date | null {
-  const m = message.match(ZAI_USAGE_LIMIT_PATTERN);
-  if (!m || !m[1] || !m[2]) return null;
-  const iso = `${m[1]}T${m[2]}Z`;
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-
-/**
- * Kimi Code 429 shape is undocumented as of 2026-04-25. Best-effort: try to
- * recognize a generic ISO-style timestamp in the body; otherwise return null
- * so the chain falls back to defaultBackoffMs.
- */
-export function parseKimi429(message: string): Date | null {
-  // Permissive: match either "reset at YYYY-MM-DD HH:MM:SS" or a bare ISO
-  // 8601 timestamp, since we don't yet know Kimi Code's exact phrasing.
-  const m =
-    message.match(/reset(?:[^"\d]+)(\d{4}-\d{2}-\d{2})[\sT](\d{2}:\d{2}:\d{2})/i) ??
-    message.match(/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)/);
-  if (!m) return null;
-  const iso = m[2] ? `${m[1]}T${m[2]}Z` : m[1];
-  if (!iso) return null;
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-
 /** OpenRouter 429s carry no documented reset timestamp in the body; use the default backoff. */
 export function parseOpenRouter429(_message: string): Date | null {
   return null;
 }
 
 const PARSERS: Record<ProviderName, (m: string) => Date | null> = {
-  "z.ai": parseZAi429,
-  kimi: parseKimi429,
   openrouter: parseOpenRouter429,
 };
 
@@ -101,9 +59,8 @@ export function createProvider(
   cfg: ProviderConfig,
   opts: CreateProviderOpts = {},
 ): LLMProvider {
-  // All three providers (Z.ai, Kimi Code, OpenRouter) accept
-  // `Authorization: Bearer <key>` rather than the SDK default `x-api-key`.
-  // Using `authToken` flips the header.
+  // OpenRouter accepts `Authorization: Bearer <key>` rather than the SDK
+  // default `x-api-key`. Using `authToken` flips the header.
   // Every OpenRouter request carries the guard-checked routing preferences
   // (no prompt-retaining upstreams, max price = the spend policy).
   const transport = cfg.name === "openrouter" ? withOpenRouterPreferences(opts.fetch ?? globalThis.fetch) : opts.fetch;
@@ -164,8 +121,8 @@ export function createProviderChain(
  * concurrent slots against different primaries — each slot gets its own
  * chain so one slot's 429 doesn't cascade into a primary swap that the
  * other slots are already using. All slots share the same provider objects
- * (and their gates), so a 429 on Z.ai arms it globally regardless of which
- * slot saw it.
+ * (and their gates), so a 429 on one provider arms it globally regardless of
+ * which slot saw it.
  */
 export function chainStartingWith(
   canonical: ProviderChain,
@@ -187,8 +144,8 @@ export function chainStartingWith(
  * dropped — keeps reviewer config robust to typos in env vars (you'll
  * still get a working chain, just not the one you typed).
  *
- * Use this for the reviewer's chain so it prefers a different provider
- * than primary, giving uncorrelated blind spots.
+ * Used for the reviewer's chain. With OpenRouter as the only provider the
+ * reviewer runs on the same model as the primary.
  */
 export function chainWithOrder(
   canonical: ProviderChain,
@@ -227,7 +184,7 @@ export class AllProvidersExhaustedError extends Error {
 
 /**
  * A provider answered 200 with no text content. The SDK does not treat that
- * as an error, so the chain has to: Z.ai returned 425 consecutive empty
+ * as an error, so the chain has to: Z.ai (since retired) returned 425 consecutive empty
  * classifier completions for one ticket on 2026-08-31 while serving other
  * tickets normally (mb-b2tw). Per-request, not a quota signal, so the
  * provider's gate is not armed; the call just moves to the next provider.
@@ -253,9 +210,9 @@ export class EmptyCompletionError extends Error {
  * because instanceof checks across multiple imports of the SDK are
  * fragile.
  *
- * Some providers (e.g. Kimi) return 403 or 402 instead of 429 for
- * usage-limit / insufficient-balance errors. We treat those as rate limits
- * so the chain falls through to the next provider rather than crashing.
+ * Some providers return 403 or 402 instead of 429 for usage-limit /
+ * insufficient-balance errors (OpenRouter: 402 when out of credits). We treat
+ * those as rate limits so the gate backs off rather than crashing.
  */
 export function isRateLimitError(err: unknown): boolean {
   if (typeof err !== "object" || err === null) return false;

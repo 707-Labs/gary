@@ -307,7 +307,7 @@ function makeFixture() {
   const db = openDb(":memory:");
   upsertTicket(db, { linearId: issue.id, identifier: issue.identifier });
   const provider = createProvider(
-    { name: "z.ai", apiKey: "offline-fixture", baseUrl: "https://provider.invalid", model: "fake", defaultBackoffMs: 1000 },
+    { name: "openrouter", apiKey: "offline-fixture", baseUrl: "https://provider.invalid", model: "fake", defaultBackoffMs: 1000 },
     { fetch: (async () => { throw new Error("Network forbidden in offline handler tests"); }) as unknown as typeof fetch },
   );
   const glm = new GLMClient(createProviderChain([provider]));
@@ -343,7 +343,7 @@ function makeFixture() {
     linear: { postComment, unassign: async () => {}, addPrAttachment: async () => {} } as unknown as LinearAdapter,
     reposDir: "/offline/repos", workspacesDir: "/offline/workspaces",
     agentLoopMaxIterations: 50, agentLoopTimeoutMs: 1000,
-    review: { providerOrder: ["z.ai"], maxRounds: 2, iterationCap: 15, timeoutMs: 1000 },
+    review: { providerOrder: ["openrouter"], maxRounds: 2, iterationCap: 15, timeoutMs: 1000 },
   };
   return {
     db, deps, run, hasCommits, primary, review, complete, push, openPr, rebase, postComment, pr, gitCommand, factory,

@@ -20,6 +20,10 @@ function message(): Anthropic.Message {
   } as Anthropic.Message;
 }
 
+// ProviderName is only "openrouter" now; the chain is generic over names, so
+// fallback tests use a distinct fake name for the second provider.
+const SECONDARY = "secondary" as LLMProvider["name"];
+
 function provider(
   name: LLMProvider["name"],
   create: (_body: unknown, options?: RequestOptions) => Promise<Anthropic.Message>,
@@ -48,7 +52,7 @@ describe("GLMClient shared deadlines", () => {
       let watchdog: ReturnType<typeof setTimeout> | undefined;
       let signal: AbortSignal | undefined;
       let onAbort: (() => void) | undefined;
-      const primary = provider("z.ai", async (_body, options) => {
+      const primary = provider("openrouter", async (_body, options) => {
         attempts++;
         captured = options;
         signal = options?.signal;
@@ -70,7 +74,7 @@ describe("GLMClient shared deadlines", () => {
           else signal?.addEventListener("abort", onAbort, { once: true });
         });
       });
-      const fallback = provider("kimi", async () => { fallbackCalls++; return message(); });
+      const fallback = provider(SECONDARY, async () => { fallbackCalls++; return message(); });
       const glm = new GLMClient(createProviderChain([primary, fallback]));
       try {
         await expect(call(glm, Date.now() + 50)).rejects.toBeInstanceOf(DeadlineExceededError);
@@ -94,7 +98,7 @@ describe("GLMClient shared deadlines", () => {
       let onAbort: (() => void) | undefined;
       let watchdog: ReturnType<typeof setTimeout> | undefined;
       let responseDelivered = false;
-      const primary = provider("z.ai", async (_body, options) => {
+      const primary = provider("openrouter", async (_body, options) => {
         signal = options?.signal;
         return new Promise((resolve) => {
           onAbort = () => {
@@ -125,7 +129,7 @@ describe("GLMClient shared deadlines", () => {
   it("disables the real SDK's automatic retries using an entirely mocked transport", async () => {
     let transportCalls = 0;
     const primary = createProvider({
-      name: "z.ai", model: "offline-model", apiKey: "offline-test-key",
+      name: "openrouter", model: "offline-model", apiKey: "offline-test-key",
       baseUrl: "https://offline.invalid", defaultBackoffMs: 1_000,
     }, {
       fetch: (async () => {
@@ -143,7 +147,7 @@ describe("GLMClient shared deadlines", () => {
 
   it("does not start a provider call when the inherited deadline has already expired", async () => {
     let attempts = 0;
-    const primary = provider("z.ai", async () => { attempts++; return message(); });
+    const primary = provider("openrouter", async () => { attempts++; return message(); });
     const glm = new GLMClient(createProviderChain([primary]));
     await expect(glm.complete({ system: "", user: "offline", deadlineMs: Date.now() - 1 }))
       .rejects.toBeInstanceOf(DeadlineExceededError);
@@ -167,7 +171,7 @@ describe('GLM trusted host cancellation', () => {
       await drain; cleaned = true;
       throw Object.assign(new Error('retryable transport failure during shutdown'), { status: 429 });
     });
-    const glm = new GLMClient(createProviderChain([primary, provider('kimi', async () => { fallbacks++; return message(); })]), { signal: host.signal });
+    const glm = new GLMClient(createProviderChain([primary, provider(SECONDARY, async () => { fallbacks++; return message(); })]), { signal: host.signal });
     const pending = method === 'complete' ? glm.complete({ system: '', user: 'offline', signal: local.signal })
       : glm.createMessage({ max_tokens: 8, messages: [{ role: 'user', content: 'offline' }] }, { signal: local.signal });
     const result = pending.then(() => { settled = true; throw new Error('unexpected success'); }, error => { settled = true; return error; });

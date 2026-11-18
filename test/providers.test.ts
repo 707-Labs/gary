@@ -11,42 +11,24 @@ import {
   type LLMProvider,
   type ProviderName,
   parseOpenRouter429,
-  parseKimi429,
-  parseZAi429,
 } from "../src/providers.ts";
 import { createRateLimitGate } from "../src/rate-limit.ts";
 
-describe("parseZAi429", () => {
-  it("parses the Z.ai 5-hour cap message", () => {
-    const raw =
-      '429 {"error":{"code":"1308","message":"Usage limit reached for 5 hour. Your limit will reset at 2026-04-25 15:43:26"},"request_id":"abc"}';
-    expect(parseZAi429(raw)?.toISOString()).toBe("2026-04-25T15:43:26.000Z");
-  });
-
-  it("returns null on unrelated messages", () => {
-    expect(parseZAi429("400 bad request")).toBeNull();
-    expect(parseZAi429("429 Too Many Requests")).toBeNull();
-    expect(parseZAi429("")).toBeNull();
-  });
-});
-
-describe("parseKimi429", () => {
-  it("parses a reset-style message", () => {
-    expect(
-      parseKimi429("Quota exceeded. Reset at 2026-04-25 12:00:00.")?.toISOString(),
-    ).toBe("2026-04-25T12:00:00.000Z");
-  });
-
-  it("parses a bare ISO 8601 timestamp", () => {
-    expect(
-      parseKimi429("rate limit; retry after 2026-04-25T15:00:00Z")?.toISOString(),
-    ).toBe("2026-04-25T15:00:00.000Z");
-  });
-
-  it("returns null when no timestamp is present", () => {
-    expect(parseKimi429("429 Too Many Requests")).toBeNull();
-  });
-});
+/**
+ * The chain machinery is generic over provider names. ProviderName is now just
+ * "openrouter", so these tests use distinct fake names (cast) to exercise
+ * ordering, gates and rotation across more than one provider.
+ */
+function namedProvider(name: string, parse429: (m: string) => Date | null = () => null): LLMProvider {
+  return {
+    name: name as ProviderName,
+    model: `${name}-model`,
+    client: {} as AnthropicClient,
+    gate: createRateLimitGate(),
+    defaultBackoffMs: 60_000,
+    parse429,
+  };
+}
 
 describe("parseOpenRouter429", () => {
   it("always returns null (no documented usage cap)", () => {
@@ -55,16 +37,7 @@ describe("parseOpenRouter429", () => {
 });
 
 describe("createProvider", () => {
-  it("attaches the right parser per provider name", () => {
-    const zai = createProvider({
-      name: "z.ai",
-      apiKey: "x",
-      baseUrl: "https://example",
-      model: "m",
-      defaultBackoffMs: 1000,
-    });
-    expect(zai.parse429("Usage limit reached. reset at 2026-04-25 15:43:26"))
-      .not.toBeNull();
+  it("attaches the OpenRouter parser", () => {
     const ds = createProvider({
       name: "openrouter",
       apiKey: "x",
@@ -77,31 +50,21 @@ describe("createProvider", () => {
 });
 
 describe("ProviderChain", () => {
-  function fakeProvider(name: "z.ai" | "kimi" | "openrouter"): LLMProvider {
-    return createProvider({
-      name,
-      apiKey: "x",
-      baseUrl: "https://example",
-      model: `${name}-model`,
-      defaultBackoffMs: 1000,
-    });
-  }
-
   it("active() returns the first unarmed provider", () => {
-    const a = fakeProvider("z.ai");
-    const b = fakeProvider("kimi");
-    const c = fakeProvider("openrouter");
+    const a = namedProvider("primary");
+    const b = namedProvider("secondary");
+    const c = namedProvider("openrouter");
     const chain = createProviderChain([a, b, c]);
-    expect(chain.active()?.name).toBe("z.ai");
+    expect(chain.active()?.name as string).toBe("primary");
     a.gate.armUntil(new Date(Date.now() + 60_000));
-    expect(chain.active()?.name).toBe("kimi");
+    expect(chain.active()?.name as string).toBe("secondary");
     b.gate.armUntil(new Date(Date.now() + 60_000));
-    expect(chain.active()?.name).toBe("openrouter");
+    expect(chain.active()?.name as string).toBe("openrouter");
   });
 
   it("active() returns null when all providers are armed", () => {
-    const a = fakeProvider("z.ai");
-    const b = fakeProvider("kimi");
+    const a = namedProvider("primary");
+    const b = namedProvider("secondary");
     const chain = createProviderChain([a, b]);
     a.gate.armUntil(new Date(Date.now() + 60_000));
     b.gate.armUntil(new Date(Date.now() + 60_000));
@@ -110,16 +73,16 @@ describe("ProviderChain", () => {
   });
 
   it("earliestReset() returns null when any provider is unarmed", () => {
-    const a = fakeProvider("z.ai");
-    const b = fakeProvider("kimi");
+    const a = namedProvider("primary");
+    const b = namedProvider("secondary");
     const chain = createProviderChain([a, b]);
     a.gate.armUntil(new Date(Date.now() + 60_000));
     expect(chain.earliestReset()).toBeNull();
   });
 
   it("earliestReset() returns the soonest reset when all are armed", () => {
-    const a = fakeProvider("z.ai");
-    const b = fakeProvider("kimi");
+    const a = namedProvider("primary");
+    const b = namedProvider("secondary");
     const chain = createProviderChain([a, b]);
     const sooner = new Date(Date.now() + 60_000);
     const later = new Date(Date.now() + 600_000);
@@ -134,57 +97,47 @@ describe("ProviderChain", () => {
 });
 
 describe("chainStartingWith", () => {
-  function fakeProvider(name: "z.ai" | "kimi" | "openrouter"): LLMProvider {
-    return createProvider({
-      name,
-      apiKey: "x",
-      baseUrl: "https://example",
-      model: `${name}-model`,
-      defaultBackoffMs: 1000,
-    });
-  }
-
   it("rotates the canonical chain so primary leads", () => {
-    const a = fakeProvider("z.ai");
-    const b = fakeProvider("kimi");
-    const c = fakeProvider("openrouter");
+    const a = namedProvider("primary");
+    const b = namedProvider("secondary");
+    const c = namedProvider("openrouter");
     const canonical = createProviderChain([a, b, c]);
     const rotated = chainStartingWith(canonical, b);
-    expect(rotated.providers.map((p) => p.name)).toEqual([
-      "kimi",
-      "z.ai",
+    expect(rotated.providers.map((p) => p.name as string)).toEqual([
+      "secondary",
+      "primary",
       "openrouter",
     ]);
   });
 
   it("preserves canonical order for non-primary providers", () => {
-    const a = fakeProvider("z.ai");
-    const b = fakeProvider("kimi");
-    const c = fakeProvider("openrouter");
+    const a = namedProvider("primary");
+    const b = namedProvider("secondary");
+    const c = namedProvider("openrouter");
     const canonical = createProviderChain([a, b, c]);
     const rotated = chainStartingWith(canonical, c);
-    expect(rotated.providers.map((p) => p.name)).toEqual([
+    expect(rotated.providers.map((p) => p.name as string)).toEqual([
       "openrouter",
-      "z.ai",
-      "kimi",
+      "primary",
+      "secondary",
     ]);
   });
 
   it("shares gates with the canonical chain", () => {
     // Critical: arming a provider via one chain must reflect in another. All
     // slots see the same gates, so a 429 anywhere arms it everywhere.
-    const a = fakeProvider("z.ai");
-    const b = fakeProvider("kimi");
+    const a = namedProvider("primary");
+    const b = namedProvider("secondary");
     const canonical = createProviderChain([a, b]);
     const rotated = chainStartingWith(canonical, b);
     a.gate.armUntil(new Date(Date.now() + 60_000));
-    expect(canonical.active()?.name).toBe("kimi");
-    expect(rotated.active()?.name).toBe("kimi");
+    expect(canonical.active()?.name as string).toBe("secondary");
+    expect(rotated.active()?.name as string).toBe("secondary");
   });
 
   it("throws when the requested primary isn't in the canonical chain", () => {
-    const a = fakeProvider("z.ai");
-    const b = fakeProvider("kimi");
+    const a = namedProvider("primary");
+    const b = namedProvider("secondary");
     const canonical = createProviderChain([a]);
     expect(() => chainStartingWith(canonical, b)).toThrow();
   });
@@ -227,17 +180,9 @@ describe("isRateLimitError", () => {
 
 describe("armOnRateLimit", () => {
   it("uses the parsed reset when available", () => {
-    const p = createProvider({
-      name: "z.ai",
-      apiKey: "x",
-      baseUrl: "https://e",
-      model: "m",
-      defaultBackoffMs: 60_000,
-    });
-    const reset = armOnRateLimit(
-      p,
-      "Usage limit reached. reset at 2026-04-25 15:43:26",
-    );
+    const parsed = new Date("2026-04-25T15:43:26Z");
+    const p = namedProvider("primary", () => parsed);
+    const reset = armOnRateLimit(p, "rate limited, resets later");
     expect(reset.toISOString()).toBe("2026-04-25T15:43:26.000Z");
     expect(p.gate.armedUntil()?.toISOString()).toBe("2026-04-25T15:43:26.000Z");
   });
@@ -275,40 +220,29 @@ describe("AllProvidersExhaustedError", () => {
 });
 
 describe("chainWithOrder", () => {
-  function fakeProvider(name: ProviderName): LLMProvider {
-    return {
-      name,
-      model: name,
-      client: {} as AnthropicClient,
-      gate: createRateLimitGate(),
-      defaultBackoffMs: 60_000,
-      parse429: () => null,
-    };
-  }
-
   it("reorders providers to match the requested preference", () => {
-    const zai = fakeProvider("z.ai");
-    const kimi = fakeProvider("kimi");
-    const deepseek = fakeProvider("openrouter");
+    const zai = namedProvider("primary");
+    const kimi = namedProvider("secondary");
+    const deepseek = namedProvider("openrouter");
     const canonical = createProviderChain([zai, kimi, deepseek]);
-    const reordered = chainWithOrder(canonical, ["openrouter", "z.ai", "kimi"]);
-    expect(reordered.providers.map((p) => p.name)).toEqual(["openrouter", "z.ai", "kimi"]);
+    const reordered = chainWithOrder(canonical, ["openrouter", "primary", "secondary"] as ProviderName[]);
+    expect(reordered.providers.map((p) => p.name as string)).toEqual(["openrouter", "primary", "secondary"]);
   });
 
   it("ignores names not present in the canonical chain", () => {
-    const zai = fakeProvider("z.ai");
-    const deepseek = fakeProvider("openrouter");
+    const zai = namedProvider("primary");
+    const deepseek = namedProvider("openrouter");
     const canonical = createProviderChain([zai, deepseek]);
-    const reordered = chainWithOrder(canonical, ["openrouter", "kimi", "z.ai"]);
-    expect(reordered.providers.map((p) => p.name)).toEqual(["openrouter", "z.ai"]);
+    const reordered = chainWithOrder(canonical, ["openrouter", "secondary", "primary"] as ProviderName[]);
+    expect(reordered.providers.map((p) => p.name as string)).toEqual(["openrouter", "primary"]);
   });
 
   it("appends unrequested providers at the end in canonical order", () => {
-    const zai = fakeProvider("z.ai");
-    const kimi = fakeProvider("kimi");
-    const deepseek = fakeProvider("openrouter");
+    const zai = namedProvider("primary");
+    const kimi = namedProvider("secondary");
+    const deepseek = namedProvider("openrouter");
     const canonical = createProviderChain([zai, kimi, deepseek]);
-    const reordered = chainWithOrder(canonical, ["openrouter"]);
-    expect(reordered.providers.map((p) => p.name)).toEqual(["openrouter", "z.ai", "kimi"]);
+    const reordered = chainWithOrder(canonical, ["openrouter"] as ProviderName[]);
+    expect(reordered.providers.map((p) => p.name as string)).toEqual(["openrouter", "primary", "secondary"]);
   });
 });

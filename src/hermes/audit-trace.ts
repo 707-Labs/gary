@@ -21,7 +21,8 @@ export interface AuditTraceBinding {
 export interface AuditFingerprint { readonly bytes: number; readonly sha256: string }
 export type AuditPhase = "unknown" | "single" | "hermes" | "investigation" | "implementation" | "validation" | "review" | "publication";
 export interface AuditModelState {
-  /** "deepseek" / "deepseek-v4-pro" appear only in traces written before the OpenRouter cutover. */
+  /** "deepseek" / "deepseek-v4-pro" appear only in traces written before the OpenRouter cutover;
+   * "z.ai" / "glm-5.3" only in traces from before the subscription routes were retired (2026-11-18). */
   provider: "unknown" | typeof PAID_ROUTE.provider | typeof LEGACY_DEEPSEEK_ROUTE.provider | "z.ai";
   model: "unknown" | typeof PAID_ROUTE.model | typeof LEGACY_DEEPSEEK_ROUTE.model | "glm-5.3";
   /** Only explicitly selected request settings. Provider defaults stay unknown. */

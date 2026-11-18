@@ -27,15 +27,17 @@ inspect the specific script and its authorized scope before running it:
 bun run scripts/probe-linear.ts          # verify Linear auth + list assignments
 bun run scripts/probe-github.ts          # verify App auth + list own PRs
 bun run scripts/probe-github-raw.ts      # diagnostic; raw fetch with installation token
-bun run scripts/probe-glm.ts             # chat + tool use against Z.ai
-bun run scripts/probe-classifier.ts      # classifier on fixture tickets (no Linear writes)
-bun run scripts/probe-agent-loop.ts      # agent loop in temp workspace
+bun run scripts/probe-classifier.ts      # classifier on fixture tickets (no Linear writes; paid, unledgered OpenRouter calls)
+bun run scripts/probe-agent-loop.ts      # agent loop in temp workspace (paid, unledgered OpenRouter calls)
 bun run scripts/probe-loop-tick.ts       # ONE real tick — will post comments / open PRs
 bun run scripts/probe-ticket-details.ts  # print descriptions of Gary's current assignments
 bun run scripts/probe-relations.ts       # print blocks/related relations + derived blockers per assignment
 bun run scripts/probe-cloudflare.ts      # verify CF observability auth + recent errors
 bun run scripts/probe-d1.ts              # verify D1 read auth + SELECT-only clamp
 ```
+
+`scripts/rewrite-pr-style.ts`, `probe-reviewer.ts`, `probe-cache.ts` and
+`probe-openrouter.ts` also make paid OpenRouter calls outside the spend ledger.
 
 ## Architecture (one-liner)
 
@@ -44,8 +46,9 @@ bun run scripts/probe-d1.ts              # verify D1 read auth + SELECT-only cla
 ## Reviewer pass
 
 After the primary agent finishes and `bun run check` passes, a fresh
-reviewer agent (different provider preference: OpenRouter first by
-default, configurable via `GARY_REVIEWER_PROVIDER_ORDER`) reviews the
+reviewer agent (same OpenRouter model as the primary since the
+subscription providers were retired, so its blind spots are correlated;
+`GARY_REVIEWER_PROVIDER_ORDER` defaults to `openrouter`) reviews the
 diff before push. It has read+run+submit_review tools — it can verify
 claims by running tests/queries/fetches but cannot edit code.
 
@@ -80,7 +83,7 @@ Files: `src/review/{precheck.ts, tools.ts, prompts.ts, runner.ts}`,
 
 ## Environment
 
-`.env` required keys: `LINEAR_API_KEY`, `GARY_LINEAR_USER_ID`, `LINEAR_TEAM_ID`, `LINEAR_IN_PROGRESS_STATE_ID`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_PATH` (or inline `GITHUB_APP_PRIVATE_KEY`), `GITHUB_APP_INSTALLATION_ID`, `Z_AI_API_KEY`, `GARY_REPO_MAP`. Optional fallback providers: `KIMI_API_KEY` (Kimi Code, defaults to `https://api.kimi.com/coding` + `kimi-for-coding`), `OPENROUTER_API_KEY` (defaults to `https://openrouter.ai/api` + `deepseek/deepseek-v4.1-flash`; the only paid route, pinned in `src/model-route.ts`; coding and conversation runtimes refuse to start without it). Optional: `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` to enable Workers Observability tools (`query_cloudflare_logs`, `list_cloudflare_invocations`) inside the agent loop. `GARY_ALLOWLISTED_MENTION_USER_IDS` (comma-separated Linear user ids) opts into the @mention pipeline — empty (default) disables it. Reviewer pass env vars (all optional): `GARY_REVIEWER_PROVIDER_ORDER`, `GARY_REVIEW_MAX_ROUNDS`, `GARY_REVIEW_ITERATION_CAP`, `GARY_REVIEW_TIMEOUT_MS`. See `.env.example`.
+`.env` required keys: `LINEAR_API_KEY`, `GARY_LINEAR_USER_ID`, `LINEAR_TEAM_ID`, `LINEAR_IN_PROGRESS_STATE_ID`, `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY_PATH` (or inline `GITHUB_APP_PRIVATE_KEY`), `GITHUB_APP_INSTALLATION_ID`, `OPENROUTER_API_KEY` (defaults to `https://openrouter.ai/api` + `deepseek/deepseek-v4.1-flash`; the only provider, pinned in `src/model-route.ts`), `GARY_REPO_MAP`. The Z.ai GLM and Kimi for Coding subscription routes were retired 2026-11-18; leftover `Z_AI_*` / `KIMI_*` / `DEEPSEEK_*` variables are ignored with a warning. Optional: `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` to enable Workers Observability tools (`query_cloudflare_logs`, `list_cloudflare_invocations`) inside the agent loop. `GARY_ALLOWLISTED_MENTION_USER_IDS` (comma-separated Linear user ids) opts into the @mention pipeline — empty (default) disables it. Reviewer pass env vars (all optional): `GARY_REVIEWER_PROVIDER_ORDER`, `GARY_REVIEW_MAX_ROUNDS`, `GARY_REVIEW_ITERATION_CAP`, `GARY_REVIEW_TIMEOUT_MS`. See `.env.example`.
 
 `src/config.ts` exposes per-subsystem loaders (`loadLinearConfig`, `loadGitHubConfig`, `loadCloudflareConfig`, etc.) so probes can load only what they need. `loadCloudflareConfig` returns `null` when the token isn't set — Gary runs fine without it, just without log access.
 
@@ -102,7 +105,7 @@ Files: `src/review/{precheck.ts, tools.ts, prompts.ts, runner.ts}`,
 - **Comment-based fingerprints excise non-human writes**: `humanInputSignature` (Linear) hashes non-Gary comment ids; `prCommentSignature` (GitHub) hashes only `User`-typed comments — bots are filtered entirely (Gary, linear[bot] linkbacks, dependabot, etc.). Without this, ANSWER and PR-review tickets would loop because Gary's own response bumps `updatedAt` / adds a comment and shifts the cache. PR review responses are also tracked in `pr_comment_responses` so the signature returns "empty" once Gary has answered every pending human comment. See `src/state-fingerprint.ts`.
 - **Revisit marks gate `revisit_code`**: `ticket_revisit_marks` stores the `humanInputSignature` Gary acted on when `start_coding` ran; `revisit_code` only fires when the current signature differs. Pre-feature tickets without a mark stay dormant by design — back-filling the mark to "current" would silently drop comments Gary missed. See `src/state/queries.ts:getRevisitMark`.
 - **GitHub App viewer login has the `[bot]` suffix**: `getViewer()` for App auth returns `${slug}[bot]` (e.g. `gary-707-labs[bot]`), not the bare slug — that matches the login GitHub attaches to comments authored via the installation token. The bare slug looped pr-review on the first deploy.
-- **LLM provider chain (Z.ai → Kimi Code → OpenRouter)**: `GLMClient` owns a `ProviderChain` (`src/providers.ts`). `complete()` and `createMessage()` route through the highest-priority unarmed provider; on a 429 they arm that provider's gate and fall through to the next. Per-provider `parse429` extracts a reset timestamp when possible (Z.ai's `code=1308` shape; Kimi a permissive ISO matcher; OpenRouter always null since its body carries no documented reset). Falls back to `defaultBackoffMs` (60s default) when no parse. `AllProvidersExhaustedError` only fires when every provider is armed; the tick catches it, emits `rate_limit_skip`, records the action as a non-bouncing failure so it retries with the same fingerprint when a provider clears. Tests live in `test/glm-fallback.test.ts` + `test/providers.test.ts`. **Note Kimi Code ≠ Moonshot Open Platform** — different billing surface, different endpoint (`api.kimi.com/coding` vs `api.moonshot.ai/anthropic`).
+- **LLM provider chain (OpenRouter only)**: `GLMClient` owns a `ProviderChain` (`src/providers.ts`), which is generic over providers but holds only OpenRouter since the Z.ai and Kimi subscriptions were retired (2026-11-18). On a 429 it arms the provider's gate; OpenRouter's `parse429` is always null (no documented reset in the body), so the gate uses `defaultBackoffMs` (60s default). `loadGLMChain()` is unledgered and only for operator probe scripts: calls through it are paid. `AllProvidersExhaustedError` only fires when every provider is armed; the tick catches it, emits `rate_limit_skip`, records the action as a non-bouncing failure so it retries with the same fingerprint when a provider clears. Tests live in `test/glm-fallback.test.ts` + `test/providers.test.ts`.
 - **Blocked tickets hold instead of coding**: `start_coding` is gated on Linear "blocked by" relations (`inverseRelations` with `type: "blocks"` in the issue fetch). An open blocker (state not completed/canceled — unknown/inaccessible counts as open, fail closed) swaps the emitted action to `wait_for_blocker`, which posts one hold comment (voice.md example 18) and goes dormant. Blocker state is deliberately NOT in `fingerprintDerivedState` — adding a canonical field would shift every existing fingerprint and dump the action cache. `wait_for_blocker` is also excluded from `countActionsSince` so humans discussing a blocked ticket can't trip the circuit breaker. Only `start_coding` is gated: classify/answer/bounce and all existing-PR actions proceed regardless of blockers.
 - **Beads awareness is detection-based**: `loadProjectContext` sets `hasBeads` when the workspace has a `.beads/` directory (mulligan-labs repos do), and `formatProjectContext` injects a read-only note — agents may read `.beads/issues.jsonl` for context but must never mutate beads state or commit changes under `.beads/`. Linear stays the ticket source of truth; a Gary↔beads state seam remains a §16-style non-goal.
 - **Scope=L no longer auto-bounces** — removed in `4a5dac1` ("defaults to ambition", voice.md). `decideClassifyOutcome` only enforces the confidence floor; scope is still recorded. The backstop for oversized tickets is now in `code.ts`: a loop that hits iteration_cap/timeout with no commits escalates to the reporter (ERT-1648 burned 617k input tokens this way pre-removal; ERT-2353 hit the same cap 2026-08-15 and escalated cleanly). If L tickets start burning caps routinely, revisit — the removal traded token waste for ambition deliberately.

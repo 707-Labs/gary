@@ -21,8 +21,8 @@ export interface SessionOptions {
   admission: AdmittedSession;
   capabilityToken: string;
   ledger: SpendLedger;
-  provider: 'z.ai' | typeof PAID_ROUTE.provider;
-  model: 'glm-5.3' | typeof PAID_ROUTE.model;
+  provider: typeof PAID_ROUTE.provider;
+  model: typeof PAID_ROUTE.model;
   providerApiKey: string;
   /** Trusted host policy for the paid OpenRouter route; never read from native request JSON. */
   thinking?: 'disabled';
@@ -66,7 +66,7 @@ export function createSessionHost(options: SessionOptions) {
       || (options.trace.binding.ticketId !== undefined && options.trace.binding.ticketId !== admission.ticketId))) throw new Error('trace admission mismatch');
   if (token.length < 32 || !admission.actionId || !admission.fingerprint || !admission.requestId
       || !Number.isFinite(admission.deadlineMs)) throw new Error('invalid admitted session');
-  if (options.model !== (options.provider === 'z.ai' ? 'glm-5.3' : PAID_ROUTE.model)) throw new Error('unpriced provider/model pair');
+  if (options.provider !== PAID_ROUTE.provider || options.model !== PAID_ROUTE.model) throw new Error('unpriced provider/model pair');
   const thinking=options.thinking;
   if (thinking !== undefined && (thinking !== 'disabled' || options.provider !== PAID_ROUTE.provider)) throw new Error('invalid host thinking policy');
   const longTestPolicy = options.longTestPolicy === undefined ? undefined : snapshotLongTestPolicy(options.longTestPolicy);
@@ -155,8 +155,7 @@ export function createSessionHost(options: SessionOptions) {
   try {model = createModelTransport({
     ledger: options.ledger,
     capability: { ticketId: admission.ticketId, ownerId: admission.ownerEpoch,
-      ...(options.provider === 'z.ai' ? { provider: 'z.ai' as const, model: 'glm-5.3' as const }
-        : { provider: PAID_ROUTE.provider, model: PAID_ROUTE.model }), deadlineMs: admission.deadlineMs,
+      provider: PAID_ROUTE.provider, model: PAID_ROUTE.model, deadlineMs: admission.deadlineMs,
       allowedToolNames: bridge.definitions.map(t => t.function.name),
       signal: cancellation.signal,
     },

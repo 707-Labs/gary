@@ -230,7 +230,7 @@ test('failure diagnostic persistence failure cancels the session after one accou
 });
 test('session rejects non-DeepSeek or invalid trusted thinking policy before transport',()=>{
  const f=fixture();
- expect(()=>createSessionHost({...f.options,provider:'z.ai',model:'glm-5.3',thinking:'disabled'})).toThrow('invalid host thinking policy');
+ expect(()=>createSessionHost({...f.options,provider:'z.ai',model:'glm-5.3',thinking:'disabled'} as unknown as SessionOptions)).toThrow('unpriced provider/model pair');
  for(const thinking of ['enabled',null,{type:'disabled'}])expect(()=>createSessionHost({...f.options,thinking} as unknown as SessionOptions)).toThrow('invalid host thinking policy');
  expect(f.ledger.status('ticket-1')!.attemptCount).toBe(0);
 });

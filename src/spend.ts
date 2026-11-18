@@ -7,21 +7,22 @@ import { PAID_ROUTE } from "./model-route.ts";
 
 // Peak, uncached USD / million tokens. One micro-USD per token at $1/MTok.
 // Use integer hundredths of a micro-USD throughout ($1/MTok = 100).
-// z.ai reviewed 2026-10-07:
-// https://docs.z.ai/guides/overview/pricing
-// https://docs.z.ai/guides/llm/glm-5.3
-// openrouter reviewed 2026-10-28. OpenRouter may route a request to any listed
-// upstream endpoint, so the policy uses the HIGHEST endpoint price on each axis,
-// rounded up: input $0.60/MTok (BaseTen "baseten/fast"), output $2.40/MTok
-// (BaseTen "baseten/fast"); the model page lists $0.045/$0.50 for the cheapest.
+// OpenRouter is the only priced route. Policy reviewed 2026-10-28 at input
+// $0.60/MTok, output $2.40/MTok (then the highest listed endpoint, BaseTen
+// "baseten/fast"). The endpoint list is not fixed: on 2026-11-18 it also listed
+// venice/ultrafast at $3/$12. The policy is therefore NOT the highest endpoint
+// price; the cap holds only because every request carries max_price equal to
+// this policy (OPENROUTER_PROVIDER_PREFERENCES), which tells OpenRouter not to
+// route to a pricier endpoint. Settlement still charges the billed cost if it
+// is higher, so the ledger stays honest even if that preference is not honored.
 // https://openrouter.ai/api/v1/models/deepseek/deepseek-v4.1-flash/endpoints
-// Re-check that list before trusting these numbers after any provider change.
+// The Z.ai GLM and Kimi for Coding subscription routes were retired 2026-11-18;
+// no ledger row was ever priced on them.
 // The retired direct DeepSeek route (LEGACY_DEEPSEEK_ROUTE, 132/396) has no
 // policy: historical rows keep their stored charges and are never re-priced.
 export const SPEND_CONTEXT_TOKENS = 1_048_576;
 export const SPEND_MAX_OUTPUT_TOKENS = 8192;
 const POLICIES = {
-  "z.ai": { model: "glm-5.3", url: "https://api.z.ai/api/anthropic/v1/messages", input: 140, output: 440 },
   [PAID_ROUTE.provider]: { model: PAID_ROUTE.model, url: PAID_ROUTE.url, input: 60, output: 240 },
 } as const;
 type PricedProvider = keyof typeof POLICIES;
@@ -176,7 +177,7 @@ function receiptDetails(body: unknown, policy: Policy, response?: Response): str
     responseModelHash: hash(envelope.model),
     modelMatches: envelope.model === policy.model,
     serviceTier: !Object.hasOwn(usage, "service_tier") ? "missing" : usage.service_tier === "standard" ? "standard" : "unrecognized",
-    unknownUsageFields: Object.keys(usage).filter((key) => !(policy === POLICIES[PAID_ROUTE.provider] ? OPENROUTER_USAGE_FIELDS as readonly string[] : [...USAGE_COUNTERS, "service_tier"]).includes(key)).length,
+    unknownUsageFields: Object.keys(usage).filter((key) => !(OPENROUTER_USAGE_FIELDS as readonly string[]).includes(key)).length,
     counters: Object.fromEntries(USAGE_COUNTERS.map((key) => [key,
       tokenCount(usage[key]) ? { state: "integer", value: usage[key] }
         : { state: !Object.hasOwn(usage, key) ? "missing" : usage[key] === null ? "null" : "invalid" },
@@ -218,8 +219,8 @@ async function validateRequest(provider: string, request: Request): Promise<{ po
   if (!record(body) || !onlyKeys(body, ["model", "max_tokens", "system", "messages", "tools", "tool_choice", "stream", "temperature", "top_p", "top_k", "stop_sequences", "metadata", "thinking", "output_config", "provider"])) {
     throw new SpendLimitError("unpriced request fields");
   }
-  // openrouter requests must carry exactly the reviewed routing preferences; no other route may send `provider`.
-  if (policy === POLICIES[PAID_ROUTE.provider] ? !isOpenRouterPreferences(body.provider) : body.provider !== undefined) {
+  // Every request must carry exactly the reviewed OpenRouter routing preferences.
+  if (!isOpenRouterPreferences(body.provider)) {
     throw new SpendLimitError("unreviewed provider routing preferences");
   }
   if (body.model !== policy.model || (body.stream !== undefined && body.stream !== false)) throw new SpendLimitError("unpriced model or streaming request");
@@ -253,12 +254,7 @@ function receiptInput(body: unknown, policy: Policy, maxTokens: number): Receipt
   if (!validateContent(body.content)) return { reason: "content" };
   if (!record(body.usage)) return { reason: "usage_missing" };
   const usage = body.usage;
-  if (policy === POLICIES[PAID_ROUTE.provider]) return openRouterUsage(usage, maxTokens);
-  if (!onlyKeys(usage, USAGE_COUNTERS)) return { reason: "usage_fields" };
-  if (!USAGE_COUNTERS.every((key) => tokenCount(usage[key]))) return { reason: "usage_counters" };
-  const input = (usage.input_tokens as number) + (usage.cache_read_input_tokens as number) + (usage.cache_creation_input_tokens as number);
-  if (input > SPEND_CONTEXT_TOKENS || (usage.output_tokens as number) > maxTokens) return { reason: "token_bounds" };
-  return { reason: "accepted", inputTokens: input, providerCostMicros: 0 };
+  return openRouterUsage(usage, maxTokens);
 }
 
 /**

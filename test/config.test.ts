@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import { log } from "../src/logger.ts";
-import type { ProviderConfig } from "../src/providers.ts";
+import type { ProviderConfig, ProviderName } from "../src/providers.ts";
 import { PAID_ROUTE } from "../src/model-route.ts";
 import {
   loadProviderConfigs,
@@ -92,16 +92,37 @@ describe("loadReviewConfig", () => {
     setEnv("GARY_REVIEW_ITERATION_CAP", undefined);
     setEnv("GARY_REVIEW_TIMEOUT_MS", undefined);
     const cfg = loadReviewConfig();
-    expect(cfg.providerOrder).toEqual(["openrouter", "z.ai", "kimi"]);
+    expect(cfg.providerOrder).toEqual(["openrouter"]);
     expect(cfg.maxRounds).toBe(3);
     expect(cfg.iterationCap).toBe(15);
     expect(cfg.timeoutMs).toBe(300_000);
   });
 
   it("respects GARY_REVIEWER_PROVIDER_ORDER", () => {
-    setEnv("GARY_REVIEWER_PROVIDER_ORDER", "kimi,openrouter");
-    const cfg = loadReviewConfig();
-    expect(cfg.providerOrder).toEqual(["kimi", "openrouter"]);
+    setEnv("GARY_REVIEWER_PROVIDER_ORDER", "openrouter");
+    expect(loadReviewConfig().providerOrder).toEqual(["openrouter"]);
+  });
+
+  it("drops the retired z.ai and kimi routes from GARY_REVIEWER_PROVIDER_ORDER with one warning", () => {
+    setEnv("GARY_REVIEWER_PROVIDER_ORDER", "openrouter,z.ai,kimi");
+    const warn = spyOn(log, "warn").mockImplementation(() => {});
+    try {
+      expect(loadReviewConfig().providerOrder).toEqual(["openrouter"]);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]![1]).toEqual({ providers: ["z.ai", "kimi"] });
+    } finally { warn.mockRestore(); }
+  });
+
+  it("falls back to openrouter when only retired routes are listed", () => {
+    setEnv("GARY_REVIEWER_PROVIDER_ORDER", "z.ai,kimi");
+    const warn = spyOn(log, "warn").mockImplementation(() => {});
+    try { expect(loadReviewConfig().providerOrder).toEqual(["openrouter"]); } finally { warn.mockRestore(); }
+  });
+
+  it("does not warn when the default order is used", () => {
+    setEnv("GARY_REVIEWER_PROVIDER_ORDER", undefined);
+    const warn = spyOn(log, "warn").mockImplementation(() => {});
+    try { expect(loadReviewConfig().providerOrder).toEqual(["openrouter"]); expect(warn).not.toHaveBeenCalled(); } finally { warn.mockRestore(); }
   });
 
   it("fails loudly on unknown provider names, including the retired direct deepseek route", () => {
@@ -128,13 +149,7 @@ describe("loadReviewConfig", () => {
 });
 
 describe("validateProviderRoute", () => {
-  it("accepts Gary's direct, bounded model routes", () => {
-    expect(() =>
-      validateProviderRoute("z.ai", "https://api.z.ai/api/anthropic", "glm-5.3"),
-    ).not.toThrow();
-    expect(() =>
-      validateProviderRoute("kimi", "https://api.kimi.com/coding", "k3"),
-    ).not.toThrow();
+  it("accepts Gary's direct, bounded model route", () => {
     expect(() =>
       validateProviderRoute(
         "openrouter",
@@ -144,23 +159,29 @@ describe("validateProviderRoute", () => {
     ).not.toThrow();
   });
 
-  it("rejects proxy endpoints outside each provider's approved host", () => {
+  it("rejects the retired z.ai and kimi subscription routes (no approved route remains)", () => {
     expect(() =>
-      validateProviderRoute("kimi", "https://openrouter.ai/api", "k3"),
-    ).toThrow(/disallowed.*host/i);
+      validateProviderRoute("z.ai" as unknown as ProviderName, "https://api.z.ai/api/anthropic", "glm-5.3"),
+    ).toThrow(/Unapproved provider/);
+    expect(() =>
+      validateProviderRoute("kimi" as unknown as ProviderName, "https://api.kimi.com/coding", "k3"),
+    ).toThrow(/Unapproved provider/);
+  });
+
+  it("rejects proxy endpoints outside the approved host", () => {
     expect(() =>
       validateProviderRoute("openrouter", "https://api.deepseek.com/anthropic", "deepseek/deepseek-v4.1-flash"),
     ).toThrow(/disallowed.*host/i);
     expect(() =>
-      validateProviderRoute("kimi", "http://api.kimi.com/coding", "k3"),
+      validateProviderRoute("openrouter", "https://api.z.ai/api/anthropic", "deepseek/deepseek-v4.1-flash"),
+    ).toThrow(/disallowed.*host/i);
+    expect(() =>
+      validateProviderRoute("openrouter", "http://openrouter.ai/api", "deepseek/deepseek-v4.1-flash"),
     ).toThrow(/https/i);
   });
 
   it("rejects unreviewed model overrides", () => {
-    expect(() =>
-      validateProviderRoute("z.ai", "https://api.z.ai/api/anthropic", "glm-premium"),
-    ).toThrow(/disallowed.*model/i);
-    for (const model of ["deepseek-v4-pro", "deepseek/deepseek-v4-pro", "openrouter/auto"]) {
+    for (const model of ["glm-5.3", "deepseek-v4-pro", "deepseek/deepseek-v4-pro", "openrouter/auto"]) {
       expect(() =>
         validateProviderRoute("openrouter", "https://openrouter.ai/api", model),
       ).toThrow(/disallowed.*model/i);
@@ -168,9 +189,9 @@ describe("validateProviderRoute", () => {
   });
 });
 
-describe("loadProviderConfigs without DEEPSEEK_API_KEY", () => {
-  const keys = ["Z_AI_API_KEY", "KIMI_API_KEY", "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY",
-    "OPENROUTER_BASE_URL", "OPENROUTER_MODEL", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL"];
+describe("loadProviderConfigs", () => {
+  const keys = ["Z_AI_API_KEY", "Z_AI_BASE_URL", "Z_AI_MODEL", "KIMI_API_KEY", "KIMI_BASE_URL", "KIMI_MODEL",
+    "OPENROUTER_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_BASE_URL", "OPENROUTER_MODEL", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL"];
   const saved: Record<string, string | undefined> = {};
   afterEach(() => {
     for (const key of keys) {
@@ -184,16 +205,42 @@ describe("loadProviderConfigs without DEEPSEEK_API_KEY", () => {
   };
 
   it("boots the paid route from OPENROUTER_API_KEY alone, without warnings", () => {
-    env({ Z_AI_API_KEY: "fake-zai", OPENROUTER_API_KEY: "fake-openrouter" });
+    env({ OPENROUTER_API_KEY: "fake-openrouter" });
     const warn = spyOn(log, "warn").mockImplementation(() => {});
-    try { loadProviderConfigs(); expect(warn).not.toHaveBeenCalled(); } finally { warn.mockRestore(); }
-    const providers = loadProviderConfigs();
-    expect(providers.map((p) => p.name)).toEqual(["z.ai", "openrouter"]);
-    expect(providers[1]).toMatchObject({ apiKey: "fake-openrouter", baseUrl: PAID_ROUTE.baseUrl, model: PAID_ROUTE.model });
+    let providers: readonly ProviderConfig[];
+    try { providers = loadProviderConfigs(); expect(warn).not.toHaveBeenCalled(); } finally { warn.mockRestore(); }
+    expect(providers.map((p) => p.name)).toEqual(["openrouter"]);
+    expect(providers[0]).toMatchObject({ apiKey: "fake-openrouter", baseUrl: PAID_ROUTE.baseUrl, model: PAID_ROUTE.model });
+  });
+
+  it("throws naming OPENROUTER_API_KEY when it is missing, even if Z_AI_API_KEY is set", () => {
+    env({ Z_AI_API_KEY: "fake-zai" });
+    const warn = spyOn(log, "warn").mockImplementation(() => {});
+    try {
+      expect(() => loadProviderConfigs()).toThrow("Missing required env var: OPENROUTER_API_KEY");
+    } finally { warn.mockRestore(); }
+  });
+
+  it("ignores leftover Z_AI_*/KIMI_* variables with one warning that names them, never their values", () => {
+    env({ OPENROUTER_API_KEY: "fake-openrouter", Z_AI_API_KEY: "secret-zai-value", Z_AI_MODEL: "glm-5.3",
+      Z_AI_BASE_URL: "https://api.z.ai/api/anthropic", KIMI_API_KEY: "secret-kimi-value", KIMI_MODEL: "k3" });
+    const warn = spyOn(log, "warn").mockImplementation(() => {});
+    let providers: readonly ProviderConfig[];
+    try {
+      providers = loadProviderConfigs();
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]![1]).toEqual({ variables: ["KIMI_API_KEY", "KIMI_MODEL", "Z_AI_API_KEY", "Z_AI_BASE_URL", "Z_AI_MODEL"] });
+      const logged = JSON.stringify(warn.mock.calls);
+      for (const value of ["secret-zai-value", "secret-kimi-value", "fake-openrouter", "api.z.ai", "glm-5.3", "k3"]) {
+        expect(logged).not.toContain(value);
+      }
+    } finally { warn.mockRestore(); }
+    expect(providers.map((p) => p.name)).toEqual(["openrouter"]);
+    expect(providers.some((p) => p.apiKey.startsWith("secret-") || p.baseUrl.includes("z.ai") || p.baseUrl.includes("kimi"))).toBe(false);
   });
 
   it("ignores a leftover DEEPSEEK_API_KEY with a warning and never builds a direct DeepSeek provider", () => {
-    env({ Z_AI_API_KEY: "fake-zai", OPENROUTER_API_KEY: "fake-openrouter", DEEPSEEK_API_KEY: "fake-deepseek",
+    env({ OPENROUTER_API_KEY: "fake-openrouter", DEEPSEEK_API_KEY: "fake-deepseek",
       DEEPSEEK_BASE_URL: "https://api.deepseek.com/anthropic", DEEPSEEK_MODEL: "deepseek-v4-pro" });
     const warn = spyOn(log, "warn").mockImplementation(() => {});
     let providers: readonly ProviderConfig[];
@@ -201,12 +248,12 @@ describe("loadProviderConfigs without DEEPSEEK_API_KEY", () => {
       expect(warn.mock.calls[0]![1]).toEqual({ variables: ["DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL"] });
       expect(JSON.stringify(warn.mock.calls)).not.toContain("fake-deepseek");
     } finally { warn.mockRestore(); }
-    expect(providers.map((p) => p.name)).toEqual(["z.ai", "openrouter"]);
+    expect(providers.map((p) => p.name)).toEqual(["openrouter"]);
     expect(providers.some((p) => p.apiKey === "fake-deepseek" || p.baseUrl.includes("deepseek.com"))).toBe(false);
   });
 
   it("rejects an OPENROUTER_MODEL override off the approved route", () => {
-    env({ Z_AI_API_KEY: "fake-zai", OPENROUTER_API_KEY: "fake-openrouter", OPENROUTER_MODEL: "deepseek-v4-pro" });
+    env({ OPENROUTER_API_KEY: "fake-openrouter", OPENROUTER_MODEL: "deepseek-v4-pro" });
     expect(() => loadProviderConfigs()).toThrow(/disallowed.*model/i);
   });
 });

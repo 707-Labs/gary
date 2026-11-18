@@ -1,8 +1,7 @@
 import { log } from "./logger.ts";
 
 /**
- * Thrown when a provider's long-window usage limit kicks in (e.g. Z.ai's
- * 5-hour cap, Kimi Code's 5-hour Moderato window). The provider chain
+ * Thrown when a provider's usage limit or rate limit kicks in. The provider chain
  * uses this to decide when to fall through to the next provider — see
  * `src/providers.ts`.
  */

@@ -115,11 +115,13 @@ describe("OpenRouter receipt compatibility", () => {
     const { ledger, path } = setup();
     let calls = 0;
     const zai = ledger.guardedFetch("z.ai", (async () => { calls++; return Response.json({ ...responseBody(), model: "glm-5.3" }); }) as unknown as typeof fetch);
-    await ledger.withSpendScope("ticket", () => zai("https://api.z.ai/api/anthropic/v1/messages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "glm-5.3", max_tokens: 2048, messages: [{ role: "user", content: "offline" }] }) }));
-    expect(rows(path, "SELECT reason FROM spend_receipts")).toEqual([{ reason: "usage_fields" }]);
+    // The retired z.ai route is unpriced: rejected before any reservation or send.
+    await expect(ledger.withSpendScope("ticket", () => zai("https://api.z.ai/api/anthropic/v1/messages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "glm-5.3", max_tokens: 2048, messages: [{ role: "user", content: "offline" }] }) }))).rejects.toThrow("unpriced provider");
+    expect(calls).toBe(0);
+    expect(rows(path, "SELECT reason FROM spend_receipts")).toEqual([]);
     const deepseek = ledger.guardedFetch("openrouter", (async () => { calls++; return Response.json(responseBody()); }) as unknown as typeof fetch);
     await expect(ledger.withSpendScope("ticket", () => deepseek(saved.endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: saved.requestedModel, provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens: 2048, service_tier: "standard", messages: [{ role: "user", content: "offline" }] }) }))).rejects.toThrow(SpendLimitError);
-    expect(calls).toBe(1);
+    expect(calls).toBe(0);
   });
 });
 
@@ -280,7 +282,7 @@ describe("OpenRouter cutover accounting", () => {
     const zai = ledger.guardedFetch("z.ai", inner);
     await expect(ledger.withSpendScope("ticket", () => zai("https://api.z.ai/api/anthropic/v1/messages", { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ model: "glm-5.3", provider: OPENROUTER_PROVIDER_PREFERENCES, max_tokens: 16, messages: [{ role: "user", content: "x" }] }) })))
-      .rejects.toThrow("unreviewed provider routing preferences");
+      .rejects.toThrow("unpriced provider");
   });
 
   it("withOpenRouterPreferences adds the preferences to each JSON request body", async () => {

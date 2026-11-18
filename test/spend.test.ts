@@ -56,9 +56,17 @@ describe("durable spending allocation", () => {
 
   it("reserves full input context at uncached peak price and full capped output", () => {
     expect(spendReservationMicros("openrouter")).toBe(648_807);
-    expect(spendReservationMicros("z.ai")).toBe(1_504_052);
+    expect(() => spendReservationMicros("z.ai")).toThrow("unpriced provider");
     expect(() => spendReservationMicros("kimi")).toThrow(SpendLimitError);
     expect(() => spendReservationMicros("openrouter", 8193)).toThrow(SpendLimitError);
+  });
+
+  it("dispatch needs one full OpenRouter reservation, the only priced route", () => {
+    // Before the subscription routes were retired the bar was the z.ai reservation (1_504_052).
+    const largest = spendReservationMicros("openrouter");
+    expect(largest).toBe(648_807);
+    expect(ledgerAt(":memory:", largest / 1_000_000).canDispatch("ERT-3189")).toBe(true);
+    expect(ledgerAt(":memory:", (largest - 1) / 1_000_000).canDispatch("ERT-3189")).toBe(false);
   });
 
   it("enrollment is immutable, campaign caps cannot be overallocated, and closure cannot renew", () => {
@@ -259,18 +267,31 @@ describe("guard at SDK transport boundary", () => {
 
   it("a fallback provider shares the original allocation", async () => {
     const ledger = ledgerAt();
-    let zaiCalls = 0;
-    let dsCalls = 0;
-    const zai = createProvider({ name: "z.ai", apiKey: "fake", baseUrl: "https://api.z.ai/api/anthropic", model: "glm-5.3", defaultBackoffMs: 60_000 }, { fetch: ledger.guardedFetch("z.ai", fakeFetch(() => {
-      zaiCalls++;
+    let firstCalls = 0;
+    let fallbackCalls = 0;
+    // Two OpenRouter-priced providers: the first is rate limited, the chain falls through to the second.
+    const first = createProvider({ name: "openrouter", apiKey: "fake", baseUrl: "https://openrouter.ai/api", model: "deepseek/deepseek-v4.1-flash", defaultBackoffMs: 60_000 }, { fetch: ledger.guardedFetch("openrouter", fakeFetch(() => {
+      firstCalls++;
       return Response.json({ type: "error", error: { type: "rate_limit_error", message: "offline quota" } }, { status: 429, headers: { "x-should-retry": "false" } });
     })) });
-    const deepseek = createProvider({ name: "openrouter", apiKey: "fake", baseUrl: "https://openrouter.ai/api", model: "deepseek/deepseek-v4.1-flash", defaultBackoffMs: 60_000 }, { fetch: ledger.guardedFetch('openrouter', fakeFetch(() => { dsCalls++; return receipt(); })) });
-    const glm = new GLMClient(createProviderChain([zai, deepseek]));
+    const fallback = createProvider({ name: "openrouter", apiKey: "fake", baseUrl: "https://openrouter.ai/api", model: "deepseek/deepseek-v4.1-flash", defaultBackoffMs: 60_000 }, { fetch: ledger.guardedFetch('openrouter', fakeFetch(() => { fallbackCalls++; return receipt(); })) });
+    const glm = new GLMClient(createProviderChain([first, fallback]));
     await ledger.withSpendScope("ERT-3189", () => glm.complete({ system: "test", user: "test", maxTokens: 8192 }));
-    expect([zaiCalls, dsCalls]).toEqual([1, 1]);
+    expect([firstCalls, fallbackCalls]).toEqual([1, 1]);
     expect(ledger.status("ERT-3189")?.attemptCount).toBe(2);
-    expect(ledger.status("ERT-3189")?.chargedMicros).toBe(1_504_052 + 20_021);
+    expect(ledger.status("ERT-3189")?.chargedMicros).toBe(648_807 + 20_021);
+  });
+
+  it("rejects a guarded call to the retired z.ai route as unpriced and sends nothing", async () => {
+    const ledger = ledgerAt();
+    let sent = 0;
+    const guarded = ledger.guardedFetch("z.ai", fakeFetch(() => { sent++; return receipt(); }));
+    await expect(ledger.withSpendScope("ERT-3189", () => guarded(ZAI_URL, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "glm-5.3", max_tokens: 8192, messages: [{ role: "user", content: "test" }] }),
+    }))).rejects.toThrow("unpriced provider");
+    expect(sent).toBe(0);
+    expect(ledger.status("ERT-3189")?.attemptCount).toBe(0);
   });
 
   it("SDK retries cannot escape a rejected reservation even if SDK wraps the error", async () => {
