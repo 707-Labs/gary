@@ -36,6 +36,9 @@ bun run scripts/probe-cloudflare.ts      # verify CF observability auth + recent
 bun run scripts/probe-d1.ts              # verify D1 read auth + SELECT-only clamp
 ```
 
+`scripts/rewrite-pr-style.ts`, `probe-reviewer.ts`, `probe-cache.ts` and
+`probe-openrouter.ts` also make paid OpenRouter calls outside the spend ledger.
+
 ## Architecture (one-liner)
 
 `src/index.ts → src/loop.ts (every 60s) → derive state per ticket → pickActionForTicket → dispatch handler`. Handlers in `src/handlers/{classifier,code,ci-failure,pr-review,pickup,answer,bounce}.ts`. Coding handlers run an agent loop (`src/agent/loop.ts`) with tools (`src/agent/tools.ts`) bound to an `Executor` (`src/executors/`). The loop also pulls @mentioned tickets via `linear.fetchMentionedIssues` when an allowlist is configured — see `src/mention.ts` for the pickup/answer trigger detection.
@@ -43,8 +46,9 @@ bun run scripts/probe-d1.ts              # verify D1 read auth + SELECT-only cla
 ## Reviewer pass
 
 After the primary agent finishes and `bun run check` passes, a fresh
-reviewer agent (different provider preference: OpenRouter first by
-default, configurable via `GARY_REVIEWER_PROVIDER_ORDER`) reviews the
+reviewer agent (same OpenRouter model as the primary since the
+subscription providers were retired, so its blind spots are correlated;
+`GARY_REVIEWER_PROVIDER_ORDER` defaults to `openrouter`) reviews the
 diff before push. It has read+run+submit_review tools — it can verify
 claims by running tests/queries/fetches but cannot edit code.
 

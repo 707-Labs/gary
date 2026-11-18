@@ -121,8 +121,8 @@ export function createProviderChain(
  * concurrent slots against different primaries — each slot gets its own
  * chain so one slot's 429 doesn't cascade into a primary swap that the
  * other slots are already using. All slots share the same provider objects
- * (and their gates), so a 429 on Z.ai arms it globally regardless of which
- * slot saw it.
+ * (and their gates), so a 429 on one provider arms it globally regardless of
+ * which slot saw it.
  */
 export function chainStartingWith(
   canonical: ProviderChain,
@@ -144,8 +144,8 @@ export function chainStartingWith(
  * dropped — keeps reviewer config robust to typos in env vars (you'll
  * still get a working chain, just not the one you typed).
  *
- * Use this for the reviewer's chain so it prefers a different provider
- * than primary, giving uncorrelated blind spots.
+ * Used for the reviewer's chain. With OpenRouter as the only provider the
+ * reviewer runs on the same model as the primary.
  */
 export function chainWithOrder(
   canonical: ProviderChain,
@@ -184,7 +184,7 @@ export class AllProvidersExhaustedError extends Error {
 
 /**
  * A provider answered 200 with no text content. The SDK does not treat that
- * as an error, so the chain has to: Z.ai returned 425 consecutive empty
+ * as an error, so the chain has to: Z.ai (since retired) returned 425 consecutive empty
  * classifier completions for one ticket on 2026-08-31 while serving other
  * tickets normally (mb-b2tw). Per-request, not a quota signal, so the
  * provider's gate is not armed; the call just moves to the next provider.
@@ -210,9 +210,9 @@ export class EmptyCompletionError extends Error {
  * because instanceof checks across multiple imports of the SDK are
  * fragile.
  *
- * Some providers (e.g. Kimi) return 403 or 402 instead of 429 for
- * usage-limit / insufficient-balance errors. We treat those as rate limits
- * so the chain falls through to the next provider rather than crashing.
+ * Some providers return 403 or 402 instead of 429 for usage-limit /
+ * insufficient-balance errors (OpenRouter: 402 when out of credits). We treat
+ * those as rate limits so the gate backs off rather than crashing.
  */
 export function isRateLimitError(err: unknown): boolean {
   if (typeof err !== "object" || err === null) return false;

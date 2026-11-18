@@ -61,6 +61,14 @@ describe("durable spending allocation", () => {
     expect(() => spendReservationMicros("openrouter", 8193)).toThrow(SpendLimitError);
   });
 
+  it("dispatch needs one full OpenRouter reservation, the only priced route", () => {
+    // Before the subscription routes were retired the bar was the z.ai reservation (1_504_052).
+    const largest = spendReservationMicros("openrouter");
+    expect(largest).toBe(648_807);
+    expect(ledgerAt(":memory:", largest / 1_000_000).canDispatch("ERT-3189")).toBe(true);
+    expect(ledgerAt(":memory:", (largest - 1) / 1_000_000).canDispatch("ERT-3189")).toBe(false);
+  });
+
   it("enrollment is immutable, campaign caps cannot be overallocated, and closure cannot renew", () => {
     const ledger = ledgerAt();
     expect(ledger.status("ERT-3189")?.draftPr).toBe(true);
