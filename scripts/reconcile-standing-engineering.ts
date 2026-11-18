@@ -17,7 +17,8 @@ const ledgerPath=one('--ledger'),guard=createStandingEngineeringFundingGuard({au
  fundingHoldReceiptPath:c.fundingHoldReceiptPath,aggregatePath:c.aggregatePath,ledgerPath});guard();
 const ledger=new SpendLedger(ledgerPath);
 try{
- const budget=createStandingEngineeringBudget({ledger,authority:c.funding,assertAuthority:guard,terminalJournalPath:c.root+'/engineering.sqlite'});
+ const budget=createStandingEngineeringBudget({ledger,authority:c.funding,assertAuthority:guard,terminalJournalPath:c.root+'/engineering.sqlite',
+  ledgerVolume:{apfsVolumeUUID:c.resourceLock.apfsVolumeUUID}});
  const before=budget.status();
  if(values.has('--apply')){
   const evidence=readFileSync(one('--evidence')),ids=(values.get('--chat-attempt')??[]).map(s=>{if(!/^[1-9][0-9]*$/.test(s))throw Error('invalid attempt');return Number(s);});

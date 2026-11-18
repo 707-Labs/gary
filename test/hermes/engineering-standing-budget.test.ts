@@ -124,8 +124,8 @@ test('an enrolled pool survives a reboot that renumbers the ledger volume dev, a
   rebooted.allocate(f.input());
   expect(JSON.parse((f.db.query('SELECT ledger_identity_json j FROM standing_engineering_pools').get() as {j:string}).j).dev).toBe(stored.dev-1);
   // Another volume, an unobservable host, or any other identity field change: rejected.
-  expect(()=>open({apfsVolumeUUID:UUID,observe:observe('00000000-0000-0000-0000-000000000000')}).status()).toThrow('pool_binding');
-  expect(()=>open({apfsVolumeUUID:UUID,observe:()=>{throw new Error('engineering_budget_admission:reboot_attestation_rejected');}}).status()).toThrow('pool_binding');
+  expect(()=>open({apfsVolumeUUID:UUID,observe:observe('00000000-0000-0000-0000-000000000000')}).status()).toThrow('pool_binding_volume');
+  expect(()=>open({apfsVolumeUUID:UUID,observe:()=>{throw new Error('engineering_budget_admission:reboot_attestation_rejected');}}).status()).toThrow('pool_binding_volume');
   for(const key of ['ino','uid','gid','mode','nlink'] as const){
     setStored({...stored,dev:stored.dev-1,[key]:stored[key]+1});
     expect(()=>open({apfsVolumeUUID:UUID,observe:observe(UUID)}).status()).toThrow('pool_binding');

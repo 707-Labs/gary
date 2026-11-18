@@ -45,7 +45,8 @@ if (flag("--enroll")) {
   }
   const ledger = new SpendLedger(ledgerPath);
   try {
-    const budget = createStandingEngineeringBudget({ ledger, authority: config.funding, assertAuthority: fundingGuard(config) });
+    const budget = createStandingEngineeringBudget({ ledger, authority: config.funding, assertAuthority: fundingGuard(config),
+      ledgerVolume: { apfsVolumeUUID: config.resourceLock.apfsVolumeUUID } });
     budget.enrollPoolReplacing({ retired: retired.funding, retainedMicros: transfer.retainedMicros, transferReceiptSha256: hold.transfer.sha256 });
     console.log(JSON.stringify({ retiredPool: retired.funding.poolId, retainedMicros: transfer.retainedMicros, enrolled: budget.status() }, null, 2));
   } finally { ledger.close(); }
