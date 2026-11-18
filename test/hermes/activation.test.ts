@@ -164,7 +164,7 @@ test('actual host runtime finishes with one ledger reservation per request and d
 });
 test('different host route, canonical ledger, repository or ticket cannot bind',async()=>{
   const f=await runtimeFixture();const config=loadHermesActivationConfig(f.path);
-  expect(()=>createHermesActivation(config,{...f.deps,route:{...f.deps.route,model:'glm-5.3'}})).toThrow('host_route_mismatch');
+  expect(()=>createHermesActivation(config,{...f.deps,route:{...f.deps.route,model:'glm-5.3' as unknown as typeof f.deps.route.model}})).toThrow('host_route_mismatch');
   const activation=createHermesActivation(config,f.deps);
   for(const bad of [{ticketId:OTHER},{repo:'fixture/other'},{ledger:{} as SpendLedger},{ownerEpoch:'forged'}])expect(()=>activation.createAdmittedCodeLoop({...f.binding.admission,...bad})).toThrow();
   expect(f.counts()).toEqual({requests:0,launches:0});

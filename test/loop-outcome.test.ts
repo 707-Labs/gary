@@ -8,7 +8,8 @@ import { tick, type LoopDeps } from "../src/loop.ts";
 import { AllProvidersExhaustedError, createProvider, createProviderChain } from "../src/providers.ts";
 import { openDb, type DB } from "../src/state/db.ts";
 import { getRevisitMark, getTicket, setClassification, setTerminalState, upsertTicket } from "../src/state/queries.ts";
-import { openSpendLedger, spendReservationMicros, type SpendLedger } from "../src/spend.ts";
+import { PAID_ROUTE } from "../src/model-route.ts";
+import { openSpendLedger, spendReservationMicros, type SpendLedger, withOpenRouterPreferences } from "../src/spend.ts";
 
 const issue: AssignedIssue = {
   id: "issue-1", identifier: "ERT-1", title: "Offline fixture", description: "A fixed description",
@@ -27,7 +28,7 @@ beforeEach(() => {
   upsertTicket(db, { linearId: issue.id, identifier: issue.identifier });
   setClassification(db, { linearId: issue.id, classification: "CODE", confidence: 0.9, scope: "S" });
   const provider = createProvider(
-    { name: "z.ai", apiKey: "offline-fixture", baseUrl: "https://provider.invalid", model: "fake", defaultBackoffMs: 1000 },
+    { name: "openrouter", apiKey: "offline-fixture", baseUrl: "https://provider.invalid", model: "fake", defaultBackoffMs: 1000 },
     { fetch: (async () => { throw new Error("Network is forbidden in this test"); }) as unknown as typeof fetch },
   );
   deps = {
@@ -46,7 +47,7 @@ beforeEach(() => {
     reposDir: "/offline/repos", workspacesDir: "/offline/workspaces",
     agentLoopMaxIterations: 5, agentLoopTimeoutMs: 1000,
     maxCiAttempts: 3, maxAttemptsPerTicket: 5, circuitBreakerWindowHours: 6, stalePrAfterMs: 1000,
-    review: { providerOrder: ["z.ai"], maxRounds: 1, iterationCap: 1, timeoutMs: 1000 },
+    review: { providerOrder: ["openrouter"], maxRounds: 1, iterationCap: 1, timeoutMs: 1000 },
   };
   coding = spyOn(codeHandler, "runCodeHandler");
 });
@@ -68,10 +69,10 @@ describe("bounded ticket dispatch", () => {
   }
 
   function unknownFetch(ledger: SpendLedger): () => Promise<Response> {
-    const guarded = ledger.guardedFetch("z.ai", (async () => new Response("{}", { status: 200 })) as unknown as typeof fetch);
-    return () => guarded("https://api.z.ai/api/anthropic/v1/messages", {
+    const guarded = withOpenRouterPreferences(ledger.guardedFetch(PAID_ROUTE.provider, (async () => new Response("{}", { status: 200 })) as unknown as typeof fetch));
+    return () => guarded(PAID_ROUTE.url, {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "glm-5.3", max_tokens: 8192, messages: [{ role: "user", content: "offline" }] }),
+      body: JSON.stringify({ model: PAID_ROUTE.model, max_tokens: 8192, messages: [{ role: "user", content: "offline" }] }),
     });
   }
 
@@ -84,7 +85,7 @@ describe("bounded ticket dispatch", () => {
   });
 
   it("inherits ticket scope and permits draft publication after the last affordable call", async () => {
-    const ledger = enroll(spendReservationMicros("z.ai") / 1_000_000);
+    const ledger = enroll(spendReservationMicros(PAID_ROUTE.provider) / 1_000_000);
     const request = unknownFetch(ledger);
     coding.mockImplementation(async (handlerDeps, args) => {
       expect(args.draftPr).toBe(true);
@@ -103,7 +104,7 @@ describe("bounded ticket dispatch", () => {
   });
 
   it("records exhausted reservations even when a handler converts the error to a result", async () => {
-    const ledger = enroll(spendReservationMicros("z.ai") / 1_000_000);
+    const ledger = enroll(spendReservationMicros(PAID_ROUTE.provider) / 1_000_000);
     const request = unknownFetch(ledger);
     coding.mockImplementation(async (handlerDeps) => {
       await request();

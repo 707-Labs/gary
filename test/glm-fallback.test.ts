@@ -6,6 +6,7 @@ import {
   createProviderChain,
   EmptyCompletionError,
   type LLMProvider,
+  type ProviderName,
 } from "../src/providers.ts";
 import { createRateLimitGate } from "../src/rate-limit.ts";
 
@@ -18,11 +19,14 @@ interface FakeOpts {
   >;
 }
 
+// ProviderName is only "openrouter" now; the chain is generic over names, so
+// fake providers take any string and cast it.
 function fakeProvider(
-  name: "z.ai" | "kimi" | "openrouter",
+  rawName: string,
   opts: FakeOpts,
 ): LLMProvider & { calls: number } {
   let calls = 0;
+  const name = rawName as ProviderName;
   const provider = {
     name,
     model: `${name}-model`,
@@ -79,8 +83,8 @@ function fakeProvider(
 
 describe("GLMClient.complete — provider fallback", () => {
   it("returns the first provider's response when no rate limit hits", async () => {
-    const a = fakeProvider("z.ai", { responses: [{ kind: "ok", text: "from-z" }] });
-    const b = fakeProvider("kimi", { responses: [] });
+    const a = fakeProvider("primary", { responses: [{ kind: "ok", text: "from-z" }] });
+    const b = fakeProvider("secondary", { responses: [] });
     const glm = new GLMClient(createProviderChain([a, b]));
     const out = await glm.complete({ system: "", user: "" });
     expect(out).toBe("from-z");
@@ -90,32 +94,32 @@ describe("GLMClient.complete — provider fallback", () => {
 
   it("falls through to the next provider on 429", async () => {
     const reset = new Date(Date.now() + 60_000);
-    const a = fakeProvider("z.ai", {
+    const a = fakeProvider("primary", {
       responses: [{ kind: "rate_limit", resetAt: reset }],
     });
-    const b = fakeProvider("kimi", {
-      responses: [{ kind: "ok", text: "from-kimi" }],
+    const b = fakeProvider("secondary", {
+      responses: [{ kind: "ok", text: "from-secondary" }],
     });
     const glm = new GLMClient(createProviderChain([a, b]));
     const out = await glm.complete({ system: "", user: "" });
-    expect(out).toBe("from-kimi");
+    expect(out).toBe("from-secondary");
     expect(a.gate.isArmed()).toBe(true);
     expect(a.gate.armedUntil()?.getTime()).toBe(reset.getTime());
     expect(b.gate.isArmed()).toBe(false);
   });
 
   it("uses defaultBackoffMs when the 429 has no parseable timestamp", async () => {
-    const a = fakeProvider("z.ai", {
+    const a = fakeProvider("primary", {
       responses: [{ kind: "rate_limit", message: "no timestamp here" }],
     });
-    const b = fakeProvider("kimi", {
-      responses: [{ kind: "ok", text: "from-kimi" }],
+    const b = fakeProvider("secondary", {
+      responses: [{ kind: "ok", text: "from-secondary" }],
     });
     const glm = new GLMClient(createProviderChain([a, b]));
     const before = Date.now();
     const out = await glm.complete({ system: "", user: "" });
     const after = Date.now();
-    expect(out).toBe("from-kimi");
+    expect(out).toBe("from-secondary");
     const armed = a.gate.armedUntil()!.getTime();
     expect(armed).toBeGreaterThanOrEqual(before + 30_000);
     expect(armed).toBeLessThanOrEqual(after + 30_000 + 100);
@@ -123,10 +127,10 @@ describe("GLMClient.complete — provider fallback", () => {
 
   it("throws AllProvidersExhaustedError when every provider 429s", async () => {
     const reset = new Date(Date.now() + 60_000);
-    const a = fakeProvider("z.ai", {
+    const a = fakeProvider("primary", {
       responses: [{ kind: "rate_limit", resetAt: reset }],
     });
-    const b = fakeProvider("kimi", {
+    const b = fakeProvider("secondary", {
       responses: [{ kind: "rate_limit", resetAt: reset }],
     });
     const glm = new GLMClient(createProviderChain([a, b]));
@@ -138,48 +142,48 @@ describe("GLMClient.complete — provider fallback", () => {
   });
 
   it("does NOT fall through on non-429 errors (e.g. 5xx, malformed input)", async () => {
-    const a = fakeProvider("z.ai", {
+    const a = fakeProvider("primary", {
       responses: [{ kind: "error", message: "500 Internal Server Error" }],
     });
-    const b = fakeProvider("kimi", { responses: [] });
+    const b = fakeProvider("secondary", { responses: [] });
     const glm = new GLMClient(createProviderChain([a, b]));
     await expect(glm.complete({ system: "", user: "" })).rejects.toThrow(
       "500 Internal Server Error",
     );
     expect(b.calls).toBe(0);
-    // Z.ai's gate is NOT armed — non-429 means the call genuinely failed.
+    // Primary's gate is NOT armed — non-429 means the call genuinely failed.
     expect(a.gate.isArmed()).toBe(false);
   });
 
   it("falls through to the next provider on an empty completion without arming the gate", async () => {
-    const a = fakeProvider("z.ai", { responses: [{ kind: "ok", text: "" }] });
-    const b = fakeProvider("kimi", {
-      responses: [{ kind: "ok", text: "from-kimi" }],
+    const a = fakeProvider("primary", { responses: [{ kind: "ok", text: "" }] });
+    const b = fakeProvider("secondary", {
+      responses: [{ kind: "ok", text: "from-secondary" }],
     });
     const glm = new GLMClient(createProviderChain([a, b]));
     const out = await glm.complete({ system: "", user: "" });
-    expect(out).toBe("from-kimi");
+    expect(out).toBe("from-secondary");
     expect(a.calls).toBe(1);
     expect(b.calls).toBe(1);
-    // Empty is per-request, not a quota signal: Z.ai stays the active provider.
+    // Empty is per-request, not a quota signal: Primary stays the active provider.
     expect(a.gate.isArmed()).toBe(false);
-    expect(glm.active().name).toBe("z.ai");
+    expect(glm.active().name as string).toBe("primary");
   });
 
   it("treats whitespace-only text as empty", async () => {
-    const a = fakeProvider("z.ai", { responses: [{ kind: "ok", text: " \n\t" }] });
-    const b = fakeProvider("kimi", { responses: [{ kind: "ok", text: "{}" }] });
+    const a = fakeProvider("primary", { responses: [{ kind: "ok", text: " \n\t" }] });
+    const b = fakeProvider("secondary", { responses: [{ kind: "ok", text: "{}" }] });
     const glm = new GLMClient(createProviderChain([a, b]));
     expect(await glm.complete({ system: "", user: "" })).toBe("{}");
   });
 
   it("throws EmptyCompletionError, not AllProvidersExhaustedError, when every provider returns empty", async () => {
-    const a = fakeProvider("z.ai", { responses: [{ kind: "ok", text: "" }] });
-    const b = fakeProvider("kimi", { responses: [{ kind: "ok", text: "" }] });
+    const a = fakeProvider("primary", { responses: [{ kind: "ok", text: "" }] });
+    const b = fakeProvider("secondary", { responses: [{ kind: "ok", text: "" }] });
     const glm = new GLMClient(createProviderChain([a, b]));
     const err = await glm.complete({ system: "", user: "" }).catch((e) => e);
     expect(err).toBeInstanceOf(EmptyCompletionError);
-    expect(err.provider).toBe("kimi");
+    expect(err.provider as string).toBe("secondary");
     expect(a.calls).toBe(1);
     expect(b.calls).toBe(1);
     expect(a.gate.isArmed()).toBe(false);
@@ -188,8 +192,8 @@ describe("GLMClient.complete — provider fallback", () => {
 
   it("skips armed providers when looking past an empty completion", async () => {
     const reset = new Date(Date.now() + 60_000);
-    const a = fakeProvider("z.ai", { responses: [{ kind: "ok", text: "" }] });
-    const b = fakeProvider("kimi", { responses: [] });
+    const a = fakeProvider("primary", { responses: [{ kind: "ok", text: "" }] });
+    const b = fakeProvider("secondary", { responses: [] });
     b.gate.armUntil(reset);
     const c = fakeProvider("openrouter", {
       responses: [{ kind: "ok", text: "from-deepseek" }],
@@ -203,25 +207,25 @@ describe("GLMClient.complete — provider fallback", () => {
 describe("GLMClient.createMessage — provider fallback", () => {
   it("reaches the second provider on 429 and returns its message", async () => {
     const reset = new Date(Date.now() + 60_000);
-    const a = fakeProvider("z.ai", {
+    const a = fakeProvider("primary", {
       responses: [{ kind: "rate_limit", resetAt: reset }],
     });
-    const b = fakeProvider("kimi", {
-      responses: [{ kind: "ok", text: "from-kimi" }],
+    const b = fakeProvider("secondary", {
+      responses: [{ kind: "ok", text: "from-secondary" }],
     });
     const glm = new GLMClient(createProviderChain([a, b]));
     const msg = await glm.createMessage({
       max_tokens: 64,
       messages: [{ role: "user", content: "hi" }],
     });
-    expect(msg.content[0]).toMatchObject({ type: "text", text: "from-kimi" });
-    // Active provider is now Kimi (Z.ai armed)
-    expect(glm.active().name).toBe("kimi");
+    expect(msg.content[0]).toMatchObject({ type: "text", text: "from-secondary" });
+    // Active provider is now Secondary (Primary armed)
+    expect(glm.active().name as string).toBe("secondary");
   });
 
   it("does not treat a text-less message as a failure (tool-use turns have no text)", async () => {
-    const a = fakeProvider("z.ai", { responses: [{ kind: "ok", text: "" }] });
-    const b = fakeProvider("kimi", { responses: [] });
+    const a = fakeProvider("primary", { responses: [{ kind: "ok", text: "" }] });
+    const b = fakeProvider("secondary", { responses: [] });
     const glm = new GLMClient(createProviderChain([a, b]));
     const msg = await glm.createMessage({
       max_tokens: 64,

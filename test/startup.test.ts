@@ -8,6 +8,7 @@ import { Database } from 'bun:sqlite';
 import { main } from '../src/index.ts';
 import type { Config } from '../src/config.ts';
 import type { StartupDependencies } from '../src/startup.ts';
+import type { ProviderConfig } from '../src/providers.ts';
 import { HERMES_CODING_WORKER_IMAGE, HERMES_CANARY_CHILD_IMAGE, type HermesActivationConfig } from '../src/hermes/activation.ts';
 import { bindCanonicalCodeAction } from '../src/hermes/canonical-admission.ts';
 import { HERMES_CODING_RUNTIME_POLICY } from '../src/hermes/coding-runtime-policy.ts';
@@ -103,7 +104,7 @@ test('actual main selects the real Hermes factory and an injected failure never 
 });
 test('actual legacy main keeps coding on the single OpenRouter paid route and omits all canary hooks',async()=>{
   const f=fixture(); let polls=0;
-  f.config.providers=[...f.config.providers,{name:'z.ai',apiKey:'fake-zai',baseUrl:'https://api.z.ai/api/anthropic',model:'glm-5.3',defaultBackoffMs:1000}];
+  f.config.providers=[...f.config.providers,{name:'z.ai',apiKey:'fake-zai',baseUrl:'https://api.z.ai/api/anthropic',model:'glm-5.3',defaultBackoffMs:1000} as unknown as ProviderConfig];
   await main({...f.deps,env:{},runLoop:async args=>{polls++;expect(args.createAdmittedCodeLoop).toBeUndefined();expect(args.allowedIssueIds).toBeUndefined();expect(args.codingTrial).toBeUndefined();expect(args.codingExecutorProfile).toBeUndefined();expect(args.codingBase).toBeUndefined();
     expect(args.glm.chain.providers.map(p=>p.name)).toEqual(['openrouter']);expect(args.review).toEqual(f.config.review);}});
   expect(polls).toBe(1);expect(f.networkCalls()).toBe(0);
@@ -114,7 +115,7 @@ test('unsafe executor, missing activation and mismatched route stop before polli
     if(kind==='missing')f.env.GARY_HERMES_ACTIVATION_PATH=join(f.root,'missing.json');
     if(kind==='route')f.config.providers=[{...f.config.providers[0]!,baseUrl:'https://other.invalid'}];
     // Without OPENROUTER_API_KEY no paid provider loads; the coding canary must refuse to start.
-    if(kind==='no-openrouter-key')f.config.providers=[{name:'z.ai',apiKey:'fake-zai',baseUrl:'https://api.z.ai/api/anthropic',model:'glm-5.3',defaultBackoffMs:1000}];
+    if(kind==='no-openrouter-key')f.config.providers=[{name:'z.ai',apiKey:'fake-zai',baseUrl:'https://api.z.ai/api/anthropic',model:'glm-5.3',defaultBackoffMs:1000} as unknown as ProviderConfig];
     await expect(main({...f.deps,runLoop:async()=>{polls++;}})).rejects.toThrow();expect(polls).toBe(0);expect(f.networkCalls()).toBe(0);
   }
 });

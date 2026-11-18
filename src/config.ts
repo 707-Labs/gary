@@ -109,17 +109,6 @@ export type GitHubConfig =
       username: string;
     };
 
-/**
- * Single-provider config. The legacy `loadGLMConfig` returns this for
- * Z.ai compatibility with the older probe scripts; the chain-aware
- * `loadProviderConfigs` returns an array.
- */
-export interface GLMConfig {
-  apiKey: string;
-  baseUrl: string;
-  model: string;
-}
-
 export interface CloudflareConfig {
   apiToken: string;
   accountId: string;
@@ -150,17 +139,24 @@ export interface ReviewConfig {
   timeoutMs: number;
 }
 
-const KNOWN_PROVIDERS: ReadonlySet<string> = new Set(["z.ai", "kimi", "openrouter"]);
+const KNOWN_PROVIDERS: ReadonlySet<string> = new Set(["openrouter"]);
+/** Subscription routes retired 2026-11-18. Listing one is ignored with a warning, not a boot failure. */
+const RETIRED_SUBSCRIPTION_PROVIDERS: ReadonlySet<string> = new Set(["z.ai", "kimi"]);
 
 export function loadReviewConfig(): ReviewConfig {
   const orderRaw = optionalString("GARY_REVIEWER_PROVIDER_ORDER");
-  const names = (orderRaw ?? "openrouter,z.ai,kimi").split(",").map((s) => s.trim()).filter((s) => s.length > 0);
-  // A stale name (e.g. the retired "deepseek") must stop boot, not silently shrink the reviewer chain.
+  const listed = (orderRaw ?? "openrouter").split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+  const retired = listed.filter((s) => RETIRED_SUBSCRIPTION_PROVIDERS.has(s));
+  if (retired.length > 0) {
+    log.warn("ignoring retired subscription providers in GARY_REVIEWER_PROVIDER_ORDER", { providers: retired });
+  }
+  const names = listed.filter((s) => !RETIRED_SUBSCRIPTION_PROVIDERS.has(s));
+  // Any other stale name (e.g. the retired "deepseek") must stop boot, not silently shrink the reviewer chain.
   const unknown = names.filter((s) => !KNOWN_PROVIDERS.has(s));
   if (unknown.length > 0) {
     throw new Error(`Invalid GARY_REVIEWER_PROVIDER_ORDER: unknown provider(s) ${unknown.join(", ")}; known: ${[...KNOWN_PROVIDERS].join(", ")}`);
   }
-  const providerOrder = names as ProviderName[];
+  const providerOrder = (names.length > 0 ? names : ["openrouter"]) as ProviderName[];
   return {
     providerOrder,
     maxRounds: intFromEnv("GARY_REVIEW_MAX_ROUNDS", 3),
@@ -248,32 +244,12 @@ function loadAppPrivateKey(): string {
   return inline.includes("\\n") ? inline.replace(/\\n/g, "\n") : inline;
 }
 
-export function loadGLMConfig(): GLMConfig {
-  return {
-    apiKey: stringFromEnv("Z_AI_API_KEY"),
-    baseUrl: stringFromEnv("Z_AI_BASE_URL", "https://api.z.ai/api/anthropic"),
-    model: stringFromEnv("Z_AI_MODEL", "glm-5.3"),
-  };
-}
-
 const DEFAULT_BACKOFF_MS = 60_000;
 
 const PROVIDER_DEFAULTS: Record<
   ProviderName,
   { baseUrl: string; model: string; apiKeyEnv: string; defaultBackoffMs: number }
 > = {
-  "z.ai": {
-    apiKeyEnv: "Z_AI_API_KEY",
-    baseUrl: "https://api.z.ai/api/anthropic",
-    model: "glm-5.3",
-    defaultBackoffMs: DEFAULT_BACKOFF_MS,
-  },
-  kimi: {
-    apiKeyEnv: "KIMI_API_KEY",
-    baseUrl: "https://api.kimi.com/coding",
-    model: "kimi-for-coding",
-    defaultBackoffMs: DEFAULT_BACKOFF_MS,
-  },
   openrouter: {
     apiKeyEnv: PAID_ROUTE.apiKeyEnv,
     baseUrl: PAID_ROUTE.baseUrl,
@@ -283,22 +259,12 @@ const PROVIDER_DEFAULTS: Record<
 };
 
 const PROVIDER_ENV_PREFIX: Record<ProviderName, string> = {
-  "z.ai": "Z_AI",
-  kimi: "KIMI",
   openrouter: "OPENROUTER",
 };
 
 export const APPROVED_PROVIDER_ROUTES: Readonly<
   Record<ProviderName, { hosts: ReadonlySet<string>; models: ReadonlySet<string> }>
 > = {
-  "z.ai": {
-    hosts: new Set(["api.z.ai"]),
-    models: new Set(["glm-5.3"]),
-  },
-  kimi: {
-    hosts: new Set(["api.kimi.com"]),
-    models: new Set(["k3", "kimi-for-coding"]),
-  },
   openrouter: {
     hosts: new Set([PAID_ROUTE.host]),
     models: new Set([PAID_ROUTE.model]),
@@ -310,7 +276,8 @@ export function validateProviderRoute(
   baseUrl: string,
   model: string,
 ): void {
-  const policy = APPROVED_PROVIDER_ROUTES[name];
+  const policy = Object.hasOwn(APPROVED_PROVIDER_ROUTES, name) ? APPROVED_PROVIDER_ROUTES[name] : undefined;
+  if (!policy) throw new Error(`Unapproved provider ${String(name)}; approved: ${Object.keys(APPROVED_PROVIDER_ROUTES).join(", ")}`);
   let host: string;
   try {
     const parsed = new URL(baseUrl);
@@ -355,31 +322,30 @@ function loadProviderConfig(name: ProviderName): ProviderConfig | null {
 }
 
 /**
- * Load every configured provider, in priority order (Z.ai → Kimi → OpenRouter).
- * Z.ai is required; Kimi and OpenRouter are optional (omit their key to
- * disable). The returned array is non-empty.
+ * Load the paid provider chain: OpenRouter only (src/model-route.ts PAID_ROUTE).
+ * OPENROUTER_API_KEY is required. The retired direct DeepSeek route and the
+ * retired Z.ai GLM / Kimi for Coding subscription routes are never built; any
+ * of their variables left in the environment are ignored with a warning that
+ * names the variables, never their values.
  */
 export function loadProviderConfigs(): readonly ProviderConfig[] {
-  // The direct DeepSeek route was retired 2026-10-28; its variables are ignored.
-  const staleDeepSeek = Object.keys(process.env).filter((key) => key.startsWith("DEEPSEEK_")).sort();
-  if (staleDeepSeek.length > 0) {
-    log.warn("ignoring retired DeepSeek provider variables; paid inference uses OpenRouter", { variables: staleDeepSeek });
+  const retired = Object.keys(process.env)
+    .filter((key) => ["DEEPSEEK_", "Z_AI_", "KIMI_"].some((prefix) => key.startsWith(prefix))).sort();
+  if (retired.length > 0) {
+    log.warn("ignoring retired provider variables; paid inference uses OpenRouter", { variables: retired });
   }
-  // Z.ai stays required so existing deployments keep working without
-  // env changes. Kimi/OpenRouter are opt-in fallbacks.
-  const zai = loadProviderConfig("z.ai");
-  if (!zai) {
-    throw new Error("Missing required env var: Z_AI_API_KEY");
-  }
-  const out: ProviderConfig[] = [zai];
-  const kimi = loadProviderConfig("kimi");
-  if (kimi) out.push(kimi);
   const openrouter = loadProviderConfig("openrouter");
-  if (openrouter) out.push(openrouter);
-  return out;
+  if (!openrouter) {
+    throw new Error(`Missing required env var: ${PAID_ROUTE.apiKeyEnv}`);
+  }
+  return [openrouter];
 }
 
-/** Convenience: build the production provider chain in one shot. */
+/**
+ * Convenience for operator probe scripts: an UNLEDGERED OpenRouter chain.
+ * Calls through it are paid and bypass the spend guard; Gary's runtime builds
+ * its chain in src/startup.ts with spend.guardedFetch instead.
+ */
 export function loadGLMChain(): ProviderChain {
   return createProviderChain(loadProviderConfigs().map((p) => createProvider(p)));
 }

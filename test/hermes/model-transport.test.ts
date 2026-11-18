@@ -110,7 +110,7 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
     for (const thinking of ["enabled", null, { type: "disabled" }]) {
       expect(() => createModelTransport({ ...options, thinking } as unknown as ModelTransportOptions)).toThrow("invalid host thinking policy");
     }
-    expect(() => createModelTransport({ ...options, capability: { ...options.capability, provider: "z.ai", model: "glm-5.3" }, thinking: "disabled" })).toThrow("invalid host thinking policy");
+    expect(() => createModelTransport({ ...options, capability: { ...options.capability, provider: "z.ai", model: "glm-5.3" } as unknown as ModelTransportOptions["capability"], thinking: "disabled" })).toThrow("invalid host capability");
     expect(() => createModelTransport({ ...options, onFailure: "untrusted" } as unknown as ModelTransportOptions)).toThrow("invalid host failure callback");
     expect(sent).toHaveLength(0);
     expect(ledger.status("TICKET-1")!.attemptCount).toBe(0);
@@ -208,13 +208,13 @@ describe("guarded Hermes model transport (offline fake provider only)", () => {
     expect(callbacks).toBe(1); expect(calls).toBe(2);
   });
 
-  test("supports only the already-priced Z.ai model/route pairing", async () => {
+  test("rejects the retired Z.ai route as an invalid host capability and sends nothing", async () => {
     const sent: Request[] = [];
-    const { handler } = setup({ capability: { ticketId: "TICKET-1", ownerId: "owner-1", provider: "z.ai", model: "glm-5.3", deadlineMs: Date.now() + 5000, allowedToolNames: [] },
-      fetch: async (req) => { sent.push(req); return Response.json(providerBody({ model: "glm-5.3" })); } });
-    expect((await handler(request({ model: "glm-5.3" }))).status).toBe(200);
-    expect(sent[0]!.url).toBe("https://api.z.ai/api/anthropic/v1/messages");
-    expect((await sent[0]!.json()).model).toBe("glm-5.3");
+    const retired = { ticketId: "TICKET-1", ownerId: "owner-1", provider: "z.ai", model: "glm-5.3", deadlineMs: Date.now() + 5000, allowedToolNames: [] };
+    expect(() => setup({ capability: retired as unknown as ModelTransportOptions["capability"],
+      fetch: async (req) => { sent.push(req); return Response.json(providerBody({ model: "glm-5.3" })); } })).toThrow("invalid host capability");
+    expect(sent).toHaveLength(0);
+    expect(ledger.status("TICKET-1")!.attemptCount).toBe(0);
   });
 
   test("rejects unauthorized and non-chat routes before transport or reservation", async () => {

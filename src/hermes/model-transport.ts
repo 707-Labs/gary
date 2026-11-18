@@ -6,15 +6,13 @@ import { PAID_ROUTE } from "../model-route.ts";
 /** Host-owned ceiling for one request, always clamped to the shared action deadline. */
 export const MODEL_REQUEST_TIMEOUT_MS = 120_000;
 
-/** These are Gary's existing priced Anthropic routes, not new pricing policies. */
+/** Gary's priced Anthropic route (src/spend.ts POLICIES), not a new pricing policy. */
 const ROUTES = {
-  "z.ai": { model: "glm-5.3", url: "https://api.z.ai/api/anthropic/v1/messages" },
   [PAID_ROUTE.provider]: { model: PAID_ROUTE.model, url: PAID_ROUTE.url },
 } as const;
 
 type PricedRoute =
-  | { readonly provider: "z.ai"; readonly model: "glm-5.3" }
-  | { readonly provider: typeof PAID_ROUTE.provider; readonly model: typeof PAID_ROUTE.model };
+  { readonly provider: typeof PAID_ROUTE.provider; readonly model: typeof PAID_ROUTE.model };
 
 export type ModelTransportCapability = PricedRoute & {
   readonly ticketId: string;

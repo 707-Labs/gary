@@ -1,10 +1,9 @@
-// Verify whether each provider in the production chain honors Anthropic-style
-// prompt caching. We send the same large system prompt twice — if the
+// Verify whether the production provider (OpenRouter) honors Anthropic-style
+// prompt caching. Paid and unledgered: run only with an explicit spend OK. We send the same large system prompt twice — if the
 // provider supports caching, the second call should report nonzero
 // `cache_read_input_tokens` (and a much smaller `input_tokens`).
 //
-// Run on the mini (where all three API keys live):
-//   ssh mini 'cd ~/Developer/gary && bun run scripts/probe-cache.ts'
+// Run locally: bun run scripts/probe-cache.ts
 
 import Anthropic from "@anthropic-ai/sdk";
 import { PAID_ROUTE } from "../src/model-route.ts";
@@ -17,18 +16,6 @@ interface ProbeTarget {
 }
 
 const targets: ProbeTarget[] = [
-  {
-    name: "z.ai",
-    baseURL: "https://api.z.ai/api/anthropic",
-    model: "glm-4.6",
-    apiKeyEnv: "Z_AI_API_KEY",
-  },
-  {
-    name: "kimi",
-    baseURL: "https://api.kimi.com/coding",
-    model: "kimi-for-coding",
-    apiKeyEnv: "KIMI_API_KEY",
-  },
   {
     name: PAID_ROUTE.provider,
     baseURL: PAID_ROUTE.baseUrl,
