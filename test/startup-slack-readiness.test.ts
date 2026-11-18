@@ -62,7 +62,7 @@ async function fixture(){
   for(const command of ['git init -q','git config user.email fixture@example.invalid','git config user.name Fixture','git config core.hooksPath /dev/null'])expect((await run(command)).exitCode).toBe(0);
   writeFileSync(join(workspace,'task.ts'),'baseline\n');writeFileSync(join(workspace,'package.json'),JSON.stringify({scripts:{'ci:full':'bun run check',check:'test "$(cat task.ts)" = updated'}}));
   expect((await run('git add task.ts package.json && git commit -qm baseline')).exitCode).toBe(0);
-  const activation:HermesActivationConfig={version:1,issueId:ISSUE,repo:REPO,provider:'deepseek',model:'deepseek-v4-pro',workerImage:HERMES_CODING_WORKER_IMAGE,
+  const activation:HermesActivationConfig={version:1,issueId:ISSUE,repo:REPO,provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',workerImage:HERMES_CODING_WORKER_IMAGE,
     childImage:HERMES_CANARY_CHILD_IMAGE,dockerExecutable:'/usr/local/bin/docker',dockerHost:'unix:///Users/tanner/.colima/default/docker.sock',traceDirectory:traces,
     policy:{baseCommit:(await run('git rev-parse HEAD')).stdout.trim(),task:{allowedFiles:['task.ts'],criteria:[{id:'fix',description:'Exact scoped change',requiredCommands:['bun run check',CHECK]}]},
       progress:{maxModelRequests:50,maxModelRequestsWithoutProgress:20,maxSuccessfulToolCalls:100,toolRepeatWindow:10,maxRepeatedToolCalls:5},instructions:[],voicePrinciples:'Use Gary voice.',
@@ -72,9 +72,9 @@ async function fixture(){
   writeFileSync(credentialsPath,`SLACK_BOT_TOKEN=${credentials.botToken}\nSLACK_APP_TOKEN=${credentials.appToken}\n`,{mode:0o600});
   const config:Config={gary:{name:'Offline Gary',linearUserId:'fixture-user',home:root,stateDir:join(root,'state'),reposDir:join(root,'repos'),workspacesDir:join(root,'workspaces'),
     dbPath:join(root,'state','gary.db'),repoMap:new Map([['ERT',REPO]]),allowlistedMentionUserIds:[]},linear:{apiKey:'fake-linear',teamId:'fixture-team',inProgressStateId:'fixture-progress'},
-    github:{kind:'pat',token:'fake-github',username:'fixture'},providers:[{name:'deepseek',apiKey:'fake-provider-key',baseUrl:'https://api.deepseek.com/anthropic',model:'deepseek-v4-pro',defaultBackoffMs:1000}],cloudflare:null,
+    github:{kind:'pat',token:'fake-github',username:'fixture'},providers:[{name:'openrouter',apiKey:'fake-provider-key',baseUrl:'https://openrouter.ai/api',model:'deepseek/deepseek-v4.1-flash',defaultBackoffMs:1000}],cloudflare:null,
     runtime:{pollIntervalMs:1,maxAttemptsPerTicket:1,circuitBreakerWindowHours:6,maxCiAttempts:1,agentLoopMaxIterations:50,agentLoopTimeoutMs:30_000,stalePrAfterMs:1000},
-    review:{providerOrder:['deepseek'],maxRounds:1,iterationCap:5,timeoutMs:1000}};
+    review:{providerOrder:['openrouter'],maxRounds:1,iterationCap:5,timeoutMs:1000}};
   const executor:Executor={workspaceRoot:workspace,readFile:async path=>readFileSync(join(workspace,path),'utf8'),writeFile:async(path,content)=>{writeFileSync(join(workspace,path),content);},listFiles:async()=>[],grep:async()=>[],
     run:async(command,options)=>runProcess('/bin/bash',['-c',command],{...options,cwd:workspace,env,timeoutMs:options?.timeoutMs??10_000})};
   const sockets:FakeSocket[]=[],posts:Record<string,unknown>[]=[],methods:string[]=[];let modelCalls=0,launches=0,credentialLoads=0;
@@ -83,12 +83,12 @@ async function fixture(){
       GARY_BUN_CACHE_VOLUME:HERMES_CODING_RUNTIME_POLICY.executor.bunCacheVolume,
       DOCKER_HOST:'unix:///Users/tanner/.colima/default/docker.sock',GARY_SLACK_ENABLED:'1',GARY_SLACK_CREDENTIALS_FILE:credentialsPath},
     fetch:(async(input:RequestInfo|URL,init?:RequestInit)=>{
-      const request=new Request(input,init);expect(request.url).toBe('https://api.deepseek.com/anthropic/v1/messages');
-      const body=await request.json();expect(body.model).toBe('deepseek-v4-pro');expect(body.thinking).toEqual({type:'disabled'});modelCalls++;
+      const request=new Request(input,init);expect(request.url).toBe('https://openrouter.ai/api/v1/messages');
+      const body=await request.json();expect(body.model).toBe('deepseek/deepseek-v4.1-flash');expect(body.thinking).toEqual({type:'disabled'});modelCalls++;
       const steps=[['read_file',{path:'task.ts'}],['write_file',{path:'task.ts',content:'updated\n'}],['run_bash',{command:'bun run check'}],['run_bash',{command:CHECK}],['finish',{summary:'Verified offline fixture'}]] as const;
       const step=steps[modelCalls-1]!;
-      return Response.json({id:'reply-'+modelCalls,type:'message',role:'assistant',model:'deepseek-v4-pro',content:[{type:'tool_use',id:'tool-'+modelCalls,name:step[0],input:step[1]}],stop_reason:'tool_use',
-        usage:{input_tokens:10,output_tokens:8,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+      return Response.json({id:'reply-'+modelCalls,type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'tool_use',id:'tool-'+modelCalls,name:step[0],input:step[1]}],stop_reason:'tool_use',
+        usage:{input_tokens:10,output_tokens:8,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});
     }) as typeof fetch,
     launch:async(...args)=>{launches++;return native(...args);},
     slackTransport:loaded=>{credentialLoads++;expect(loaded).toEqual(credentials);expect(Object.isFrozen(loaded)).toBe(true);
@@ -119,12 +119,12 @@ for(const mode of modes)test('actual startup Slack readiness: '+mode,async()=>{
     noSend();expect(f.counts()).toEqual({modelCalls:0,launches:0,credentialLoads:1});
     mention(f.sockets[0]!,'Before');await flush();noSend();expect(f.sockets[0]!.sent).toHaveLength(1);
     args.spend!.createCampaign('offline',10);args.spend!.enrollTicket('offline',ISSUE,10,{draftPr:true,codingReviewReserve:true});upsertTicket(args.db,{linearId:ISSUE,identifier:'ERT-1'});
-    const admitted={issueId:ISSUE,fingerprint:'fp',humanSignature:'fixture-human',provider:'deepseek',model:'deepseek-v4-pro',repo:REPO};
+    const admitted={issueId:ISSUE,fingerprint:'fp',humanSignature:'fixture-human',provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',repo:REPO};
     const classify=args.codingTrial!.admit({...admitted,actionType:'classify'});
     setClassification(args.db,{linearId:ISSUE,classification:'CODE',confidence:.99,scope:'S'});classify.complete(true,'handled');
     const trial=args.codingTrial!.admit({...admitted,actionType:'start_coding'}),actionId=trial.actionId;
     const binding=bindCanonicalCodeAction({db:args.db,ledger:args.spend!,actionId,fingerprint:'fp',issue:{id:ISSUE,identifier:'ERT-1',teamKey:'ERT',teamId:'fixture-team'} as AssignedIssue,
-      repo:REPO,provider:'deepseek',model:'deepseek-v4-pro'});
+      repo:REPO,provider:'openrouter',model:'deepseek/deepseek-v4.1-flash'});
     try{
       const result=await args.createAdmittedCodeLoop!(binding.admission)({glm:args.glm,executor:f.executor,systemPrompt:'Offline Gary fixture',task:'Update task.ts',maxIterations:5,
         maxTokensPerTurn:128,timeoutMs:30_000,deadlineMs:Date.now()+30_000,finishGateCommand:CHECK,disableSubagent:true});
@@ -149,9 +149,9 @@ for(const mode of modes)test('actual startup Slack readiness: '+mode,async()=>{
       await args.onCodePublication!(binding.admission,receipt);await refresh();noSend();
       if(mode!=='missing-pr')recordPr(args.db,{githubId:42,ticketLinearId:ISSUE,repo:REPO,prNumber:42,branch:'gary/canary'});
       if(mode==='unknown-spend'){
-        const guarded=args.spend!.guardedFetch('deepseek',(async()=>{throw new Error('offline_ambiguous_request');}) as unknown as typeof fetch);
-        await expect(args.spend!.withSpendScope(ISSUE,()=>guarded('https://api.deepseek.com/anthropic/v1/messages',{method:'POST',headers:{'content-type':'application/json'},
-          body:JSON.stringify({model:'deepseek-v4-pro',max_tokens:128,messages:[{role:'user',content:'offline'}]})}))).rejects.toThrow('offline_ambiguous_request');
+        const guarded=args.spend!.guardedFetch('openrouter',(async()=>{throw new Error('offline_ambiguous_request');}) as unknown as typeof fetch);
+        await expect(args.spend!.withSpendScope(ISSUE,()=>guarded('https://openrouter.ai/api/v1/messages',{method:'POST',headers:{'content-type':'application/json'},
+          body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens:128,messages:[{role:'user',content:'offline'}]})}))).rejects.toThrow('offline_ambiguous_request');
         expect(args.spend!.status(ISSUE)?.unknownAttempts).toBe(1);
       }
       if(mode==='ready')trial.complete(true,'pr_opened');

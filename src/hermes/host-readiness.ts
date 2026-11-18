@@ -5,6 +5,14 @@ import type { DB } from '../state/db.ts';
 import type { SpendLedger } from '../spend.ts';
 import type { CodeActionAdmission } from './canonical-admission.ts';
 import type { HermesActivationBinding } from './activation.ts';
+import { LEGACY_DEEPSEEK_ROUTE, PAID_ROUTE } from '../model-route.ts';
+
+/** A completed publication proves readiness on the current route, or on the
+ * retired DeepSeek route when it predates the 2026-10-28 OpenRouter cutover. */
+function isCodingPublicationRoute(provider: string, model: string): boolean {
+  return (provider === PAID_ROUTE.provider && model === PAID_ROUTE.model)
+    || (provider === LEGACY_DEEPSEEK_ROUTE.provider && model === LEGACY_DEEPSEEK_ROUTE.model);
+}
 
 export interface HostReadiness { ready: boolean; hermesCanarySucceeded: boolean; receiptId: string }
 export interface CanaryReadinessOptions {
@@ -43,7 +51,7 @@ export function createCanaryReadiness(options: CanaryReadinessOptions) {
            AND NOT EXISTS (SELECT 1 FROM hermes_action_owners claimed LEFT JOIN actions pending ON pending.id=claimed.action_id
              WHERE pending.id IS NULL OR pending.completed_at IS NULL OR length(trim(claimed.owner_epoch))=0 OR pending.action_type<>'start_coding')`).get(actionId, options.issueId);
       if (!row || row.state_fingerprint !== fingerprint || row.owner_epoch !== ownerEpoch
-          || row.provider !== 'deepseek' || row.model !== 'deepseek-v4-pro') return NOT_READY;
+          || !isCodingPublicationRoute(row.provider, row.model)) return NOT_READY;
       const allocation = options.ledger.status(options.issueId);
       if (!allocation || allocation.state !== 'closed' || allocation.terminalReason !== 'pr_opened'
           || !allocation.draftPr || allocation.unknownAttempts !== 0 || allocation.attemptCount < 1) return NOT_READY;

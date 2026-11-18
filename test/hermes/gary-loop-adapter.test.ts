@@ -53,16 +53,16 @@ function fixture() {
   const host: SessionOptions = {
     admission: { taskId: "task-1", requestId: "request-1", ticketId: "TICKET-1", actionId: "action-1",
       fingerprint: "fingerprint-1", ownerEpoch: epoch, deadlineMs: Date.now() + 5000 },
-    capabilityToken: TOKEN, ledger, provider: "deepseek", model: "deepseek-v4-pro",
+    capabilityToken: TOKEN, ledger, provider: "openrouter", model: "deepseek/deepseek-v4.1-flash",
     providerApiKey: "offline-upstream-key", currentOwnerEpoch: () => epoch,
     assertAdmission: current => {
       if (!admitted || current.actionId !== "action-1" || current.fingerprint !== "fingerprint-1") throw new Error("revoked");
     },
     fetch: async req => {
       upstream.push(req);
-      return Response.json({ id: "offline-receipt", type: "message", role: "assistant", model: "deepseek-v4-pro",
+      return Response.json({ id: "offline-receipt", type: "message", role: "assistant", model: "deepseek/deepseek-v4.1-flash",
         content: [{ type: "text", text: "Model prose says it is finished." }], stop_reason: "end_turn", stop_sequence: null,
-        usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } });
+        usage: { input_tokens: 10, output_tokens: 8, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0 } });
     },
     executor, allowedTools: ["read_file", "write_file", "run_bash", "finish", "report_blocked"],
     finishGateCommand: "bun run check",
@@ -103,7 +103,7 @@ test("single-phase seam uses the guarded route, real ledger and Gary check/finis
   expect(f.ledger.status("TICKET-1")!.unknownAttempts).toBe(0);
   expect(f.ledger.status("TICKET-1")!.chargedMicros).toBeGreaterThan(0);
   expect(f.upstream).toHaveLength(1);
-  expect(f.upstream[0]!.url).toBe("https://api.deepseek.com/anthropic/v1/messages");
+  expect(f.upstream[0]!.url).toBe("https://openrouter.ai/api/v1/messages");
   expect(f.upstream[0]!.headers.get("authorization")).toBe("Bearer offline-upstream-key");
   expect((await f.upstream[0]!.json()).max_tokens).toBe(128);
   expect(captured!.prompt).toBe(f.args.task); expect(captured!.systemPrompt).toBe(f.args.systemPrompt);

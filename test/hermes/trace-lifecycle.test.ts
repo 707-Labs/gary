@@ -21,7 +21,7 @@ function fixture() {
   const executor = { workspaceRoot: "/offline", readFile: async () => "", writeFile: async () => {}, listFiles: async () => [], grep: async () => [],
     run: async () => ({ stdout: "", stderr: "", exitCode: 0, timedOut: false }) };
   const host: SessionOptions = { admission: { taskId: "task", requestId: "request", actionId: "action", ownerEpoch: "owner", ticketId: "ticket", fingerprint: "fingerprint", deadlineMs: Date.now() + 5000 },
-    capabilityToken: "offline-capability-00000000000000000000", ledger, provider: "deepseek", model: "deepseek-v4-pro", providerApiKey: "fake",
+    capabilityToken: "offline-capability-00000000000000000000", ledger, provider: "openrouter", model: "deepseek/deepseek-v4.1-flash", providerApiKey: "fake",
     fetch: async () => { paid++; throw new Error("paid route must not run"); }, executor, allowedTools: ["run_bash", "finish", "report_blocked"], finishGateCommand: "check",
     currentOwnerEpoch: () => "owner", assertAdmission: () => {}, trace };
   const args: AgentLoopArgs = { glm: {} as AgentLoopArgs["glm"], executor, systemPrompt: "offline", task: "offline", maxIterations: 2, timeoutMs: 1000, disableSubagent: true, finishGateCommand: "check" };

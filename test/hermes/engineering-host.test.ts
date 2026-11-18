@@ -1,0 +1,114 @@
+import { Database } from 'bun:sqlite';
+import { afterEach, expect, test } from 'bun:test';
+import { createEngineeringHost, type HostEngineeringRequest, type HostEngineeringReceipt } from '../../src/hermes/engineering-host.ts';
+import { readEngineeringDiagnostics } from '../../src/hermes/engineering-diagnostics.ts';
+const dbs: Database[] = []; afterEach(() => dbs.splice(0).forEach(db => db.close()));
+const request: HostEngineeringRequest = { requestId: 'request', eventId: 'event', eventKey: 'event-key', messageKey: 'message',
+  authority: { authenticated: true, requesterId: 'U0A9M5W16F8', teamId: 'T0AA24R7VUZ', surface: 'private_dm', channelId: 'D0C7EJELQJX', threadTs: '1234.1234' },
+  repository: '707-Labs/gary', task: 'Make the scoped edit and test it.' };
+function fixture() {
+  const db = new Database(':memory:'); dbs.push(db);
+  let executions = 0, preparations = 0, failCleanup = false;
+  const delivered: HostEngineeringReceipt[] = [];
+  const options = { db, grantId: 'grant', allocationId: 'allocation', now: () => 1000,
+    assertGrant() {}, assertBudget() {},
+    async prepare(r: HostEngineeringRequest, taskId: string) {
+      preparations++; return { runtime: null, spec: { taskId, requestId: r.requestId, grantId: 'grant', allocationId: 'allocation',
+        scope: { teamId: r.authority.teamId, surface: r.authority.surface, audienceId: r.authority.requesterId, projectId: '707-labs:gary' },
+        repositoryId: '123', repository: r.repository, baseCommit: 'a'.repeat(40), policyHash: 'sha256:' + 'b'.repeat(64), deadlineMs: 10000 } };
+    },
+    async execute() { executions++; return { completed: true, artifactReceiptId: 'artifact', summary: 'Verified scoped patch and tests.' }; },
+    async cleanup(t: any) { if (failCleanup) throw Error('unavailable'); return { receiptId: 'cleanup', taskId: t.taskId, sessionId: t.sessionId, ownerEpoch: t.ownerEpoch, absent: true as const }; },
+    async deliver(r: HostEngineeringReceipt) { delivered.push(r); },
+  };
+  return { host: createEngineeringHost(options), options, delivered, executions: () => executions, preparations: () => preparations, failCleanup() { failCleanup = true; } };
+}
+const signal = () => new AbortController().signal;
+test('durable receipt precedes execution; repeated event and start never repeat paid work', async () => {
+  const f = fixture(); const ack = await f.host.admit(request, signal()) as HostEngineeringReceipt;
+  expect(ack.phase).toBe('admitted'); expect(f.executions()).toBe(0);
+  expect(f.host.readReceipt({requestId:request.requestId,taskId:ack.taskId})).toEqual(ack);
+  expect(f.host.readReceipt({requestId:request.requestId,taskId:'foreign-task'})).toBeNull();
+  expect(await f.host.admit({ ...request, eventId: 'different-event', eventKey: 'different' }, signal())).toEqual(ack);
+  f.host.start(ack); f.host.start(ack); await new Promise(resolve => setTimeout(resolve, 0)); await f.host.stop();
+  expect(f.executions()).toBe(1); expect(f.preparations()).toBe(1);
+  expect(f.delivered[0]?.status).toBe('completed'); expect(f.host.verifyReceipt(f.delivered[0]!)).toBe(true);
+  expect(f.host.readReceipt({requestId:request.requestId,taskId:ack.taskId})).toEqual(f.delivered[0]!);
+  expect(f.executions()).toBe(1);
+  expect(f.host.verifyReceipt({ ...f.delivered[0]!, text: 'forged' })).toBe(false);
+});
+test('fresh host cannot adopt old ownership or reuse the acceptance allocation', async () => {
+  const f = fixture(); const ack = await f.host.admit(request, signal()) as HostEngineeringReceipt;
+  const restarted = createEngineeringHost(f.options); restarted.start(ack);
+  expect(f.executions()).toBe(0);
+  expect(await restarted.admit({ ...request, requestId: 'other', messageKey: 'other' }, signal())).toEqual({ kind: 'rejected', code: 'busy' });
+  await restarted.stop(); await f.host.stop();
+});
+test('uncertain cleanup is reported without freeing task or claiming success', async () => {
+  const f = fixture(); f.failCleanup(); const ack = await f.host.admit(request, signal()) as HostEngineeringReceipt;
+  f.host.start(ack); expect(await f.host.stop()).toEqual({ drained: false }); expect(f.delivered[0]?.status).toBe('cleanup_unknown');
+  const state = f.options.db.query('SELECT state,cleanup_confirmed FROM engineering_tasks').get();
+  expect(state).toEqual({ state: 'cleanup_unknown', cleanup_confirmed: 0 });
+});
+test('immutable project scope uses only the validated host-acquired repository ID and keeps audience exact', async () => {
+  for (const mutation of ['none', 'audience', 'id', 'project']) {
+    const f = fixture();
+    const prepare = f.options.prepare;
+    const host = createEngineeringHost({ ...f.options, immutableRepositoryScope: true,
+      async prepare(r, taskId) {
+        const p = await prepare(r, taskId); p.spec.scope.projectId = 'repository:123';
+        if (mutation === 'audience') p.spec.scope.audienceId = 'someone-else';
+        if (mutation === 'id') p.spec.repositoryId = '123\n';
+        if (mutation === 'project') p.spec.scope.projectId = 'repository:456';
+        return p;
+      } });
+    const result = await host.admit(request, signal());
+    if (mutation === 'none') {
+      expect(result).toMatchObject({ phase: 'admitted' });
+      expect(host.store.get((result as HostEngineeringReceipt).taskId, {
+        teamId: request.authority.teamId, surface: 'private_dm',
+        audienceId: request.authority.requesterId, projectId: 'repository:123',
+      })?.spec.scope.projectId).toBe('repository:123');
+      host.start(result as HostEngineeringReceipt);
+    } else expect(result).toEqual({ kind: 'rejected', code: 'unavailable' });
+    expect(await host.stop()).toEqual({ drained: true });
+  }
+});
+test('unauthenticated and shared requests cannot enter a private pilot', async () => {
+  const f = fixture();
+  expect(await f.host.admit({ ...request, authority: { ...request.authority, requesterId: 'other' } }, signal())).toMatchObject({ kind: 'rejected' });
+  expect(await f.host.admit({ ...request, authority: { ...request.authority, surface: 'shared_channel', channelId: 'C0BBUCPN3FX' } }, signal())).toMatchObject({ kind: 'rejected' });
+  expect(f.preparations()).toBe(0); await f.host.stop();
+});
+
+test('stop fences an admitted but unstarted task; invalid executor evidence never becomes success', async () => {
+  const stopped = fixture(); const ack = await stopped.host.admit(request, signal()) as HostEngineeringReceipt;
+  await stopped.host.stop(); stopped.host.start(ack); expect(stopped.executions()).toBe(0);
+  const bad = fixture(); bad.options.execute = async () => ({ completed: true, artifactReceiptId: '', summary: 'invalid success' });
+  const ack2 = await bad.host.admit(request, signal()) as HostEngineeringReceipt;
+  bad.host.start(ack2); await new Promise(resolve => setTimeout(resolve, 0)); await bad.host.stop();
+  expect(bad.delivered[0]?.status).toBe('blocked');
+});
+
+test('host retains bounded failure evidence across reconstruction without exposing error text or replaying work', async () => {
+  const f = fixture(); let attempts = 0;
+  f.options.execute = async () => { attempts++; throw new Error('secret API key, raw provider body and command'); };
+  const ack = await f.host.admit(request, signal()) as HostEngineeringReceipt;
+  f.host.start(ack); await new Promise(resolve => setTimeout(resolve, 0)); await f.host.stop();
+  const owner = f.options.db.query('SELECT session_id,owner_epoch FROM engineering_tasks').get() as { session_id: string; owner_epoch: string };
+  const records = readEngineeringDiagnostics(f.options.db, { requestId: request.requestId, taskId: ack.taskId, sessionId: owner.session_id, ownerEpoch: owner.owner_epoch });
+  expect(records).toEqual([{ version: 1, event: 'failure', phase: 'host_execute', code: 'unknown_failure' }]);
+  const reopened = createEngineeringHost(f.options); reopened.start(ack);
+  expect(reopened.readReceipt({ requestId: request.requestId, taskId: ack.taskId })?.status).toBe('blocked');
+  expect(JSON.stringify(f.options.db.query('SELECT * FROM engineering_diagnostics_v1').all())).not.toContain('secret');
+  expect(JSON.stringify(f.delivered)).not.toContain('secret'); expect(attempts).toBe(1); await reopened.stop();
+});
+test('prepare failure retains evidence under intent identity and does not invent an admitted task', async () => {
+  const f = fixture(); f.options.prepare = async () => { throw Error('engineering_repository:acquisition_failed'); };
+  expect(await f.host.admit(request, signal())).toEqual({ kind: 'rejected', code: 'unavailable' });
+  const row = f.options.db.query('SELECT task_id,stage FROM engineering_ingress_requests').get() as { task_id: string; stage: string };
+  expect(row.stage).toBe('blocked'); expect(f.options.db.query('SELECT count(*) n FROM engineering_tasks').get()).toEqual({ n: 0 });
+  expect(readEngineeringDiagnostics(f.options.db, { requestId: request.requestId, taskId: row.task_id, sessionId: null, ownerEpoch: null })).toEqual([
+    { version: 1, event: 'failure', phase: 'prepare', code: 'engineering_repository:acquisition_failed' },
+  ]); await f.host.stop();
+});

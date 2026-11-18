@@ -3,10 +3,12 @@ import { Database } from 'bun:sqlite';
 import { chmodSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createSlackSharedConversation, loadSlackSharedConversationConfig, fingerprintSlackSharedConversationConfig,
+import { createSlackSharedConversation, migrateSlackSharedConversationPolicy, legacyFingerprintSlackSharedConversationConfig, loadSlackSharedConversationConfig, fingerprintSlackSharedConversationConfig,
   SHARED_CONVERSATION_POLICY as POLICY, type SlackSharedConversationInput, type SlackSharedMetadata } from '../../src/slack/shared-conversation.ts';
 import { DMReplyError, type DMTurn } from '../../src/hermes/dm-conversation.ts';
 import { SpendLedger } from '../../src/spend.ts';
+import { createSlackService, GARY_SLACK } from '../../src/slack/service.ts';
+import type { SlackTransport } from '../../src/slack/transport.ts';
 const cleanups:Array<()=>void>=[];
 afterEach(()=>{for(const cleanup of cleanups.splice(0).reverse())cleanup();});
 const signal=new AbortController().signal;
@@ -24,6 +26,44 @@ function fixture(){
 }
 const mention=(n:number,overrides:Partial<SlackSharedConversationInput>={}):SlackSharedConversationInput=>({type:'app_mention',appId:POLICY.appId,teamId:POLICY.teamId,botUserId:POLICY.botUserId,
   requesterId:'U0MEMBER11',eventId:'EvShared'+n,channel:'C0CHANNEL1',ts:'1791417600.'+String(n).padStart(6,'0'),threadTs:'1791417600.'+String(n).padStart(6,'0'),text:`<@${POLICY.botUserId}> fabricated channel phrase`,...overrides});
+test('known owned reservation preserves joined-thread routing and queues mentions/replies until actual settlement',async()=>{
+  const f=fixture(),turns:DMTurn[]=[],messages:string[]=[];let release!:()=>void,entered!:()=>void;
+  const gate=new Promise<void>(r=>release=r),started=new Promise<void>(r=>entered=r);
+  const transport=f.ledger.guardedFetch('openrouter',(async(_request:RequestInfo|URL,_init?:RequestInit)=>{
+    if(turns.length===1){entered();await gate;}
+    return Response.json({id:'msg_shared_queue',type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'text',text:'fixture'}],stop_reason:'end_turn',
+      usage:{input_tokens:30,output_tokens:5,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});
+  }) as typeof fetch);
+  const shared=createSlackSharedConversation({...f,reply:async turn=>{
+    turns.push(turn);await f.ledger.withSpendScope(f.config.allocationId,()=>transport(new Request('https://openrouter.ai/api/v1/messages',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer offline-fixture'},
+      body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens:4096,messages:[{role:'user',content:'synthetic shared fixture'}]})})));return 'answer '+turns.length;
+  }});
+  const deliver=async(text:string,kind?:'answer'|'notice')=>{messages.push(kind+':'+text);return 'sent' as const;};
+  const root=mention(1),first=shared.respond(root,deliver,signal);await started;
+  expect(shared.ready()).toBe(false);expect(shared.joined(root.channel,root.ts)).toBe(true);expect(shared.joined('C0CHANNEL2',root.ts)).toBe(false);
+  const second=shared.respond(mention(2,{threadTs:root.ts}),deliver,signal);
+  const third=shared.respond(mention(3,{type:'thread_reply',threadTs:root.ts,text:'a plain authorized follow-up'}),deliver,signal);
+  await new Promise(resolve=>setImmediate(resolve));
+  const db=new Database(join(f.dir,'shared-context.sqlite'));
+  expect(db.query('SELECT state FROM events ORDER BY rowid').all()).toEqual([{state:'running'},{state:'queued'},{state:'queued'}]);expect(messages).toEqual([]);expect(turns).toHaveLength(1);
+  release();await Promise.all([first,second,third]);expect(turns).toHaveLength(3);expect(turns[1]!.history).toHaveLength(2);expect(turns[2]!.history).toHaveLength(4);
+  expect(messages.map(text=>text.split(':')[0])).toEqual(['answer','answer','answer']);expect(f.ledger.status(f.config.allocationId)?.attemptCount).toBe(3);expect(f.ledger.unresolvedAttempts(f.config.allocationId)).toEqual([]);
+  expect(shared.ready()).toBe(true);db.close();expect(shared.close()).toEqual({drained:true});
+});
+
+test('unowned shared reserved/unknown attempts do not mark existing threads joined or admit more paid work',async()=>{
+  const f=fixture();let calls=0,release!:()=>void,entered!:()=>void;
+  const gate=new Promise<void>(r=>release=r),started=new Promise<void>(r=>entered=r);
+  const shared=createSlackSharedConversation({...f,reply:async()=>{calls++;return 'confirmed';}});
+  const root=mention(1);await shared.respond(root,sent,signal);
+  const transport=f.ledger.guardedFetch('openrouter',(async(_request:RequestInfo|URL,_init?:RequestInit):Promise<Response>=>{entered();await gate;throw new Error('synthetic uncertain foreign request');}) as typeof fetch);
+  const foreign=f.ledger.withSpendScope(f.config.allocationId,()=>transport(new Request('https://openrouter.ai/api/v1/messages',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer offline-fixture'},
+    body:JSON.stringify({model:'deepseek/deepseek-v4.1-flash',provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens:4096,messages:[{role:'user',content:'synthetic foreign fixture'}]})}))).catch(()=>{});
+  await started;expect(shared.joined(root.channel,root.ts)).toBe(false);
+  await shared.respond(mention(2,{threadTs:root.ts}),sent,signal);expect(calls).toBe(1);
+  release();await foreign;expect(f.ledger.unresolvedAttempts(f.config.allocationId)[0]?.state).toBe('unknown');expect(shared.joined(root.channel,root.ts)).toBe(false);
+  await shared.respond(mention(3,{type:'thread_reply',threadTs:root.ts,text:'plain follow-up'}),sent,signal);expect(calls).toBe(1);shared.close();
+});
 test('strict config binds exact workspace/app/bot/trigger and private file independently of DM config',()=>{
   const f=fixture();expect(fingerprintSlackSharedConversationConfig(f.config)).toMatch(/^[a-f0-9]{64}$/);
   for(const value of [{...f.raw,teamId:'TFOREIGN'},{...f.raw,trigger:'ambient'},{...f.raw,dmContext:'/private/dm'}, {...f.raw,allocationId:'local:hermes-dm-20261008-tanner'}]){
@@ -164,5 +204,47 @@ test('metadata lookup failures and policy denials have fixed diagnostics and no 
     expect(records.some(r=>r.stage===({member_lookup:'shared_member_lookup_failed',channel_lookup:'shared_channel_lookup_failed',member_policy:'shared_member_rejected',channel_policy:'shared_channel_rejected'}[reason]))).toBe(true);
     expect(JSON.stringify(records)).not.toContain('xoxb-private-raw-error');shared.close();
     const db=new Database(join(f.dir,'shared-context.sqlite'));expect(db.query('SELECT count(*) AS n FROM events').get()).toEqual({n:0});db.close();
+  }
+});
+
+test('shared policy migration is exact, preserves all sender/audience bindings, and never opens private DM state',async()=>{
+  const f=fixture();writeFileSync(join(f.dir,'context.sqlite'),'private state outside this migration',{mode:0o600});
+  const shared=createSlackSharedConversation({...f,reply:async()=> 'shared evidence'});await shared.respond(mention(1),sent,signal);shared.close();
+  const db=new Database(join(f.dir,'shared-context.sqlite'));db.query('UPDATE control SET fingerprint=?').run(legacyFingerprintSlackSharedConversationConfig(f.config));
+  const events=db.query('SELECT * FROM events').all(),sessions=db.query('SELECT * FROM sessions').all();
+  expect(()=>createSlackSharedConversation({...f,reply:async()=> 'never'})).toThrow('dm_context_config_mismatch');
+  expect(migrateSlackSharedConversationPolicy(f.config)?.toFingerprint).toBe(fingerprintSlackSharedConversationConfig(f.config));
+  expect(db.query('SELECT * FROM events').all()).toEqual(events);expect(db.query('SELECT * FROM sessions').all()).toEqual(sessions);db.close();
+  let calls=0;const reopened=createSlackSharedConversation({...f,reply:async turn=>{calls++;expect(turn.authority?.surface).toBe('shared_channel');expect(turn.history).toHaveLength(2);return 'continued';}});
+  await reopened.respond(mention(1),sent,signal);await reopened.respond(mention(2,{threadTs:mention(1).ts}),sent,signal);expect(calls).toBe(1);reopened.close();
+});
+
+test('real shared multipart delivery refreshes exact audience before every post and stops on member/channel revocation',async()=>{
+  for(const revoke of ['member','channel']){
+    const f=fixture(),db=new Database(':memory:',{strict:true});cleanups.push(()=>db.close());
+    let revoked=false,memberReads=0,channelReads=0,connected=false,callback:Parameters<SlackTransport['start']>[0]|undefined;
+    const memberInfo=f.metadata.memberInfo,channelInfo=f.metadata.channelInfo;
+    f.metadata.memberInfo=async id=>{memberReads++;expect(id).toBe('U0MEMBER11');return{...await memberInfo(id),isRestricted:revoked&&revoke==='member'};};
+    f.metadata.channelInfo=async id=>{channelReads++;expect(id).toBe('C0CHANNEL1');return{...await channelInfo(id),isExtShared:revoked&&revoke==='channel'};};
+    let providerCalls=0;const shared=createSlackSharedConversation({...f,reply:async()=>{providerCalls++;return 'x'.repeat(40_000);}});
+    const posts:Array<Parameters<SlackTransport['sendMessage']>[0]>=[];
+    const transport:SlackTransport={async identity(){return{appId:GARY_SLACK.appId,teamId:GARY_SLACK.teamId,botUserId:GARY_SLACK.botUserId};},socketHealthy:()=>connected,
+      async start(handler){callback=handler;connected=true;},async stop(){connected=false;},async sendMessage(args){
+        posts.push(args);expect(args.channel).toBe('C0CHANNEL1');expect(args.threadTs).toBe(mention(1).ts);
+        const states=db.query('SELECT status FROM gary_slack_conversation_parts ORDER BY part_index').all();expect(states).toEqual([{status:'unknown'},{status:'planned'},{status:'planned'}]);
+        revoked=true;return{ok:true,channel:args.channel,ts:'1791417600.000100'};
+      }};
+    const service=createSlackService({db,transport,sharedConversation:shared,checkConversationHealth:()=>true,checkHostHealth:()=>({ready:false,hermesCanarySucceeded:false,receiptId:'offline'})});
+    const input=mention(1),event={type:'events_api',payload:{type:'event_callback',team_id:input.teamId,api_app_id:input.appId,event_id:input.eventId,
+      event:{type:'app_mention',user:input.requesterId,channel:input.channel,ts:input.ts,text:input.text}}};
+    try{
+      await service.start();await callback!(event);const reads=memberReads;await callback!(event);
+      expect(providerCalls).toBe(1);expect(posts).toHaveLength(1);expect(memberReads).toBe(reads);expect(reads).toBe(5);expect(channelReads).toBe(5);
+      expect(db.query('SELECT status,error_code FROM gary_slack_shared_outbox').get()).toEqual({status:'unknown',error_code:'shared_authority_unavailable'});
+      expect(db.query('SELECT status FROM gary_slack_conversation_parts ORDER BY part_index').all()).toEqual([{status:'sent'},{status:'planned'},{status:'planned'}]);
+      const context=new Database(join(f.dir,'shared-context.sqlite'));
+      expect(context.query('SELECT history,blocked FROM sessions').get()).toEqual({history:'[]',blocked:1});
+      expect(context.query('SELECT state,cleanup FROM events').get()).toEqual({state:'unknown',cleanup:1});context.close();
+    }finally{await service.stop();shared.close();}
   }
 });

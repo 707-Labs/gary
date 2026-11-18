@@ -7,6 +7,7 @@
 //   ssh mini 'cd ~/Developer/gary && bun run scripts/probe-cache.ts'
 
 import Anthropic from "@anthropic-ai/sdk";
+import { PAID_ROUTE } from "../src/model-route.ts";
 
 interface ProbeTarget {
   name: string;
@@ -29,10 +30,10 @@ const targets: ProbeTarget[] = [
     apiKeyEnv: "KIMI_API_KEY",
   },
   {
-    name: "deepseek",
-    baseURL: "https://api.deepseek.com/anthropic",
-    model: "deepseek-v4-pro",
-    apiKeyEnv: "DEEPSEEK_API_KEY",
+    name: PAID_ROUTE.provider,
+    baseURL: PAID_ROUTE.baseUrl,
+    model: PAID_ROUTE.model,
+    apiKeyEnv: PAID_ROUTE.apiKeyEnv,
   },
 ];
 

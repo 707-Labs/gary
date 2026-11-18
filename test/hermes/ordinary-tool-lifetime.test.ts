@@ -36,7 +36,7 @@ function setup(deadlineMs = Date.now() + 5000) {
   const ledger = new SpendLedger(':memory:');
   ledger.createCampaign('offline', 1); ledger.enrollTicket('offline', 'ticket', 1);
   const host = createSessionHost({ admission: { taskId: 'task', requestId: 'request', ticketId: 'ticket', actionId: 'action', fingerprint: 'fingerprint', ownerEpoch: 'owner', deadlineMs },
-    capabilityToken: token, ledger, provider: 'deepseek', model: 'deepseek-v4-pro', providerApiKey: 'offline-fixture',
+    capabilityToken: token, ledger, provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash', providerApiKey: 'offline-fixture',
     fetch: async () => { providerCalls++; throw new Error('provider must not run'); }, executor,
     allowedTools: ['run_bash', 'finish', 'report_blocked'], finishGateCommand: 'bun run ci:full',
     currentOwnerEpoch: () => 'owner', assertAdmission: () => {} });

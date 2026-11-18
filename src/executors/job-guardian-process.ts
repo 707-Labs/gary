@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { closeSync, constants, fsyncSync, lstatSync, openSync, readdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import type { ExecutorJobGuardianBinding } from "./job-guardian.ts";
+import { armExecutorGuardianDeadline, executorGuardianDeadlineDelay } from './guardian-deadline.ts';
 
 const GRACE_MS = 15_000;
 const JOB_LABEL = "dev.gary.executor-job", JOURNAL_LABEL = "dev.gary.executor-journal";
@@ -18,7 +19,7 @@ export async function runGuardian(): Promise<void> {
     process.exitCode = 1; return;
   }
   let binding: ExecutorJobGuardianBinding | undefined, db: Database | undefined, daemonId = "";
-  let timer: ReturnType<typeof setTimeout> | undefined, stopPromise: Promise<void> | undefined;
+  let cancelDeadline: (() => void) | undefined, stopPromise: Promise<void> | undefined;
   let boundId: string | null = null, input = "", inputBytes = 0, initialized = false;
   let serial = Promise.resolve();
   const bootTimer = setTimeout(() => { process.exitCode = 1; process.stdin.destroy(); }, GRACE_MS);
@@ -113,14 +114,14 @@ export async function runGuardian(): Promise<void> {
     const temporary = `${path}.${process.pid}.tmp`;
     const fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     try { writeFileSync(fd, JSON.stringify({ journalId: binding.journalId, invocationId: binding.invocationId,
-      deadlineMs: binding.deadlineMs, ...value }) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
+      deadlineMs: binding.deadlineMs, ...(binding.standingSession ? { standingSession: binding.standingSession } : {}), ...value }) + "\n"); fsyncSync(fd); } finally { closeSync(fd); }
     renameSync(temporary, path);
     const directory = openSync(binding.directory, constants.O_RDONLY);
     try { fsyncSync(directory); } finally { closeSync(directory); }
   };
   const stop = (reason: string): Promise<void> => {
     stopPromise ??= (async () => {
-      clearTimeout(timer); clearTimeout(bootTimer); emit({ type: "stopping", reason });
+      cancelDeadline?.(); clearTimeout(bootTimer); emit({ type: "stopping", reason });
       let exit = 1;
       try {
         const containerId = await cleanup();
@@ -149,11 +150,10 @@ export async function runGuardian(): Promise<void> {
           || !Number.isSafeInteger(binding.ownerPid) || binding.ownerPid < 1
           || typeof binding.ownerToken !== "string" || !binding.ownerToken
           || typeof binding.expectedBinding !== "string" || binding.expectedBinding.length > 16_384
-          || !Number.isSafeInteger(binding.deadlineMs) || binding.deadlineMs <= Date.now()
-          || binding.deadlineMs > Date.now() + 30 * 60_000
           || !isAbsolute(binding.dockerBinary) || !/^unix:\/\/\/[^\x00-\x1f]+$/.test(binding.dockerHost)
           || !isAbsolute(binding.directory) || binding.databasePath !== join(binding.directory, "jobs.sqlite")
           || binding.dockerConfig !== join(binding.directory, "docker-config")) fail("guardian_manifest_invalid");
+      executorGuardianDeadlineDelay(binding, Date.now());
       privatePath(binding.directory, true); privatePath(binding.dockerConfig, true);
       const stat = privatePath(binding.databasePath, false); dbIdentity = `${stat.dev}:${stat.ino}`;
       db = new Database(binding.databasePath, { readonly: true, strict: true });
@@ -162,7 +162,7 @@ export async function runGuardian(): Promise<void> {
       if (!/^[a-zA-Z0-9:._-]{8,128}$/.test(daemonId)) fail("guardian_daemon_unverified");
       read(true);
       // The one-shot monotonic timer cannot be renewed by messages or wall-clock rollback.
-      timer = setTimeout(() => { void stop("deadline"); }, binding.deadlineMs - Date.now());
+      cancelDeadline = armExecutorGuardianDeadline(binding, () => { void stop("deadline"); });
       initialized = true; clearTimeout(bootTimer);
       await daemon(Math.min(binding.deadlineMs, Date.now() + GRACE_MS));
       if (!stopPromise) emit({ type: "armed" });

@@ -161,7 +161,7 @@ describe('GLM trusted host cancellation', () => {
     const aborted = new Promise<void>(resolve => { sawAbort = resolve; });
     let cleaned = false, settled = false, attempts = 0, fallbacks = 0;
     let captured: RequestOptions | undefined;
-    const primary = provider('deepseek', async (_body, options) => {
+    const primary = provider('openrouter', async (_body, options) => {
       attempts++; captured = options; entered();
       await new Promise<void>(resolve => options!.signal!.addEventListener('abort', () => { sawAbort(); resolve(); }, { once: true }));
       await drain; cleaned = true;
@@ -180,7 +180,7 @@ describe('GLM trusted host cancellation', () => {
 
   it('disables real SDK retry sleeps for signal-only calls with a completely fake transport', async () => {
     const controller = new AbortController(); let physicalRequests = 0;
-    const primary = createProvider({ name: 'deepseek', model: 'deepseek-v4-pro', apiKey: 'fake-only',
+    const primary = createProvider({ name: 'openrouter', model: 'deepseek/deepseek-v4.1-flash', apiKey: 'fake-only',
       baseUrl: 'https://offline.invalid', defaultBackoffMs: 1000 }, { fetch: (async () => {
         physicalRequests++; return Response.json({ type: 'error', error: { type: 'api_error', message: 'offline failure' } }, { status: 500 });
       }) as unknown as typeof fetch });
@@ -191,7 +191,7 @@ describe('GLM trusted host cancellation', () => {
   it('an already-aborted host starts no request and omitted signal keeps legacy SDK defaults', async () => {
     const host = new AbortController(); host.abort(new Error('already stopped'));
     let requests = 0, options: RequestOptions | undefined;
-    const chain = createProviderChain([provider('deepseek', async (_body, opts) => { requests++; options = opts; return message(); })]);
+    const chain = createProviderChain([provider('openrouter', async (_body, opts) => { requests++; options = opts; return message(); })]);
     await expect(new GLMClient(chain, { signal: host.signal }).complete({ system: '', user: 'offline' })).rejects.toThrow('already stopped');
     expect(requests).toBe(0);
     await new GLMClient(chain).complete({ system: '', user: 'offline' });

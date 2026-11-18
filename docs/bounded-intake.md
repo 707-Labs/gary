@@ -2,8 +2,9 @@
 
 The daemon and `scripts/probe-loop-tick.ts` require a durable spending allocation
 before dispatching any assigned or mentioned ticket. Existing unallocated
-tickets remain idle. For the current campaign they use only the configured
-DeepSeek API provider, which is metered usage from an existing balance.
+tickets remain idle. They use only the paid OpenRouter route
+(`deepseek/deepseek-v4.1-flash`, `src/model-route.ts`), which is metered
+pay-as-you-go usage. Before 2026-10-28 this was the direct DeepSeek API.
 Z.ai Coding Plan eligibility for Gary's custom client and Kimi Extra Usage
 pricing/account status are unverified; neither is an automatic fallback.
 Credentials and subscriptions are not changed by this implementation.

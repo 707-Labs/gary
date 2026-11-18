@@ -52,6 +52,23 @@ mkdir -p "$LOG_DIR" "$(dirname "$PLIST")"
 sed "s/__GARY_RELEASE__/$release/" "$TEMPLATE" > "$PLIST.tmp"
 plutil -lint "$PLIST.tmp" > /dev/null
 grep -q "<string>$release</string>" "$PLIST.tmp"
+
+# Standing engineering's four pins are private host state, not template content.
+# They live in $STANDING_ENV (0600, KEY=value lines) and are re-applied on every
+# deploy. The file is never hashed into anything, so there is no circular pin.
+STANDING_ENV="${GARY_STANDING_ENGINEERING_ENV:-$HOME/.gary/runtime/standing-engineering.env}"
+STANDING_KEYS=(GARY_STANDING_ENGINEERING_CONFIG GARY_STANDING_ENGINEERING_CONFIG_SHA256 GARY_STANDING_ENGINEERING_AUTHORITY GARY_STANDING_ENGINEERING_AUTHORITY_SHA256)
+if [[ -e "$STANDING_ENV" ]]; then
+  "$BUN" "$GARY_DIR/scripts/standing-engineering-env.ts" "$STANDING_ENV" "$release" > "$PLIST.standing"
+  while IFS='=' read -r key value; do
+    plutil -insert "EnvironmentVariables.$key" -string "$value" "$PLIST.tmp"
+  done < "$PLIST.standing"
+  rm -f "$PLIST.standing"
+  for key in "${STANDING_KEYS[@]}"; do plutil -extract "EnvironmentVariables.$key" raw "$PLIST.tmp" > /dev/null; done
+  echo "[deploy] standing engineering pins applied from $STANDING_ENV"
+else
+  echo "[deploy] no $STANDING_ENV; standing engineering stays disabled"
+fi
 mv "$PLIST.tmp" "$PLIST"
 echo "[deploy] installed $PLIST"
 

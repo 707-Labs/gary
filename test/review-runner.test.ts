@@ -73,8 +73,8 @@ function fakeGlm(turns: Array<() => Anthropic.Message>): GLMClient {
       return make();
     },
     chain: {
-      providers: [{ name: "deepseek", model: "deepseek-v4-pro" } as never],
-      active: () => ({ name: "deepseek", model: "deepseek-v4-pro" }) as never,
+      providers: [{ name: "openrouter", model: "deepseek/deepseek-v4.1-flash" } as never],
+      active: () => ({ name: "openrouter", model: "deepseek/deepseek-v4.1-flash" }) as never,
       allArmed: () => false,
       earliestReset: () => null,
     },
@@ -152,8 +152,8 @@ describe("runReviewer", () => {
         return approveTurn();
       },
       chain: {
-        providers: [{ name: "deepseek", model: "deepseek-v4-pro" } as never],
-        active: () => ({ name: "deepseek", model: "deepseek-v4-pro" }) as never,
+        providers: [{ name: "openrouter", model: "deepseek/deepseek-v4.1-flash" } as never],
+        active: () => ({ name: "openrouter", model: "deepseek/deepseek-v4.1-flash" }) as never,
         allArmed: () => false, earliestReset: () => null,
       },
     } as unknown as GLMClient;

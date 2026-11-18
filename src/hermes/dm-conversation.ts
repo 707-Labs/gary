@@ -7,11 +7,21 @@ import { HERMES_CANARY_WORKER_IMAGE } from './activation.ts';
 import { canonicalizeConversation, sameConversation, type ConversationMessage } from './conversation.ts';
 import type { GaryRuntimeLauncher, GaryRuntimeManifest } from './gary-loop-adapter.ts';
 import type { SpendLedger, SpendStatus } from '../spend.ts';
+import { PAID_ROUTE } from '../model-route.ts';
 
-export const DM_CONVERSATION_POLICY = Object.freeze({ version:1, provider:'deepseek', model:'deepseek-v4-pro', thinking:'disabled',
+export const LEGACY_DM_CONVERSATION_POLICY = Object.freeze({ version:1, provider:'deepseek', model:'deepseek-v4-pro', thinking:'disabled',
   workerImage:HERMES_CANARY_WORKER_IMAGE, dockerExecutable:'/usr/local/bin/docker', dockerHost:'unix:///Users/tanner/.colima/default/docker.sock',
   capMicros:5_000_000, campaignCapMicros:5_000_000, maxRequestsPerMessage:1, maxTokens:1024, timeoutMs:90_000, temperature:0.4,
   maxInputBytes:4000, maxReplyBytes:8000, maxContextBytes:24_000, maxTurns:12, maxSessions:16, maxAcceptedEvents:64, maxNotices:64, maxQueued:4 } as const);
+/** Approved conversation sizing on the retired direct DeepSeek route. Kept verbatim:
+ * stored contexts carry its fingerprint until the operator migrates them to v3. */
+export const DEEPSEEK_DM_CONVERSATION_POLICY = Object.freeze({...LEGACY_DM_CONVERSATION_POLICY, version:2,
+  maxTokens:4096, timeoutMs:300_000, maxInputBytes:16_000, maxReplyBytes:65_536, maxContextBytes:196_608,
+  maxTurns:256, maxSessions:64, maxAcceptedEvents:4096, maxNotices:64 } as const);
+/** v2 sizing, caps and text-only fallback on the OpenRouter paid route. */
+export const DM_CONVERSATION_POLICY = Object.freeze({...DEEPSEEK_DM_CONVERSATION_POLICY, version:3,
+  provider:PAID_ROUTE.provider, model:PAID_ROUTE.model } as const);
+
 const SYSTEM = "You are Gary, Tanner's assistant in this private Slack conversation. Respond naturally, clearly, and concisely. Use only the messages in this conversation. You have no tools or access to files, repositories, Slack history, work systems, or coding actions here. Never claim to have inspected or changed those systems. If asked to do something outside this conversation, explain that limitation briefly and help with what can be answered from the conversation. Do not reveal or invent hidden context.";
 export type DMText = {role:'user'|'assistant';content:string};
 export class DMReplyError extends Error {
@@ -21,9 +31,13 @@ export interface DMTurn {
   requestId:string; ownerId:string; allocationId:string; campaignId:string;
   /** Host-authenticated audience. Never derive authorization from message text. */
   authority?: {surface:'private_dm'|'shared_channel';requesterId:string;teamId:string;channelId:string;threadTs:string};
+  /** Ephemeral capability minted by authenticated Slack ingress, never by conversation text. */
+  engineering?: import('./conversation-engineering.ts').ConversationEngineeringCapability;
   history:readonly DMText[]; text:string; signal:AbortSignal;
   assertActive():void;
   recordWorker(name:string):void;
+  /** Host-selected same-audience history; caller commits it only with verified delivery. */
+  compactHistory?(history:readonly DMText[]):void;
 }
 export interface DMReplyDependencies {
   ledger:SpendLedger; providerApiKey:string; fetch:(request:Request)=>Promise<Response>; launch?:GaryRuntimeLauncher;
@@ -70,7 +84,7 @@ function createHermesTextResponder(deps:DMReplyDependencies,systemPrompt:string)
         ||Buffer.byteLength(JSON.stringify(expected))>p.maxContextBytes||Buffer.byteLength(turn.text)>p.maxInputBytes)fail('dm_context_limit');
       guard();
       const route=createModelTransport({onFailure:failure=>{transportFailure=failure.errorCode;},ledger:deps.ledger,providerApiKey:deps.providerApiKey,fetch:deps.fetch,bearerToken:capability,thinking:'disabled',
-        capability:{provider:'deepseek',model:'deepseek-v4-pro',ticketId:turn.allocationId,ownerId:turn.ownerId,deadlineMs,allowedToolNames:[],signal},
+        capability:{provider:PAID_ROUTE.provider,model:PAID_ROUTE.model,ticketId:turn.allocationId,ownerId:turn.ownerId,deadlineMs,allowedToolNames:[],signal},
         assertOwner:(ticket,owner)=>{if(ticket!==turn.allocationId||owner!==turn.ownerId)fail('dm_owner_changed');guard();}});
       const manifest:GaryRuntimeManifest={taskId:'dm-'+turn.requestId,requestId:turn.requestId,ownerEpoch:turn.ownerId,capability,
         modelBaseUrl:'http://127.0.0.1/v1',executorUrl:'http://127.0.0.1/tools/execute',stateUrl:'http://127.0.0.1/tools/state',

@@ -31,6 +31,16 @@ Identical CLAUDE/AGENTS instruction bodies are included once with both source na
 
 Private traces retain ordered model/tool activity, safe argument/command/output fingerprints, shell exit status, cancellation and terminal reason. Raw prompts, credentials and private output are not written. Explicitly supplied output redaction can enable bounded diagnostic previews. Trace persistence failure stops the run. Budget exhaustion remains distinct from native runtime failure, and existing ledger reservations/receipts remain authoritative.
 
+### Opt-in engineering task route
+
+The separate `engineering-execution.ts` composition selects the host-owned `native_batch` result-presentation contract. A native handler first closes its execution admission with `tool.end`, binding the original result and operation receipts. After the native executor finishes warnings, output formatting and batch budgeting, the worker sends one `tool.presentation` receipt for each completed call, in order. It binds the same call, admission and original result hash to the final model-facing result hash. Only that final hash advances the host's strict conversation validation. Presentation grants no execution or retry authority; missing, changed, reordered or repeated bindings fail closed. Older direct fixtures retain the raw-result contract.
+
+Distinct host-observed call IDs remain distinct even when their names and arguments match. This permits a test to run before and after an intervening edit in one sequential batch. Reused IDs are rejected. Native loop warnings and hard stops remain active; the bridge does not fabricate admissions for skipped tools or trust an unobserved native completion message.
+
+Bounded private error diagnostics retain the first six native error tool names, call ordinals and original result hashes, with an overflow flag. They retain no arbitrary error text, arguments, paths or output. Older count-only diagnostics remain readable. The actual native-to-artifact replay is in `test/hermes/engineering-offline04-flow.test.ts`; it uses fixed provider responses and disposable files, with synthetic Docker and lease boundaries, and is not a live acceptance.
+
+This route's existing acceptance policy still limits work to three requests and one separate review. It is independent of the core coding phase budgets and project conversation limits. Changing an iteration count alone does not alter the canonical dollar cap, review reserve or host request admission.
+
 ## Evidence and material differences
 
 See `docker/hermes-worker/README.md` in the worktree for exact pinned source, Python base, wheel hashes, image digest, build commands, runtime arguments and containment receipts. The Linux build preserves both upstream contributor filenames that collided on the Mac filesystem. Source is baked into the image; no host source mount is needed.

@@ -1,0 +1,151 @@
+/** Operator-only relocation of a standing engineering grant to a new aggregate
+ * file. Planning is read-only; applying writes NEW files only (no existing file
+ * is edited) and never touches the spend ledger. Enrollment of the new pool is
+ * a separate explicit step. */
+import type { Database } from 'bun:sqlite';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { closeSync, constants, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, writeSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
+import { assertEngineeringRebootQuiescent } from './engineering-reboot-quiescence.ts';
+import { standingReconciliationAmounts } from './engineering-standing-reconciliation.ts';
+import { planStandingFundingTransfer, type StandingFundingTransferPlan } from './engineering-standing-funding.ts';
+import { parseStandingEngineeringConfig, type StandingEngineeringRuntimeConfig } from './standing-engineering-config.ts';
+
+function fail(code: string): never { throw new Error('engineering_standing_relocation:' + code); }
+const sha = (bytes: Buffer | string) => createHash('sha256').update(bytes).digest('hex');
+const hasTable = (db: Database, name: string) => !!db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
+
+/** What the old pool must keep: every committed task cap net of reviewed releases,
+ * plus its conversation/auxiliary charges. Refuses anything unresolved. */
+export function standingPoolRetainedMicros(spendDb: Database, config: StandingEngineeringRuntimeConfig): number {
+  const a = config.funding;
+  if (!hasTable(spendDb, 'standing_engineering_pools')) fail('pool_not_enrolled');
+  const pool = spendDb.query('SELECT campaign_id FROM standing_engineering_pools WHERE pool_id=?').get(a.poolId) as { campaign_id: string } | null;
+  if (!pool || pool.campaign_id !== a.campaignId) fail('pool_not_enrolled');
+  if (hasTable(spendDb, 'standing_engineering_conversation_leases')
+      && spendDb.query('SELECT 1 FROM standing_engineering_conversation_leases WHERE pool_id=? AND end_attempt_id IS NULL').get(a.poolId)) fail('conversation_lease_open');
+  if (spendDb.query(`SELECT 1 FROM spend_attempts x JOIN spend_tickets t ON t.ticket_id=x.ticket_id WHERE t.campaign_id=? AND x.state<>'settled'`).get(a.campaignId)) fail('unsettled_attempt');
+  const gross = (spendDb.query('SELECT COALESCE(SUM(cap_micros),0) n FROM spend_tickets WHERE campaign_id=?').get(a.campaignId) as { n: number }).n;
+  const charged = (spendDb.query(`SELECT COALESCE(SUM(x.charged_micros),0) n FROM spend_attempts x JOIN spend_tickets t ON t.ticket_id=x.ticket_id WHERE t.campaign_id=?`).get(a.campaignId) as { n: number }).n;
+  const { released, auxiliary } = standingReconciliationAmounts(spendDb, a);
+  const retained = gross - released + auxiliary;
+  if (!Number.isSafeInteger(retained) || retained < charged || retained > a.capMicros) fail('pool_accounting');
+  return retained;
+}
+
+export interface StandingRelocationInspectInput {
+  config: StandingEngineeringRuntimeConfig;
+  journalDb: Database; spendDb: Database;
+  listLabelledContainers: () => readonly string[];
+  next: { poolId: string; campaignId: string; taskCapMicros?: number };
+}
+export interface StandingRelocationInspection {
+  quiescence: Readonly<Record<string, number>>;
+  retainedMicros: number; transferredMicros: number; sourceHoldId: string;
+  /** Held allocations whose reconciliation code (engineering-budget, readonly-canary-budget)
+   * writes the OLD aggregate path. The tombstone would block that, so these must be closed first. */
+  openHolds: readonly { id: string; state: string; retainedAmountUsd: unknown }[];
+  /** Other held allocations (hand-maintained bookkeeping, no Gary writer): copied verbatim. */
+  carriedHolds: readonly { id: string; state: string; retainedAmountUsd: unknown }[];
+  /** Fill approver/approvedAt/approvalText, have Tanner confirm, save 0600, pass via --approval-evidence. */
+  approvalTemplate: Record<string, unknown>;
+}
+
+/** Read-only: quiescence, the amounts that would move, and any blocking holds. */
+export function inspectStandingRelocation(i: StandingRelocationInspectInput): StandingRelocationInspection {
+  const quiescence = assertEngineeringRebootQuiescent({ journalDb: i.journalDb, spendDb: i.spendDb, listLabelledContainers: i.listLabelledContainers });
+  const retainedMicros = standingPoolRetainedMicros(i.spendDb, i.config);
+  const sourceHoldId = 'standing-engineering:' + i.config.funding.poolId;
+  const source = JSON.parse(readFileSync(i.config.aggregatePath, 'utf8')) as { runtimeAllocations?: { id?: unknown; state?: unknown; retainedAmountUsd?: unknown }[] };
+  const held = (source.runtimeAllocations ?? []).filter(v => typeof v.state === 'string' && v.state.startsWith('held_for_') && v.id !== sourceHoldId)
+    .map(v => ({ id: String(v.id), state: String(v.state), retainedAmountUsd: v.retainedAmountUsd }));
+  const reconciledByGary = new Set(['held_for_engineering_acceptance', 'held_for_readonly_canary']);
+  const openHolds = held.filter(h => reconciledByGary.has(h.state)), carriedHolds = held.filter(h => !reconciledByGary.has(h.state));
+  const transferredMicros = i.config.funding.capMicros - retainedMicros;
+  return { quiescence, retainedMicros, transferredMicros, sourceHoldId, openHolds, carriedHolds,
+    approvalTemplate: { version: 1, kind: 'standing_engineering_relocation_approval', approver: '<name>', approvedAt: '<YYYY-MM-DD>',
+      approvalText: '<verbatim approval>', sourceHoldId, retiredPoolId: i.config.funding.poolId, transferredMicros, newPoolId: i.next.poolId } };
+}
+
+export interface StandingRelocationInput extends StandingRelocationInspectInput {
+  configPath: string; ledgerPath: string;
+  approvalEvidenceBytes: Buffer;
+  targetDirectory: string;
+  now: Date;
+}
+export interface StandingRelocationPlan extends StandingFundingTransferPlan {
+  retainedMicros: number;
+  newConfigPath: string; newConfigBytes: Buffer; newConfigSha256: string;
+  tombstonePath: string; tombstoneBytes: Buffer;
+  quiescence: Readonly<Record<string, number>>;
+}
+
+/** Read-only. Refuses while anything is in flight or any other hold is open. */
+export function planStandingRelocation(i: StandingRelocationInput): StandingRelocationPlan {
+  const inspection = inspectStandingRelocation(i);
+  if (inspection.openHolds.length) fail('open_holds:' + inspection.openHolds.map(h => h.id).join(','));
+  const { quiescence, retainedMicros } = inspection;
+  // No symlinked ancestors: the nearest existing ancestor must already be canonical.
+  let ancestor = dirname(i.targetDirectory);
+  for (;;) { try { lstatSync(ancestor); break; } catch { ancestor = dirname(ancestor); } }
+  if (realpathSync(ancestor) !== ancestor) fail('target_parent');
+  try { lstatSync(i.targetDirectory); fail('target_exists'); } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
+  const sourceAggregateBytes = readFileSync(i.config.aggregatePath);
+  const plan = planStandingFundingTransfer({ sourceAggregateBytes, sourceAggregatePath: i.config.aggregatePath,
+    retired: { poolId: i.config.funding.poolId, authoritySha256: i.config.funding.authoritySha256, capMicros: i.config.funding.capMicros },
+    retainedMicros, next: { poolId: i.next.poolId, campaignId: i.next.campaignId, taskCapMicros: i.next.taskCapMicros ?? i.config.funding.taskCapMicros },
+    ledgerPath: i.ledgerPath, approvalEvidenceBytes: i.approvalEvidenceBytes, directory: i.targetDirectory,
+    aggregatePath: join(i.targetDirectory, 'aggregate.json'), now: i.now });
+  const raw = JSON.parse(readFileSync(i.configPath, 'utf8'));
+  const next = { ...raw, funding: plan.authority, fundingAuthorityPath: plan.fundingAuthorityPath,
+    fundingHoldReceiptPath: plan.fundingHoldReceiptPath, aggregatePath: plan.aggregatePath };
+  parseStandingEngineeringConfig(next);
+  const newConfigBytes = Buffer.from(JSON.stringify(next, null, 2) + '\n');
+  const stamp = i.now.toISOString().slice(0, 10).replaceAll('-', '');
+  const tombstonePath = i.config.aggregatePath + '.admission.lock';
+  const tombstoneBytes = Buffer.from(JSON.stringify({ version: 1, kind: 'standing_engineering_aggregate_transferred',
+    transferredTo: plan.aggregatePath, retiredPoolId: i.config.funding.poolId, sourceSha256: sha(sourceAggregateBytes),
+    note: 'Gary budget writers create this lock directory exclusively, and the standing funding guard refuses any grant whose aggregate has this file.' }, null, 2) + '\n');
+  return { ...plan, retainedMicros, quiescence,
+    newConfigPath: join(dirname(i.configPath), basename(i.configPath, '.json') + '-relocated-' + stamp + '.json'),
+    newConfigBytes, newConfigSha256: sha(newConfigBytes), tombstonePath, tombstoneBytes };
+}
+
+/** --apply/--enroll require the LaunchAgent to have no running process. */
+export function assertGaryStopped(printService: () => string): void {
+  let output: string;
+  try { output = printService(); }
+  catch (error) {
+    // Only launchctl's explicit "not loaded" answer means stopped; anything else is unknown.
+    const text = String((error as { stderr?: unknown })?.stderr ?? '') + String((error as Error)?.message ?? '');
+    if (/Could not find service/.test(text)) return;
+    throw error;
+  }
+  if (/^\s*pid = \d+/m.test(output) || /^\s*state = running/m.test(output)) fail('gary_running');
+}
+
+function writeNew(path: string, bytes: Buffer): void {
+  const fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+  try { if (writeSync(fd, bytes) !== bytes.length) fail('short_write'); fsyncSync(fd); } finally { closeSync(fd); }
+}
+function syncDirectory(path: string): void { const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY); try { fsyncSync(fd); } finally { closeSync(fd); } }
+
+/** Writes only new paths (exclusive create); fails before writing if any exists. */
+export function applyStandingRelocation(plan: StandingRelocationPlan, targetDirectory: string): void {
+  for (const path of [plan.newConfigPath, plan.tombstonePath]) {
+    try { lstatSync(path); fail('exists:' + path); } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e; }
+  }
+  mkdirSync(dirname(targetDirectory), { recursive: true, mode: 0o700 });
+  mkdirSync(targetDirectory, { mode: 0o700 });
+  for (const file of plan.files) writeNew(file.path, file.bytes);
+  syncDirectory(targetDirectory);
+  writeNew(plan.newConfigPath, plan.newConfigBytes); syncDirectory(dirname(plan.newConfigPath));
+  mkdirSync(plan.tombstonePath, { mode: 0o700 });
+  writeNew(join(plan.tombstonePath, 'transferred.json'), plan.tombstoneBytes); syncDirectory(dirname(plan.tombstonePath));
+}
+
+/** The production launchctl probe used by the operator scripts. */
+export function launchctlGaryService(): string {
+  return execFileSync('/bin/launchctl', ['print', `gui/${process.getuid!()}/com.707labs.gary`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+}

@@ -10,7 +10,7 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 const binding = { taskId: "task-1", requestId: "request-1", actionId: "action-1", ownerEpoch: "epoch-1", ticketId: "ticket-1" };
-const metadata = { iteration: 1, phase: "implementation" as const, modelState: { provider: "deepseek" as const, model: "deepseek-v4-pro" as const, thinking: "unknown" as const, effort: "unknown" as const } };
+const metadata = { iteration: 1, phase: "implementation" as const, modelState: { provider: "openrouter" as const, model: "deepseek/deepseek-v4.1-flash" as const, thinking: "unknown" as const, effort: "unknown" as const } };
 const start = (operationId = "model-1"): AuditOperationStart => ({ kind: "model", stage: "start", operationId, ...metadata });
 const terminal = (status: AuditTerminal["status"] = "finished"): AuditTerminal => ({ kind: "terminal", status, ...metadata });
 function fixture(options: Partial<AuditTraceOptions> = {}) {
@@ -81,16 +81,25 @@ describe("durable sanitized local execution trace", () => {
 
   test("explicit selected thinking/effort are retained without inferring provider defaults", () => {
     const f = fixture();
-    f.trace.append({ ...start(), modelState: { provider: "deepseek", model: "deepseek-v4-pro", thinking: "enabled", effort: "high", thinkingBudgetTokens: 1024 } });
+    f.trace.append({ ...start(), modelState: { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash", thinking: "enabled", effort: "high", thinkingBudgetTokens: 1024 } });
     f.trace.append({ kind: "model", stage: "result", operationId: "model-1" }); f.trace.append(terminal()); f.trace.close();
-    expect(f.events()[2].modelState).toEqual({ provider: "deepseek", model: "deepseek-v4-pro", thinking: "enabled", effort: "high", thinkingBudgetTokens: 1024 });
+    expect(f.events()[2].modelState).toEqual({ provider: "openrouter", model: "deepseek/deepseek-v4.1-flash", thinking: "enabled", effort: "high", thinkingBudgetTokens: 1024 });
     expect(unknownAuditModelState()).toEqual({ provider: "unknown", model: "unknown", thinking: "unknown", effort: "unknown" });
+  });
+
+  test("model state written before the OpenRouter cutover (direct deepseek-v4-pro) remains valid", () => {
+    const f = fixture();
+    f.trace.append({ ...start(), modelState: { provider: "deepseek", model: "deepseek-v4-pro", thinking: "disabled", effort: "unknown" } });
+    f.trace.append({ kind: "model", stage: "result", operationId: "model-1" }); f.trace.append(terminal()); f.trace.close();
+    expect(f.events()[2].modelState).toEqual({ provider: "deepseek", model: "deepseek-v4-pro", thinking: "disabled", effort: "unknown" });
   });
 
   test.each([
     { prompt: "PRIVATE_PROMPT" }, { command: "PRIVATE_COMMAND" }, { arguments: { secret: "PRIVATE_ARGUMENT" } },
     { providerApiKey: "PRIVATE_KEY" }, { modelState: { ...metadata.modelState, effort: "PRIVATE_REASONING" } },
-    { modelState: { ...metadata.modelState, provider: "deepseek", model: "glm-5.3" } },
+    { modelState: { ...metadata.modelState, provider: "openrouter", model: "glm-5.3" } },
+    { modelState: { ...metadata.modelState, provider: "openrouter", model: "deepseek-v4-pro" } },
+    { modelState: { ...metadata.modelState, provider: "deepseek", model: "deepseek/deepseek-v4.1-flash" } },
     { modelState: { ...metadata.modelState, thinkingBudgetTokens: 1024 } },
     { ownerEpoch: "forged" }, { binding: { ...binding } }, { iteration: Infinity },
     { input: { bytes: 1, sha256: "not-a-hash" } }, { input: { ...fingerprintBytes("secret"), raw: "secret" } },

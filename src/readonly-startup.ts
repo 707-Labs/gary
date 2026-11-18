@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadGaryConfig, loadProviderConfigs } from './config.ts';
+import { PAID_ROUTE } from './model-route.ts';
 import type { ProviderConfig } from './providers.ts';
 import type { HostStartupConfig } from './host-config.ts';
 import type { StartupDependencies } from './startup.ts';
@@ -64,13 +65,13 @@ export async function runReadonlyGaryHost(host: HostStartupConfig, deps: Startup
   const config = loadReadonlyCanaryConfig(host.activationPath);
   (deps.verifyReadonlyRelease ?? verifyReadonlyRelease)(config.releaseCommit,host.readonlySlackReleaseCommit);
   const setup = deps.readonlySetup ? deps.readonlySetup() : (() => {
-    const providers = loadProviderConfigs().filter(provider => provider.name === 'deepseek');
+    const providers = loadProviderConfigs().filter(provider => provider.name === PAID_ROUTE.provider);
     if (providers.length !== 1) throw new Error('readonly_provider_unavailable');
     return { stateDir: loadGaryConfig().stateDir, provider: providers[0]! };
   })();
   const provider = setup.provider;
-  if (provider.name !== 'deepseek' || provider.model !== 'deepseek-v4-pro'
-      || provider.baseUrl !== 'https://api.deepseek.com/anthropic' || !provider.apiKey) throw new Error('readonly_route_mismatch');
+  if (provider.name !== PAID_ROUTE.provider || provider.model !== PAID_ROUTE.model
+      || provider.baseUrl !== PAID_ROUTE.baseUrl || !provider.apiKey) throw new Error('readonly_route_mismatch');
   const credentials = await loadSlackCredentials(host.slack.credentialsPath);
   const db = (deps.db ?? openDb)(resolve(setup.stateDir, 'gary.db'));
   let ledger: ReturnType<typeof openSpendLedger> | undefined;
@@ -90,7 +91,7 @@ export async function runReadonlyGaryHost(host: HostStartupConfig, deps: Startup
     ledger = (deps.ledger ?? openSpendLedger)(resolve(setup.stateDir, 'spend.db'));
     const rawFetch = deps.fetch ?? globalThis.fetch;
     const canary = (deps.readonlyCanary ?? createReadonlyCanary)(config, { db, ledger,
-      route: { provider: 'deepseek', model: 'deepseek-v4-pro', providerApiKey: provider.apiKey, fetch: request => rawFetch(request) },
+      route: { provider: PAID_ROUTE.provider, model: PAID_ROUTE.model, providerApiKey: provider.apiKey, fetch: request => rawFetch(request) },
       signal: controller.signal, ...(deps.launch ? { launch: deps.launch } : {}) });
     const transport = deps.slackTransport ? deps.slackTransport(credentials) : createSlackTransport({ credentials, onIngressDiagnostic:logSlackIngressDiagnostic });
     if(host.readonlySlackReleaseCommit&&!canary.check().ready)throw new Error('readonly_slack_release_requires_existing_receipt');
@@ -112,7 +113,7 @@ export async function runReadonlyGaryHost(host: HostStartupConfig, deps: Startup
       readyDelivery: ready.readyDelivery, runtime: host.mode, codingDispatch: 'disabled' });
     if(conversation&&!conversation.ready())throw new Error('dm_conversation_not_ready');
     if(conversationConfig)log.info('readonly conversation ready',{runId:conversationConfig.runId,allocationId:conversationConfig.allocationId,
-      configFingerprint:fingerprintSlackConversationConfig(conversationConfig),model:'deepseek-v4-pro',tools:'none'});
+      configFingerprint:fingerprintSlackConversationConfig(conversationConfig),model:PAID_ROUTE.model,tools:'none'});
     await (deps.waitReadonlyIdle ?? idle)(controller.signal, async () => {
       const health = await slack!.refreshHealth();
       log.info('readonly slack health', { connected: health.running && health.identityVerified && health.socketHealthy,

@@ -1,0 +1,43 @@
+/**
+ * Parse a Scryfall card page URL to extract set code and collector number.
+ *
+ * Supports formats:
+ * - https://scryfall.com/card/{set}/{number}
+ * - https://scryfall.com/card/{set}/{number}/{name}
+ * - scryfall.com/card/{set}/{number}
+ * - scryfall.com/card/{set}/{number}/{name}
+ */
+export function parseScryfallUrl(url: string): { set: string; number: string } | null {
+  // Normalize URL - add https:// if missing
+  let normalized = url.trim();
+  if (!normalized.startsWith('http://') && !normalized.startsWith('https://')) {
+    normalized = 'https://' + normalized;
+  }
+
+  try {
+    const parsed = new URL(normalized);
+
+    // Check it's actually scryfall.com
+    if (!parsed.hostname.endsWith('scryfall.com')) {
+      return null;
+    }
+
+    // Path should be /card/{set}/{number} or /card/{set}/{number}/{name}
+    const pathParts = parsed.pathname.split('/').filter(Boolean);
+
+    if (pathParts.length < 3 || pathParts[0] !== 'card') {
+      return null;
+    }
+
+    const set = pathParts[1];
+    const number = pathParts[2];
+
+    if (!set || !number) {
+      return null;
+    }
+
+    return { set, number };
+  } catch {
+    return null;
+  }
+}

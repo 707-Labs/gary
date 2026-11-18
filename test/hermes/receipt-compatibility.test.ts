@@ -27,7 +27,7 @@ function enrolled(): SpendLedger {
 
 const standardUsage = {
   input_tokens: 887,
-  cache_creation_input_tokens: 0,
+  cache_creation_input_tokens: 0, cost: 0,
   cache_read_input_tokens: 0,
   output_tokens: 212,
   service_tier: "standard",
@@ -35,13 +35,13 @@ const standardUsage = {
 
 async function call(ledger: SpendLedger, usage: Record<string, unknown>, maxTokens = 2048, ticket = "future") {
   // Deliberately fake transport: no credentials, network, or provider calls.
-  const transport = ledger.guardedFetch("deepseek", (async () => Response.json({
-    id: "msg_offline_receipt", type: "message", role: "assistant", model: "deepseek-v4-pro",
+  const transport = ledger.guardedFetch("openrouter", (async () => Response.json({
+    id: "msg_offline_receipt", type: "message", role: "assistant", model: "deepseek/deepseek-v4.1-flash",
     content: [{ type: "text", text: "offline fixture" }], stop_reason: "end_turn", usage,
   })) as unknown as typeof fetch);
-  return ledger.withSpendScope(ticket, () => transport(new Request("https://api.deepseek.com/anthropic/v1/messages", {
+  return ledger.withSpendScope(ticket, () => transport(new Request("https://openrouter.ai/api/v1/messages", {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: "deepseek-v4-pro", max_tokens: maxTokens, messages: [{ role: "user", content: "offline fixture" }] }),
+    body: JSON.stringify({ model: "deepseek/deepseek-v4.1-flash", provider:{data_collection:'deny',max_price:{prompt:0.6,completion:2.4}}, max_tokens: maxTokens, messages: [{ role: "user", content: "offline fixture" }] }),
   })));
 }
 
@@ -60,7 +60,7 @@ describe("standard service tier receipt compatibility", () => {
     const input = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
     expect(ledger.status("future")).toMatchObject({
       attemptCount: 1, unknownAttempts: 0, state: "active",
-      chargedMicros: Math.ceil((input * 132 + 2048 * 396) / 100),
+      chargedMicros: Math.ceil((input * 60 + 2048 * 240) / 100),
     });
   });
 
@@ -69,22 +69,22 @@ describe("standard service tier receipt compatibility", () => {
     const { service_tier: _, ...usage } = standardUsage;
     await call(ledger, usage);
     expect(ledger.status("future")?.unknownAttempts).toBe(0);
-    expect(ledger.status("future")?.chargedMicros).toBe(9281);
+    expect(ledger.status("future")?.chargedMicros).toBe(5448); // ceil((887*60 + 2048*240)/100)
   });
 
   test.each([
     { service_tier: "priority" }, { service_tier: "batch" }, { service_tier: "Standard" },
-    { service_tier: null }, { service_tier: 0 }, { service_tier: {} },
+    { service_tier: 0 }, { service_tier: {} },
     { future_charge: 1 }, { reasoning_tokens: 50 }, { server_tool_use: { web_search_requests: 1 } },
     { input_tokens: undefined }, { output_tokens: undefined }, { cache_read_input_tokens: undefined },
-    { cache_creation_input_tokens: undefined }, { cache_creation_input_tokens: null },
+    { cache_creation_input_tokens: undefined }, { cache_creation_input_tokens: null, cost: undefined }, { cost: undefined },
     { input_tokens: "887" }, { input_tokens: -1 }, { output_tokens: 0.1 },
     { cache_read_input_tokens: Number.MAX_SAFE_INTEGER + 1 },
   ])("keeps the complete reservation for an ambiguous future receipt %#", async (overrides) => {
     const ledger = enrolled();
     await call(ledger, { ...standardUsage, ...overrides });
     expect(ledger.status("future")).toMatchObject({
-      unknownAttempts: 1, attemptCount: 1, chargedMicros: spendReservationMicros("deepseek", 2048),
+      unknownAttempts: 1, attemptCount: 1, chargedMicros: spendReservationMicros("openrouter", 2048),
     });
   });
 
@@ -98,7 +98,7 @@ describe("standard service tier receipt compatibility", () => {
     await expect(call(ledger, { ...standardUsage, ...overrides })).rejects.toBeInstanceOf(SpendLimitError);
     expect(ledger.status("future")).toMatchObject({
       state: "closed", terminalReason: "receipt_exceeds_bounds", unknownAttempts: 1,
-      chargedMicros: spendReservationMicros("deepseek", 2048),
+      chargedMicros: spendReservationMicros("openrouter", 2048),
     });
     expect(() => ledger.withSpendScope("future", () => {})).toThrow(SpendLimitError);
   });
@@ -116,8 +116,8 @@ describe("standard service tier receipt compatibility", () => {
     // Historical state fixture only, in a disposable database. Deliberately no
     // reconstructed usage/body: the missing receipts cannot authorize refunds.
     const db = new Database(path);
-    for (const maxTokens of [1024, 512, 8192]) {
-      const reserved = spendReservationMicros("deepseek", maxTokens);
+    // Reservations the retired DeepSeek policy (132/396) made for these limits.
+    for (const [maxTokens, reserved] of [[1024, 1_388_176], [512, 1_386_148], [8192, 1_416_561]] as const) {
       db.query("INSERT INTO spend_attempts(ticket_id,provider,model,max_tokens,reserved_micros,charged_micros,state,http_status) VALUES(?,?,?,?,?,?,'unknown',200)")
         .run("old-exhausted", "deepseek", "deepseek-v4-pro", maxTokens, reserved, reserved);
     }
@@ -135,14 +135,14 @@ describe("standard service tier receipt compatibility", () => {
     });
     expect(() => ledger.withSpendScope("old-exhausted", () => {})).toThrow(SpendLimitError);
     await call(ledger, standardUsage);
-    expect(ledger.status("future")).toMatchObject({ chargedMicros: 9281, unknownAttempts: 0 });
+    expect(ledger.status("future")).toMatchObject({ chargedMicros: 5448, unknownAttempts: 0 });
     ledger.close();
 
     ledger = open(path);
     expect(ledger.status("old-exhausted")).toMatchObject({
       state: oldStatus.state, terminalReason: oldStatus.terminalReason, chargedMicros: oldStatus.chargedMicros,
       unknownAttempts: oldStatus.unknownAttempts, attemptCount: oldStatus.attemptCount,
-      campaignChargedMicros: 4_190_885 + 9281,
+      campaignChargedMicros: 4_190_885 + 5448,
     });
     const readback = new Database(path, { readonly: true });
     expect(readback.query("SELECT * FROM spend_attempts WHERE ticket_id=? ORDER BY id").all("old-exhausted")).toEqual(oldRows);

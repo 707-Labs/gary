@@ -30,7 +30,7 @@ let answer: ReturnType<typeof spyOn<typeof answerHandler, "runAnswerHandler">>;
 beforeEach(() => {
   db = openDb(":memory:"); assigned = []; mentioned = []; metaReads = []; commentReads = [];
   posted = []; pickedUp = []; providerCalls = 0; mentionBody = "@gary take this";
-  const provider = createProvider({ name: "deepseek", model: "deepseek-v4-pro", apiKey: "offline-only",
+  const provider = createProvider({ name: "openrouter", model: "deepseek/deepseek-v4.1-flash", apiKey: "offline-only",
     baseUrl: "https://provider.invalid", defaultBackoffMs: 1000 }, { fetch: (async () => {
     providerCalls++; throw new Error("Provider calls forbidden in intake tests");
   }) as unknown as typeof fetch });
@@ -46,7 +46,7 @@ beforeEach(() => {
     repoMap: new Map([["ERT", "fixture/repo"]]), allowlistedMentionUserIds: ["human"],
     reposDir: "/offline/repos", workspacesDir: "/offline/workspaces", agentLoopMaxIterations: 5,
     agentLoopTimeoutMs: 1000, maxCiAttempts: 3, maxAttemptsPerTicket: 5, circuitBreakerWindowHours: 6,
-    stalePrAfterMs: 1000, review: { providerOrder: ["deepseek"], maxRounds: 1, iterationCap: 1, timeoutMs: 1000 } };
+    stalePrAfterMs: 1000, review: { providerOrder: ["openrouter"], maxRounds: 1, iterationCap: 1, timeoutMs: 1000 } };
   classify = spyOn(classifier, "classifyTicket").mockResolvedValue({ classification: "CODE", confidence: 0.99, scope: "S", reasoning: "Offline fixture" });
   comment = spyOn(classifier, "generateClassificationComment").mockResolvedValue("Offline classification");
   coding = spyOn(codeHandler, "runCodeHandler").mockResolvedValue({ status: "no_changes", branch: "fixture", summary: "Offline fixture" });

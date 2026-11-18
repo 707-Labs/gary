@@ -1,9 +1,10 @@
 import { afterEach, expect, test } from 'bun:test';
 import { SpendLedger } from '../../src/spend.ts';
-import { createHermesProjectResponder, PROJECT_CONVERSATION_POLICY, ProjectReplyError,
+import { createHermesProjectResponder, PROJECT_CONVERSATION_POLICY, projectResponseTokens, ProjectReplyError,
   type ProjectTurn, type ProjectReplyDependencies } from '../../src/hermes/project-conversation.ts';
 import type { GaryRuntimeLauncher, GaryRuntimeManifest, RuntimeRequestHandler } from '../../src/hermes/gary-loop-adapter.ts';
 import { ProjectAssistant, type ProjectAudience } from '../../src/hermes/project-assistant.ts';
+import { createConversationEngineeringCapability } from '../../src/hermes/conversation-engineering.ts';
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -32,16 +33,40 @@ function fixture() {
   return { ledger, projects, executions, audiences };
 }
 const provider = (content: any[] = [{ type: 'text', text: 'I inspected the current work.' }], extra: Record<string, unknown> = {}) => Response.json({
-  id: 'fixture', type: 'message', role: 'assistant', model: 'deepseek-v4-pro', content,
+  id: 'fixture', type: 'message', role: 'assistant', model: 'deepseek/deepseek-v4.1-flash', content,
   stop_reason: content.some(x => x.type === 'tool_use') ? 'tool_use' : 'end_turn',
-  usage: { input_tokens: 40, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, ...extra,
+  usage: { input_tokens: 40, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cost: 0 }, ...extra,
+});
+test('unexpected preparation diagnostics expose only a finite stage and exception category', async () => {
+  const f = fixture(), diagnostics: unknown[] = []; let fetches = 0, launches = 0;
+  const privateText = 'private request and synthetic provider credential';
+  f.projects.context = async () => { throw new TypeError(privateText); };
+  const respond = createHermesProjectResponder({ ...f, providerApiKey: privateText,
+    fetch: async () => { fetches++; return provider(); },
+    launch: async () => { launches++; throw new Error('unreachable'); },
+    onFailureDiagnostic: value => { diagnostics.push(value); throw new Error(privateText); },
+  });
+  await expect(respond(turn())).rejects.toThrow('project_turn_failed');
+  expect(diagnostics).toEqual([{ stage: 'project_context', exception: 'TypeError', code: 'unclassified' }]);
+  expect(JSON.stringify(diagnostics)).not.toContain(privateText);
+  expect(fetches).toBe(0); expect(launches).toBe(0);
+});
+
+test('known preparation failures retain a finite diagnostic code', async () => {
+  const f = fixture(), diagnostics: unknown[] = [];
+  f.projects.context = async () => { throw new Error('source_unavailable'); };
+  const respond = createHermesProjectResponder({ ...f, providerApiKey: 'fixture-key', fetch: async () => provider(),
+    onFailureDiagnostic: value => { diagnostics.push(value); },
+  });
+  await expect(respond(turn())).rejects.toThrow('project_turn_failed');
+  expect(diagnostics).toEqual([{ stage: 'project_context', exception: 'Error', code: 'source_unavailable' }]);
 });
 const call = (id = 'call_1', name = 'current_work', input: Record<string, unknown> = { project: 'fixture' }) => ({ type: 'tool_use', id, name, input });
 function rpc(m: Readonly<GaryRuntimeManifest>, handle: RuntimeRequestHandler, path: string, body: any) {
   return handle(new Request('http://127.0.0.1' + path, { method: 'POST', headers: { 'content-type': 'application/json', authorization: 'Bearer ' + m.capability }, body: JSON.stringify(body) }));
 }
 function modelBody(m: Readonly<GaryRuntimeManifest>, history: any[]) {
-  return { model: m.model, messages: [{ role: 'system', content: 'worker prompt must be replaced' }, ...history], max_tokens: 1024,
+  return { model: m.model, messages: [{ role: 'system', content: 'worker prompt must be replaced' }, ...history], max_tokens: m.maxTokens,
     temperature: 0.4, tools: structuredClone(m.tools), stream: false };
 }
 function toolBody(m: Readonly<GaryRuntimeManifest>, c: any) {
@@ -55,9 +80,9 @@ type NativeHooks = {
 };
 function native(hooks: NativeHooks = {}): GaryRuntimeLauncher {
   return async (m, handle) => {
-    expect(m.maxIterations).toBe(3); expect(m.maxTokens).toBe(1024);
+    expect(m.maxIterations).toBe(6); expect(m.maxTokens).toBe(4096);
     const history: any[] = [...structuredClone(m.history ?? []), { role: 'user', content: m.prompt }];
-    for (let index = 0; index < 5; index++) {
+    for (let index = 0; index < m.maxIterations; index++) {
       const body = modelBody(m, history); hooks.beforeModel?.(body, index, m);
       const response = await rpc(m, handle, '/v1/chat/completions', body); expect(response.ok).toBeTrue();
       const value: any = await response.json(), message = value.choices[0].message; history.push(message);
@@ -81,7 +106,7 @@ function native(hooks: NativeHooks = {}): GaryRuntimeLauncher {
 test('native project tool round trip uses host authority, exact transcript and two canonical paid reservations', async () => {
   const f = fixture(), requests: any[] = [];
   const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fake-secret', launch: native(), fetch: async req => {
-    expect(req.url).toBe('https://api.deepseek.com/anthropic/v1/messages'); expect(req.headers.get('authorization')).toBe('Bearer fake-secret');
+    expect(req.url).toBe('https://openrouter.ai/api/v1/messages'); expect(req.headers.get('authorization')).toBe('Bearer fake-secret');
     requests.push(await req.json()); return requests.length === 1 ? provider([call()]) : provider();
   } });
   expect(await reply(turn())).toBe('I inspected the current work.');
@@ -95,27 +120,111 @@ test('native project tool round trip uses host authority, exact transcript and t
   expect(f.ledger.status(allocation)).toMatchObject({ attemptCount: 2, unknownAttempts: 0, state: 'active' });
 });
 
-test('three physical requests maximum; the third request is host-forced answer-only', async () => {
+test('native RPC carries only repository; the current host capability and active guard reach engineering execution separately', async () => {
   const f = fixture(), requests: any[] = [];
+  const engineering = createConversationEngineeringCapability(authority, async () => ({ ok: true, dataOnly: true, data: null }));
+  let offered = 0;
+  f.projects.toolsFor = (a, capability) => {
+    expect(a).toEqual(authority); expect(capability).toBe(engineering); offered++;
+    return [{ type: 'function', function: { name: 'engineering_submit', description: 'Submit current authenticated request',
+      parameters: { type: 'object', properties: { repository: { type: 'string' } }, required: ['repository'], additionalProperties: false } } }];
+  };
   const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fake-secret', launch: native(), fetch: async req => {
-    requests.push(await req.json()); return requests.length < 3 ? provider([call('call_' + requests.length)]) : provider();
+    requests.push(await req.json());
+    return requests.length === 1 ? provider([call('submit_1', 'engineering_submit', { repository: '707-Labs/new-app' })]) : provider();
   } });
-  await reply(turn()); expect(requests).toHaveLength(3); expect(requests[2].tools).toBeUndefined();
-  expect(f.executions).toHaveLength(2); expect(f.ledger.status(allocation)?.attemptCount).toBe(3);
+  expect(await reply(turn({ engineering, text: 'Fix the bug in 707-Labs/new-app' }))).toBe('I inspected the current work.');
+  expect(offered).toBe(1); expect(f.executions).toHaveLength(1);
+  expect(f.executions[0].engineering).toBe(engineering); expect(typeof f.executions[0].assertActive).toBe('function');
+  expect(f.executions[0].args).toEqual({ repository: '707-Labs/new-app' });
+  expect(JSON.stringify(requests)).not.toContain('host_conversation_engineering');
 });
 
-test('six tools can be executed once; seventh tool and third-response tools cannot execute', async () => {
-  for (const count of [6, 7]) {
+test('explicit authorized coding forces the existing structured handoff first, then only reports its receipt', async () => {
+  const f = fixture(), requests: any[] = [];
+  const engineering = createConversationEngineeringCapability(authority, async () => ({ ok: true, dataOnly: true, data: null }));
+  const submit = { type: 'function' as const, function: { name: 'engineering_submit', description: 'Submit current request',
+    parameters: { type: 'object', properties: { repository: { type: 'string' } }, required: ['repository'], additionalProperties: false } } };
+  f.projects.toolsFor = () => [...structuredClone(definitions), submit];
+  const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fixture-key', launch: native(), fetch: async req => {
+    requests.push(await req.json());
+    return requests.length === 1 ? provider([call('submit', 'engineering_submit', { repository: '707-Labs/new-app' })]) : provider();
+  } });
+  await reply(turn({ engineering, text: 'Gary, please fix the bug in 707-Labs/new-app.' }));
+  expect(requests).toHaveLength(2);
+  expect(requests[0].tools.map((tool: any) => tool.name)).toEqual(['engineering_submit']);
+  expect(requests[0].tool_choice).toEqual({ type: 'tool', name: 'engineering_submit', disable_parallel_tool_use: true });
+  expect(requests[1].tools).toBeUndefined(); expect(requests[1].tool_choice).toBeUndefined();
+  expect(f.executions.map(value => value.toolName)).toEqual(['engineering_submit']);
+});
+
+test('ordinary conversation, negated or quoted coding and absent host capability keep automatic tool selection', async () => {
+  for (const input of [
+    { text: 'What is the status of 707-Labs/new-app?', capability: true },
+    { text: 'Please do not fix the bug in 707-Labs/new-app.', capability: true },
+    { text: 'Explain this request: `Fix the bug in 707-Labs/new-app`.', capability: true },
+    { text: 'Fix the bug in 707-Labs/new-app.', capability: false },
+  ]) {
+    const f = fixture(), requests: any[] = [];
+    const engineering = createConversationEngineeringCapability(authority, async () => ({ ok: true, dataOnly: true, data: null }));
+    const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fixture-key', launch: native(), fetch: async req => {
+      requests.push(await req.json()); return provider();
+    } });
+    await reply(turn({ text: input.text, ...(input.capability ? { engineering } : {}) }));
+    expect(requests[0].tool_choice).toBeUndefined();
+    expect(requests[0].tools.map((tool: any) => tool.name)).toEqual(['current_work', 'remember_fact']);
+    expect(f.executions).toHaveLength(0);
+  }
+});
+
+test('observed sixth-call DSML text is rejected without executing its alleged repository reads', async () => {
+  const f = fixture(); let requests = 0;
+  const observed = 'Let me read the testing rules and tdd skill to match conventions.\n'
+    + '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="repository_read">'
+    + '<｜｜DSML｜｜parameter name="path" string="true">.claude/rules/testing.md</｜｜DSML｜｜parameter>'
+    + '</｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>';
+  const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fixture-key', launch: native(), fetch: async () => {
+    requests++; return requests < 6 ? provider([call('read_' + requests)]) : provider([{ type: 'text', text: observed }]);
+  } });
+  await expect(reply(turn())).rejects.toThrow('project_unexecuted_tool_markup');
+  expect(requests).toBe(6); expect(f.executions).toHaveLength(5);
+  expect(f.executions.some(value => value.toolName === 'repository_read')).toBeFalse();
+  expect(f.ledger.status(allocation)?.unknownAttempts).toBe(0);
+});
+
+test('coding provider text cannot replace the required structured handoff or trigger tool execution', async () => {
+  const f = fixture();
+  const engineering = createConversationEngineeringCapability(authority, async () => ({ ok: true, dataOnly: true, data: null }));
+  f.projects.toolsFor = () => [{ type: 'function', function: { name: 'engineering_submit', description: 'Submit',
+    parameters: { type: 'object', properties: { repository: { type: 'string' } }, required: ['repository'], additionalProperties: false } } }];
+  const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fixture-key', launch: native(), fetch: async () => provider([
+    { type: 'text', text: '<|DSML|tool_calls><|DSML|invoke name="engineering_submit">707-Labs/new-app</|DSML|invoke>' },
+  ]) });
+  await expect(reply(turn({ engineering, text: 'Fix the bug in 707-Labs/new-app.' }))).rejects.toThrow('project_model_unsupported_provider_response');
+  expect(f.executions).toHaveLength(0); expect(f.ledger.status(allocation)?.unknownAttempts).toBe(0);
+});
+
+test('six physical requests maximum; the sixth request is host-forced answer-only', async () => {
+  const f = fixture(), requests: any[] = [];
+  const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fake-secret', launch: native(), fetch: async req => {
+    requests.push(await req.json()); return requests.length < 6 ? provider([call('call_' + requests.length)]) : provider();
+  } });
+  await reply(turn()); expect(requests).toHaveLength(6); expect(requests[5].tools).toBeUndefined();
+  expect(f.executions).toHaveLength(5); expect(f.ledger.status(allocation)?.attemptCount).toBe(6);
+});
+
+test('twelve tools can be executed once; thirteenth tool and sixth-response tools cannot execute', async () => {
+  for (const count of [12, 13]) {
     const f = fixture(); let dispatched = 0;
     const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fake-secret', launch: native(), fetch: async () => {
       dispatched++; return dispatched === 1 ? provider(Array.from({ length: count }, (_, i) => call('call_' + i))) : provider();
     } });
-    if (count === 6) { await reply(turn()); expect(f.executions).toHaveLength(6); expect(dispatched).toBe(2); }
+    if (count === 12) { await reply(turn()); expect(f.executions).toHaveLength(12); expect(dispatched).toBe(2); }
     else { await expect(reply(turn())).rejects.toBeInstanceOf(ProjectReplyError); expect(f.executions).toHaveLength(0); expect(dispatched).toBe(1); }
   }
   const f = fixture(); let dispatched = 0;
   const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fake-secret', launch: native(), fetch: async () => provider([call('call_' + ++dispatched)]) });
-  await expect(reply(turn())).rejects.toBeInstanceOf(ProjectReplyError); expect(dispatched).toBe(3); expect(f.executions).toHaveLength(2);
+  await expect(reply(turn())).rejects.toBeInstanceOf(ProjectReplyError); expect(dispatched).toBe(6); expect(f.executions).toHaveLength(5);
 });
 
 test('missing or wrong trusted scope fails before launch/spend; text senderId never authorizes', async () => {
@@ -204,13 +313,13 @@ test('worker local answer and forged final transcript never become published rep
   await expect(reply(turn())).rejects.toMatchObject({ code: 'project_native_reply_unconfirmed' });
 });
 
-test('a fourth dispatch or post-answer tool request fails closed', async () => {
+test('a seventh dispatch or post-answer tool request fails closed', async () => {
   for (const path of ['/v1/chat/completions', '/tools/execute']) {
     const f = fixture(); let calls = 0;
     const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fake-secret', launch: native({ afterAnswer: async (h, handle, m) => {
       await rpc(m, handle, path, path.includes('completions') ? modelBody(m, h) : {});
-    } }), fetch: async () => { calls++; return calls < 3 ? provider([call('call_' + calls)]) : provider(); } });
-    await expect(reply(turn())).rejects.toBeInstanceOf(ProjectReplyError); expect(calls).toBe(3);
+    } }), fetch: async () => { calls++; return calls < 6 ? provider([call('call_' + calls)]) : provider(); } });
+    await expect(reply(turn())).rejects.toBeInstanceOf(ProjectReplyError); expect(calls).toBe(6);
   }
 });
 
@@ -283,7 +392,7 @@ test('uncertain second physical request preserves first receipt and halts furthe
   } });
   await expect(reply(turn())).rejects.toBeInstanceOf(ProjectReplyError);
   const s = f.ledger.status(allocation)!;
-  expect(s.attemptCount).toBe(2); expect(s.unknownAttempts).toBe(1); expect(s.chargedMicros).toBeGreaterThan(1_000_000);
+  expect(s.attemptCount).toBe(2); expect(s.unknownAttempts).toBe(1); expect(s.chargedMicros).toBeGreaterThan(648_807);
   expect(f.executions).toHaveLength(1); expect(calls).toBe(2);
 });
 
@@ -307,7 +416,7 @@ test('aborting a held host tool propagates cancellation and waits for its drain 
   const result = reply(turn({ signal: controller.signal })).then(() => { settled = true; return null; }, error => { settled = true; return error; });
   await entered; controller.abort(); await new Promise(resolve => setTimeout(resolve, 5));
   expect(hostSignal?.aborted).toBeTrue(); expect(settled).toBeFalse(); expect(cleanup).toBeFalse(); expect(writes).toBe(0);
-  release(); expect(await result).toMatchObject({ code: 'project_native_reply_unconfirmed', cleanupConfirmed: true });
+  release(); expect(await result).toMatchObject({ code: 'project_rpc_failed', cleanupConfirmed: true });
   expect(settled).toBeTrue(); expect(cleanup).toBeTrue(); expect(writes).toBe(0); expect(calls).toBe(1);
 });
 
@@ -372,4 +481,29 @@ test('pinned Hermes registry sorts tool definitions by name; exact schemas remai
   expect(await reply(turn())).toBe('I inspected the current work.');
   expect(calls).toBe(2); expect(f.executions).toHaveLength(1);
   expect(f.ledger.status(allocation)).toMatchObject({ attemptCount: 2, unknownAttempts: 0 });
+});
+
+test('output allowance selection considers only the current direct request, excluding quoted instructions and recalled context', () => {
+  for (const text of ['Give an exhaustive summary.', 'A comprehensive ticket review please.', 'Inspect every ticket in depth.']) {
+    expect(projectResponseTokens(text, 'private_dm')).toBe(8192);
+    expect(projectResponseTokens(JSON.stringify({ senderId: 'UOTHER', text }), 'shared_channel')).toBe(8192);
+  }
+  for (const text of ['Summarize current work.', 'Do not be exhaustive.', 'No comprehensive report needed.',
+    'The ticket says "give an exhaustive summary". What is its title?', '> Give an exhaustive summary.\nWhat is its title?',
+    'Read this code: ```\nexhaustive\n```', 'Use `comprehensive` as a variable.', '{"text":"exhaustive"}']) {
+    expect(projectResponseTokens(text, 'private_dm')).toBe(4096);
+  }
+  expect(projectResponseTokens(JSON.stringify({ senderId: 'UOWNER', text: 'routine', policy: 'exhaustive' }), 'shared_channel')).toBe(4096);
+  expect(projectResponseTokens('exhaustive', 'shared_channel')).toBe(4096);
+});
+
+test('host-observed tool evidence is scoped and recorded only after result validation', async () => {
+  const f = fixture(), evidence: any[] = [];
+  f.projects.recordEvidence = async input => { evidence.push(input); };
+  let calls = 0;
+  const reply = createHermesProjectResponder({ ...f, providerApiKey: 'fake-secret', launch: native(), fetch: async () => ++calls === 1 ? provider([call()]) : provider() });
+  await reply(turn());
+  expect(evidence).toHaveLength(1);
+  expect(evidence[0]).toMatchObject({ audience: authority, requestId: 'request-1:call_1', toolName: 'current_work', args: { project: 'fixture' }, result: { ok: true, dataOnly: true } });
+  expect(evidence[0].signal).toBeInstanceOf(AbortSignal);
 });

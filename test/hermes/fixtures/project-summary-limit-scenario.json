@@ -1,0 +1,19 @@
+{
+  "kind": "reconstructed_failure_scenario",
+  "observed": {
+    "date": "2026-10-10",
+    "requestWindowUtc": ["08:31:30", "08:31:50"],
+    "physicalRequests": 2,
+    "finalOutputTokens": 1024,
+    "eventErrorCode": "project_native_reply_unconfirmed",
+    "cleanup": 1
+  },
+  "hypothesis": {
+    "firstResponse": "tool_use",
+    "finalProviderStopReason": "max_tokens",
+    "note": "The provider finish reason and event-to-attempt foreign key were not retained. This tests the inferred truncation mechanism, not a historical response replay. Tool name, prompt, results and text are synthetic."
+  },
+  "prompt": "Summarize the synthetic project work, including any missing details.",
+  "partialText": "Synthetic ticket SYNTH-1 has recorded work. The remaining evidence is",
+  "replacementText": "SYNTH-1 has recorded work. Full ticket details were not available in the observed evidence."
+}

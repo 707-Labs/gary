@@ -8,6 +8,7 @@ import type { CodeActionAdmission } from './canonical-admission.ts';
 import type { ExecutorJobJournal } from '../executors/index.ts';
 import type { DB } from '../state/db.ts';
 import type { SpendLedger } from '../spend.ts';
+import { PAID_ROUTE } from '../model-route.ts';
 import type { LoopDeps } from '../loop.ts';
 import { createHermesCodeLoopFactory, type ProductionTaskPolicy, type ProductionRuntimeOptions } from './production-runtime.ts';
 import { createDockerRuntimeLauncher } from './docker-launcher.ts';
@@ -49,7 +50,7 @@ const policySchema = z.object({
 }).strict();
 const activationSchema = z.object({
   version: z.literal(1), issueId: z.string().uuid(), repo: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),
-  provider: z.literal('deepseek'), model: z.literal('deepseek-v4-pro'),
+  provider: z.literal(PAID_ROUTE.provider), model: z.literal(PAID_ROUTE.model),
   workerImage: z.literal(HERMES_CODING_WORKER_IMAGE), childImage: z.literal(HERMES_CANARY_CHILD_IMAGE),
   dockerExecutable: z.literal('/usr/local/bin/docker'), dockerHost: z.literal('unix:///Users/tanner/.colima/default/docker.sock'),
   traceDirectory: text(4096), policy: policySchema,

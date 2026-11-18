@@ -134,6 +134,33 @@ function actionRows(): Array<{ success: number; outcome: string; error_message: 
   ).all();
 }
 
+describe("host dispatch occupancy", () => {
+  it("refuses dispatch before any action record when the host lease is unavailable", async () => {
+    deps.beginDispatch = () => null;
+    expect((await tick(deps)).actionsTaken).toEqual([]);
+    expect(coding).not.toHaveBeenCalled();
+    expect(actionRows()).toEqual([]);
+  });
+
+  for (const throwing of [false, true]) {
+    it(`retains and releases the host lease across ${throwing ? 'failed' : 'successful'} handler completion`, async () => {
+      let occupied = false, released = 0;
+      deps.beginDispatch = () => {
+        expect(occupied).toBe(false); occupied = true;
+        return () => { expect(occupied).toBe(true); occupied = false; released++; };
+      };
+      coding.mockImplementation(async () => {
+        expect(occupied).toBe(true);
+        await Promise.resolve(); expect(occupied).toBe(true);
+        if (throwing) throw new Error('offline handler failure');
+        return { status: 'no_changes', branch: 'fixture', summary: 'offline' };
+      });
+      await tick(deps);
+      expect(occupied).toBe(false); expect(released).toBe(1);
+    });
+  }
+});
+
 describe("tick outcome reporting", () => {
   for (const status of ["pr_opened", "no_changes", "agent_failed", "blocked", "timeout", "check_failed", "review_failed"] as const) {
     it(`records ${status} from the coding handler without re-dispatching unchanged input`, async () => {

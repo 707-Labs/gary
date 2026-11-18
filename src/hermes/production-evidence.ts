@@ -94,6 +94,64 @@ export function gitSnapshotCommand(baseCommit: string, allowedFiles: readonly st
   return 'set -euo pipefail\n# gary-hermes-git-evidence-v1\nnode -e ' + quote(GIT_SNAPSHOT_SCRIPT)
     + ' -- ' + quote(baseCommit) + ' ' + quote(JSON.stringify(allowedFiles));
 }
+
+/** Standing-task evidence runs only in the independently acquired verifier.
+ * Its input is the host-captured changed-file manifest, not author Git status or
+ * the candidate's potentially changed .gitignore. No broad path discovery here. */
+const REPOSITORY_SNAPSHOT_SCRIPT = String.raw`
+const {spawnSync}=require('node:child_process');
+const {createHash}=require('node:crypto');
+const [base,input,mode='snapshot']=process.argv.slice(1);
+const raw=input==='-'?require('node:fs').readFileSync(0,'utf8'):input,changedFiles=JSON.parse(raw);
+const hash=x=>createHash('sha256').update(x).digest('hex');
+function git(args,ok=[0]) {
+ const r=spawnSync('git',['--no-optional-locks','--literal-pathspecs','-c','core.fsmonitor=false',
+  '-c','core.untrackedCache=false','-c','core.filemode=true','-c','core.hooksPath=/dev/null',...args],
+  {encoding:'utf8',maxBuffer:8*1024*1024,env:{...process.env,GIT_OPTIONAL_LOCKS:'0',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null',GIT_PAGER:'cat'}});
+ if(r.error||r.signal||!ok.includes(r.status)) throw Error('git_snapshot_failed');
+ return {output:r.stdout,status:r.status};
+}
+try {
+ if(git(['rev-parse','--verify',base+'^{commit}']).output.trim()!==base) throw Error('base_changed');
+ const head=git(['rev-parse','--verify','HEAD']).output.trim();
+ if(head!==base) throw Error('verifier_head_changed');
+ const patches=changedFiles.map(path=>{
+  const tracked=git(['ls-files','--error-unmatch','--',path],[0,1]).status===0;
+  const patch=tracked?git(['diff','--no-ext-diff','--no-textconv','--no-renames','--binary',base,'--',path]).output
+   :git(['diff','--no-index','--no-ext-diff','--no-textconv','--binary','--','/dev/null',path],[0,1]).output;
+  if(!patch.trim()) throw Error('captured_change_missing');
+  return {path,sha256:hash(patch),patch};
+ });
+ if(git(['rev-parse','--verify','HEAD']).output.trim()!==head) throw Error('workspace_changed');
+ if(mode==='patch') process.stdout.write(patches.map(value=>value.patch).join(''));
+ else {
+  const workspaceDigest=hash(JSON.stringify({changedFiles,patches:patches.map(({path,sha256})=>({path,sha256}))}));
+  console.log(JSON.stringify({version:1,baseCommit:base,head,changedFiles,workspaceDigest,
+   taskDiffDigest:changedFiles.length?workspaceDigest:null,statusDigest:hash(JSON.stringify(changedFiles))}));
+ }
+} catch { console.error('git_snapshot_failed'); process.exit(1); }
+`;
+
+export function gitRepositorySnapshotCommand(baseCommit: string, changedFiles: readonly string[]): string {
+  if (!/^[a-f0-9]{40}$/.test(baseCommit) || !Array.isArray(changedFiles) || changedFiles.length > 512
+      || new Set(changedFiles).size !== changedFiles.length || changedFiles.some(path => typeof path !== 'string'
+        || !path || Buffer.byteLength(path) > 1024 || /[\\\x00-\x1f\x7f]/.test(path) || path.startsWith('/')
+        || path.split('/').some(part => !part || part === '.' || part === '..'))) fail('invalid_repository_manifest');
+  return 'set -euo pipefail\n# gary-engineering-repository-evidence-v1\nnode -e ' + quote(REPOSITORY_SNAPSHOT_SCRIPT)
+    + ' -- ' + quote(baseCommit) + ' ' + quote(JSON.stringify([...changedFiles].sort()));
+}
+
+/** Fixed host script plus stdin keeps even the maximum manifest out of shell
+ * syntax and the executor's 32KiB command limit. Only the trusted capture chooses
+ * paths; both modes enforce exact independently cloned HEAD and missing changes. */
+export function gitRepositoryEvidenceRequest(baseCommit: string, changedFiles: readonly string[], options: { patch?: boolean } = {}): { command: string; stdin: string } {
+  gitRepositorySnapshotCommand(baseCommit, changedFiles); // Identical validation.
+  const stdin = JSON.stringify([...changedFiles].sort());
+  if (Buffer.byteLength(stdin) > 256 * 1024) fail('invalid_repository_manifest');
+  return { command: 'set -euo pipefail\n# gary-engineering-repository-evidence-v1\nnode -e ' + quote(REPOSITORY_SNAPSHOT_SCRIPT)
+    + ' -- ' + quote(baseCommit) + ' - ' + (options.patch ? 'patch' : 'snapshot'),
+    stdin };
+}
 function validateResult(result: ExecResult): void {
   if (!result || typeof result.stdout !== 'string' || typeof result.stderr !== 'string'
       || !Number.isSafeInteger(result.exitCode) || typeof result.timedOut !== 'boolean') fail('invalid_executor_result');

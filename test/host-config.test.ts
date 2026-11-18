@@ -114,3 +114,21 @@ test('alert intake needs its own exact configuration hash and pinned combined ru
  for(const change of [{GARY_SLACK_ALERT_CONFIG:undefined},{GARY_SLACK_ALERT_CONFIG_SHA256:undefined},{GARY_SLACK_ALERT_CONFIG_SHA256:'main'},
   {GARY_SLACK_ALERT_CONFIG:'relative.json'},{GARY_CONVERSATION_RUNTIME_RELEASE:undefined},{GARY_RUNTIME_MODE:'legacy'},{GARY_SLACK_ENABLED:'0'}])expect(()=>loadHostStartupConfig({...env,...change})).toThrow();
 });
+
+test('engineering remains dormant without separate pinned policy and authority in the reviewed owner DM runtime',()=>{
+ const base={...canary,GARY_SLACK_ENABLED:'1',GARY_SLACK_CREDENTIALS_FILE:'/private/runtime/slack.env',GARY_SLACK_TANNER_DM_ENABLED:'1',
+  GARY_SLACK_CONVERSATION_CONFIG:'/private/dm/config.json',GARY_CONVERSATION_RUNTIME_RELEASE:'c'.repeat(40)};
+ expect(loadHostStartupConfig(base).engineeringConfigPath).toBeUndefined();
+ const env={...base,GARY_ENGINEERING_CONFIG:'/private/engineering/config.json',GARY_ENGINEERING_CONFIG_SHA256:'d'.repeat(64),
+  GARY_ENGINEERING_AUTHORITY_RECEIPT:'/private/engineering/approval.json',GARY_ENGINEERING_AUTHORITY_RECEIPT_SHA256:'e'.repeat(64)};
+ expect(loadHostStartupConfig(env)).toMatchObject({engineeringConfigPath:env.GARY_ENGINEERING_CONFIG,engineeringConfigSha256:env.GARY_ENGINEERING_CONFIG_SHA256,
+  engineeringAuthorityReceiptPath:env.GARY_ENGINEERING_AUTHORITY_RECEIPT,engineeringAuthorityReceiptSha256:env.GARY_ENGINEERING_AUTHORITY_RECEIPT_SHA256});
+ for(const key of ['GARY_ENGINEERING_CONFIG','GARY_ENGINEERING_CONFIG_SHA256','GARY_ENGINEERING_AUTHORITY_RECEIPT','GARY_ENGINEERING_AUTHORITY_RECEIPT_SHA256',
+  'GARY_SLACK_CONVERSATION_CONFIG','GARY_CONVERSATION_RUNTIME_RELEASE','GARY_SLACK_TANNER_DM_ENABLED','GARY_SLACK_ENABLED'])
+  expect(()=>loadHostStartupConfig({...env,[key]:undefined})).toThrow();
+ for(const change of [{GARY_ENGINEERING_CONFIG_SHA256:'main'},{GARY_ENGINEERING_AUTHORITY_RECEIPT_SHA256:'main'},
+  {GARY_ENGINEERING_CONFIG:'relative.json'},{GARY_ENGINEERING_AUTHORITY_RECEIPT:'relative.json'},
+  {GARY_ENGINEERING_AUTHORITY_RECEIPT:env.GARY_ENGINEERING_CONFIG},{GARY_CONVERSATION_RUNTIME_RELEASE:'main'},
+  {GARY_SLACK_ALLOWED_CHANNEL_IDS:'C0123456789'},{GARY_RUNTIME_MODE:'legacy'},{GARY_RUNTIME_MODE:'hermes-readonly-canary'},
+  {GARY_SLACK_TANNER_DM_ENABLED:'0'},{GARY_SLACK_ENABLED:'0'}])expect(()=>loadHostStartupConfig({...env,...change})).toThrow();
+});

@@ -3,7 +3,7 @@
 //   1. Complete a basic chat (text in / text out)
 //   2. Use tools (the agent loop relies on this)
 //
-// Mirrors probe-kimi.ts and probe-deepseek.ts. Talks directly to the SDK
+// Mirrors probe-kimi.ts and probe-openrouter.ts. Talks directly to the SDK
 // rather than going through GLMClient/the chain so a Z.ai-specific failure
 // doesn't get masked by fallback to another provider.
 //

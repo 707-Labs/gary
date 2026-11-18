@@ -25,7 +25,7 @@ function configFixture() {
   cleanups.push(()=>rmSync(directory,{recursive:true,force:true}));
   const trace=join(directory,'traces');mkdirSync(trace,{mode:0o700});
   const path=join(directory,'activation.json');
-  const config:HermesActivationConfig={version:1,issueId:ID,repo:'fixture/repo',provider:'deepseek',model:'deepseek-v4-pro',
+  const config:HermesActivationConfig={version:1,issueId:ID,repo:'fixture/repo',provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',
     workerImage:HERMES_CODING_WORKER_IMAGE,childImage:HERMES_CANARY_CHILD_IMAGE,dockerExecutable:'/usr/local/bin/docker',dockerHost:'unix:///Users/tanner/.colima/default/docker.sock',traceDirectory:trace,
     policy:{baseCommit:'a'.repeat(40),task:{allowedFiles:['task.ts'],criteria:[{id:'fix',description:'Exact scoped change',requiredCommands:['bun run check',CHECK]}]},
       progress:{maxModelRequests:50,maxModelRequestsWithoutProgress:20,maxSuccessfulToolCalls:100,toolRepeatWindow:10,maxRepeatedToolCalls:5},
@@ -69,20 +69,20 @@ async function runtimeFixture(configure?:(config:HermesActivationConfig,workspac
   const executor:Executor={workspaceRoot:workspace,readFile:async path=>readFileSync(join(workspace,path),'utf8'),writeFile:async(path,content)=>{writeFileSync(join(workspace,path),content);},
     listFiles:async()=>[],grep:async()=>[],run:async(command,opts)=>runProcess('/bin/bash',['-c',command],{...opts,cwd:workspace,env,timeoutMs:opts?.timeoutMs??10_000})};
   let requests=0,launches=0;
-  const route={provider:'deepseek' as const,model:'deepseek-v4-pro' as const,providerApiKey:'offline-fixture-key',fetch:async(request:Request)=>{
-    const body=await request.json();expect(body.model).toBe('deepseek-v4-pro');expect(body.thinking).toEqual({type:'disabled'});requests++;
+  const route={provider:'openrouter' as const,model:'deepseek/deepseek-v4.1-flash' as const,providerApiKey:'offline-fixture-key',fetch:async(request:Request)=>{
+    const body=await request.json();expect(body.model).toBe('deepseek/deepseek-v4.1-flash');expect(body.thinking).toEqual({type:'disabled'});requests++;
     const steps=[['read_file',{path:'task.ts'}],['write_file',{path:'task.ts',content:'updated\n'}],['run_bash',{command:'bun run check'}],['run_bash',{command:CHECK}],['finish',{summary:'Verified fixture'}]] as const;
     const step=steps[(requests-1)%5]!;
-    return Response.json({id:'reply-'+requests,type:'message',role:'assistant',model:'deepseek-v4-pro',content:[{type:'tool_use',id:'call-'+requests,name:step[0],input:step[1]}],stop_reason:'tool_use',usage:{input_tokens:10,output_tokens:8,cache_read_input_tokens:0,cache_creation_input_tokens:0}});
+    return Response.json({id:'reply-'+requests,type:'message',role:'assistant',model:'deepseek/deepseek-v4.1-flash',content:[{type:'tool_use',id:'call-'+requests,name:step[0],input:step[1]}],stop_reason:'tool_use',usage:{input_tokens:10,output_tokens:8,cache_read_input_tokens:0,cache_creation_input_tokens:0, cost: 0}});
   }};
   const deps={db,ledger,route,executorJobJournal:{directory:join(f.trace,'offline-jobs'),close(){}},launch:async(...args:Parameters<GaryRuntimeLauncher>)=>{launches++;return native(...args);}};
   const admissionActivation=createHermesActivation(loadHermesActivationConfig(f.path),deps);
-  const admitted={issueId:ID,fingerprint:'fp',humanSignature:'human-fp',provider:'deepseek',model:'deepseek-v4-pro',repo:'fixture/repo'};
+  const admitted={issueId:ID,fingerprint:'fp',humanSignature:'human-fp',provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',repo:'fixture/repo'};
   const classify=admissionActivation.codingTrial.admit({...admitted,actionType:'classify'});
   setClassification(db,{linearId:ID,classification:'CODE',confidence:.99,scope:'S'});
   classify.complete(true,'handled');
   const admit=()=>{const trial=admissionActivation.codingTrial.admit({...admitted,actionType:'start_coding'});
-    return bindCanonicalCodeAction({db,ledger,actionId:trial.actionId,fingerprint:'fp',issue,provider:'deepseek',model:'deepseek-v4-pro',repo:'fixture/repo'});};
+    return bindCanonicalCodeAction({db,ledger,actionId:trial.actionId,fingerprint:'fp',issue,provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',repo:'fixture/repo'});};
   const binding=admit();
   const args:AgentLoopArgs={glm:{} as AgentLoopArgs['glm'],executor,systemPrompt:'Gary admitted instructions.',task:'Change task.ts',maxIterations:5,maxTokensPerTurn:128,timeoutMs:30_000,deadlineMs:Date.now()+30_000,finishGateCommand:CHECK,disableSubagent:true};
   return{...f,workspace,db,ledger,binding,admit,deps,args,counts:()=>({requests,launches})};
@@ -99,7 +99,7 @@ test('coding activation accepts the bounded-watchdog worker and rejects previous
 });
 test('coding worker pin leaves the read-only canary policy unchanged',()=>{
   expect(HERMES_CANARY_WORKER_IMAGE).toBe('sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab');
-  expect(READONLY_CANARY_POLICY).toEqual({version:2,provider:'deepseek',model:'deepseek-v4-pro',thinking:'disabled',
+  expect(READONLY_CANARY_POLICY).toEqual({version:3,provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',thinking:'disabled',
     workerImage:'sha256:b52a41253812cc6d3054b84e6c59e6be5cf485a3cd955baf1085a4bb1bde9eab',
     executorImage:'sha256:e77edfc6e20402c7ed9f447dca81dc61e277c2a39199963f455a37a03dfcedf4',
     dockerExecutable:'/usr/local/bin/docker',dockerHost:'unix:///Users/tanner/.colima/default/docker.sock',
@@ -173,8 +173,8 @@ test('non-draft enrollment and second coding attempt fail before native launch o
   const nondraft=configFixture(),db=openDb(':memory:'),ledger=new SpendLedger(':memory:');
   cleanups.push(()=>db.close(),()=>ledger.close());ledger.createCampaign('offline',5);ledger.enrollTicket('offline',ID,5);
   upsertTicket(db,{linearId:ID,identifier:'ERT-1'});
-  const non=createHermesActivation(loadHermesActivationConfig(nondraft.path),{db,ledger,executorJobJournal:{directory:join(nondraft.trace,'offline-jobs'),close(){}},route:{provider:'deepseek',model:'deepseek-v4-pro',providerApiKey:'offline',fetch:async()=>{throw new Error('must not fetch');}},launch:async()=>{throw new Error('must not launch');}});
-  expect(()=>non.codingTrial.admit({issueId:ID,actionType:'classify',fingerprint:'fp',humanSignature:'human-fp',provider:'deepseek',model:'deepseek-v4-pro',repo:'fixture/repo'})).toThrow('coding_trial_rejected:allocation');
+  const non=createHermesActivation(loadHermesActivationConfig(nondraft.path),{db,ledger,executorJobJournal:{directory:join(nondraft.trace,'offline-jobs'),close(){}},route:{provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',providerApiKey:'offline',fetch:async()=>{throw new Error('must not fetch');}},launch:async()=>{throw new Error('must not launch');}});
+  expect(()=>non.codingTrial.admit({issueId:ID,actionType:'classify',fingerprint:'fp',humanSignature:'human-fp',provider:'openrouter',model:'deepseek/deepseek-v4.1-flash',repo:'fixture/repo'})).toThrow('coding_trial_rejected:allocation');
   expect(db.query('SELECT count(*) AS n FROM actions').get()).toEqual({n:0});
   const f=await runtimeFixture();const before=f.db.query('SELECT * FROM actions ORDER BY id').all();
   expect(()=>f.admit()).toThrow('coding_trial_rejected:unfinished_owner');
