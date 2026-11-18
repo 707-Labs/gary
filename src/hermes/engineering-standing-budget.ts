@@ -7,6 +7,8 @@ import { lstatSync, realpathSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { SpendLedger, codingReservePolicyVersion } from '../spend.ts';
 import { fingerprintJson } from './audit-trace.ts';
+import { log } from '../logger.ts';
+import { observeEngineeringLedgerBootIdentity, type EngineeringLedgerBootIdentity } from './engineering-budget-reboot.ts';
 import { ENGINEERING_STANDING_MIN_TASK_CAP_MICROS, engineeringStandingBudgetPolicySha256 } from './engineering-policy.ts';
 import { initializeStandingReconciliation, assertStandingReconciliationSchema, standingReconciliationAmounts,
   retainStandingAuxiliaryCharges, reconcileStandingTerminal, withStandingTerminalJournal, STANDING_CHAT_TICKET, standingTaskConversationCharge } from './engineering-standing-reconciliation.ts';
@@ -72,6 +74,13 @@ export function createStandingEngineeringBudget(options: {
   assertAuthority(): void;
   /** Canonical host-selected journal; never supplied by a worker or model. */
   terminalJournalPath?: string;
+  /**
+   * Hash-pinned APFS Data volume that holds the ledger. A macOS reboot can
+   * renumber that volume's st_dev; with this pin an enrolled pool accepts a
+   * ledger whose identity differs only in dev, on the same volume. Without it
+   * any identity change rejects the pool.
+   */
+  ledgerVolume?: { apfsVolumeUUID: string; observe?: (dev: number) => Readonly<EngineeringLedgerBootIdentity> };
 }) {
   if (!(options.ledger instanceof SpendLedger) || typeof options.assertAuthority !== 'function'
       || !exact(options.authority, ['version','poolId','campaignId','capMicros','taskCapMicros','authoritySha256','holdReceiptSha256'])) fail('authority');
@@ -92,6 +101,27 @@ export function createStandingEngineeringBudget(options: {
     if (options.ledger.databasePath !== ledgerPath || digest(identity(ledgerPath)) !== digest(ledgerIdentity)) fail('ledger_changed');
   }
   guard();
+  const identityKeys = ['dev','ino','uid','gid','mode','nlink'] as const;
+  let driftLogged = false;
+  // The pool row is never rewritten: a reboot-renumbered dev is re-proven on every check.
+  // Returns normally only for the same ledger; a failed volume proof has its own code.
+  function assertPoolLedger(stored: unknown): void {
+    if (digest(stored) === digest(ledgerIdentity)) return;
+    const volume = options.ledgerVolume;
+    if (!volume || !exact(stored, identityKeys) || identityKeys.some(k => !Number.isSafeInteger(stored[k]))) fail('pool_binding');
+    if (stored.dev === ledgerIdentity.dev || identityKeys.some(k => k !== 'dev' && stored[k] !== ledgerIdentity[k])) fail('pool_binding');
+    let observed: string;
+    try {
+      // Throws unless the ledger's current dev is the live Data volume's dev.
+      observed = (volume.observe ?? observeEngineeringLedgerBootIdentity)(ledgerIdentity.dev).apfsVolumeUUID;
+    } catch { return fail('pool_binding_volume'); }
+    if (observed !== volume.apfsVolumeUUID) fail('pool_binding_volume');
+    if (!driftLogged) {
+      driftLogged = true;
+      log.info('standing pool ledger dev renumbered on the pinned volume', { poolId: a.poolId,
+        storedDev: stored.dev, currentDev: ledgerIdentity.dev, apfsVolumeUUID: observed });
+    }
+  }
   const tables = (db: Database) => !!db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='standing_engineering_pools'").get();
   function open<T>(write: boolean, fn: (db: Database) => T): T {
     guard();
@@ -112,7 +142,8 @@ export function createStandingEngineeringBudget(options: {
       'SELECT authority_hash,authority_json,ledger_identity_json,campaign_id FROM standing_engineering_pools WHERE pool_id=?').get(a.poolId);
     if (!row) return false;
     if (row.authority_hash !== authorityHash || digest(JSON.parse(row.authority_json)) !== authorityHash
-        || row.campaign_id !== a.campaignId || digest(JSON.parse(row.ledger_identity_json)) !== digest(ledgerIdentity)) fail('pool_binding');
+        || row.campaign_id !== a.campaignId) fail('pool_binding');
+    assertPoolLedger(JSON.parse(row.ledger_identity_json));
     const campaign = db.query<{cap_micros:number},[string]>('SELECT cap_micros FROM spend_campaigns WHERE id=?').get(a.campaignId);
     if (campaign?.cap_micros !== a.capMicros) fail('campaign_changed');
     // No external enrollments may consume this dedicated standing campaign.

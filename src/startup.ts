@@ -283,6 +283,8 @@ export async function runGaryHost(deps: StartupDependencies = {}): Promise<void>
           fundingHoldReceiptPath:pinned.fundingHoldReceiptPath,aggregatePath:pinned.aggregatePath,ledgerPath,
         });
         standingBudget=createStandingEngineeringBudget({ledger:spend,authority:pinned.funding,terminalJournalPath:join(pinned.root,'engineering.sqlite'),
+          // spend.db and the resource lock (/private/tmp) both live on the Data volume; its UUID is in the hash-pinned config.
+          ledgerVolume:{apfsVolumeUUID:pinned.resourceLock.apfsVolumeUUID},
           assertAuthority:()=>{assertPinned();assertFunding();}});
         // Startup observes explicit enrollment; it cannot create or borrow funds.
         const assertBudget=()=>{if(!standingBudget!.status().enrolled)throw new Error('standing_engineering_funding_not_enrolled');};
