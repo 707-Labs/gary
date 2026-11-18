@@ -105,3 +105,33 @@ finally {pool.close();ledger.close();}`,{mode:0o600});
     expect(f.db.query('SELECT * FROM standing_engineering_allocations').all()).toHaveLength(1);
   } finally {for(const c of children)if(c.exitCode===null)c.kill();await Promise.all(children.map(c=>c.exited));}
 },15_000);
+test('an enrolled pool survives a reboot that renumbers the ledger volume dev, and nothing else',()=>{
+  const f=fixture();f.allocator.enrollPool();f.allocator.close();
+  const stored=JSON.parse((f.db.query('SELECT ledger_identity_json j FROM standing_engineering_pools').get() as {j:string}).j);
+  const setStored=(v:Record<string,unknown>)=>f.db.query('UPDATE standing_engineering_pools SET ledger_identity_json=?').run(JSON.stringify(v));
+  const UUID='7CD7DC2C-1F22-4B7C-BB7A-525D8FF5B697';
+  const seen:number[]=[];
+  const observe=(uuid:string)=>(dev:number)=>{seen.push(dev);return {bootSessionUUID:'2C2DEAF4-4608-4037-97F1-6E3E007AEBA7',apfsVolumeUUID:uuid};};
+  const open=(ledgerVolume?:Parameters<typeof createStandingEngineeringBudget>[0]['ledgerVolume'])=>{
+    const b=createStandingEngineeringBudget({ledger:f.ledger,authority:f.authority,assertAuthority:f.assertAuthority,...(ledgerVolume?{ledgerVolume}:{})});
+    clean.push(()=>b.close());return b;};
+  setStored({...stored,dev:stored.dev-1});
+  // No pin: any identity change still rejects.
+  expect(()=>open().status()).toThrow('pool_binding');
+  // Same pinned volume: accepted, the row is not rewritten, and the live dev is what gets observed.
+  const rebooted=open({apfsVolumeUUID:UUID,observe:observe(UUID)});
+  expect(rebooted.status().enrolled).toBe(true);expect(seen).toEqual([stored.dev]);
+  rebooted.allocate(f.input());
+  expect(JSON.parse((f.db.query('SELECT ledger_identity_json j FROM standing_engineering_pools').get() as {j:string}).j).dev).toBe(stored.dev-1);
+  // Another volume, an unobservable host, or any other identity field change: rejected.
+  expect(()=>open({apfsVolumeUUID:UUID,observe:observe('00000000-0000-0000-0000-000000000000')}).status()).toThrow('pool_binding');
+  expect(()=>open({apfsVolumeUUID:UUID,observe:()=>{throw new Error('engineering_budget_admission:reboot_attestation_rejected');}}).status()).toThrow('pool_binding');
+  for(const key of ['ino','uid','gid','mode','nlink'] as const){
+    setStored({...stored,dev:stored.dev-1,[key]:stored[key]+1});
+    expect(()=>open({apfsVolumeUUID:UUID,observe:observe(UUID)}).status()).toThrow('pool_binding');
+  }
+  setStored({...stored,dev:stored.dev-1,extra:1});
+  expect(()=>open({apfsVolumeUUID:UUID,observe:observe(UUID)}).status()).toThrow('pool_binding');
+  setStored({...stored,dev:String(stored.dev-1)});
+  expect(()=>open({apfsVolumeUUID:UUID,observe:observe(UUID)}).status()).toThrow('pool_binding');
+});
